@@ -1,286 +1,131 @@
+"""Pure UART transport (synchronous request/response).
+
+`MotionUart` no longer owns connection lifecycle — the owning handle
+(`MotionConsole`) drives `open(port)` / `close()` from its state machine.
+On a fatal serial error during reads or writes, the transport invokes the
+`on_io_error(errno, message)` callback; the handle's state machine is
+expected to react by transitioning out of CONNECTED.
+"""
+from __future__ import annotations
+
 import logging
-import asyncio
-import time
-import queue
 import threading
+import time
+from typing import Callable, Optional
+
 import serial
 import serial.tools.list_ports
 
-from omotion.connection_state import ConnectionState
-
 from omotion.UartPacket import UartPacket
-from omotion.signal_wrapper import SignalWrapper
 from omotion.config import (
-    OW_CMD_NOP,
-    OW_START_BYTE,
-    OW_END_BYTE,
     OW_ACK,
-    OW_RESP,
+    OW_CMD_NOP,
+    OW_END_BYTE,
     OW_ERROR,
+    OW_START_BYTE,
 )
 from omotion.utils import util_crc16
 from omotion import _log_root
 from omotion.CommandError import CommandError
 
-# Set up logging
 logger = logging.getLogger(f"{_log_root}.UART" if _log_root else "UART")
 
 
-class MOTIONUart(SignalWrapper):
+class MotionUart:
     def __init__(
         self,
-        vid,
-        pid,
-        baudrate=921600,
-        timeout=10,
-        align=0,
-        async_mode=False,
-        demo_mode=False,
-        desc="VCP",
+        vid: int,
+        pid: int,
+        baudrate: int = 921600,
+        timeout: int = 10,
+        align: int = 0,
+        demo_mode: bool = False,
+        desc: str = "VCP",
+        on_io_error: Optional[Callable[[Optional[int], str], None]] = None,
     ):
-        super().__init__()
         self.vid = vid
         self.pid = pid
-        self.port = None
+        self.port: Optional[str] = None
         self.baudrate = baudrate
         self.timeout = timeout
         self.align = align
         self.packet_count = 0
-        self.asyncMode = async_mode
-        self.running = False
-        self.monitoring_task = None
         self.demo_mode = demo_mode
         self.descriptor = desc
-        self.read_thread = None
-        self.last_rx = time.monotonic()
-        self.read_buffer = []
-        self.serial = None
+        self.serial: Optional[serial.Serial] = None
         self._io_lock = threading.RLock()
-        self.state = ConnectionState.DISCONNECTED
+        self.on_io_error = on_io_error
 
-        if async_mode:
-            self.loop = asyncio.get_event_loop()
-            self.response_queues = {}
-            self.response_lock = (
-                threading.Lock()
-            )  # Lock for thread-safe access to response_queues
+    # ────────────────────────────────────────────────────────────────────
+    # Lifecycle (driven by MotionConsole state machine)
+    # ────────────────────────────────────────────────────────────────────
 
-    def connect(self):
-        """Open the serial port."""
+    def open(self, port: str) -> None:
+        """Open the serial port. Raises serial.SerialException on failure."""
         if self.demo_mode:
-            logger.info("Demo mode: Simulating UART connection.")
-            self._set_state(ConnectionState.CONNECTED, reason="demo_mode")
-            self.signal_connect.emit(self.descriptor, "demo_mode")
+            self.port = port or "DEMO"
             return
-        self._set_state(ConnectionState.CONNECTING)
-        try:
-            self.serial = serial.Serial(
-                port=self.port, baudrate=self.baudrate, timeout=self.timeout
-            )
+        self.serial = serial.Serial(
+            port=port, baudrate=self.baudrate, timeout=self.timeout
+        )
+        self.port = port
+        logger.info("UART %s opened on %s", self.descriptor, port)
 
-            logger.info("Connected to UART on port %s.", self.port)
-            self._set_state(ConnectionState.CONNECTED)
-            self.signal_connect.emit(self.descriptor, self.port)
-
-            if self.asyncMode:
-                logger.info("Starting read thread for %s.", self.descriptor)
-                self.running = True
-                self.read_thread = threading.Thread(target=self._read_data)
-                self.read_thread.daemon = True
-                self.read_thread.start()
-        except serial.SerialException as se:
-            logger.error("Failed to connect to %s: %s", self.port, se)
-            self.serial = None
-            self.running = False
+    def close(self) -> None:
+        """Close the serial port. Idempotent."""
+        if self.demo_mode:
             self.port = None
-            self._set_state(ConnectionState.ERROR, reason=str(se))
-        except Exception as e:
-            self._set_state(ConnectionState.ERROR, reason=str(e))
-            raise e
-
-    def disconnect(self):
-        """Close the serial port.
-
-        Safe to call multiple times — subsequent calls after the first are
-        no-ops so that both the error-recovery path inside send_packet() and
-        the explicit teardown path in MOTIONInterface.disconnect() can each
-        call this without double-emitting signals or crashing during Python
-        interpreter shutdown.
-        """
-        self.running = False
-        if self.demo_mode:
-            logger.info("Demo mode: Simulating UART disconnection.")
-            if self.state != ConnectionState.DISCONNECTED:
-                self._set_state(ConnectionState.DISCONNECTED, reason="demo_mode")
-                try:
-                    self.signal_disconnect.emit(self.descriptor, "demo_mode")
-                except Exception as e:
-                    logger.debug("signal_disconnect.emit skipped during shutdown: %s", e)
             return
-
-        if self.read_thread:
-            self.read_thread.join(timeout=2.0)
-            self.read_thread = None
-        if self.serial and self.serial.is_open:
+        s = self.serial
+        self.serial = None
+        if s is not None:
             try:
-                self.serial.close()
+                if s.is_open:
+                    s.close()
             except Exception as e:
-                logger.debug("serial.close() raised during disconnect: %s", e)
-            self.serial = None
-
-        # Only transition and emit if we haven't already done so.  This makes
-        # disconnect() idempotent — critical because send_packet()'s error
-        # handler and MOTIONInterface.disconnect() can both call this.
-        if self.state != ConnectionState.DISCONNECTED:
-            logger.info("Disconnected from UART.")
-            self._set_state(ConnectionState.DISCONNECTED)
-            try:
-                self.signal_disconnect.emit(self.descriptor, self.port)
-            except Exception as e:
-                # The underlying Qt/C++ object can already be deleted when
-                # Python tears down objects at interpreter exit.
-                logger.debug("signal_disconnect.emit skipped during shutdown: %s", e)
+                logger.debug("serial.close raised: %s", e)
+        if self.port is not None:
+            logger.info("UART %s closed (was on %s)", self.descriptor, self.port)
         self.port = None
 
-    def is_connected(self) -> bool:
-        """
-        Check if the device is connected.
-
-        Returns:
-            bool: True if connected, False otherwise.
-        """
+    def is_open(self) -> bool:
         if self.demo_mode:
-            return True
-        return self.state == ConnectionState.CONNECTED
+            return self.port is not None
+        return self.serial is not None and self.serial.is_open
 
-    def check_usb_status(self):
-        """Check if the USB device is connected or disconnected."""
-        device = self.list_vcp_with_vid_pid()
-        if device and not self.port:
-            logger.debug("Device found; trying to connect.")
-            self._set_state(ConnectionState.DISCOVERED)
-            self.port = device
-            self.connect()
-        elif not device and self.port:
-            logger.debug("Device removed; disconnecting.")
-            self._set_state(ConnectionState.DISCONNECTED, reason="device_removed")
-            self.running = False
-            time.sleep(0.5)  # Short delay to avoid replug thrash
-            self.disconnect()
-            self.port = None
+    # ────────────────────────────────────────────────────────────────────
+    # VID/PID discovery
+    # ────────────────────────────────────────────────────────────────────
 
-    async def monitor_usb_status(self, interval=1):
-        """Periodically check for USB device connection."""
-        if self.demo_mode:
-            logger.debug("Monitoring in demo mode.")
-            self.connect()
-            return
-        while True:
-            self.check_usb_status()
-            await asyncio.sleep(interval)
-
-    def start_monitoring(self, interval=1):
-        """Start the periodic USB device connection check."""
-        if self.demo_mode:
-            logger.debug("Monitoring in demo mode.")
-            return
-        if not self.monitoring_task and self.asyncMode:
-            self.monitoring_task = asyncio.create_task(
-                self.monitor_usb_status(interval)
-            )
-
-    def stop_monitoring(self):
-        """Stop the periodic USB device connection check."""
-        if self.demo_mode:
-            logger.info("Monitoring in demo mode.")
-            return
-        if self.monitoring_task:
-            self.monitoring_task.cancel()
-            self.monitoring_task = None
-
-    def list_vcp_with_vid_pid(self):
-        """Find the USB device by VID and PID."""
-        ports = serial.tools.list_ports.comports()
-        for port in ports:
+    def find_port(self) -> Optional[str]:
+        """Return the COM/tty device path that matches our VID/PID, or None."""
+        for p in serial.tools.list_ports.comports():
             if (
-                hasattr(port, "vid")
-                and hasattr(port, "pid")
-                and port.vid == self.vid
-                and port.pid == self.pid
+                getattr(p, "vid", None) == self.vid
+                and getattr(p, "pid", None) == self.pid
             ):
-                return port.device
+                return p.device
         return None
 
-    def _read_data(self, timeout=20):
-        """Read data from the serial port in a separate thread."""
-        logger.debug("Starting data read loop for %s.", self.descriptor)
+    # ────────────────────────────────────────────────────────────────────
+    # I/O
+    # ────────────────────────────────────────────────────────────────────
+
+    def _notify_io_error(self, errno: Optional[int], message: str) -> None:
+        cb = self.on_io_error
+        if cb is None:
+            return
+        try:
+            cb(errno, message)
+        except Exception as e:
+            logger.warning("on_io_error callback raised: %s", e)
+
+    def _tx(self, data: bytes) -> None:
         if self.demo_mode:
-            logger.info("Demo mode: Simulating UART read NOT IMPLEMENTED.")
+            logger.debug("Demo mode TX: %s", data.hex())
             return
-
-        # In async mode, run the reading loop in a thread
-        while self.running:
-            bytes_waiting = 0
-            try:
-                if not self.serial or not self.serial.is_open:
-                    logger.warning("Serial port closed during read loop.")
-                    self._set_state(ConnectionState.ERROR, reason="serial_closed")
-                    self.disconnect()
-                    break
-                if self.serial.in_waiting > 0:
-                    time.sleep(0.002)  # Brief sleep to avoid a busy loop
-                    bytes_waiting = self.serial.in_waiting
-                    data = self.serial.read(self.serial.in_waiting)
-                    self.read_buffer.extend(data)
-
-                    logger.debug("Data received on %s: %s", self.descriptor, data)
-                    # Attempt to parse a complete packet from read_buffer.
-                    try:
-                        # Note: Depending on your protocol, you might need to check for start/end bytes
-                        # and possibly handle partial packets.
-                        packet = UartPacket(buffer=bytes(self.read_buffer))
-                        # Clear the buffer after a successful parse.
-
-                        self.read_buffer = []
-                        if self.asyncMode:
-                            with self.response_lock:
-                                # Check if a queue is waiting for this packet ID.
-                                if packet.id in self.response_queues:
-                                    self.response_queues[packet.id].put(packet)
-                                else:
-                                    logger.warning(
-                                        "Received an unsolicited packet with ID %d",
-                                        packet.id,
-                                    )
-                                    logger.warning(
-                                        "Packet type: 0x%02X, Command: 0x%02X",
-                                        packet.packet_type,
-                                        packet.command,
-                                    )
-                        else:
-                            self.signal_data_received.emit(self.descriptor, packet)
-
-                    except ValueError as ve:
-                        logger.error(f"Data bytes {bytes_waiting}")
-                        logger.error("Error parsing packet: %s", ve)
-                else:
-                    time.sleep(0.01)  # Brief sleep to avoid a busy loop
-            except serial.SerialException as se:
-                self._set_state(ConnectionState.ERROR, reason=str(se))
-                self.disconnect()
-            except Exception as e:
-                logger.error("Unexpected serial error on %s: %s", self.descriptor, e)
-                self._set_state(ConnectionState.ERROR, reason=str(e))
-                self.disconnect()
-
-    def _tx(self, data: bytes):
-        """Send data over UART."""
-        if not self.serial or not self.serial.is_open:
-            logger.error("Serial port is not initialized.")
-            return
-        if self.demo_mode:
-            logger.info("Demo mode: Simulating data transmission: %s", data)
-            return
+        if self.serial is None or not self.serial.is_open:
+            raise CommandError("UART not open")
         try:
             with self._io_lock:
                 if self.align > 0:
@@ -288,23 +133,18 @@ class MOTIONUart(SignalWrapper):
                         data += bytes([OW_END_BYTE])
                 self.serial.write(data)
         except serial.SerialException as se:
-            logger.error("Serial error during transmission: %s", se)
-            self._set_state(ConnectionState.ERROR, reason=str(se))
-            self.disconnect()
-            raise
-        except Exception as e:
-            logger.error("Error during transmission: %s", e)
-            self._set_state(ConnectionState.ERROR, reason=str(e))
-            self.disconnect()
+            errno = getattr(se, "errno", None)
+            self._notify_io_error(errno, str(se))
             raise
 
-    def read_packet(self, timeout=20) -> UartPacket:
-        """
-        Read a packet from the UART interface.
-
-        Returns:
-            UartPacket: Parsed packet or an error packet if parsing fails.
-        """
+    def read_packet(self, timeout: int = 20) -> UartPacket:
+        """Block until a packet arrives or `timeout` seconds elapse."""
+        if self.demo_mode:
+            return UartPacket(
+                id=0, packet_type=OW_ERROR, command=0, addr=0, reserved=0, data=[]
+            )
+        if self.serial is None:
+            raise CommandError("UART not open")
         with self._io_lock:
             start_time = time.monotonic()
             raw_data = b""
@@ -312,50 +152,48 @@ class MOTIONUart(SignalWrapper):
 
             while timeout == -1 or time.monotonic() - start_time < timeout:
                 time.sleep(0.05)
-                raw_data += self.serial.read_all()
+                try:
+                    raw_data += self.serial.read_all()
+                except serial.SerialException as se:
+                    self._notify_io_error(getattr(se, "errno", None), str(se))
+                    raise
                 if raw_data:
                     count += 1
                     if count > 1:
                         break
 
-        try:
-            if not raw_data:
-                raise ValueError("No data received from UART within timeout")
-            packet = UartPacket(buffer=raw_data)
-        except Exception as e:
-            logger.error("Error parsing packet: %s", e)
-            packet = UartPacket(
-                id=0, packet_type=OW_ERROR, command=0, addr=0, reserved=0, data=[]
-            )
-            raise e
-
-        return packet
+        if not raw_data:
+            raise ValueError("No data received from UART within timeout")
+        return UartPacket(buffer=raw_data)
 
     def send_packet(
         self,
         id=None,
         packetType=OW_ACK,
         command=OW_CMD_NOP,
-        addr=0,
-        reserved=0,
+        addr: int = 0,
+        reserved: int = 0,
         data=None,
-        timeout=20,
-    ):
-        """
-        Send a packet over UART and, if not running, return a response packet.
-        """
+        timeout: int = 20,
+    ) -> Optional[UartPacket]:
+        """Send a command packet and return the matching response.
 
+        Returns None only when the transport is closed (caller should treat
+        as a connection error). Raises `CommandError` on validation errors
+        and re-raises `serial.SerialException` after notifying the I/O
+        error callback so the handle can transition out of CONNECTED.
+        """
         try:
-            if not self.serial or not self.serial.is_open:
-                logger.error("Cannot send packet. Serial port is not connected.")
+            if not self.demo_mode and (
+                self.serial is None or not self.serial.is_open
+            ):
+                logger.error("Cannot send packet. UART not open.")
                 return None
 
             if id is None:
                 self.packet_count += 1
-
                 if self.packet_count >= 0xFFFF:
                     self.packet_count = 1
-
                 id = self.packet_count
 
             if data:
@@ -378,90 +216,37 @@ class MOTIONUart(SignalWrapper):
             if payload_length > 0:
                 packet.extend(payload)
 
-            crc_value = util_crc16(packet[1:])  # Exclude start byte
+            crc_value = util_crc16(packet[1:])  # exclude start byte
             packet.extend(crc_value.to_bytes(2, "big"))
             packet.append(OW_END_BYTE)
 
-            # print("Sending packet: ", packet.hex())
             with self._io_lock:
                 self._tx(packet)
                 time.sleep(0.0005)
-
-                if not self.asyncMode:
-                    ret_packet = self.read_packet(timeout=timeout)
-                    time.sleep(0.0005)
-                    return ret_packet
-                else:
-                    response_queue = queue.Queue()
-                    with self.response_lock:
-                        self.response_queues[id] = response_queue
-
-                    try:
-                        # Wait for a response that matches the packet ID.
-                        response = response_queue.get(timeout=timeout)
-                        # Optionally, check that the response has the expected type and command.
-                        if (
-                            response.packet_type == OW_RESP
-                            and response.command == command
-                        ):
-                            return response
-                        else:
-                            logger.error("Received unexpected response: %s", response)
-                            return response
-                    except queue.Empty:
-                        logger.error("Timeout waiting for response to packet ID %d", id)
-                        return None
-                    finally:
-                        with self.response_lock:
-                            # Clean up the queue entry regardless of outcome.
-                            self.response_queues.pop(id, None)
+                ret_packet = self.read_packet(timeout=timeout)
+                time.sleep(0.0005)
+                return ret_packet
 
         except ValueError as ve:
             logger.error("Validation error in send_packet: %s", ve)
-            # Wrap validation errors in CommandError so callers expecting
-            # protocol/transport errors can catch a consistent exception type.
             raise CommandError(str(ve)) from ve
         except serial.SerialException as se:
-            logger.error("Serial error in send_packet: %s", se)
-            self._set_state(ConnectionState.ERROR, reason=str(se))
-            self.disconnect()
-            raise
-        except Exception as e:
-            logger.error("Unexpected error in send_packet: %s", e)
-            self._set_state(ConnectionState.ERROR, reason=str(e))
-            self.disconnect()
+            # Already notified on_io_error from _tx/read_packet — the
+            # handle's state machine logs the disconnect at INFO. Logging
+            # here at DEBUG keeps in-flight commands from spamming ERROR
+            # during the disconnect window. The exception is still
+            # re-raised so callers can react.
+            logger.debug("Serial error in send_packet: %s", se)
             raise
 
-    def clear_buffer(self):
-        """Clear the read buffer."""
-        self.read_buffer = []
-
-    def _set_state(self, new_state: ConnectionState, reason: str | None = None):
-        if self.state == new_state:
+    def clear_buffer(self) -> None:
+        if self.demo_mode or self.serial is None:
             return
-        prior = self.state
-        self.state = new_state
-        if reason:
-            logger.info(
-                "UART %s state %s -> %s (%s)",
-                self.descriptor,
-                prior.name,
-                new_state.name,
-                reason,
-            )
-        else:
-            logger.info(
-                "UART %s state %s -> %s", self.descriptor, prior.name, new_state.name
-            )
+        try:
+            self.serial.reset_input_buffer()
+        except Exception:
+            pass
 
-    def run_coroutine(self, coro):
-        """Run a coroutine using the internal event loop."""
-        if not self.loop.is_running():
-            return self.loop.run_until_complete(coro)
-        else:
-            return asyncio.create_task(coro)
-
-    def print(self):
-        """Print the current UART configuration."""
+    def print(self) -> None:
         logger.info("    Serial Port: %s", self.port)
         logger.info("    Serial Baud: %s", self.baudrate)

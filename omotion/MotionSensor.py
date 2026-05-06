@@ -1,7 +1,15 @@
 import logging
 import struct
+import threading
 import time
+from typing import Literal, Optional
+
+import usb.core
+
 from omotion.MotionComposite import MotionComposite
+from omotion.usb_backend import get_libusb1_backend
+from omotion.connection_state import ConnectionState
+from omotion.signal_wrapper import SignalWrapper
 from omotion.config import (
     OW_BAD_CRC,
     OW_BAD_PARSE,
@@ -64,22 +72,251 @@ logger = logging.getLogger(f"{_log_root}.Sensor" if _log_root else "Sensor")
 _ERROR_TYPES = frozenset({OW_ERROR, OW_BAD_CRC, OW_BAD_PARSE, OW_UNKNOWN})
 
 
-class MOTIONSensor:
-    def __init__(self, uart: MotionComposite):
-        """Initialize the MOTIONSensor Module."""
-        self.uart = uart
-        # Cached IDs (populated by refresh_id_cache(), cleared on disconnect or explicitly)
-        self._cached_camera_uids = (
-            None  # dict[int, str] camera_id (0-7) -> "0x..." hex string
-        )
-        self._cached_hwid = None  # str, hex hardware ID
+class MotionSensor(SignalWrapper):
+    """Stable handle for a sensor module (left or right).
 
-        if self.uart and not self.uart.async_mode:
-            self.uart.check_usb_status()
-            if self.uart.is_connected():
-                logger.info("MOTION MOTIONSensor connected.")
-            else:
-                logger.info("MOTION MOTIONSensor NOT Connected.")
+    Identified by USB ``port_numbers[-1]`` (2 = left, 3 = right). The handle
+    is constructed once by ``MotionInterface`` and lives for its entire
+    lifetime — never replaced. Apps cache the reference once and gate any
+    use on ``handle.is_connected()``.
+
+    The lifecycle is owned by ``ConnectionMonitor``. The on-entry sequence
+    for ``CONNECTING`` is: usb.core.find by VID/PID + port → claim 3
+    interfaces → ping → ``refresh_id_cache()`` (HWID + 8 camera UIDs) →
+    version. Five-step retry backoff for the post-enumeration "resource
+    busy" window. ``self.uart`` is None when DISCONNECTED and a fresh
+    ``MotionComposite`` while CONNECTING/CONNECTED.
+    """
+
+    def __init__(
+        self,
+        side: Literal["left", "right"],
+        vid: int,
+        pid: int,
+    ):
+        super().__init__()
+        self.side: Literal["left", "right"] = side
+        self.name: str = side
+        self.vid = vid
+        self.pid = pid
+        self._port_suffix = 2 if side == "left" else 3
+
+        # Transport — None when DISCONNECTED; populated during CONNECTING.
+        self.uart: Optional[MotionComposite] = None
+
+        # Cached IDs (populated by refresh_id_cache during CONNECTING)
+        self._cached_camera_uids: Optional[dict[int, str]] = None
+        self._cached_hwid: Optional[str] = None
+        self.hardware_id: Optional[str] = None  # alias kept on the handle for clarity
+        self._version: str = "v0.0.0"
+
+        # State machine
+        self._state = ConnectionState.DISCONNECTED
+        self._state_cv = threading.Condition()
+        self._monitor = None  # set by MotionInterface.start()
+
+    # ──────────────────────────────────────────────────────────────────
+    # Compatibility: MotionSensor itself does not support demo mode in the
+    # new design (it constructs its own MotionComposite from a real libusb
+    # dev). Existing command method bodies use `self.demo_mode` to decide
+    # whether to short-circuit with a mock value; with this set to False
+    # they always proceed to `_send`, which raises cleanly when uart is
+    # None. If a demo-mode sensor is ever needed, expose a constructor
+    # parameter and override this attribute.
+    # ──────────────────────────────────────────────────────────────────
+
+    demo_mode: bool = False
+
+    # ──────────────────────────────────────────────────────────────────
+    # State (read-only from outside)
+    # ──────────────────────────────────────────────────────────────────
+
+    @property
+    def state(self) -> ConnectionState:
+        return self._state
+
+    def is_connected(self) -> bool:
+        return self._state == ConnectionState.CONNECTED
+
+    def wait_for(self, target: ConnectionState, timeout: float = 5.0) -> bool:
+        with self._state_cv:
+            return self._state_cv.wait_for(
+                lambda: self._state == target, timeout=timeout
+            )
+
+    def request_disconnect(self) -> None:
+        if self._monitor is None:
+            return
+        from omotion.connection_monitor import UserStop
+
+        self._monitor.submit(UserStop(handle_name=self.name))
+
+    # ──────────────────────────────────────────────────────────────────
+    # Wiring
+    # ──────────────────────────────────────────────────────────────────
+
+    def _attach_monitor(self, monitor) -> None:
+        self._monitor = monitor
+
+    def _on_uart_io_error(self, errno, message: str) -> None:
+        if self._monitor is None:
+            return
+        from omotion.connection_monitor import IoError
+
+        self._monitor.submit(
+            IoError(handle_name=self.name, errno=errno, message=message)
+        )
+
+    # ──────────────────────────────────────────────────────────────────
+    # State machine
+    # ──────────────────────────────────────────────────────────────────
+
+    def _set_state(self, new_state: ConnectionState, reason: str = "") -> None:
+        with self._state_cv:
+            if self._state == new_state:
+                return
+            old = self._state
+            self._state = new_state
+            self._state_cv.notify_all()
+        try:
+            self.signal_state_changed.emit(self, old, new_state, reason)
+        except Exception as e:
+            logger.debug("signal_state_changed emit suppressed: %s", e)
+        logger.info(
+            "%s state %s -> %s (%s)",
+            self.name,
+            old.name,
+            new_state.name,
+            reason or "",
+        )
+
+    def _handle_event(self, event) -> None:
+        from omotion.connection_monitor import (
+            IoError,
+            PollArrived,
+            PollGone,
+            UserStop,
+        )
+
+        st = self._state
+        if isinstance(event, PollArrived):
+            if st == ConnectionState.DISCONNECTED:
+                self._drive_connecting(reason="poll_arrived")
+        elif isinstance(event, (PollGone, IoError)):
+            if st == ConnectionState.CONNECTED:
+                reason = (
+                    f"usb_io_error:errno={event.errno}"
+                    if isinstance(event, IoError)
+                    else "poll_gone"
+                )
+                self._drive_disconnecting(reason=reason)
+            # Already DISCONNECTING/DISCONNECTED/CONNECTING → no-op (dedup).
+        elif isinstance(event, UserStop):
+            if st in (ConnectionState.CONNECTED, ConnectionState.CONNECTING):
+                self._drive_disconnecting(reason="user_stop")
+
+    def _find_dev(self):
+        """Locate the libusb device matching this sensor's VID/PID + port suffix."""
+        backend = get_libusb1_backend()
+        for dev in usb.core.find(
+            find_all=True, idVendor=self.vid, idProduct=self.pid, backend=backend
+        ):
+            try:
+                ports = getattr(dev, "port_numbers", []) or []
+                if ports and ports[-1] == self._port_suffix:
+                    return dev
+            except Exception:
+                continue
+        return None
+
+    def _drive_connecting(self, reason: str) -> None:
+        self._set_state(ConnectionState.CONNECTING, reason=reason)
+
+        backoff = [0.05, 0.1, 0.25, 0.5, 1.0]
+        last_error: Optional[Exception] = None
+        for delay in backoff:
+            try:
+                dev = self._find_dev()
+                if dev is None:
+                    raise RuntimeError(
+                        f"sensor device not found (VID=0x{self.vid:04X} "
+                        f"PID=0x{self.pid:04X} port_suffix={self._port_suffix})"
+                    )
+                composite = MotionComposite(
+                    dev,
+                    desc=self.side.upper(),
+                    async_mode=True,
+                    on_io_error=self._on_uart_io_error,
+                )
+                composite.open()
+                self.uart = composite
+
+                # Ping to confirm firmware is responsive. Bound the wait so
+                # a non-responsive device falls into our retry/backoff
+                # loop instead of hanging on the default 10 s timeout
+                # inherited from CommInterface.send_packet (which is sized
+                # for normal in-scan command latency, not connect probes).
+                # 2 s per attempt × 5 attempts + backoffs ≈ 12 s worst case,
+                # which covers typical post-power-on firmware boot.
+                r = self.uart.comm.send_packet(
+                    id=None, packetType=OW_CMD, command=OW_CMD_PING,
+                    timeout=2.0,
+                )
+                if r is None or r.packet_type in _ERROR_TYPES:
+                    raise RuntimeError("sensor ping failed or returned error")
+
+                # Read HWID + 8 camera security UIDs. HWID failure → retry.
+                # Per-camera UID failures are tolerated (dead camera marks
+                # its slot as "" but the connect still succeeds — same
+                # lenient policy as the legacy refresh_id_cache).
+                self.refresh_id_cache()
+                if not self._cached_hwid:
+                    raise RuntimeError("sensor HWID read returned empty")
+                self.hardware_id = self._cached_hwid
+
+                # Cache version (best-effort).
+                try:
+                    self._version = self.get_version()
+                except Exception as e:
+                    logger.debug("get_version during connect failed: %s", e)
+
+                self._set_state(ConnectionState.CONNECTED, reason="ping_ok")
+                return
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    "%s connect attempt failed (%s); retrying in %.0f ms",
+                    self.name, e, delay * 1000,
+                )
+                # Roll back any partial open.
+                try:
+                    if self.uart is not None:
+                        self.uart.close()
+                except Exception:
+                    pass
+                self.uart = None
+                self._cached_camera_uids = None
+                self._cached_hwid = None
+                self.hardware_id = None
+                time.sleep(delay)
+
+        self._set_state(
+            ConnectionState.DISCONNECTED,
+            reason=f"connect_retry_exhausted:{last_error}",
+        )
+
+    def _drive_disconnecting(self, reason: str) -> None:
+        self._set_state(ConnectionState.DISCONNECTING, reason=reason)
+        try:
+            if self.uart is not None:
+                self.uart.close()
+        except Exception:
+            logger.exception("uart close failed")
+        self.uart = None
+        self._cached_camera_uids = None
+        self._cached_hwid = None
+        self.hardware_id = None
+        self._set_state(ConnectionState.DISCONNECTED, reason=reason)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -88,12 +325,12 @@ class MOTIONSensor:
     def _send(self, **kwargs):
         """Send a command packet and return the firmware response.
 
-        Raises ValueError if the device is not connected.  All keyword
-        arguments are forwarded directly to CommInterface.send_packet;
-        ``id=None`` is always set so the comm layer assigns the next
-        sequence number.
+        Raises ValueError if the transport is not open. We allow sending
+        during CONNECTING (after USB claim succeeds) so that the on-entry
+        ping/refresh_id_cache/version sequence works without state
+        gymnastics; ``self.uart`` is the gate, not state.
         """
-        if not self.uart.is_connected():
+        if self.uart is None:
             raise ValueError("Sensor Module not connected")
         return self.uart.comm.send_packet(id=None, **kwargs)
 
@@ -105,27 +342,19 @@ class MOTIONSensor:
             )
 
     # ------------------------------------------------------------------
-    # Connection
-    # ------------------------------------------------------------------
-
-    def is_connected(self) -> bool:
-        """Return True if the sensor module is connected."""
-        return bool(self.uart and self.uart.is_connected())
-
-    # ------------------------------------------------------------------
     # Basic commands
     # ------------------------------------------------------------------
 
     def ping(self) -> bool:
         """Send a ping and return True if the device acknowledges."""
-        if self.uart.demo_mode:
+        if self.demo_mode:
             return True
         r = self._send(packetType=OW_CMD, command=OW_CMD_PING)
         return r.packet_type not in _ERROR_TYPES
 
     def get_version(self) -> str:
         """Return the firmware version string (e.g. 'v1.2.3')."""
-        if self.uart.demo_mode:
+        if self.demo_mode:
             return "v0.1.1"
         r = self._send(packetType=OW_CMD, command=OW_CMD_VERSION)
         if r.data_len == 3:
@@ -142,7 +371,7 @@ class MOTIONSensor:
 
     def echo(self, echo_data=None) -> tuple[bytes, int]:
         """Send echo_data and return (echoed_bytes, length), or (None, None)."""
-        if self.uart.demo_mode:
+        if self.demo_mode:
             data = b"Hello Motion!!"
             return data, len(data)
         if echo_data is not None and not isinstance(echo_data, (bytes, bytearray)):
@@ -152,28 +381,28 @@ class MOTIONSensor:
 
     def toggle_led(self) -> bool:
         """Toggle the status LED."""
-        if self.uart.demo_mode:
+        if self.demo_mode:
             return True
         self._send(packetType=OW_CMD, command=OW_CMD_TOGGLE_LED)
         return True
 
     def soft_reset(self) -> bool:
         """Perform a soft reset."""
-        if self.uart.demo_mode:
+        if self.demo_mode:
             return True
         r = self._send(packetType=OW_CMD, command=OW_CMD_RESET)
         return r.packet_type not in _ERROR_TYPES
 
     def enter_dfu(self) -> bool:
         """Reset into DFU (firmware update) mode."""
-        if self.uart.demo_mode:
+        if self.demo_mode:
             return True
         r = self._send(packetType=OW_CMD, command=OW_CMD_DFU)
         return r.packet_type != OW_ERROR
 
     def get_hardware_id(self) -> str | None:
         """Return the 16-byte hardware ID as a hex string, or None."""
-        if self.uart.demo_mode:
+        if self.demo_mode:
             return bytes.fromhex("deadbeefcafebabe1122334455667788")
         r = self._send(packetType=OW_CMD, command=OW_CMD_HWID)
         return r.data.hex() if r.data_len == 16 else None
@@ -184,7 +413,7 @@ class MOTIONSensor:
 
     def set_fan_control(self, fan_on: bool) -> bool:
         """Turn the fan ON (True) or OFF (False)."""
-        if self.uart.demo_mode:
+        if self.demo_mode:
             return True
         reserved = 0x01 | (0x02 if fan_on else 0x00)
         r = self._send(
@@ -194,7 +423,7 @@ class MOTIONSensor:
 
     def get_fan_control_status(self) -> bool:
         """Return True if the fan is currently ON."""
-        if self.uart.demo_mode:
+        if self.demo_mode:
             return True
         r = self._send(
             packetType=OW_CONTROLLER, command=OW_CTRL_FAN_CTL, reserved=0x00
@@ -214,7 +443,7 @@ class MOTIONSensor:
         Bit 4 (DEBUG_FLAG_COMM_VERBOSE) enables cmd id and "." response prints.
         Bit 5 (DEBUG_FLAG_CMD_VERBOSE) enables printf in command handlers.
         """
-        if self.uart.demo_mode:
+        if self.demo_mode:
             return True
         r = self._send(
             packetType=OW_CMD,
@@ -230,7 +459,7 @@ class MOTIONSensor:
 
     def get_debug_flags(self) -> int:
         """Return the current firmware debug flags, or 0 on error."""
-        if self.uart.demo_mode:
+        if self.demo_mode:
             return 0
         r = self._send(packetType=OW_CMD, command=OW_CMD_DEBUG_FLAGS, reserved=0)
         if r.packet_type in _ERROR_TYPES or r.data_len != 4:
@@ -248,7 +477,7 @@ class MOTIONSensor:
 
         Must be called before :meth:`imu_on`.
         """
-        if self.uart.demo_mode:
+        if self.demo_mode:
             return True
         r = self._send(packetType=OW_IMU, command=OW_IMU_INIT)
         return r is not None
@@ -259,7 +488,7 @@ class MOTIONSensor:
         Includes a 100 ms startup delay so data registers are valid when
         the caller proceeds to read motion data.
         """
-        if self.uart.demo_mode:
+        if self.demo_mode:
             return True
         r = self._send(packetType=OW_IMU, command=OW_IMU_ON)
         # Most IMU chips require 50–100 ms after power-on before data registers
@@ -269,14 +498,14 @@ class MOTIONSensor:
 
     def imu_off(self) -> bool:
         """Power down the IMU."""
-        if self.uart.demo_mode:
+        if self.demo_mode:
             return True
         r = self._send(packetType=OW_IMU, command=OW_IMU_OFF)
         return r is not None
 
     def imu_get_temperature(self) -> float:
         """Return IMU temperature in degrees Celsius."""
-        if self.uart.demo_mode:
+        if self.demo_mode:
             return 25.0
         r = self._send(packetType=OW_IMU, command=OW_IMU_GET_TEMP)
         if r.data_len != 4:
@@ -287,7 +516,7 @@ class MOTIONSensor:
 
     def imu_get_accelerometer(self) -> list[int]:
         """Return raw accelerometer readings as [x, y, z] signed 16-bit integers."""
-        if self.uart.demo_mode:
+        if self.demo_mode:
             return [0, 0, 0]
         r = self._send(packetType=OW_IMU, command=OW_IMU_GET_ACCEL)
         if r.data_len != 6:
@@ -298,7 +527,7 @@ class MOTIONSensor:
 
     def imu_get_gyroscope(self) -> list[int]:
         """Return raw gyroscope readings as [x, y, z] signed 16-bit integers."""
-        if self.uart.demo_mode:
+        if self.demo_mode:
             return [0, 0, 0]
         r = self._send(packetType=OW_IMU, command=OW_IMU_GET_GYRO)
         if r.data_len != 6:
@@ -314,7 +543,7 @@ class MOTIONSensor:
     def reset_camera_sensor(self, camera_position: int) -> bool:
         """Reset the camera sensor(s) indicated by the bitmask."""
         self._check_camera_mask(camera_position)
-        if self.uart.demo_mode:
+        if self.demo_mode:
             return True
         r = self._send(packetType=OW_FPGA, command=OW_FPGA_RESET, addr=camera_position)
         return r.packet_type not in _ERROR_TYPES
@@ -322,7 +551,7 @@ class MOTIONSensor:
     def activate_camera_fpga(self, camera_position: int) -> bool:
         """Activate the FPGA for the camera(s) indicated by the bitmask."""
         self._check_camera_mask(camera_position)
-        if self.uart.demo_mode:
+        if self.demo_mode:
             return True
         r = self._send(
             packetType=OW_FPGA, command=OW_FPGA_ACTIVATE, addr=camera_position
@@ -332,7 +561,7 @@ class MOTIONSensor:
     def check_camera_fpga(self, camera_position: int) -> bool:
         """Return True if the FPGA ID check passes for the given bitmask."""
         self._check_camera_mask(camera_position)
-        if self.uart.demo_mode:
+        if self.demo_mode:
             return True
         r = self._send(packetType=OW_FPGA, command=OW_FPGA_ID, addr=camera_position)
         return r.packet_type not in _ERROR_TYPES
@@ -340,7 +569,7 @@ class MOTIONSensor:
     def enter_sram_prog_fpga(self, camera_position: int) -> bool:
         """Enter SRAM programming mode for the FPGA(s) indicated by the bitmask."""
         self._check_camera_mask(camera_position)
-        if self.uart.demo_mode:
+        if self.demo_mode:
             return True
         r = self._send(
             packetType=OW_FPGA,
@@ -352,7 +581,7 @@ class MOTIONSensor:
     def exit_sram_prog_fpga(self, camera_position: int) -> bool:
         """Exit SRAM programming mode for the FPGA(s) indicated by the bitmask."""
         self._check_camera_mask(camera_position)
-        if self.uart.demo_mode:
+        if self.demo_mode:
             return True
         r = self._send(
             packetType=OW_FPGA,
@@ -364,7 +593,7 @@ class MOTIONSensor:
     def erase_sram_fpga(self, camera_position: int) -> bool:
         """Erase SRAM for the FPGA(s) indicated by the bitmask."""
         self._check_camera_mask(camera_position)
-        if self.uart.demo_mode:
+        if self.demo_mode:
             return True
         r = self._send(
             packetType=OW_FPGA,
@@ -377,7 +606,7 @@ class MOTIONSensor:
     def get_status_fpga(self, camera_position: int) -> bool:
         """Return the FPGA status for the camera(s) indicated by the bitmask."""
         self._check_camera_mask(camera_position)
-        if self.uart.demo_mode:
+        if self.demo_mode:
             return True
         r = self._send(
             packetType=OW_FPGA, command=OW_FPGA_STATUS, addr=camera_position
@@ -387,7 +616,7 @@ class MOTIONSensor:
     def get_usercode_fpga(self, camera_position: int) -> bool:
         """Return the FPGA usercode for the camera(s) indicated by the bitmask."""
         self._check_camera_mask(camera_position)
-        if self.uart.demo_mode:
+        if self.demo_mode:
             return True
         r = self._send(
             packetType=OW_FPGA, command=OW_FPGA_USERCODE, addr=camera_position
@@ -464,7 +693,7 @@ class MOTIONSensor:
         up to 60 seconds for a full load.
         """
         self._check_camera_mask(camera_position)
-        if self.uart.demo_mode:
+        if self.demo_mode:
             return True
         r = self._send(
             packetType=OW_FPGA,
@@ -482,7 +711,7 @@ class MOTIONSensor:
     def camera_configure_registers(self, camera_position: int) -> bool:
         """Write the default register set to the camera sensor(s)."""
         self._check_camera_mask(camera_position)
-        if self.uart.demo_mode:
+        if self.demo_mode:
             return True
         r = self._send(
             packetType=OW_CAMERA,
@@ -506,7 +735,7 @@ class MOTIONSensor:
             raise ValueError(
                 f"test_pattern must be 0x00 to 0x04, got {test_pattern:#04x}"
             )
-        if self.uart.demo_mode:
+        if self.demo_mode:
             return True
         r = self._send(
             packetType=OW_CAMERA,
@@ -520,7 +749,7 @@ class MOTIONSensor:
     def camera_capture_histogram(self, camera_position: int) -> bool:
         """Trigger a single-frame histogram capture for the given camera(s)."""
         self._check_camera_mask(camera_position)
-        if self.uart.demo_mode:
+        if self.demo_mode:
             return True
         r = self._send(
             packetType=OW_CAMERA,
@@ -538,7 +767,7 @@ class MOTIONSensor:
         a 4-byte float32 temperature.  Returns None on firmware error.
         """
         self._check_camera_mask(camera_position)
-        if self.uart.demo_mode:
+        if self.demo_mode:
             return None
         r = self._send(
             packetType=OW_CAMERA,
@@ -646,7 +875,7 @@ class MOTIONSensor:
             7 — Streaming enabled
         """
         self._check_camera_mask(camera_position)
-        if self.uart.demo_mode:
+        if self.demo_mode:
             return {i: 0x07 for i in range(8) if (camera_position >> i) & 1}
         r = self._send(
             packetType=OW_CAMERA,
@@ -749,14 +978,14 @@ class MOTIONSensor:
 
     def enable_aggregator_fsin(self) -> bool:
         """Enable the internal frame-sync signal generator."""
-        if self.uart.demo_mode:
+        if self.demo_mode:
             return True
         r = self._send(packetType=OW_CAMERA, command=OW_CAMERA_FSIN, reserved=1)
         return r.packet_type not in _ERROR_TYPES
 
     def disable_aggregator_fsin(self) -> bool:
         """Disable the internal frame-sync signal generator."""
-        if self.uart.demo_mode:
+        if self.demo_mode:
             return True
         r = self._send(packetType=OW_CAMERA, command=OW_CAMERA_FSIN, reserved=0)
         return r.packet_type not in _ERROR_TYPES
@@ -764,7 +993,7 @@ class MOTIONSensor:
     def enable_camera(self, camera_position) -> bool:
         """Enable streaming for the camera(s) indicated by the bitmask."""
         self._check_camera_mask(camera_position)
-        if self.uart.demo_mode:
+        if self.demo_mode:
             return True
         # 1.5 s accommodates stream-armed IF0 contention: when streaming on
         # IF1 has just been armed, the MCU can take ~1 s to service the
@@ -782,7 +1011,7 @@ class MOTIONSensor:
     def disable_camera(self, camera_position) -> bool:
         """Disable streaming for the camera(s) indicated by the bitmask."""
         self._check_camera_mask(camera_position)
-        if self.uart.demo_mode:
+        if self.demo_mode:
             return True
         r = self._send(
             packetType=OW_CAMERA,
@@ -795,7 +1024,7 @@ class MOTIONSensor:
 
     def enable_camera_fsin_ext(self) -> bool:
         """Enable external frame-sync input."""
-        if self.uart.demo_mode:
+        if self.demo_mode:
             return True
         r = self._send(
             packetType=OW_CAMERA,
@@ -807,7 +1036,7 @@ class MOTIONSensor:
 
     def disable_camera_fsin_ext(self) -> bool:
         """Disable external frame-sync input."""
-        if self.uart.demo_mode:
+        if self.demo_mode:
             return True
         r = self._send(
             packetType=OW_CAMERA, command=OW_CAMERA_FSIN_EXTERNAL, reserved=0
@@ -828,7 +1057,7 @@ class MOTIONSensor:
 
     def camera_i2c_write(self, packet, packet_id=None):
         """Write a single register via the I2C passthrough interface."""
-        if self.uart.demo_mode:
+        if self.demo_mode:
             return True
         data = packet.register_address.to_bytes(2, "big") + packet.data.to_bytes(
             1, "big"
@@ -876,15 +1105,19 @@ class MOTIONSensor:
     def refresh_id_cache(self) -> None:
         """Read and cache all camera security UIDs (0–7) and the sensor hardware ID.
 
-        Call after connection so :meth:`get_cached_camera_security_uid` and
-        :meth:`get_cached_hardware_id` can return values without repeated
-        device reads.  Also updates :data:`omotion.MotionProcessing.PEDESTAL_HEIGHT`
-        based on the sensor firmware version (64 for ≤ 1.5.2, 128 for ≥ 1.5.3).
+        Used both as part of the CONNECTING on-entry sequence (called from
+        ``_drive_connecting`` while ``state`` is CONNECTING — gating on
+        ``is_connected()`` would early-return there) and as a manually-
+        invoked refresh once connected. The transport (``self.uart``) is
+        the gate: if it's None, the inner command sends raise cleanly.
+
+        Also updates :data:`omotion.MotionProcessing.PEDESTAL_HEIGHT` based
+        on the sensor firmware version (64 for ≤ 1.5.2, 128 for ≥ 1.5.3).
         """
         self._cached_camera_uids = None
         self._cached_hwid = None
         try:
-            if not self.is_connected():
+            if self.uart is None:
                 return
             uids = {}
             for camera_id in range(8):
@@ -1030,19 +1263,10 @@ class MOTIONSensor:
         except Exception as e:
             logger.warning("Sensor: failed to read device info: %s", e)
 
-    def disconnect(self):
-        """Disconnect the UART and clean up."""
-        if self.uart:
-            logger.info("Disconnecting MOTIONSensor UART...")
-            self.uart.disconnect()
-            self.uart = None
-
-    def __del__(self):
-        """Fallback cleanup on garbage collection."""
-        try:
-            self.disconnect()
-        except Exception as e:
-            logger.warning("Error in MOTIONSensor destructor: %s", e)
+# Note: graceful disconnect is now driven by ConnectionMonitor via
+# `request_disconnect()` (which submits an EVT_USER_STOP). The old
+# `disconnect()`/`__del__` pair has been removed — the monitor owns the
+# transport lifecycle.
 
     # ------------------------------------------------------------------
     # Utilities

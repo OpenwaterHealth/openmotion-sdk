@@ -68,6 +68,57 @@ jobs:
         if: steps.prerelease.outputs.pre != 'true'
         run: pip install --upgrade twine
 
+      # 7.5️⃣ Preflight: confirm the PyPI project exists. OIDC trusted
+      #     publishers cannot create new projects (HTTP 400 "Non-user
+      #     identities cannot create new projects."), so a missing project
+      #     turns into a confusing 400 from twine. Catch it here with a
+      #     clear, actionable error.
+      - name: Preflight — verify PyPI project exists
+        if: steps.prerelease.outputs.pre != 'true'
+        run: |
+          echo "── Distribution files in dist/:"
+          ls -la dist/
+
+          # Wheel filename: {distribution}-{version}-...-py3-none-any.whl
+          # PEP 427 says the distribution part uses '_' instead of '-'.
+          WHL=$(ls dist/*.whl 2>/dev/null | head -1)
+          if [ -z "$WHL" ]; then
+            echo "::error::No .whl file in dist/ — nothing to publish."
+            exit 1
+          fi
+          PKG_NAME=$(basename "$WHL" .whl | cut -d'-' -f1 | tr '_' '-')
+          echo "── Resolved package name from wheel: ${PKG_NAME}"
+
+          HTTP=$(curl -s -o /dev/null -w "%{http_code}" "https://pypi.org/pypi/${PKG_NAME}/json")
+          if [ "$HTTP" = "404" ]; then
+            cat <<EOF >> "$GITHUB_STEP_SUMMARY"
+          ## ❌ PyPI project '${PKG_NAME}' does not exist
+
+          OIDC trusted publishers cannot create new projects. Fix one of two ways:
+
+          **Option A — Pending Publisher (recommended):**
+          1. Go to https://pypi.org/manage/account/publishing/
+          2. Add a Pending Publisher with:
+             - Project name: \`${PKG_NAME}\`
+             - Owner: \`OpenwaterHealth\`
+             - Repository: \`openmotion-sdk\`
+             - Workflow: \`publish-pypi.yml\`
+          3. Re-run this workflow (workflow_dispatch).
+
+          **Option B — One-time manual upload:**
+          From a developer machine with PyPI credentials:
+          \`\`\`
+          python -m build
+          twine upload dist/${PKG_NAME//-/_}-*.tar.gz dist/${PKG_NAME//-/_}-*.whl
+          \`\`\`
+          The first manual upload registers the project; subsequent CI runs
+          via the OIDC publisher will then succeed.
+          EOF
+            echo "::error title=PyPI project not found::'${PKG_NAME}' is not registered on PyPI. See the run summary for fix instructions."
+            exit 1
+          fi
+          echo "  ${PKG_NAME} exists on PyPI (HTTP ${HTTP}) — ready to publish"
+
       # 8️⃣ Publish to PyPI
       - name: Publish to PyPI
         if: steps.prerelease.outputs.pre != 'true'
@@ -76,3 +127,28 @@ jobs:
           user: __token__
           password: ${{ secrets.PYPI_API_TOKEN }}
           packages_dir: ./dist
+
+      # 9️⃣ Post-publish verification: hit PyPI and confirm the new
+      #     version is actually visible. Catches silent failures where
+      #     twine returns success but PyPI didn't actually accept the
+      #     upload (rare but has happened during outages).
+      - name: Verify on PyPI
+        if: steps.prerelease.outputs.pre != 'true'
+        run: |
+          WHL=$(ls dist/*.whl | head -1)
+          PKG_NAME=$(basename "$WHL" .whl | cut -d'-' -f1 | tr '_' '-')
+          PKG_VERSION=$(basename "$WHL" .whl | cut -d'-' -f2)
+
+          # PyPI's CDN can lag a few seconds after a successful upload.
+          for i in 1 2 3 4 5; do
+            HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
+              "https://pypi.org/pypi/${PKG_NAME}/${PKG_VERSION}/json")
+            if [ "$HTTP" = "200" ]; then
+              echo "::notice ::Verified: https://pypi.org/project/${PKG_NAME}/${PKG_VERSION}/"
+              exit 0
+            fi
+            echo "  attempt ${i}/5: HTTP ${HTTP} — waiting 10s for PyPI to surface..."
+            sleep 10
+          done
+          echo "::error::${PKG_NAME}@${PKG_VERSION} not visible on PyPI after upload (last HTTP ${HTTP})"
+          exit 1

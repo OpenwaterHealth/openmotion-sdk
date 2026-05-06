@@ -82,8 +82,13 @@ class CommInterface(USBInterfaceBase):
         self._buffer_condition = threading.Condition(self._buffer_lock)
         self.packet_count = 0
         self.async_mode = async_mode
-        self.on_disconnect = None
-        self._disconnect_notified = False
+        # Callback invoked once when the read loop sees a fatal USB error
+        # (e.g. ENODEV, EIO, EPIPE). The owning MotionSensor wires this to
+        # submit an EVT_IO_ERROR to the ConnectionMonitor, which then drives
+        # the handle's state machine. The single-event-queue design means we
+        # don't need the previous _disconnect_notified flag or the daemon-
+        # thread dispatch hack that worked around join-self deadlocks.
+        self.on_io_error = None
         self._io_lock = threading.RLock()
         self._send_lock = threading.Lock()
         if self.async_mode:
@@ -235,43 +240,29 @@ class CommInterface(USBInterfaceBase):
         logger.info(f"{self.desc}: Read thread started")
 
     def stop_read_thread(self):
+        """Signal the read loop to exit and join it (unless we're being
+        called from the read thread itself, in which case the caller is
+        already on its way out)."""
         self.stop_event.set()
-        # We're intentionally shutting down; prevent the read loop from
-        # triggering disconnect callbacks/logging if the device disappears.
-        self._disconnect_notified = True
-        if self.read_thread:
-            # Safety net: _trigger_disconnect now dispatches on_disconnect to a
-            # separate daemon thread, so this guard should never fire in normal
-            # operation.  It stays here to prevent a hang if anyone calls
-            # stop_read_thread() from a context where the read thread is on the
-            # call stack (joining the current thread raises RuntimeError).
-            if threading.current_thread() is not self.read_thread:
-                self.read_thread.join(timeout=2.0)
+        rt = self.read_thread
+        if rt is not None and threading.current_thread() is not rt:
+            rt.join(timeout=2.0)
         logger.info(f"{self.desc}: Read thread stopped")
 
-    def _trigger_disconnect(self, error):
-        # During an intentional shutdown, ignore disconnect triggers.
-        if self.stop_event.is_set():
+    def _notify_io_error(self, error):
+        """Invoke the io-error callback exactly once per read-loop exit.
+
+        The state-machine on the owning handle dedups further events that
+        arrive while the handle is already in DISCONNECTING, so we don't
+        need a flag here — the queue serializes everything."""
+        cb = self.on_io_error
+        if cb is None:
             return
-        if self._disconnect_notified:
-            return
-        self._disconnect_notified = True
-        logger.error(f"{self.desc}: triggering disconnect due to USB error: {error}")
-        self.stop_event.set()
-        if callable(self.on_disconnect):
-            # Dispatch the disconnect callback to a new daemon thread rather than
-            # calling it directly from the read thread.  on_disconnect typically
-            # calls MotionComposite.disconnect() → stop_read_thread() → join(),
-            # which would deadlock if run on the read thread itself.  By handing
-            # off to a separate thread the read loop exits naturally (stop_event
-            # is already set) and the join in stop_read_thread() completes quickly.
-            t = threading.Thread(
-                target=self.on_disconnect,
-                args=(self.desc, error),
-                daemon=True,
-                name=f"{self.desc}-disconnect",
-            )
-            t.start()
+        errno = getattr(error, "errno", None)
+        try:
+            cb(errno, str(error))
+        except Exception as e:
+            logger.warning("on_io_error callback raised: %s", e)
 
     def _read_loop(self):
         while not self.stop_event.is_set():
@@ -287,34 +278,27 @@ class CommInterface(USBInterfaceBase):
                     logger.debug(f"Read {len(data)} bytes.")
                 time.sleep(0.001)
             except usb.core.USBError as e:
-                # If we're shutting down, USB errors here are expected and should not be noisy.
+                # During an intentional shutdown the read loop will see USB
+                # errors as the transport is closed; suppress them silently.
                 if self.stop_event.is_set():
                     break
-                if e.errno == 110:
-                    pass
-                elif e.errno == 10060:
-                    pass
-                elif e.errno == 32:
-                    # Only log at ERROR when this is unexpected (not a clean shutdown).
-                    if not self._disconnect_notified:
-                        logger.error(f"{self.desc} read error: DISCONNECT{e}")
-                    self._trigger_disconnect(e)
-                    break
-
-                elif e.errno == 19 or e.errno == 5:
-                    # errno 19 = ENODEV (device unplugged or GC'd during shutdown).
-                    # errno  5 = EIO   (device I/O error).
-                    # Both are expected when the app is tearing down — only log at
-                    # ERROR when the disconnect is genuinely unintentional.
-                    if not self._disconnect_notified:
-                        logger.error(f"{self.desc} read error: IO Error{e}")
-                    self._trigger_disconnect(e)
-                    break
-                else:
-                    if not self._disconnect_notified:
-                        logger.error(f"{self.desc} read error: Unknown Error{e}")
-                    self._trigger_disconnect(e)
-                    break
+                if e.errno in (110, 10060):
+                    # Read timeout — no data this window. Keep looping.
+                    continue
+                # errno 32 = EPIPE (stalled/disconnected endpoint)
+                # errno 19 = ENODEV (device unplugged)
+                # errno  5 = EIO (device I/O error)
+                # Any other USB error we treat the same way: notify the
+                # owning handle and exit. The handle's state machine
+                # decides how to react (transition to DISCONNECTING,
+                # release resources). Logging the disconnect once at the
+                # state-machine level avoids the historical duplicate-log
+                # spam from multiple disconnect paths racing.
+                logger.warning(
+                    f"{self.desc}: USB read error (errno={e.errno}); exiting read loop: {e}"
+                )
+                self._notify_io_error(e)
+                break
 
     def _process_responses(self):
         while not self.stop_event.is_set():

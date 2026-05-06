@@ -7,11 +7,10 @@ produces a meaningful test run.
 """
 
 import os
-import time
 
 import pytest
 
-from omotion.Interface import MOTIONInterface
+from omotion import MotionInterface
 
 
 # ---------------------------------------------------------------------------
@@ -20,12 +19,12 @@ from omotion.Interface import MOTIONInterface
 
 @pytest.fixture(scope="session")
 def motion():
-    """Initialise MOTIONInterface and yield for the whole session."""
+    """Initialise MotionInterface and yield for the whole session."""
     demo = os.getenv("OPENMOTION_DEMO", "0") == "1"
-    iface = MOTIONInterface(demo_mode=demo)
-    time.sleep(0.5)  # brief settle after enumeration
+    iface = MotionInterface(demo_mode=demo)
+    iface.start(wait=True, wait_timeout=3.0)
     yield iface
-    iface.disconnect()
+    iface.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -34,10 +33,9 @@ def motion():
 
 @pytest.fixture(scope="session")
 def console(motion):
-    c = motion.console_module
-    if c is None or not c.is_connected():
+    if not motion.console.is_connected():
         pytest.skip("Console module not connected")
-    return c
+    return motion.console
 
 
 # ---------------------------------------------------------------------------
@@ -46,18 +44,16 @@ def console(motion):
 
 @pytest.fixture(scope="session")
 def sensor_left(motion):
-    s = motion.sensors.get("left") if motion.sensors else None
-    if s is None or not s.is_connected():
+    if not motion.left.is_connected():
         pytest.skip("Left sensor not connected")
-    return s
+    return motion.left
 
 
 @pytest.fixture(scope="session")
 def sensor_right(motion):
-    s = motion.sensors.get("right") if motion.sensors else None
-    if s is None or not s.is_connected():
+    if not motion.right.is_connected():
         pytest.skip("Right sensor not connected")
-    return s
+    return motion.right
 
 
 @pytest.fixture(
@@ -68,7 +64,7 @@ def sensor_right(motion):
 def any_sensor(request, motion):
     """Parametrised fixture — each sensor test runs against both sides."""
     side = request.param
-    s = motion.sensors.get(side) if motion.sensors else None
-    if s is None or not s.is_connected():
+    sensor = motion.left if side == "left" else motion.right
+    if not sensor.is_connected():
         pytest.skip(f"{side} sensor not connected")
-    return s
+    return sensor

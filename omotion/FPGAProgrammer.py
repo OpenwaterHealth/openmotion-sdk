@@ -27,7 +27,7 @@ import time
 from typing import Callable, Optional
 from omotion import _log_root
 from omotion.CommandError import CommandError
-from omotion.Console import MOTIONConsole
+from omotion.MotionConsole import MotionConsole
 from omotion.config import (
     XO2_FLASH_PAGE_SIZE,
     ERASE_ALL,
@@ -174,7 +174,7 @@ class FpgaPageProgrammer:
 
     def __init__(
         self,
-        api: MOTIONConsole,
+        api: MotionConsole,
         verify: bool = True,
         erase_mode: int = ERASE_ALL,
         erase_timeout: float = 35.0,

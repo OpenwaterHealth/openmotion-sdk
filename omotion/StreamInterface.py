@@ -344,13 +344,26 @@ class StreamInterface(USBInterfaceBase):
         _READ_TIMEOUT_MS = 500
 
         while True:
+            # Check stop FIRST so a stop-then-clear race in stop_streaming
+            # (which nulls expected_size/data_queue after join times out)
+            # can't drive us back into dev.read with None args.
+            if self.stop_event.is_set():
+                break
+            # Snapshot the read parameters under the assumption stop_streaming
+            # may null them out concurrently. If they're already None the
+            # streaming session is over — exit instead of crashing inside
+            # libusb on `length * b'\x00'`.
+            expected_size = self.expected_size
+            data_queue = self.data_queue
+            if expected_size is None or data_queue is None:
+                break
             try:
                 data = self.dev.read(
-                    self.ep_in.bEndpointAddress, self.expected_size,
+                    self.ep_in.bEndpointAddress, expected_size,
                     timeout=_READ_TIMEOUT_MS,
                 )
-                if data and self.data_queue:
-                    self.data_queue.put(bytes(data))
+                if data and data_queue is self.data_queue:
+                    data_queue.put(bytes(data))
                     self.packets_received += 1
             except usb.core.USBError as e:
                 if e.errno in (110, 10060):

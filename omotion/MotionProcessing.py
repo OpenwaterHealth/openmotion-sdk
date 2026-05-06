@@ -212,16 +212,49 @@ class FrameIdUnwrapper:
 
     One unwrapper instance must be kept per (side, cam_id) pair so that
     independent per-camera counters do not interfere with one another.
+
+    **Sensor firmware quirk handling:** the camera's *very first* frame
+    after a fresh scan start often has raw_id=1, then the cycle starts
+    properly from raw_id=0 on the second frame. Naively this produces
+    a non-monotonic absolute_frame_id sequence (1, 0, 1, 2, 3, ...).
+    The unwrapper detects this exact pattern on the second call and
+    re-aligns: the spurious first frame keeps abs_frame_id=0 (a
+    "preamble" slot that the discard_count warmup will drop anyway),
+    and the second frame's raw=0 becomes abs=1.
     """
 
     def __init__(self) -> None:
         self._last_raw: int | None = None
         self._epoch: int = 0
+        # Set to True after the first call. Lets unwrap() detect the
+        # camera's spurious-first-frame pattern on the second call.
+        self._first_seen_raw: int | None = None
+        self._second_call_realigned: bool = False
+        # Offset added to the raw cycle position to derive abs. Starts
+        # at 0 and gets bumped to 1 if the spurious-first-frame pattern
+        # is detected.
+        self._cycle_offset: int = 0
 
     def unwrap(self, raw_frame_id: int) -> int:
         if self._last_raw is None:
+            # First frame ever. Tentatively treat it as the start of
+            # the cycle (return 0 as a "preamble" slot).
             self._last_raw = raw_frame_id
-            return raw_frame_id
+            self._first_seen_raw = raw_frame_id
+            return 0 if raw_frame_id == 1 else raw_frame_id
+
+        # On the second call, decide whether the camera quirk is in
+        # play. The signature is: first raw=1, second raw=0. If we see
+        # this, the cycle's "true" first frame is the SECOND frame, so
+        # we re-anchor _last_raw to raw=0 and bump cycle_offset so abs
+        # comes out as 1 for that frame instead of 0.
+        if not self._second_call_realigned:
+            self._second_call_realigned = True
+            if self._first_seen_raw == 1 and raw_frame_id == 0:
+                # Re-anchor.
+                self._last_raw = 0
+                self._cycle_offset = 1
+                return 1
 
         delta = (raw_frame_id - self._last_raw) & 0xFF
 
@@ -232,11 +265,14 @@ class FrameIdUnwrapper:
         # treat as anomaly and leave epoch unchanged.
 
         self._last_raw = raw_frame_id
-        return self._epoch * FRAME_ID_MODULUS + raw_frame_id
+        return self._epoch * FRAME_ID_MODULUS + raw_frame_id + self._cycle_offset
 
     def reset(self) -> None:
         self._last_raw = None
         self._epoch = 0
+        self._first_seen_raw = None
+        self._second_call_realigned = False
+        self._cycle_offset = 0
 
 
 # ---------------------------------------------------------------------------
@@ -1092,6 +1128,9 @@ class SciencePipeline:
         discard_count: int = 9,
         expected_row_sum: int | None = None,
         noise_floor: int = 10,
+        log_dark_endpoints: bool = False,
+        dark_integrity_max_u1_above_pedestal: float = 30.0,
+        dark_integrity_max_std: float = 20.0,
     ):
         self._bfi_c_min = bfi_c_min
         self._bfi_c_max = bfi_c_max
@@ -1103,6 +1142,16 @@ class SciencePipeline:
         self._on_rolling_avg_fn = on_rolling_avg_fn
         self._rolling_avg_enabled = bool(rolling_avg_enabled)
         self._rolling_avg_window = int(rolling_avg_window)
+        self._log_dark_endpoints = bool(log_dark_endpoints)
+        # Dark-integrity monitor: every frame stored in _dark_history is
+        # cross-checked against these bounds. The defaults catch the
+        # firmware off-by-one symptom we've actually observed in the
+        # field (frame 10 looks like a light frame: u1≈200, std≈40).
+        self._dark_integrity_max_u1_above_pedestal = float(dark_integrity_max_u1_above_pedestal)
+        self._dark_integrity_max_std = float(dark_integrity_max_std)
+        # Populated by _check_dark_integrity. Callers (CalibrationWorkflow)
+        # query this after pipeline.stop() to fail loudly.
+        self._dark_integrity_warnings: list[str] = []
         # Per (side, cam_id): deque of the last N uncorrected light Samples.
         # Populated lazily on first light sample for that key; empty when
         # rolling_avg_enabled is False so disabled mode has zero overhead.
@@ -1150,6 +1199,48 @@ class SciencePipeline:
 
     def start(self) -> None:
         self._science_thread.start()
+
+    @property
+    def dark_integrity_warnings(self) -> list[str]:
+        """Return the list of dark-integrity warnings collected so far.
+
+        A non-empty list means the science pipeline classified one or
+        more frames as dark-by-schedule, but the actual measurement
+        (u1, std) failed the dark heuristic — i.e. the firmware emitted
+        a light frame in a slot the science pipeline expected to be
+        dark. Calibration callers should fail loudly when this is
+        non-empty since the dark interpolation will be polluted.
+        """
+        return list(self._dark_integrity_warnings)
+
+    def _check_dark_integrity(
+        self,
+        side: str,
+        cam_id: int,
+        absolute_frame: int,
+        u1: float,
+        variance: float,
+    ) -> None:
+        """Verify a frame the schedule classified as dark actually
+        looks dark. Logs at ERROR level and stores a warning string on
+        the pipeline if not."""
+        std = float(np.sqrt(max(0.0, variance)))
+        max_u1 = PEDESTAL_HEIGHT + self._dark_integrity_max_u1_above_pedestal
+        max_std = self._dark_integrity_max_std
+        if u1 <= max_u1 and std <= max_std:
+            return
+        msg = (
+            f"DARK INTEGRITY FAILURE: {side} cam {cam_id} frame "
+            f"{absolute_frame} was classified as dark by schedule, but "
+            f"its measurement looks like a light frame "
+            f"(u1={u1:.2f} > pedestal+{self._dark_integrity_max_u1_above_pedestal:.0f}={max_u1:.0f}? "
+            f"std={std:.2f} > {max_std:.0f}?). "
+            "Probable cause: firmware off-by-one in NUM_DARK_FRAMES_AT_START "
+            "or unwrapper alignment quirk. Dark-frame interpolation will be "
+            "polluted; corrected stream values are unreliable."
+        )
+        logger.error(msg)
+        self._dark_integrity_warnings.append(msg)
 
     def stop(self, timeout: float = 2.0) -> None:
         self._stop_event.set()
@@ -1283,6 +1374,12 @@ class SciencePipeline:
                     "u1=%.2f var=%.4f",
                     absolute_frame, side, cam_id, len(dark_list),
                     u1, variance,
+                )
+                # Sanity-check: did this frame *actually* look like a
+                # dark? If not, the schedule and the firmware disagree
+                # and we want to know about it.
+                self._check_dark_integrity(
+                    side, cam_id, absolute_frame, u1, variance,
                 )
 
                 # With 2+ dark frames we can correct the preceding interval.
@@ -1450,6 +1547,13 @@ class SciencePipeline:
                 "absolute frame %d",
                 key[0], key[1], terminal.absolute_frame_id,
             )
+            # Same sanity check applies to the terminal dark — guards
+            # against scans that ended without the firmware-guaranteed
+            # laser-off frame.
+            self._check_dark_integrity(
+                key[0], key[1], terminal.absolute_frame_id,
+                terminal.u1, terminal_var,
+            )
             self._emit_corrected_for_camera(key)
 
     def _is_dark_frame(self, absolute_frame: int) -> bool:
@@ -1517,6 +1621,17 @@ class SciencePipeline:
         pending = self._pending_moments.get(key, [])
         if not pending:
             return
+
+        if self._log_dark_endpoints:
+            side, cam_id = key
+            logger.info(
+                "dark endpoints for %s cam %d: "
+                "frame %d  u1=%.2f  std=%.2f  ->  "
+                "frame %d  u1=%.2f  std=%.2f",
+                side, cam_id,
+                prev_abs, prev_u1, float(np.sqrt(max(0.0, prev_var))),
+                curr_abs, curr_u1, float(np.sqrt(max(0.0, curr_var))),
+            )
 
         interval = curr_abs - prev_abs
         corrected_samples: list[Sample] = []
@@ -1666,6 +1781,9 @@ def create_science_pipeline(
     discard_count: int = 9,
     expected_row_sum: int | None = None,
     noise_floor: int = 10,
+    log_dark_endpoints: bool = False,
+    dark_integrity_max_u1_above_pedestal: float = 30.0,
+    dark_integrity_max_std: float = 20.0,
 ) -> SciencePipeline:
     """
     Factory for a ready-to-run unified science pipeline.
@@ -1725,6 +1843,9 @@ def create_science_pipeline(
         discard_count=discard_count,
         expected_row_sum=expected_row_sum,
         noise_floor=noise_floor,
+        log_dark_endpoints=log_dark_endpoints,
+        dark_integrity_max_u1_above_pedestal=dark_integrity_max_u1_above_pedestal,
+        dark_integrity_max_std=dark_integrity_max_std,
     )
     pipeline.start()
     return pipeline

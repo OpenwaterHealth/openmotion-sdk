@@ -11,7 +11,7 @@ from typing import Callable, List, Optional, TYPE_CHECKING
 from omotion import _log_root
 
 if TYPE_CHECKING:
-    from omotion.Console import MOTIONConsole
+    from omotion.MotionConsole import MotionConsole
 
 logger = logging.getLogger(f"{_log_root}.ConsoleTelemetry" if _log_root else "ConsoleTelemetry")
 
@@ -87,6 +87,12 @@ class ConsoleTelemetry:
     safety_se: int = 0              # raw byte from channel 6
     safety_so: int = 0              # raw byte from channel 7
     safety_ok: bool = True          # True if both low-nibbles are zero (interlock clear)
+    # safety_known is False until _read_safety has actually heard back
+    # from the interlock chip on this poll. Lets callers distinguish
+    # "no data, defaulted to OK" (don't trust safety_ok) from "chip
+    # responded, faults absent" (trust safety_ok). See issue
+    # OpenwaterHealth/openmotion-bloodflow-app#107.
+    safety_known: bool = False
 
     # --- Read health ---
     read_ok: bool = True            # False if any sub-read threw an exception
@@ -114,7 +120,7 @@ class ConsoleTelemetryPoller:
     they run on the poller thread, so they should be fast / non-blocking.
     """
 
-    def __init__(self, console: "MOTIONConsole") -> None:
+    def __init__(self, console: "MotionConsole") -> None:
         self._console = console
         self._lock = threading.Lock()
         self._snapshot: Optional[ConsoleTelemetry] = None
@@ -241,17 +247,20 @@ class ConsoleTelemetryPoller:
         except Exception as exc:
             snap.read_ok = False
             snap.error = str(exc)
-            logger.error("ConsoleTelemetryPoller _read_all error: %s", exc)
-            # If the underlying UART is no longer connected (e.g. the device
-            # rebooted or was unplugged), stop polling immediately instead of
-            # retrying every second until stop() is called externally.
+            # If the underlying UART is no longer connected, this poll
+            # tick caught the device on its way out — log at INFO not
+            # ERROR (the state machine will already log the disconnect),
+            # then stop the loop so we don't keep retrying.
             if not self._console.is_connected():
                 logger.info(
-                    "ConsoleTelemetryPoller: console disconnected, stopping poll loop"
+                    "ConsoleTelemetryPoller: console disconnected mid-poll (%s); stopping",
+                    exc,
                 )
                 with self._lock:
                     self._running = False
                 self._wake.set()
+            else:
+                logger.error("ConsoleTelemetryPoller _read_all error: %s", exc)
 
         snap.timestamp = time.time()
         return snap
@@ -291,7 +300,11 @@ class ConsoleTelemetryPoller:
         )
         if not se_raw or not so_raw:
             # Safety interlock chip not responding — treat as unknown/unavailable.
-            # Leave safety_ok at its default True so callers don't falsely trip on absent hardware.
+            # Leave safety_ok at its default True so legacy callers don't falsely
+            # trip on absent hardware; new callers should gate on safety_known
+            # to distinguish "no data, defaulted to OK" from "chip responded,
+            # faults absent". See issue
+            # OpenwaterHealth/openmotion-bloodflow-app#107.
             logger.warning(
                 "Safety I2C read returned no data (se=%s so=%s) — interlock state unknown",
                 se_raw,
@@ -303,6 +316,7 @@ class ConsoleTelemetryPoller:
         se_faults = _decode_safety_faults(snap.safety_se & _SAFETY_FAULT_MASK)
         so_faults = _decode_safety_faults(snap.safety_so & _SAFETY_FAULT_MASK)
         snap.safety_ok = not se_faults and not so_faults
+        snap.safety_known = True
 
         if se_faults:
             logger.error(
@@ -330,7 +344,10 @@ class ConsoleTelemetryPoller:
             )
 
     def _read_analog(self, snap: ConsoleTelemetry) -> None:
-        snap.tcm = int(self._console.get_lsync_pulsecount())
+        # get_lsync_pulsecount swallows transient errors and returns None;
+        # default to 0 so a single bad poll doesn't raise TypeError.
+        lsync = self._console.get_lsync_pulsecount()
+        snap.tcm = int(lsync) if lsync is not None else 0
 
         tcl_raw, _ = self._console.read_i2c_packet(
             mux_index=_MUX_IDX,

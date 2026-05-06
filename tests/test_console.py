@@ -8,7 +8,7 @@ import time
 import pytest
 
 from omotion.CommandError import CommandError
-from omotion.Console import MuxChannel
+from omotion.config import MuxChannel
 from omotion.MotionConfig import MotionConfig
 
 pytestmark = pytest.mark.console
