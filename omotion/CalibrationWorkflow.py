@@ -159,6 +159,7 @@ def _compute_calibration_from_samples(
     *,
     left_camera_mask: int,
     right_camera_mask: int,
+    baseline: Optional[Calibration] = None,
 ) -> Calibration:
     """Core calibration math: aggregate dark-corrected Samples into a
     ``(MODULES, CAMS_PER_MODULE)`` Calibration.
@@ -168,12 +169,22 @@ def _compute_calibration_from_samples(
     pipeline's corrected stream (``is_corrected=True``): ``mean``
     is dark-baseline-subtracted, ``std_dev`` has shot-noise removed,
     ``contrast = std_dev / mean`` is physical speckle contrast.
+
+    Inactive cameras (cam_id whose bit is not set in the per-side
+    mask) inherit their value from ``baseline`` if provided, otherwise
+    from :meth:`Calibration.default`. This is what makes a target-
+    restricted calibration (e.g. ``left_camera_mask=0xFF, right_camera_mask=0``)
+    safe: with the live console calibration passed in as ``baseline``,
+    the un-targeted module's row carries forward instead of being
+    clobbered with SDK defaults at write time. See bloodflow-app
+    issue #117.
     """
-    defaults = Calibration.default()
-    c_max = defaults.c_max.copy()
-    i_max = defaults.i_max.copy()
-    c_min = np.zeros_like(c_max)
-    i_min = np.zeros_like(i_max)
+    if baseline is None:
+        baseline = Calibration.default()
+    c_max = baseline.c_max.copy()
+    i_max = baseline.i_max.copy()
+    c_min = baseline.c_min.copy()
+    i_min = baseline.i_min.copy()
 
     masks = (left_camera_mask, right_camera_mask)
 
@@ -972,11 +983,19 @@ class CalibrationWorkflow:
                 _emit_progress("compute_calibration")
                 _emit_log("Calibration: computing arrays…")
                 logger.info("Calibration phase 2: computing (2, 8) arrays.")
+                # Issue #117: pass the currently-cached calibration as
+                # ``baseline`` so inactive cameras (those excluded by a
+                # left-only / right-only mask) keep their on-device
+                # values instead of falling back to SDK defaults at
+                # write time. The cache is refreshed after every
+                # write_calibration, so it reflects what's actually on
+                # the console EEPROM.
                 try:
                     cal_obj = _compute_calibration_from_samples(
                         cal_samples,
                         left_camera_mask=request.left_camera_mask,
                         right_camera_mask=request.right_camera_mask,
+                        baseline=self._interface.get_calibration(),
                     )
                 except DegenerateCalibrationError as e:
                     error = str(e)
