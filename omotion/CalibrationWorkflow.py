@@ -63,6 +63,7 @@ class CalibrationThresholds:
     min_bvi_per_camera: list[float]
     max_bfi_per_camera: Optional[list[float]] = None
     max_bvi_per_camera: Optional[list[float]] = None
+    max_dark_per_camera: Optional[list[float]] = None
 
 
 @dataclass

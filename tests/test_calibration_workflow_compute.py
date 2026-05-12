@@ -224,3 +224,22 @@ def test_write_result_json_handles_missing_sensor(tmp_path):
     assert data["canceled"] is True
     assert data["error"] == "user canceled"
     assert data["cameras"] == []
+
+
+# ----- ft_max_dark_per_camera (#122) -----
+
+
+def test_thresholds_max_dark_defaults_to_none():
+    t = _thresholds()
+    assert t.max_dark_per_camera is None
+
+
+def test_thresholds_max_dark_accepts_list():
+    t = CalibrationThresholds(
+        min_mean_per_camera=[100.0] * 8,
+        min_contrast_per_camera=[0.2] * 8,
+        min_bfi_per_camera=[3.0] * 8,
+        min_bvi_per_camera=[3.0] * 8,
+        max_dark_per_camera=[3.0] * 8,
+    )
+    assert t.max_dark_per_camera == [3.0] * 8
