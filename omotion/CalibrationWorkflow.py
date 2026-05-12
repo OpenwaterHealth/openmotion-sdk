@@ -63,6 +63,7 @@ class CalibrationThresholds:
     min_bvi_per_camera: list[float]
     max_bfi_per_camera: Optional[list[float]] = None
     max_bvi_per_camera: Optional[list[float]] = None
+    max_dark_per_camera: Optional[list[float]] = None
 
 
 @dataclass
@@ -109,10 +110,12 @@ class CalibrationResultRow:
     avg_contrast: float
     bfi: float
     bvi: float
+    dark: float
     mean_test: str
     contrast_test: str
     bfi_test: str
     bvi_test: str
+    dark_test: str
     security_id: str
     hwid: str
 
@@ -298,6 +301,7 @@ def _combined_test(*results: str) -> str:
 def _build_result_rows_from_samples(
     samples: list[Sample],
     *,
+    dark_samples: Optional[list[Sample]] = None,
     left_camera_mask: int,
     right_camera_mask: int,
     thresholds: CalibrationThresholds,
@@ -306,10 +310,19 @@ def _build_result_rows_from_samples(
 ) -> list[CalibrationResultRow]:
     """Core row aggregation: per-camera mean/contrast/BFI/BVI averages
     and threshold pass/fail. Pure function — caller pre-filters.
+
+    ``dark_samples`` is the leading + trailing out-of-window samples
+    from the validation scan (laser off; per-camera mean is the
+    ambient-light reading). When supplied alongside
+    ``thresholds.max_dark_per_camera`` the row builder also evaluates
+    the dark gate (#122). When either is absent each row's
+    ``dark_test`` is ``"NA"`` and ``dark`` is the measured mean (NaN
+    if no dark samples were captured for that camera).
     """
     rows: list[CalibrationResultRow] = []
     masks = (left_camera_mask, right_camera_mask)
     sensors = (sensor_left, sensor_right)
+    dark_samples = dark_samples or []
 
     for module_idx, side in enumerate(("left", "right")):
         mask = masks[module_idx]
@@ -328,6 +341,27 @@ def _build_result_rows_from_samples(
             contrast_val = float(np.mean([s.contrast for s in cam_samples]))
             bfi_val = float(np.mean([s.bfi for s in cam_samples]))
             bvi_val = float(np.mean([s.bvi for s in cam_samples]))
+
+            cam_dark_samples = [
+                s for s in dark_samples
+                if s.side == side and s.cam_id == cam_id
+            ]
+            if cam_dark_samples:
+                dark_val = float(np.mean([s.mean for s in cam_dark_samples]))
+            else:
+                dark_val = float("nan")
+
+            if thresholds.max_dark_per_camera is None:
+                dark_test = "NA"
+            elif cam_id >= len(thresholds.max_dark_per_camera):
+                dark_test = "NA"
+            elif not cam_dark_samples:
+                # Active camera but zero dark frames captured — surface
+                # as FAIL rather than silently passing.
+                dark_test = "FAIL"
+            else:
+                cap = thresholds.max_dark_per_camera[cam_id]
+                dark_test = "PASS" if dark_val <= float(cap) else "FAIL"
 
             security_id = ""
             hwid = ""
@@ -359,10 +393,12 @@ def _build_result_rows_from_samples(
                 avg_contrast=contrast_val,
                 bfi=bfi_val,
                 bvi=bvi_val,
+                dark=dark_val,
                 mean_test=_threshold_test(mean_val, thresholds.min_mean_per_camera, cam_id),
                 contrast_test=_threshold_test(contrast_val, thresholds.min_contrast_per_camera, cam_id),
                 bfi_test=bfi_test,
                 bvi_test=bvi_test,
+                dark_test=dark_test,
                 security_id=security_id,
                 hwid=hwid,
             ))
@@ -378,14 +414,15 @@ def evaluate_passed(rows: list[CalibrationResultRow]) -> bool:
         and r.contrast_test == "PASS"
         and r.bfi_test == "PASS"
         and r.bvi_test == "PASS"
+        and r.dark_test != "FAIL"
         for r in rows
     )
 
 
 _CSV_FIELDS = [
     "camera_index", "side", "cam",
-    "mean", "avg_contrast", "bfi", "bvi",
-    "mean_test", "contrast_test", "bfi_test", "bvi_test",
+    "mean", "avg_contrast", "bfi", "bvi", "dark",
+    "mean_test", "contrast_test", "bfi_test", "bvi_test", "dark_test",
     "security_id", "hwid",
 ]
 
@@ -414,10 +451,12 @@ def write_result_csv(path: str, rows: list[CalibrationResultRow]) -> None:
                 "avg_contrast": f"{r.avg_contrast:.6f}",
                 "bfi": f"{r.bfi:.4f}",
                 "bvi": f"{r.bvi:.4f}",
+                "dark": f"{r.dark:.4f}",
                 "mean_test": r.mean_test,
                 "contrast_test": r.contrast_test,
                 "bfi_test": r.bfi_test,
                 "bvi_test": r.bvi_test,
+                "dark_test": r.dark_test,
                 "security_id": r.security_id,
                 "hwid": r.hwid,
             })
@@ -531,6 +570,9 @@ def _row_with_thresholds(
         "min_bvi": _get(thresholds.min_bvi_per_camera, r.cam_id),
         "max_bvi": _get(thresholds.max_bvi_per_camera, r.cam_id),
         "bvi_test": r.bvi_test,
+        "dark": r.dark,
+        "max_dark": _get(thresholds.max_dark_per_camera, r.cam_id),
+        "dark_test": r.dark_test,
     }
 
 
@@ -607,6 +649,10 @@ def write_result_json(
                 list(request.thresholds.max_bvi_per_camera)
                 if request.thresholds.max_bvi_per_camera is not None else None
             ),
+            "max_dark_per_camera": (
+                list(request.thresholds.max_dark_per_camera)
+                if request.thresholds.max_dark_per_camera is not None else None
+            ),
         },
         "calibration": _calibration_to_dict(calibration),
         "scan_paths": dict(scan_paths),
@@ -622,7 +668,7 @@ def _format_result_rows_table(
     thresholds: CalibrationThresholds,
 ) -> str:
     """Multi-line per-camera table for the log: actual measurement,
-    threshold(s), and PASS/FAIL for mean / contrast / BFI / BVI."""
+    threshold(s), and PASS/FAIL for mean / contrast / BFI / BVI / dark."""
     def _t(arr: Optional[list[float]], i: int, fmt: str = "{:>7.3f}") -> str:
         if arr is None or i >= len(arr):
             return "   —   "
@@ -631,13 +677,21 @@ def _format_result_rows_table(
             return "   —   "
         return fmt.format(float(v))
 
-    pf = lambda s: "P" if s == "PASS" else "F"
+    # Map PASS/FAIL/NA to a single character so the per-camera row stays
+    # narrow. NA renders as a dash so masked-out cameras (or runs where
+    # the threshold wasn't configured) don't look like failures.
+    def pf(s: str) -> str:
+        if s == "PASS":
+            return "P"
+        if s == "NA":
+            return "-"
+        return "F"
 
     header = (
-        "| cam | side  |   mean   |   min    | M |   contrast |    min   | C |    bfi   |    min   |    max   | B |    bvi   |    min   |    max   | V |"
+        "| cam | side  |   mean   |   min    | M |   contrast |    min   | C |    bfi   |    min   |    max   | B |    bvi   |    min   |    max   | V |   dark   |    max   | D |"
     )
     sep = (
-        "|-----|-------|----------|----------|---|------------|----------|---|----------|----------|----------|---|----------|----------|----------|---|"
+        "|-----|-------|----------|----------|---|------------|----------|---|----------|----------|----------|---|----------|----------|----------|---|----------|----------|---|"
     )
     lines = [header, sep]
     for r in rows:
@@ -646,7 +700,8 @@ def _format_result_rows_table(
             "| {cam:>3d} | {side:<5} | {mean:>8.3f} | {mean_min} | {mean_pf} "
             "| {contrast:>10.5f} | {contrast_min} | {contrast_pf} "
             "| {bfi:>+8.3f} | {bfi_min} | {bfi_max} | {bfi_pf} "
-            "| {bvi:>+8.3f} | {bvi_min} | {bvi_max} | {bvi_pf} |"
+            "| {bvi:>+8.3f} | {bvi_min} | {bvi_max} | {bvi_pf} "
+            "| {dark:>8.3f} | {dark_max} | {dark_pf} |"
             .format(
                 cam=cam_id + 1, side=r.side,
                 mean=r.mean,
@@ -663,6 +718,9 @@ def _format_result_rows_table(
                 bvi_min=_t(thresholds.min_bvi_per_camera, cam_id, "{:>+8.3f}"),
                 bvi_max=_t(thresholds.max_bvi_per_camera, cam_id, "{:>+8.3f}"),
                 bvi_pf=pf(r.bvi_test),
+                dark=r.dark,
+                dark_max=_t(thresholds.max_dark_per_camera, cam_id, "{:>8.3f}"),
+                dark_pf=pf(r.dark_test),
             )
         )
     return "\n".join(lines)
@@ -684,7 +742,7 @@ def _run_subscan_capture(
     skip_leading_frames: int,
     frame_window_count: int,
     stop_evt: threading.Event,
-) -> tuple[str, str, list[Sample]]:
+) -> tuple[str, str, list[Sample], list[Sample]]:
     """Submit a ScanRequest and capture corrected samples in-memory as
     the science pipeline emits them.
 
@@ -694,9 +752,17 @@ def _run_subscan_capture(
     ``on_corrected_batch_fn``. This avoids running the science pipeline
     twice on the same data.
 
-    Returns ``(left_path, right_path, captured_samples)``. Raises
-    ``RuntimeError`` on scan failure. Honors ``stop_evt`` by calling
-    ``cancel_scan`` and returning empty paths + empty list.
+    Returns ``(left_path, right_path, captured_samples, dark_samples)``.
+    ``captured_samples`` is the in-window averaging set (laser-on
+    corrected Samples, the historical return). ``dark_samples`` is
+    the laser-off frames the science pipeline emits via
+    ``on_dark_frame_fn``: each sample has ``is_dark=True,
+    is_corrected=False`` and ``mean = u1 - PEDESTAL_HEIGHT`` —
+    pedestal-subtracted ambient DN, same convention the CQ ambient
+    gate uses (see motion_connector.py's _on_dark_frame). Used by the
+    FT calibration's #122 ambient-light gate. Raises ``RuntimeError``
+    on scan failure. Honors ``stop_evt`` by calling ``cancel_scan``
+    and returning empty paths + empty lists.
     """
     scan_req = ScanRequest(
         subject_id=subject_id,
@@ -713,6 +779,7 @@ def _run_subscan_capture(
 
     upper_bound = skip_leading_frames + int(frame_window_count)
     captured: list[Sample] = []
+    dark: list[Sample] = []
 
     def _on_corrected_batch(batch: CorrectedBatch) -> None:
         for s in batch.samples:
@@ -721,6 +788,13 @@ def _run_subscan_capture(
             if s.absolute_frame_id >= upper_bound:
                 continue
             captured.append(s)
+
+    def _on_dark_frame(s: Sample) -> None:
+        # Dark frames don't reach on_corrected_batch — the science
+        # pipeline routes them here with mean already pedestal-
+        # subtracted. Every dark frame in the schedule is a valid
+        # ambient reading; no frame-id windowing applies.
+        dark.append(s)
 
     evt = threading.Event()
     holder: dict[str, ScanResult] = {}
@@ -732,6 +806,7 @@ def _run_subscan_capture(
     started = interface.scan_workflow.start_scan(
         scan_req,
         on_corrected_batch_fn=_on_corrected_batch,
+        on_dark_frame_fn=_on_dark_frame,
         on_complete_fn=_on_complete,
         log_dark_endpoints=True,
     )
@@ -745,14 +820,14 @@ def _run_subscan_capture(
             except Exception:
                 pass
             evt.wait(timeout=5.0)
-            return "", "", []
+            return "", "", [], []
     res = holder.get("r")
     if res is None or not res.ok:
         raise RuntimeError(
             f"sub-scan failed: {(res.error if res else 'no result')}"
         )
     if res.canceled:
-        return "", "", []
+        return "", "", [], []
     # Loud failure: if the science pipeline detected dark-frame
     # schedule/measurement disagreement, abort the calibration. The
     # interpolated dark baseline would be polluted and the resulting
@@ -766,7 +841,8 @@ def _run_subscan_capture(
             f"warnings): {details}"
         )
     captured.sort(key=lambda s: (s.side, s.cam_id, s.absolute_frame_id))
-    return res.left_path or "", res.right_path or "", captured
+    dark.sort(key=lambda s: (s.side, s.cam_id, s.absolute_frame_id))
+    return res.left_path or "", res.right_path or "", captured, dark
 
 
 class CalibrationWorkflow:
@@ -961,7 +1037,12 @@ class CalibrationWorkflow:
                     request.duration_sec, request.scan_delay_sec,
                 )
                 _reset_firmware_trigger("phase 1 (pre-scan)")
-                cal_left, cal_right, cal_samples = _run_subscan_capture(
+                # _cal_dark_samples deliberately discarded — the ambient
+                # check (#122) gates on validation-scan dark frames so it
+                # measures the same scan as the row-level mean/contrast/
+                # BFI/BVI tests. If we ever want to also gate on the
+                # calibration scan's dark frames, capture this here.
+                cal_left, cal_right, cal_samples, _cal_dark_samples = _run_subscan_capture(
                     self._interface, request,
                     subject_id=f"calib1_{request.operator_id}",
                     duration_sec=request.duration_sec + request.scan_delay_sec,
@@ -1031,7 +1112,7 @@ class CalibrationWorkflow:
                     request.duration_sec, request.scan_delay_sec,
                 )
                 _reset_firmware_trigger("phase 4 (pre-scan)")
-                val_left, val_right, val_samples = _run_subscan_capture(
+                val_left, val_right, val_samples, val_dark_samples = _run_subscan_capture(
                     self._interface, request,
                     subject_id=f"calib2_{request.operator_id}",
                     duration_sec=request.duration_sec + request.scan_delay_sec,
@@ -1055,6 +1136,7 @@ class CalibrationWorkflow:
                 logger.info("Calibration phase 5: aggregating per-camera rows + thresholds.")
                 rows = _build_result_rows_from_samples(
                     val_samples,
+                    dark_samples=val_dark_samples,
                     left_camera_mask=request.left_camera_mask,
                     right_camera_mask=request.right_camera_mask,
                     thresholds=request.thresholds,

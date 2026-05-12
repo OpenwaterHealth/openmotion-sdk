@@ -83,9 +83,9 @@ def test_write_result_csv_round_trip(tmp_path):
     rows = [
         CalibrationResultRow(
             camera_index=0, side="left", cam_id=0,
-            mean=200.0, avg_contrast=0.4, bfi=5.0, bvi=5.5,
+            mean=200.0, avg_contrast=0.4, bfi=5.0, bvi=5.5, dark=0.0,
             mean_test="PASS", contrast_test="PASS",
-            bfi_test="PASS", bvi_test="FAIL",
+            bfi_test="PASS", bvi_test="FAIL", dark_test="NA",
             security_id="sec-0", hwid="hw-x",
         ),
     ]
@@ -97,8 +97,8 @@ def test_write_result_csv_round_trip(tmp_path):
     header = content[0].split(",")
     assert header == [
         "camera_index", "side", "cam",
-        "mean", "avg_contrast", "bfi", "bvi",
-        "mean_test", "contrast_test", "bfi_test", "bvi_test",
+        "mean", "avg_contrast", "bfi", "bvi", "dark",
+        "mean_test", "contrast_test", "bfi_test", "bvi_test", "dark_test",
         "security_id", "hwid",
     ]
     fields = content[1].split(",")
@@ -141,9 +141,9 @@ def test_write_result_json_includes_full_provenance(tmp_path):
     rows = [
         CalibrationResultRow(
             camera_index=0, side="left", cam_id=0,
-            mean=200.0, avg_contrast=0.4, bfi=5.0, bvi=5.5,
+            mean=200.0, avg_contrast=0.4, bfi=5.0, bvi=5.5, dark=0.0,
             mean_test="PASS", contrast_test="PASS",
-            bfi_test="PASS", bvi_test="FAIL",
+            bfi_test="PASS", bvi_test="FAIL", dark_test="NA",
             security_id="cam-uid-aaa", hwid="left-hwid-aaa",
         ),
     ]
@@ -224,3 +224,216 @@ def test_write_result_json_handles_missing_sensor(tmp_path):
     assert data["canceled"] is True
     assert data["error"] == "user canceled"
     assert data["cameras"] == []
+
+
+# ----- ft_max_dark_per_camera (#122) -----
+
+
+def test_thresholds_max_dark_defaults_to_none():
+    t = _thresholds()
+    assert t.max_dark_per_camera is None
+
+
+def test_thresholds_max_dark_accepts_list():
+    t = CalibrationThresholds(
+        min_mean_per_camera=[100.0] * 8,
+        min_contrast_per_camera=[0.2] * 8,
+        min_bfi_per_camera=[3.0] * 8,
+        min_bvi_per_camera=[3.0] * 8,
+        max_dark_per_camera=[3.0] * 8,
+    )
+    assert t.max_dark_per_camera == [3.0] * 8
+
+
+def _dark_row(*, dark_test="NA", dark=0.0, mean_test="PASS",
+              contrast_test="PASS", bfi_test="PASS", bvi_test="PASS"):
+    return CalibrationResultRow(
+        camera_index=0, side="left", cam_id=0,
+        mean=100.0, avg_contrast=0.3, bfi=4.0, bvi=4.0, dark=dark,
+        mean_test=mean_test, contrast_test=contrast_test,
+        bfi_test=bfi_test, bvi_test=bvi_test, dark_test=dark_test,
+        security_id="", hwid="",
+    )
+
+
+def test_result_row_has_dark_fields():
+    r = _dark_row(dark=1.5, dark_test="PASS")
+    assert r.dark == 1.5
+    assert r.dark_test == "PASS"
+
+
+def test_evaluate_passed_all_pass_including_dark():
+    assert evaluate_passed([_dark_row(dark_test="PASS")]) is True
+
+
+def test_evaluate_passed_dark_fail_overrides_all_other_pass():
+    assert evaluate_passed([_dark_row(dark_test="FAIL")]) is False
+
+
+def test_evaluate_passed_dark_na_does_not_gate():
+    assert evaluate_passed([_dark_row(dark_test="NA")]) is True
+
+
+# ----- _build_result_rows_from_samples dark-test path (#122) -----
+
+import math
+
+from omotion.CalibrationWorkflow import _build_result_rows_from_samples
+from omotion.MotionProcessing import Sample
+
+
+def _light(side, cam_id, *, mean=200.0, contrast=0.3, bfi=4.0, bvi=6.0,
+           frame_id=10):
+    return Sample(
+        side=side, cam_id=cam_id,
+        frame_id=frame_id, absolute_frame_id=frame_id,
+        timestamp_s=0.0, row_sum=0, temperature_c=0.0,
+        mean=mean, std_dev=mean * contrast, contrast=contrast,
+        bfi=bfi, bvi=bvi,
+        is_corrected=True, is_dark=False,
+    )
+
+
+def _dark(side, cam_id, *, mean=1.0, frame_id=0):
+    # Dark samples come from the firmware's leading/trailing windows;
+    # only the per-camera mean matters for the ambient gate.
+    return Sample(
+        side=side, cam_id=cam_id,
+        frame_id=frame_id, absolute_frame_id=frame_id,
+        timestamp_s=0.0, row_sum=0, temperature_c=0.0,
+        mean=mean, std_dev=0.0, contrast=0.0,
+        bfi=0.0, bvi=0.0,
+        is_corrected=True, is_dark=True,
+    )
+
+
+def _full_thresholds(*, max_dark_per_camera=None):
+    return CalibrationThresholds(
+        min_mean_per_camera=[100.0] * 8,
+        min_contrast_per_camera=[0.2] * 8,
+        min_bfi_per_camera=[-1.0] * 8,
+        min_bvi_per_camera=[5.0] * 8,
+        max_dark_per_camera=max_dark_per_camera,
+    )
+
+
+def test_dark_test_pass_when_below_threshold():
+    light = [_light(side, 0) for side in ("left", "right")]
+    dark = [_dark(side, 0, mean=1.0) for side in ("left", "right")]
+    rows = _build_result_rows_from_samples(
+        light, dark_samples=dark,
+        left_camera_mask=0x01, right_camera_mask=0x01,
+        thresholds=_full_thresholds(max_dark_per_camera=[3.0] * 8),
+        sensor_left=None, sensor_right=None,
+    )
+    assert len(rows) == 2
+    assert all(r.dark_test == "PASS" for r in rows)
+    assert all(r.dark == 1.0 for r in rows)
+
+
+def test_dark_test_fail_when_above_threshold():
+    light = [_light("left", 0)]
+    dark = [_dark("left", 0, mean=5.0)]
+    rows = _build_result_rows_from_samples(
+        light, dark_samples=dark,
+        left_camera_mask=0x01, right_camera_mask=0x00,
+        thresholds=_full_thresholds(max_dark_per_camera=[3.0] * 8),
+        sensor_left=None, sensor_right=None,
+    )
+    assert rows[0].dark == 5.0
+    assert rows[0].dark_test == "FAIL"
+
+
+def test_dark_test_na_when_threshold_missing():
+    light = [_light("left", 0)]
+    dark = [_dark("left", 0, mean=5.0)]
+    rows = _build_result_rows_from_samples(
+        light, dark_samples=dark,
+        left_camera_mask=0x01, right_camera_mask=0x00,
+        thresholds=_full_thresholds(max_dark_per_camera=None),
+        sensor_left=None, sensor_right=None,
+    )
+    assert rows[0].dark_test == "NA"
+
+
+def test_dark_value_present_on_passing_run():
+    light = [_light("left", 0)]
+    dark = [_dark("left", 0, mean=2.0)]
+    rows = _build_result_rows_from_samples(
+        light, dark_samples=dark,
+        left_camera_mask=0x01, right_camera_mask=0x00,
+        thresholds=_full_thresholds(max_dark_per_camera=[3.0] * 8),
+        sensor_left=None, sensor_right=None,
+    )
+    assert rows[0].dark == 2.0
+    assert rows[0].dark_test == "PASS"
+
+
+def test_dark_test_fail_when_no_dark_samples_for_active_camera():
+    light = [_light("left", 0)]
+    rows = _build_result_rows_from_samples(
+        light, dark_samples=[],
+        left_camera_mask=0x01, right_camera_mask=0x00,
+        thresholds=_full_thresholds(max_dark_per_camera=[3.0] * 8),
+        sensor_left=None, sensor_right=None,
+    )
+    assert math.isnan(rows[0].dark)
+    assert rows[0].dark_test == "FAIL"
+
+
+import csv as _csv
+
+
+def test_write_result_csv_includes_dark_columns(tmp_path):
+    rows = [_dark_row(dark=1.5, dark_test="PASS")]
+    path = str(tmp_path / "with-dark.csv")
+    write_result_csv(path, rows)
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = _csv.DictReader(f)
+        assert "dark" in reader.fieldnames
+        assert "dark_test" in reader.fieldnames
+        row0 = next(reader)
+        assert float(row0["dark"]) == 1.5
+        assert row0["dark_test"] == "PASS"
+
+
+def test_write_result_json_includes_dark(tmp_path):
+    rows = [
+        CalibrationResultRow(
+            camera_index=0, side="left", cam_id=0,
+            mean=200.0, avg_contrast=0.4, bfi=5.0, bvi=5.5, dark=1.5,
+            mean_test="PASS", contrast_test="PASS",
+            bfi_test="PASS", bvi_test="PASS", dark_test="PASS",
+            security_id="cam-uid-aaa", hwid="left-hwid-aaa",
+        ),
+    ]
+    thr = CalibrationThresholds(
+        min_mean_per_camera=[50.0] * 8,
+        min_contrast_per_camera=[0.25] * 8,
+        min_bfi_per_camera=[-0.25] * 8,
+        min_bvi_per_camera=[4.75] * 8,
+        max_bfi_per_camera=[0.25] * 8,
+        max_bvi_per_camera=[5.25] * 8,
+        max_dark_per_camera=[3.0] * 8,
+    )
+    req = CalibrationRequest(
+        operator_id="op", output_dir=str(tmp_path),
+        left_camera_mask=0xFF, right_camera_mask=0xFF,
+        thresholds=thr, duration_sec=5,
+    )
+    out = tmp_path / "with-dark.json"
+    write_result_json(
+        str(out),
+        started_timestamp="20260512_140000",
+        passed=True, canceled=False, error="",
+        request=req, rows=rows, calibration=None,
+        scan_paths={"calibration_left": "", "calibration_right": "",
+                    "validation_left": "", "validation_right": ""},
+        interface=_FakeInterface(),
+    )
+    data = json.loads(out.read_text(encoding="utf-8"))
+    assert data["thresholds"]["max_dark_per_camera"] == [3.0] * 8
+    cam = data["cameras"][0]
+    assert cam["dark"] == 1.5
+    assert cam["max_dark"] == 3.0
+    assert cam["dark_test"] == "PASS"
