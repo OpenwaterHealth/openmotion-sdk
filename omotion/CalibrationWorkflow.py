@@ -362,10 +362,12 @@ def _build_result_rows_from_samples(
                 avg_contrast=contrast_val,
                 bfi=bfi_val,
                 bvi=bvi_val,
+                dark=0.0,          # placeholder, real value lands in #122 task 4
                 mean_test=_threshold_test(mean_val, thresholds.min_mean_per_camera, cam_id),
                 contrast_test=_threshold_test(contrast_val, thresholds.min_contrast_per_camera, cam_id),
                 bfi_test=bfi_test,
                 bvi_test=bvi_test,
+                dark_test="NA",    # placeholder, real value lands in #122 task 4
                 security_id=security_id,
                 hwid=hwid,
             ))
@@ -688,7 +690,7 @@ def _run_subscan_capture(
     skip_leading_frames: int,
     frame_window_count: int,
     stop_evt: threading.Event,
-) -> tuple[str, str, list[Sample]]:
+) -> tuple[str, str, list[Sample], list[Sample]]:
     """Submit a ScanRequest and capture corrected samples in-memory as
     the science pipeline emits them.
 
@@ -698,9 +700,13 @@ def _run_subscan_capture(
     ``on_corrected_batch_fn``. This avoids running the science pipeline
     twice on the same data.
 
-    Returns ``(left_path, right_path, captured_samples)``. Raises
+    Returns ``(left_path, right_path, captured_samples, dark_samples)``.
+    ``captured_samples`` is the in-window averaging set (laser-on, the
+    historical return). ``dark_samples`` is the leading + trailing
+    out-of-window samples (laser-off; per-camera mean is ambient light,
+    used by the FT calibration's #122 ambient-light gate). Raises
     ``RuntimeError`` on scan failure. Honors ``stop_evt`` by calling
-    ``cancel_scan`` and returning empty paths + empty list.
+    ``cancel_scan`` and returning empty paths + empty lists.
     """
     scan_req = ScanRequest(
         subject_id=subject_id,
@@ -717,14 +723,16 @@ def _run_subscan_capture(
 
     upper_bound = skip_leading_frames + int(frame_window_count)
     captured: list[Sample] = []
+    dark: list[Sample] = []
 
     def _on_corrected_batch(batch: CorrectedBatch) -> None:
         for s in batch.samples:
             if s.absolute_frame_id < skip_leading_frames:
-                continue
-            if s.absolute_frame_id >= upper_bound:
-                continue
-            captured.append(s)
+                dark.append(s)
+            elif s.absolute_frame_id >= upper_bound:
+                dark.append(s)
+            else:
+                captured.append(s)
 
     evt = threading.Event()
     holder: dict[str, ScanResult] = {}
@@ -749,14 +757,14 @@ def _run_subscan_capture(
             except Exception:
                 pass
             evt.wait(timeout=5.0)
-            return "", "", []
+            return "", "", [], []
     res = holder.get("r")
     if res is None or not res.ok:
         raise RuntimeError(
             f"sub-scan failed: {(res.error if res else 'no result')}"
         )
     if res.canceled:
-        return "", "", []
+        return "", "", [], []
     # Loud failure: if the science pipeline detected dark-frame
     # schedule/measurement disagreement, abort the calibration. The
     # interpolated dark baseline would be polluted and the resulting
@@ -770,7 +778,8 @@ def _run_subscan_capture(
             f"warnings): {details}"
         )
     captured.sort(key=lambda s: (s.side, s.cam_id, s.absolute_frame_id))
-    return res.left_path or "", res.right_path or "", captured
+    dark.sort(key=lambda s: (s.side, s.cam_id, s.absolute_frame_id))
+    return res.left_path or "", res.right_path or "", captured, dark
 
 
 class CalibrationWorkflow:
@@ -965,7 +974,12 @@ class CalibrationWorkflow:
                     request.duration_sec, request.scan_delay_sec,
                 )
                 _reset_firmware_trigger("phase 1 (pre-scan)")
-                cal_left, cal_right, cal_samples = _run_subscan_capture(
+                # _cal_dark_samples deliberately discarded — the ambient
+                # check (#122) gates on validation-scan dark frames so it
+                # measures the same scan as the row-level mean/contrast/
+                # BFI/BVI tests. If we ever want to also gate on the
+                # calibration scan's dark frames, capture this here.
+                cal_left, cal_right, cal_samples, _cal_dark_samples = _run_subscan_capture(
                     self._interface, request,
                     subject_id=f"calib1_{request.operator_id}",
                     duration_sec=request.duration_sec + request.scan_delay_sec,
@@ -1035,7 +1049,7 @@ class CalibrationWorkflow:
                     request.duration_sec, request.scan_delay_sec,
                 )
                 _reset_firmware_trigger("phase 4 (pre-scan)")
-                val_left, val_right, val_samples = _run_subscan_capture(
+                val_left, val_right, val_samples, val_dark_samples = _run_subscan_capture(
                     self._interface, request,
                     subject_id=f"calib2_{request.operator_id}",
                     duration_sec=request.duration_sec + request.scan_delay_sec,
