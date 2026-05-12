@@ -668,7 +668,7 @@ def _format_result_rows_table(
     thresholds: CalibrationThresholds,
 ) -> str:
     """Multi-line per-camera table for the log: actual measurement,
-    threshold(s), and PASS/FAIL for mean / contrast / BFI / BVI."""
+    threshold(s), and PASS/FAIL for mean / contrast / BFI / BVI / dark."""
     def _t(arr: Optional[list[float]], i: int, fmt: str = "{:>7.3f}") -> str:
         if arr is None or i >= len(arr):
             return "   —   "
@@ -677,13 +677,21 @@ def _format_result_rows_table(
             return "   —   "
         return fmt.format(float(v))
 
-    pf = lambda s: "P" if s == "PASS" else "F"
+    # Map PASS/FAIL/NA to a single character so the per-camera row stays
+    # narrow. NA renders as a dash so masked-out cameras (or runs where
+    # the threshold wasn't configured) don't look like failures.
+    def pf(s: str) -> str:
+        if s == "PASS":
+            return "P"
+        if s == "NA":
+            return "-"
+        return "F"
 
     header = (
-        "| cam | side  |   mean   |   min    | M |   contrast |    min   | C |    bfi   |    min   |    max   | B |    bvi   |    min   |    max   | V |"
+        "| cam | side  |   mean   |   min    | M |   contrast |    min   | C |    bfi   |    min   |    max   | B |    bvi   |    min   |    max   | V |   dark   |    max   | D |"
     )
     sep = (
-        "|-----|-------|----------|----------|---|------------|----------|---|----------|----------|----------|---|----------|----------|----------|---|"
+        "|-----|-------|----------|----------|---|------------|----------|---|----------|----------|----------|---|----------|----------|----------|---|----------|----------|---|"
     )
     lines = [header, sep]
     for r in rows:
@@ -692,7 +700,8 @@ def _format_result_rows_table(
             "| {cam:>3d} | {side:<5} | {mean:>8.3f} | {mean_min} | {mean_pf} "
             "| {contrast:>10.5f} | {contrast_min} | {contrast_pf} "
             "| {bfi:>+8.3f} | {bfi_min} | {bfi_max} | {bfi_pf} "
-            "| {bvi:>+8.3f} | {bvi_min} | {bvi_max} | {bvi_pf} |"
+            "| {bvi:>+8.3f} | {bvi_min} | {bvi_max} | {bvi_pf} "
+            "| {dark:>8.3f} | {dark_max} | {dark_pf} |"
             .format(
                 cam=cam_id + 1, side=r.side,
                 mean=r.mean,
@@ -709,6 +718,9 @@ def _format_result_rows_table(
                 bvi_min=_t(thresholds.min_bvi_per_camera, cam_id, "{:>+8.3f}"),
                 bvi_max=_t(thresholds.max_bvi_per_camera, cam_id, "{:>+8.3f}"),
                 bvi_pf=pf(r.bvi_test),
+                dark=r.dark,
+                dark_max=_t(thresholds.max_dark_per_camera, cam_id, "{:>8.3f}"),
+                dark_pf=pf(r.dark_test),
             )
         )
     return "\n".join(lines)
