@@ -523,7 +523,7 @@ git commit -m "feat(sdk): add ScanDBSink skeleton (open/close/callbacks as stubs
 
 Fill in `on_raw_frame` (no-op when `write_raw=False`; buffer → `executemany` flush at `raw_batch_size`) and the `_flush_raw_locked` helper. Also flush on `close()` (already called; just needs the real implementation) and at the start of each corrected batch (added in Task 5).
 
-- [ ] **Step 1: Add failing tests for raw-frame behavior**
+- [x] **Step 1: Add failing tests for raw-frame behavior**
 
 Append to `tests/test_scan_db_sink.py`:
 
@@ -610,7 +610,7 @@ def test_on_raw_frame_concurrent_writers(tmp_path):
         db.close()
 ```
 
-- [ ] **Step 2: Run the tests to confirm they fail**
+- [x] **Step 2: Run the tests to confirm they fail**
 
 ```bash
 pytest tests/test_scan_db_sink.py -v
@@ -618,7 +618,7 @@ pytest tests/test_scan_db_sink.py -v
 
 Expected: the four new tests FAIL (`on_raw_frame` is still a stub — no rows get written).
 
-- [ ] **Step 3: Implement `on_raw_frame` and `_flush_raw_locked`**
+- [x] **Step 3: Implement `on_raw_frame` and `_flush_raw_locked`**
 
 In `omotion/ScanDBSink.py`, replace the body of `on_raw_frame` with:
 
@@ -687,7 +687,7 @@ Replace `_flush_raw_locked` with:
 
 Also update `_require_open` to be called outside the lock (it's only used for pre-`open()` validation). Remove the `self._require_open()` call from `on_raw_frame` now that the body has its own inline check — the existing stub-era assertion from Task 3's test `test_sink_raises_if_callbacks_called_before_open` still passes because the inline check inside the `with self._lock` block raises `RuntimeError`.
 
-- [ ] **Step 4: Run the tests to confirm they pass**
+- [x] **Step 4: Run the tests to confirm they pass**
 
 ```bash
 pytest tests/test_scan_db_sink.py -v
@@ -695,7 +695,7 @@ pytest tests/test_scan_db_sink.py -v
 
 Expected: all raw-frame tests PASS, plus the earlier open/close tests still PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add omotion/ScanDBSink.py tests/test_scan_db_sink.py

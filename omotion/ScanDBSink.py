@@ -118,8 +118,36 @@ class ScanDBSink:
         tcl: float,
         pdc: float,
     ) -> None:
+        # Pre-open check runs first so misuse surfaces regardless of
+        # write_raw (the early no-op below would otherwise swallow it).
         self._require_open()
-        # Real implementation lands in Task 4.
+        if not self._write_raw:
+            return
+        with self._lock:
+            if self._db is None or self._session_id is None:
+                # Lost the race with close() — drop silently rather than
+                # raise from a worker thread post-shutdown.
+                return
+            self._raw_buffer.append(
+                {
+                    "session_id": self._session_id,
+                    "side": side,
+                    "cam_id": int(cam_id),
+                    "frame_id": int(frame_id),
+                    # Project-wide convention: store floats to 6 decimals
+                    # (matches the corrected CSV writer). Anything beyond
+                    # 6 is noise we don't need to keep.
+                    "timestamp_s": round(float(timestamp_s), 6),
+                    "hist": bytes(hist),
+                    "temp": round(float(temp), 6) if temp is not None else None,
+                    "sum_counts": int(sum_counts) if sum_counts is not None else None,
+                    "tcm": round(float(tcm), 6),
+                    "tcl": round(float(tcl), 6),
+                    "pdc": round(float(pdc), 6),
+                }
+            )
+            if len(self._raw_buffer) >= self._raw_batch_size:
+                self._flush_raw_locked()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -134,5 +162,16 @@ class ScanDBSink:
 
     def _flush_raw_locked(self) -> None:
         """Flush buffered raw frames.  Caller holds self._lock."""
-        # Real implementation lands in Task 4.
-        self._raw_buffer.clear()
+        if not self._raw_buffer or self._db is None:
+            self._raw_buffer.clear()
+            return
+        try:
+            self._db.insert_raw_frames(self._raw_buffer)
+        except Exception:
+            logger.exception(
+                "ScanDBSink: failed to flush %d buffered raw frames",
+                len(self._raw_buffer),
+            )
+            self._insert_errors += len(self._raw_buffer)
+        finally:
+            self._raw_buffer.clear()
