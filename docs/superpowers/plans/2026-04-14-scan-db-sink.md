@@ -898,7 +898,7 @@ Two surgical additions to `ScanWorkflow.start_scan`:
 
 ScanWorkflow itself does NOT know about the DB — it just fires the callbacks.
 
-- [ ] **Step 1: Find the signature of `start_scan`**
+- [x] **Step 1: Find the signature of `start_scan`**
 
 ```bash
 grep -n "def start_scan" omotion/ScanWorkflow.py
@@ -906,7 +906,7 @@ grep -n "def start_scan" omotion/ScanWorkflow.py
 
 Confirm it's at line 173 and lists `on_uncorrected_fn`, `on_corrected_batch_fn`, etc. as shown in the spec.
 
-- [ ] **Step 2: Add the two new kwargs to `start_scan`**
+- [x] **Step 2: Add the two new kwargs to `start_scan`**
 
 In `omotion/ScanWorkflow.py`, modify the `start_scan` signature. Locate the existing line near line 181:
 
@@ -922,7 +922,7 @@ Insert right after `on_corrected_batch_fn`:
         on_scan_start_fn: Callable[[str, float], None] | None = None,
 ```
 
-- [ ] **Step 3: Fire `on_scan_start_fn` at the top of `_worker`**
+- [x] **Step 3: Fire `on_scan_start_fn` at the top of `_worker`**
 
 Find the `ts = datetime.datetime.now().strftime(...)` line (around line 206 in `_worker`). Immediately after that line, add:
 
@@ -935,7 +935,7 @@ Find the `ts = datetime.datetime.now().strftime(...)` line (around line 206 in `
                     logger.exception("on_scan_start_fn callback raised")
 ```
 
-- [ ] **Step 4: Fire `on_raw_frame_fn` from `_make_row_handler`**
+- [x] **Step 4: Fire `on_raw_frame_fn` from `_make_row_handler`**
 
 Replace the existing `_make_row_handler` (around line 433) with:
 
@@ -982,7 +982,7 @@ Replace the existing `_make_row_handler` (around line 433) with:
                     return _on_row
 ```
 
-- [ ] **Step 5: Sanity-check that existing tests still pass**
+- [x] **Step 5: Sanity-check that existing tests still pass**
 
 ```bash
 pytest tests/test_corrected_csv_output.py -v
@@ -990,7 +990,7 @@ pytest tests/test_corrected_csv_output.py -v
 
 Expected: PASS. (No behavior changes when the new callbacks aren't supplied.)
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add omotion/ScanWorkflow.py
