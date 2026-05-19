@@ -48,10 +48,17 @@ class MotionInterface:
         timeout: int = 30,
         demo_mode: bool = False,
         default_trigger_config: Optional[dict] = None,
+        db_path: Optional[str] = None,
     ):
         self.vid = vid
         self.sensor_pid = sensor_pid
         self.console_pid = console_pid
+
+        # Optional DB sink (issue #92). When set, ``start_scan`` builds a
+        # ScanDBSink that writes corrected (and optionally raw) data to
+        # this SQLite file for every scan. When None (the default), no
+        # DB code runs in the scan hot path.
+        self._db_path: Optional[str] = db_path
 
         # Resolved default trigger config used by every workflow whose
         # request doesn't carry a ``trigger_config`` override. Stored
@@ -300,7 +307,141 @@ class MotionInterface:
         )
 
     def start_scan(self, request, **kwargs) -> bool:
+        if self._db_path is not None:
+            kwargs = self._wrap_kwargs_with_db_sink(request, kwargs)
         return self.scan_workflow.start_scan(request, **kwargs)
+
+    def _wrap_kwargs_with_db_sink(self, request, kwargs: dict) -> dict:
+        """
+        Construct a ScanDBSink for this scan and chain its callbacks in
+        front of any caller-supplied callbacks. The sink is opened when
+        ScanWorkflow fires ``on_scan_start_fn`` and closed inside the
+        wrapped ``on_complete_fn``. Triggered only when the interface
+        was constructed with a ``db_path`` (issue #92).
+        """
+        import os
+        import time
+
+        from omotion import ScanDBSink
+
+        db_path = self._db_path
+        # Auto-create the parent directory so callers can pass a path
+        # inside a fresh data dir without separately mkdir-ing it.
+        parent = os.path.dirname(db_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+        sink = ScanDBSink(
+            db_path,
+            write_raw=bool(getattr(request, "write_raw_to_db", False)),
+            compress_raw_hist=True,
+        )
+
+        def _active_cams(mask: int) -> list[int]:
+            return [i + 1 for i in range(8) if (mask >> i) & 0x1]
+
+        def _safe_call(fn):
+            try:
+                return fn()
+            except Exception:
+                return None
+
+        def _hex_or_none(val):
+            return val.hex() if isinstance(val, (bytes, bytearray)) else val
+
+        def _build_meta() -> dict:
+            return {
+                "subject_id": request.subject_id,
+                "duration_sec": request.duration_sec,
+                "expected_size": request.expected_size,
+                "fps": 40,
+                "left_camera_mask": request.left_camera_mask,
+                "right_camera_mask": request.right_camera_mask,
+                "active_left_cams": _active_cams(request.left_camera_mask),
+                "active_right_cams": _active_cams(request.right_camera_mask),
+                "disable_laser": bool(request.disable_laser),
+                "sdk_version": _SDK_VERSION,
+                "console_fw_version": _safe_call(self.console.get_version),
+                "console_hw_id": _hex_or_none(
+                    _safe_call(self.console.get_hardware_id)
+                ),
+                "left_fw_version": _safe_call(self.left.get_version),
+                "right_fw_version": _safe_call(self.right.get_version),
+                "left_hw_id": _hex_or_none(
+                    _safe_call(
+                        getattr(
+                            self.left,
+                            "get_cached_hardware_id",
+                            self.left.get_hardware_id,
+                        )
+                    )
+                ),
+                "right_hw_id": _hex_or_none(
+                    _safe_call(
+                        getattr(
+                            self.right,
+                            "get_cached_hardware_id",
+                            self.right.get_hardware_id,
+                        )
+                    )
+                ),
+                "sdk_flags": {
+                    "write_raw_csv": getattr(request, "write_raw_csv", False),
+                    "write_corrected_csv": getattr(request, "write_corrected_csv", True),
+                    "write_telemetry_csv": getattr(request, "write_telemetry_csv", True),
+                    "write_raw_to_db": getattr(request, "write_raw_to_db", False),
+                },
+            }
+
+        user_on_scan_start = kwargs.pop("on_scan_start_fn", None)
+        user_on_raw_frame = kwargs.pop("on_raw_frame_fn", None)
+        user_on_corrected = kwargs.pop("on_corrected_batch_fn", None)
+        user_on_complete = kwargs.pop("on_complete_fn", None)
+
+        def _on_scan_start(ts: str, start_ts: float) -> None:
+            try:
+                sink.open(
+                    label=f"{ts}_{request.subject_id}",
+                    start_ts=start_ts,
+                    notes=getattr(request, "notes", "") or "",
+                    meta=_build_meta(),
+                )
+            except Exception:
+                logger.exception(
+                    "ScanDBSink.open failed; DB writes disabled for this scan"
+                )
+            if user_on_scan_start:
+                user_on_scan_start(ts, start_ts)
+
+        def _on_raw_frame(*args, **kw) -> None:
+            try:
+                sink.on_raw_frame(*args, **kw)
+            except Exception:
+                logger.exception("ScanDBSink.on_raw_frame raised")
+            if user_on_raw_frame:
+                user_on_raw_frame(*args, **kw)
+
+        def _on_corrected(batch) -> None:
+            try:
+                sink.on_corrected_batch(batch)
+            except Exception:
+                logger.exception("ScanDBSink.on_corrected_batch raised")
+            if user_on_corrected:
+                user_on_corrected(batch)
+
+        def _on_complete(result) -> None:
+            try:
+                sink.close(end_ts=time.time())
+            except Exception:
+                logger.exception("ScanDBSink.close raised")
+            if user_on_complete:
+                user_on_complete(result)
+
+        kwargs["on_scan_start_fn"] = _on_scan_start
+        kwargs["on_raw_frame_fn"] = _on_raw_frame
+        kwargs["on_corrected_batch_fn"] = _on_corrected
+        kwargs["on_complete_fn"] = _on_complete
+        return kwargs
 
     def cancel_scan(self, **kwargs) -> None:
         self.scan_workflow.cancel_scan(**kwargs)

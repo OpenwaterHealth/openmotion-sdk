@@ -97,6 +97,12 @@ class ScanRequest:
     # excluded from the window.
     rolling_avg_enabled: bool = False
     rolling_avg_window: int = 10
+    # Database sink (issue #92, see docs/superpowers/specs/2026-04-14-scan-db-sink-design.md).
+    # The DB endpoint itself is opt-in at SDK construction via
+    # ``MotionInterface(db_path=...)``; these per-scan fields are only
+    # effective when that path is set.
+    write_raw_to_db: bool = False
+    notes: str = ""
 
 
 @dataclass

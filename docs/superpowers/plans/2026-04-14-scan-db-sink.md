@@ -1015,7 +1015,7 @@ New `ScanRequest` fields are minimal: `write_raw_to_db: bool = False` (per-scan 
 3. `_build_meta` uses the real APIs that exist on current `next`: `self.console.get_version()`, `self.left.get_version()`, `self.right.get_version()`, plus `get_cached_hardware_id() / get_hardware_id()` for chip IDs.
 4. Wrap `on_complete_fn` so it calls `sink.close(time.time())` first, then the caller's callback.
 
-- [ ] **Step 1: Add new fields to `ScanRequest`**
+- [x] **Step 1: Add new fields to `ScanRequest`**
 
 In `omotion/ScanWorkflow.py`, locate the `@dataclass class ScanRequest:` declaration (grep for `class ScanRequest`). Add at the bottom of the dataclass (after the existing CSV-related fields):
 
@@ -1028,7 +1028,7 @@ In `omotion/ScanWorkflow.py`, locate the `@dataclass class ScanRequest:` declara
     notes: str = ""
 ```
 
-- [ ] **Step 2: Add `db_path` constructor arg to `MotionInterface`**
+- [x] **Step 2: Add `db_path` constructor arg to `MotionInterface`**
 
 In `omotion/MotionInterface.py`, locate `def __init__(self, ...)` (grep for `def __init__` inside `class MotionInterface`). Add `db_path: str | None = None` to the signature (keep the existing positional/keyword ordering — append it as a kwarg with a default), and inside the constructor body stash it:
 
@@ -1039,7 +1039,7 @@ In `omotion/MotionInterface.py`, locate `def __init__(self, ...)` (grep for `def
         self._db_path: str | None = db_path
 ```
 
-- [ ] **Step 3: Modify `MotionInterface.start_scan` to wire the sink when `db_path` is set**
+- [x] **Step 3: Modify `MotionInterface.start_scan` to wire the sink when `db_path` is set**
 
 Locate the existing `start_scan` (grep for `def start_scan` inside `MotionInterface`). Replace its body with:
 
@@ -1184,7 +1184,7 @@ Then add this helper method to `MotionInterface` (place it just below `start_sca
 
 If `logger` is not already imported at the top of `MotionInterface.py`, follow the existing module convention (e.g. `logger = logging.getLogger(f"{_log_root}.Interface" if _log_root else "Interface")`). Do not add a second logger if one already exists.
 
-- [ ] **Step 4: Smoke-test the wiring at import time**
+- [x] **Step 4: Smoke-test the wiring at import time**
 
 ```bash
 python -c "from omotion import MotionInterface; print('ok')"
@@ -1193,7 +1193,7 @@ python -c "from omotion import MotionInterface; m = MotionInterface(db_path=None
 
 Expected: both print successfully. Constructing `MotionInterface(db_path=None)` must not touch USB/serial — the constructor only stashes state; connection happens later via `connect()`/monitoring.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add omotion/MotionInterface.py omotion/ScanWorkflow.py
