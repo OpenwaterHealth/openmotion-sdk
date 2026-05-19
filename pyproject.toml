@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "openmotion-sdk"
 dynamic = ["version"]
-description = "Python library to communicate with STM32 for loading FPGA and camera sensors (OpenMOTION)."
+description = "Python library for Open-Motion blood flow imaging hardware (STM32, FPGA, and camera sensors)."
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.12"
 license = "AGPL-3.0-or-later"

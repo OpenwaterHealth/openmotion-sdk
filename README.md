@@ -1,8 +1,8 @@
 # Overview
 
-This repository contains the code used to interface with an OpenMotion sensor module and OpenMotion Console. The sensor module runs the code contained in the `motion-sensor-fw` repository on an STM32H7 processor. The programs here communicates with the modules over a USB serial connection.
+This repository contains the Open-Motion SDK, a Python library for interfacing with Open-Motion blood flow imaging hardware. The SDK communicates with sensor modules and the console module to control cameras, FPGA, and data acquisition for near-infrared speckle contrast imaging.
 
-A library called `omotion` is imported in many of the python scripts listed here to aid communication with the Sensor Module.
+The sensor modules run firmware on STM32H7 processors and communicate over USB. A Python library called `omotion` provides the core interface for hardware control and data streaming.
 
 # Getting started
 1. Install requirements.txt (`pip install -r requirements.txt`)
