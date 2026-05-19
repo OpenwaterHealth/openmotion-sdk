@@ -2,9 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make the SQLite database in `stream-db/` the default endpoint of the corrected data pipeline by re-homing `scan_db.py` into the `omotion` package, adding a `ScanDBSink` adapter, and wiring it through `MOTIONInterface.start_scan` via new callbacks on `ScanWorkflow`.
+**Goal:** Make a SQLite database an **opt-in** corrected-data endpoint of the science pipeline. The caller (typically the application) passes `db_path` to `MotionInterface(db_path=...)` at construction; if set, every scan opens a session row in that file and writes per-camera `session_data` rows from the corrected pipeline (and optionally `session_raw` rows from histograms). With `db_path=None` (the default), the SDK behavior is byte-for-byte identical to today — no DB file is created and no DB code runs in the hot path.
 
-**Architecture:** `omotion/ScanDatabase.py` replaces `stream-db/scan_db.py` with identical API. New `omotion/ScanDBSink.py` adapts `CorrectedBatch` → `session_data` inserts and raw frames → `session_raw` inserts. `ScanWorkflow.start_scan` gains two new optional callbacks (`on_raw_frame_fn`, `on_scan_start_fn`) but stays DB-unaware. `MOTIONInterface.start_scan` constructs the sink, opens the session from `on_scan_start_fn`, and closes it in a wrapped `on_complete_fn`.
+**Architecture:** `omotion/ScanDatabase.py` replaces `stream-db/scan_db.py` with identical API. New `omotion/ScanDBSink.py` adapts `CorrectedBatch` → `session_data` inserts and raw frames → `session_raw` inserts; numeric fields are rounded to 6 decimals at insert time to match the corrected CSV writer's precision (per project decision: 6 decimals is enough for any number we store). `ScanWorkflow.start_scan` gains two new optional callbacks (`on_raw_frame_fn`, `on_scan_start_fn`) but stays DB-unaware. `MotionInterface` takes a `db_path: str | None = None` constructor arg; when set, `MotionInterface.start_scan` constructs the sink, opens the session from `on_scan_start_fn`, and closes it in a wrapped `on_complete_fn`. Per-scan `ScanRequest` flags `write_raw_to_db` and `notes` control whether raw frames are persisted and what free-text annotation is attached.
+
+> **Note on line numbers in this plan:** the plan was first drafted ~5 weeks before this revision, against an earlier state of `omotion/`. Since then `next` has had ~100 commits (FT calibration #122, calibration workflow rework, file renames, etc.). All `omotion/ScanWorkflow.py` and `omotion/MotionInterface.py` references below should be re-located by **grep on the symbol**, not by trusting the printed line numbers.
 
 **Tech Stack:** Python 3.12+, SQLite (stdlib `sqlite3`), pytest. No new third-party deps.
 
@@ -26,8 +28,8 @@
 
 **Modify:**
 - `omotion/__init__.py` — re-export `ScanDatabase`, `ScanDBSink`.
-- `omotion/ScanWorkflow.py` — add `on_raw_frame_fn` + `on_scan_start_fn` kwargs to `start_scan`; fire them from `_worker` and the per-side row handler.
-- `omotion/Interface.py` — build the sink in `start_scan`, chain callbacks, ensure `close()` on completion.
+- `omotion/ScanWorkflow.py` — add `on_raw_frame_fn` + `on_scan_start_fn` kwargs to `start_scan`; fire them from `_worker` and the per-side row handler. Also add `write_raw_to_db` and `notes` fields to `ScanRequest`.
+- `omotion/MotionInterface.py` — add `db_path: str | None = None` constructor arg; in `start_scan`, build the sink and chain callbacks when `db_path` is set; ensure `close()` on completion.
 - `stream-db/db_browser.py`, `stream-db/db_validator.py`, `stream-db/importer.py`, `stream-db/sensor_module_simulator.py` — switch imports from `scan_db` to `omotion.ScanDatabase`.
 
 **Delete:**
@@ -647,13 +649,16 @@ In `omotion/ScanDBSink.py`, replace the body of `on_raw_frame` with:
                     "side": side,
                     "cam_id": int(cam_id),
                     "frame_id": int(frame_id),
-                    "timestamp_s": float(timestamp_s),
+                    # Project-wide convention: store floats to 6 decimals
+                    # (matches the corrected CSV writer). Anything beyond
+                    # 6 is noise we don't need to keep.
+                    "timestamp_s": round(float(timestamp_s), 6),
                     "hist": bytes(hist),
-                    "temp": float(temp) if temp is not None else None,
+                    "temp": round(float(temp), 6) if temp is not None else None,
                     "sum_counts": int(sum_counts) if sum_counts is not None else None,
-                    "tcm": float(tcm),
-                    "tcl": float(tcl),
-                    "pdc": float(pdc),
+                    "tcm": round(float(tcm), 6),
+                    "tcl": round(float(tcl), 6),
+                    "pdc": round(float(pdc), 6),
                 }
             )
             if len(self._raw_buffer) >= self._raw_batch_size:
@@ -842,11 +847,14 @@ In `omotion/ScanDBSink.py`, replace the `on_corrected_batch` body with:
                         "session_raw_id": None,
                         "cam_id": int(s.cam_id),
                         "side": side_int,
-                        "timestamp_s": float(s.timestamp_s),
-                        "bfi": float(s.bfi),
-                        "bvi": float(s.bvi),
-                        "contrast": float(s.contrast),
-                        "mean": float(s.mean),
+                        # 6-decimal rounding matches the corrected CSV
+                        # writer exactly — Task 9 relies on this for a
+                        # clean cell-for-cell equivalence comparison.
+                        "timestamp_s": round(float(s.timestamp_s), 6),
+                        "bfi": round(float(s.bfi), 6),
+                        "bvi": round(float(s.bvi), 6),
+                        "contrast": round(float(s.contrast), 6),
+                        "mean": round(float(s.mean), 6),
                     }
                 )
 
@@ -991,65 +999,83 @@ git commit -m "feat(sdk): ScanWorkflow exposes on_raw_frame_fn and on_scan_start
 
 ---
 
-## Task 7: Wire `ScanDBSink` into `MOTIONInterface.start_scan`
+## Task 7: Wire `ScanDBSink` into `MotionInterface` via constructor opt-in
 
 **Files:**
-- Modify: `omotion/Interface.py`
+- Modify: `omotion/MotionInterface.py`
 - Modify: `omotion/ScanWorkflow.py` (add new `ScanRequest` fields)
 
-New `ScanRequest` fields: `write_to_db: bool = True`, `write_raw_to_db: bool = False`, `db_path: str | None = None`, `notes: str = ""`.
+The DB endpoint is **opt-in at SDK construction**, not per request. When the caller does `MotionInterface(db_path="/some/path/scans.db")`, every subsequent `start_scan` writes corrected (and optionally raw) data to that file. When `db_path=None` (the default), no sink is built and the call path is identical to today.
 
-`MOTIONInterface.start_scan`:
-1. If `request.write_to_db`, build a sink.
-2. Register an `on_scan_start_fn` that opens the session once the scan thread produces `ts` (so the label matches CSV naming).
-3. Chain `sink.on_raw_frame` and `sink.on_corrected_batch` ahead of any caller-supplied callbacks.
+New `ScanRequest` fields are minimal: `write_raw_to_db: bool = False` (per-scan raw opt-in, only meaningful when the SDK has a `db_path`) and `notes: str = ""` (free-text annotation attached to the session row).
+
+`MotionInterface`:
+1. Accept `db_path: str | None = None` in `__init__`; stash as `self._db_path`.
+2. In `start_scan`, if `self._db_path is not None`, build a sink and wrap callbacks (same chaining logic as the original plan).
+3. `_build_meta` uses the real APIs that exist on current `next`: `self.console.get_version()`, `self.left.get_version()`, `self.right.get_version()`, plus `get_cached_hardware_id() / get_hardware_id()` for chip IDs.
 4. Wrap `on_complete_fn` so it calls `sink.close(time.time())` first, then the caller's callback.
 
 - [ ] **Step 1: Add new fields to `ScanRequest`**
 
-In `omotion/ScanWorkflow.py`, locate the `@dataclass class ScanRequest:` (starts at line 68). Add these fields at the bottom of the dataclass (after `raw_csv_duration_sec`):
+In `omotion/ScanWorkflow.py`, locate the `@dataclass class ScanRequest:` declaration (grep for `class ScanRequest`). Add at the bottom of the dataclass (after the existing CSV-related fields):
 
 ```python
     # Database sink (see docs/superpowers/specs/2026-04-14-scan-db-sink-design.md).
-    write_to_db: bool = True
+    # The DB endpoint itself is opt-in at SDK construction via
+    # MotionInterface(db_path=...); these per-scan fields are only effective
+    # when that path is set.
     write_raw_to_db: bool = False
-    db_path: str | None = None
     notes: str = ""
 ```
 
-- [ ] **Step 2: Modify `MOTIONInterface.start_scan` to wire the sink**
+- [ ] **Step 2: Add `db_path` constructor arg to `MotionInterface`**
 
-In `omotion/Interface.py`, replace the existing `start_scan` (around line 343):
+In `omotion/MotionInterface.py`, locate `def __init__(self, ...)` (grep for `def __init__` inside `class MotionInterface`). Add `db_path: str | None = None` to the signature (keep the existing positional/keyword ordering — append it as a kwarg with a default), and inside the constructor body stash it:
+
+```python
+        # Optional DB sink: when set, MotionInterface.start_scan builds a
+        # ScanDBSink that writes corrected (and optionally raw) data to
+        # this SQLite file for every scan. When None, no DB code runs.
+        self._db_path: str | None = db_path
+```
+
+- [ ] **Step 3: Modify `MotionInterface.start_scan` to wire the sink when `db_path` is set**
+
+Locate the existing `start_scan` (grep for `def start_scan` inside `MotionInterface`). Replace its body with:
 
 ```python
     def start_scan(self, request, **kwargs) -> bool:
         if not self.scan_workflow:
             self.scan_workflow = ScanWorkflow(self)
 
-        if getattr(request, "write_to_db", False):
+        if self._db_path is not None:
             kwargs = self._wrap_kwargs_with_db_sink(request, kwargs)
 
         return self.scan_workflow.start_scan(request, **kwargs)
 ```
 
-Then add this helper method to `MOTIONInterface` (place it just below `start_scan`):
+Then add this helper method to `MotionInterface` (place it just below `start_scan`):
 
 ```python
     def _wrap_kwargs_with_db_sink(self, request, kwargs: dict) -> dict:
         """
         Construct a ScanDBSink for this scan and chain its callbacks in
-        front of any caller-supplied callbacks.  The sink is opened when
-        ScanWorkflow fires on_scan_start_fn, and closed inside the wrapped
-        on_complete_fn.
+        front of any caller-supplied callbacks. The sink is opened when
+        ScanWorkflow fires on_scan_start_fn and closed inside the wrapped
+        on_complete_fn. Triggered only when the interface was constructed
+        with a db_path.
         """
         import os
         import time
 
         from omotion import ScanDBSink, __version__ as sdk_version
 
-        data_dir = request.data_dir
-        os.makedirs(data_dir, exist_ok=True)
-        db_path = request.db_path or os.path.join(data_dir, "scans.db")
+        db_path = self._db_path
+        # Auto-create the parent directory so callers can pass a path
+        # inside a fresh data dir without separately mkdir-ing it.
+        parent = os.path.dirname(db_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
 
         sink = ScanDBSink(
             db_path,
@@ -1060,12 +1086,14 @@ Then add this helper method to `MOTIONInterface` (place it just below `start_sca
         def _active_cams(mask: int) -> list[int]:
             return [i + 1 for i in range(8) if (mask >> i) & 0x1]
 
-        def _safe_getattr(obj, name, default=None):
+        def _safe_call(fn):
             try:
-                val = getattr(obj, name, default)
-                return val() if callable(val) else val
+                return fn()
             except Exception:
-                return default
+                return None
+
+        def _hex_or_none(val):
+            return val.hex() if isinstance(val, (bytes, bytearray)) else val
 
         def _build_meta() -> dict:
             return {
@@ -1079,25 +1107,27 @@ Then add this helper method to `MOTIONInterface` (place it just below `start_sca
                 "active_right_cams": _active_cams(request.right_camera_mask),
                 "disable_laser": bool(request.disable_laser),
                 "sdk_version": sdk_version,
-                "console_fw_version": _safe_getattr(
-                    getattr(self, "console_module", None), "firmware_version"
+                "console_fw_version": _safe_call(self.console.get_version),
+                "console_hw_id": _hex_or_none(
+                    _safe_call(self.console.get_hardware_id)
                 ),
-                "sensor_fw_versions": {
-                    "left": _safe_getattr(
-                        getattr(self.sensors or {}, "get", lambda _k: None)("left"),
-                        "firmware_version",
-                    ),
-                    "right": _safe_getattr(
-                        getattr(self.sensors or {}, "get", lambda _k: None)("right"),
-                        "firmware_version",
-                    ),
-                },
+                "left_fw_version": _safe_call(self.left.get_version),
+                "right_fw_version": _safe_call(self.right.get_version),
+                "left_hw_id": _hex_or_none(
+                    _safe_call(
+                        getattr(self.left, "get_cached_hardware_id", self.left.get_hardware_id)
+                    )
+                ),
+                "right_hw_id": _hex_or_none(
+                    _safe_call(
+                        getattr(self.right, "get_cached_hardware_id", self.right.get_hardware_id)
+                    )
+                ),
                 "sdk_flags": {
-                    "write_raw_csv": request.write_raw_csv,
-                    "write_corrected_csv": request.write_corrected_csv,
-                    "write_telemetry_csv": request.write_telemetry_csv,
-                    "write_to_db": request.write_to_db,
-                    "write_raw_to_db": request.write_raw_to_db,
+                    "write_raw_csv": getattr(request, "write_raw_csv", False),
+                    "write_corrected_csv": getattr(request, "write_corrected_csv", True),
+                    "write_telemetry_csv": getattr(request, "write_telemetry_csv", True),
+                    "write_raw_to_db": getattr(request, "write_raw_to_db", False),
                 },
             }
 
@@ -1115,7 +1145,9 @@ Then add this helper method to `MOTIONInterface` (place it just below `start_sca
                     meta=_build_meta(),
                 )
             except Exception:
-                logger.exception("ScanDBSink.open failed; DB writes disabled for this scan")
+                logger.exception(
+                    "ScanDBSink.open failed; DB writes disabled for this scan"
+                )
             if user_on_scan_start:
                 user_on_scan_start(ts, start_ts)
 
@@ -1150,21 +1182,22 @@ Then add this helper method to `MOTIONInterface` (place it just below `start_sca
         return kwargs
 ```
 
-If `logger` is not already imported at the top of `Interface.py`, grep for it and add `logger = logging.getLogger(...)` following whatever convention the rest of the file uses. Do not add a second logger if one already exists.
+If `logger` is not already imported at the top of `MotionInterface.py`, follow the existing module convention (e.g. `logger = logging.getLogger(f"{_log_root}.Interface" if _log_root else "Interface")`). Do not add a second logger if one already exists.
 
-- [ ] **Step 3: Smoke-test the wiring at import time**
+- [ ] **Step 4: Smoke-test the wiring at import time**
 
 ```bash
-python -c "from omotion.Interface import MOTIONInterface; print('ok')"
+python -c "from omotion import MotionInterface; print('ok')"
+python -c "from omotion import MotionInterface; m = MotionInterface(db_path=None); print('no-db ok')"
 ```
 
-Expected: `ok`. (No runtime check of hardware-required methods.)
+Expected: both print successfully. Constructing `MotionInterface(db_path=None)` must not touch USB/serial — the constructor only stashes state; connection happens later via `connect()`/monitoring.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
-git add omotion/Interface.py omotion/ScanWorkflow.py
-git commit -m "feat(sdk): MOTIONInterface.start_scan wires ScanDBSink by default"
+git add omotion/MotionInterface.py omotion/ScanWorkflow.py
+git commit -m "feat(sdk): MotionInterface(db_path=...) wires ScanDBSink when set (#92)"
 ```
 
 ---
@@ -1174,13 +1207,13 @@ git commit -m "feat(sdk): MOTIONInterface.start_scan wires ScanDBSink by default
 **Files:**
 - Create: `tests/test_scan_workflow_db_integration.py`
 
-Drive `MOTIONInterface.start_scan` (or `ScanWorkflow.start_scan` directly if the former pulls in too many hardware deps) with a stub interface that emits a tiny canned histogram stream. Assert:
+Drive the sink lifecycle directly with simulated callbacks (mirroring what the `MotionInterface` wrapper would do), no `MotionInterface` construction needed. Assert:
 
-1. With defaults (`write_to_db=True`, `write_raw_to_db=False`): `<data_dir>/scans.db` exists, exactly one session row, `session_end` is set, `session_data` row count matches expected.
-2. With `write_raw_to_db=True`: `session_raw` row count equals total frames emitted across both sides.
-3. With `write_to_db=False`: no DB file created.
+1. **Corrected-only** (sink with `write_raw=False`): `<db_path>` exists, exactly one session row, `session_end` is set, `session_data` row count matches expected.
+2. **Raw enabled** (sink with `write_raw=True`): `session_raw` row count equals total frames emitted across both sides.
+3. **No sink built** (mirrors `MotionInterface(db_path=None)` path): no DB file created.
 
-**Note:** Because `ScanWorkflow._worker` requires a real `MOTIONInterface` with sensors and a telemetry poller, this test bypasses `MOTIONInterface.start_scan` and calls `sink` lifecycle manually — simulating what the Interface wrapper would do. This isolates the integration boundary (sink ↔ callbacks) without requiring hardware.
+**Note:** Because `ScanWorkflow._worker` requires a real `MotionInterface` with sensors and a telemetry poller, this test bypasses `MotionInterface.start_scan` and exercises the sink directly. This isolates the integration boundary (sink ↔ callbacks) without requiring hardware. The `MotionInterface`-wired path is exercised at the system-test level on real hardware (out of scope for this plan).
 
 - [ ] **Step 1: Create the integration test**
 
@@ -1250,7 +1283,7 @@ def _drive_scan(sink: ScanDBSink, *, frames_per_side: int = 5, cams_per_side: in
     return sid
 
 
-def test_default_flags_write_corrected_no_raw(tmp_path: Path) -> None:
+def test_corrected_only_writes_session_data_no_raw(tmp_path: Path) -> None:
     db_path = tmp_path / "scans.db"
     sink = ScanDBSink(str(db_path), write_raw=False)
     sid = _drive_scan(sink, frames_per_side=5, cams_per_side=2)
@@ -1283,9 +1316,9 @@ def test_write_raw_enabled_persists_every_frame(tmp_path: Path) -> None:
         db.close()
 
 
-def test_write_to_db_false_creates_no_file(tmp_path: Path) -> None:
-    # Simulate MOTIONInterface.start_scan with write_to_db=False: no sink
-    # is constructed, so no file is created.
+def test_no_sink_means_no_file(tmp_path: Path) -> None:
+    # Mirrors MotionInterface(db_path=None).start_scan: no sink is built,
+    # so the file is never created.
     db_path = tmp_path / "scans.db"
     assert not db_path.exists()
     # No sink constructed.
@@ -1314,7 +1347,9 @@ git commit -m "test(sdk): ScanDBSink integration test with simulated scan callba
 **Files:**
 - Create: `tests/test_db_matches_corrected_csv.py`
 
-Reuse the fixture-driven setup from `tests/test_corrected_csv_output.py`: feed the two real scan CSVs through `create_science_pipeline` / `feed_pipeline_from_csv`, attaching both a CSV writer (mimicking the existing corrected CSV path) and a `ScanDBSink` in parallel. Assert that for every (frame_id, side, cam) present in the CSV, the DB has a matching `session_data` row with the same `bfi`, `bvi`, `contrast`, `mean`, and `timestamp_s` values (within floating-point epsilon due to the CSV being rounded to 6 decimals; compare at `1e-6`).
+Reuse the fixture-driven setup from `tests/test_corrected_csv_output.py`: feed the two real scan CSVs through `create_science_pipeline` / `feed_pipeline_from_csv`, attaching both a CSV writer (mimicking the existing corrected CSV path) and a `ScanDBSink` in parallel. Assert that for every (frame_id, side, cam) present in the CSV, the DB has a matching `session_data` row with the same `bfi`, `bvi`, `contrast`, `mean`, and `timestamp_s` values.
+
+The DB sink now rounds floats to 6 decimals at insert time (Task 5), and the corrected CSV writer already rounds to 6 — so the comparison can be exact-equal. We still use `math.isclose(..., abs_tol=1e-6)` for a tiny safety margin around float repr quirks, but a divergence beyond `1e-6` means one side has drifted from the canonical pipeline output.
 
 This is the load-bearing proof that the DB really is the corrected-pipeline endpoint.
 
@@ -1507,14 +1542,15 @@ git status
 
 ## Self-Review
 
-**Spec coverage:**
-- DB-as-default + CSV opt-in alongside → Task 7 (`write_to_db: bool = True`, CSV flags untouched).
-- `session_data` always, `session_raw` gated → Task 4 (`write_raw=False` no-op) + Task 5 (unconditional corrected writes).
+**Spec coverage (revised):**
+- **DB opt-in via `MotionInterface(db_path=...)`, default off, CSVs untouched** → Task 7. No behavior change unless the caller passes a path.
+- `session_data` always (when sink built), `session_raw` gated on per-scan `write_raw_to_db` → Task 4 + Task 5.
 - Re-home `scan_db.py` → Task 1; stream-db tools re-import → Task 2.
-- Shared `<data_dir>/scans.db`, one session per scan → Task 7 (`db_path` default).
-- `session_label = f"{ts}_{subject_id}"`, notes field, rich `session_meta` → Task 7 (`_build_meta`).
+- One session per scan, shared file across scans → Task 7 (caller-supplied `db_path`, single open per scan via `sink.open`).
+- `session_label = f"{ts}_{subject_id}"`, `notes` field, rich `session_meta` with subject_id / masks / fw versions / hw IDs / sdk flags → Task 7 (`_build_meta`, using real `get_version()` / `get_hardware_id()` APIs).
 - New `on_scan_start_fn` + `on_raw_frame_fn` on `ScanWorkflow` → Task 6.
-- Wiring at `MOTIONInterface.start_scan` → Task 7.
+- Wiring at `MotionInterface.start_scan` (gated on `self._db_path`) → Task 7.
+- **Floats stored to 6 decimals** (project-wide precision policy) → Task 4 + Task 5; Task 9 verifies cell-for-cell equivalence with the corrected CSV.
 - Unit tests for `ScanDatabase`, `ScanDBSink`, integration, equivalence → Tasks 1, 3–5, 8, 9.
 
 **Placeholder scan:** No TBDs, no "handle edge cases" without code, no "similar to Task N" shortcuts. Every step shows the exact code or exact command.
