@@ -712,7 +712,7 @@ git commit -m "feat(sdk): ScanDBSink.on_raw_frame with batched executemany flush
 
 This is the load-bearing piece: convert each `Sample` in a `CorrectedBatch` into one `session_data` row. Side encoding is `"left"` → `0`, `"right"` → `1`. `cam_id` is written as-is from the sample. Use `insert_session_data_rows` for a single-transaction bulk insert. Flush any buffered raw frames at the top of the call (cheap sync point). Per-row errors are logged and counted but do not raise.
 
-- [ ] **Step 1: Add failing tests for corrected-batch writes**
+- [x] **Step 1: Add failing tests for corrected-batch writes**
 
 Append to `tests/test_scan_db_sink.py`:
 
@@ -808,7 +808,7 @@ def test_on_corrected_batch_empty_is_noop(tmp_path):
         db.close()
 ```
 
-- [ ] **Step 2: Run the tests to confirm they fail**
+- [x] **Step 2: Run the tests to confirm they fail**
 
 ```bash
 pytest tests/test_scan_db_sink.py -v -k corrected
@@ -816,7 +816,7 @@ pytest tests/test_scan_db_sink.py -v -k corrected
 
 Expected: FAIL — `on_corrected_batch` is still a stub.
 
-- [ ] **Step 3: Implement `on_corrected_batch`**
+- [x] **Step 3: Implement `on_corrected_batch`**
 
 In `omotion/ScanDBSink.py`, replace the `on_corrected_batch` body with:
 
@@ -869,7 +869,7 @@ In `omotion/ScanDBSink.py`, replace the `on_corrected_batch` body with:
                 self._insert_errors += len(rows)
 ```
 
-- [ ] **Step 4: Run the tests to verify**
+- [x] **Step 4: Run the tests to verify**
 
 ```bash
 pytest tests/test_scan_db_sink.py -v
@@ -877,7 +877,7 @@ pytest tests/test_scan_db_sink.py -v
 
 Expected: every test PASSES (including all earlier ones).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add omotion/ScanDBSink.py tests/test_scan_db_sink.py

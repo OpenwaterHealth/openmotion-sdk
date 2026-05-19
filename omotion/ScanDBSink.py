@@ -103,7 +103,57 @@ class ScanDBSink:
 
     def on_corrected_batch(self, batch: "CorrectedBatch") -> None:
         self._require_open()
-        # Real implementation lands in Task 5.
+        with self._lock:
+            if self._db is None or self._session_id is None:
+                # Lost the race with close(); drop silently.
+                return
+            # Flush any buffered raw frames first so raw and corrected
+            # writes land in the DB in roughly the order they were produced.
+            self._flush_raw_locked()
+
+            if not batch.samples:
+                return
+
+            rows: list[dict[str, Any]] = []
+            for s in batch.samples:
+                side_int = (
+                    0 if s.side == "left"
+                    else 1 if s.side == "right"
+                    else None
+                )
+                if side_int is None:
+                    logger.warning(
+                        "ScanDBSink: unknown side %r, skipping sample", s.side
+                    )
+                    self._insert_errors += 1
+                    continue
+                rows.append(
+                    {
+                        "session_id": self._session_id,
+                        "session_raw_id": None,
+                        "cam_id": int(s.cam_id),
+                        "side": side_int,
+                        # 6-decimal rounding matches the corrected CSV
+                        # writer exactly — Task 9 relies on this for a
+                        # clean cell-for-cell equivalence comparison.
+                        "timestamp_s": round(float(s.timestamp_s), 6),
+                        "bfi": round(float(s.bfi), 6),
+                        "bvi": round(float(s.bvi), 6),
+                        "contrast": round(float(s.contrast), 6),
+                        "mean": round(float(s.mean), 6),
+                    }
+                )
+
+            if not rows:
+                return
+            try:
+                self._db.insert_session_data_rows(rows)
+            except Exception:
+                logger.exception(
+                    "ScanDBSink: failed to insert %d session_data rows",
+                    len(rows),
+                )
+                self._insert_errors += len(rows)
 
     def on_raw_frame(
         self,

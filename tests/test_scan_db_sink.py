@@ -148,6 +148,157 @@ def test_on_raw_frame_concurrent_writers(tmp_path: Path) -> None:
         db.close()
 
 
+# ----- Task 5: on_corrected_batch ---------------------------------------
+
+from omotion.MotionProcessing import Sample
+
+
+def _mk_sample(side, cam_id, frame_id, ts, bfi, bvi, contrast, mean):
+    return Sample(
+        side=side,
+        cam_id=cam_id,
+        frame_id=frame_id,
+        absolute_frame_id=frame_id,
+        timestamp_s=ts,
+        row_sum=0,
+        temperature_c=25.0,
+        mean=mean,
+        std_dev=0.0,
+        contrast=contrast,
+        bfi=bfi,
+        bvi=bvi,
+        is_corrected=True,
+    )
+
+
+def test_on_corrected_batch_writes_one_row_per_sample(tmp_path: Path) -> None:
+    sink, sid = _make_sink(tmp_path)
+    batch = CorrectedBatch(
+        dark_frame_start=0,
+        dark_frame_end=600,
+        samples=[
+            _mk_sample("left", 0, 1, 0.025, 0.1, 0.2, 0.3, 500.0),
+            _mk_sample("left", 1, 1, 0.025, 0.11, 0.21, 0.31, 501.0),
+            _mk_sample("right", 0, 1, 0.025, 0.12, 0.22, 0.32, 502.0),
+        ],
+    )
+    sink.on_corrected_batch(batch)
+    sink.close(end_ts=1.0)
+
+    db = ScanDatabase(db_path=str(tmp_path / "scans.db"))
+    try:
+        rows = [r for batch_ in db.stream_session_data(sid) for r in batch_]
+        assert len(rows) == 3
+        left_rows = [r for r in rows if r["side"] == 0]
+        right_rows = [r for r in rows if r["side"] == 1]
+        assert len(left_rows) == 2
+        assert len(right_rows) == 1
+        lr = next(r for r in left_rows if r["cam_id"] == 0)
+        assert lr["bfi"] == 0.1
+        assert lr["bvi"] == 0.2
+        assert lr["contrast"] == 0.3
+        assert lr["mean"] == 500.0
+        assert lr["timestamp_s"] == 0.025
+    finally:
+        db.close()
+
+
+def test_on_corrected_batch_flushes_pending_raw_frames(tmp_path: Path) -> None:
+    sink, sid = _make_sink(tmp_path, write_raw=True, raw_batch_size=100)
+    # Enqueue 5 raw frames (below batch_size, so not yet flushed).
+    for fid in range(5):
+        sink.on_raw_frame("left", 0, fid, 0.0, b"\x00" * 4096, 25.0, 0, 0.0, 0.0, 0.0)
+
+    batch = CorrectedBatch(
+        dark_frame_start=0,
+        dark_frame_end=600,
+        samples=[_mk_sample("left", 0, 1, 0.025, 0.1, 0.2, 0.3, 500.0)],
+    )
+    sink.on_corrected_batch(batch)
+
+    # Before close, raw rows should already be visible.
+    db = ScanDatabase(db_path=str(tmp_path / "scans.db"))
+    try:
+        rows = [r for b in db.stream_raw_frames(sid) for r in b]
+        assert len(rows) == 5
+    finally:
+        db.close()
+    sink.close(end_ts=1.0)
+
+
+def test_on_corrected_batch_empty_is_noop(tmp_path: Path) -> None:
+    sink, sid = _make_sink(tmp_path)
+    sink.on_corrected_batch(
+        CorrectedBatch(dark_frame_start=0, dark_frame_end=0, samples=[])
+    )
+    sink.close(end_ts=1.0)
+
+    db = ScanDatabase(db_path=str(tmp_path / "scans.db"))
+    try:
+        rows = [r for b in db.stream_session_data(sid) for r in b]
+        assert rows == []
+    finally:
+        db.close()
+
+
+def test_on_corrected_batch_rounds_floats_to_6_decimals(tmp_path: Path) -> None:
+    sink, sid = _make_sink(tmp_path)
+    sink.on_corrected_batch(
+        CorrectedBatch(
+            dark_frame_start=0,
+            dark_frame_end=600,
+            samples=[
+                _mk_sample(
+                    "left", 0, 1,
+                    0.0250001234567,  # timestamp_s → 0.025000
+                    0.1234567891,     # bfi        → 0.123457
+                    0.2345678912,     # bvi        → 0.234568
+                    0.3456789123,     # contrast   → 0.345679
+                    500.1234567891,   # mean       → 500.123457
+                ),
+            ],
+        )
+    )
+    sink.close(end_ts=1.0)
+
+    db = ScanDatabase(db_path=str(tmp_path / "scans.db"))
+    try:
+        rows = [r for b in db.stream_session_data(sid) for r in b]
+        assert len(rows) == 1
+        r = rows[0]
+        assert r["timestamp_s"] == 0.025000
+        assert r["bfi"] == 0.123457
+        assert r["bvi"] == 0.234568
+        assert r["contrast"] == 0.345679
+        assert r["mean"] == 500.123457
+    finally:
+        db.close()
+
+
+def test_on_corrected_batch_skips_unknown_side(tmp_path: Path) -> None:
+    """Defensive: a sample with an unexpected ``side`` value (not
+    'left'/'right') is counted as an insert error and skipped, not
+    written as a NULL side row."""
+    sink, sid = _make_sink(tmp_path)
+    samples = [
+        _mk_sample("left", 0, 1, 0.025, 0.1, 0.2, 0.3, 500.0),
+        _mk_sample("middle", 0, 1, 0.025, 0.1, 0.2, 0.3, 500.0),  # bogus
+    ]
+    sink.on_corrected_batch(
+        CorrectedBatch(dark_frame_start=0, dark_frame_end=600, samples=samples)
+    )
+    sink.close(end_ts=1.0)
+    assert sink.insert_errors >= 1
+
+    db = ScanDatabase(db_path=str(tmp_path / "scans.db"))
+    try:
+        rows = [r for b in db.stream_session_data(sid) for r in b]
+        assert len(rows) == 1
+        assert rows[0]["side"] == 0  # the valid 'left' sample
+    finally:
+        db.close()
+
+
 def test_on_raw_frame_rounds_floats_to_6_decimals(tmp_path: Path) -> None:
     """Per project policy, floats are stored to 6 decimals to match the
     corrected CSV writer's precision (and to keep DB size in check)."""
