@@ -232,6 +232,10 @@ class ScanWorkflow:
         on_trigger_state_fn: Callable[[str], None] | None = None,
         on_uncorrected_fn: Callable[[object], None] | None = None,
         on_corrected_batch_fn: Callable[[object], None] | None = None,
+        # Hooks for the ScanDBSink (issue #92). The workflow itself stays
+        # DB-unaware — it just fires these callbacks if supplied.
+        on_raw_frame_fn: Callable[..., None] | None = None,
+        on_scan_start_fn: Callable[[str, float], None] | None = None,
         on_dark_frame_fn: Callable[[object], None] | None = None,
         on_rolling_avg_fn: Callable[[object], None] | None = None,
         on_error_fn: Callable[[Exception], None] | None = None,
@@ -270,6 +274,16 @@ class ScanWorkflow:
             corrected_path = ""
             telemetry_path = ""
             ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            # Fire the scan-start hook so a downstream sink (e.g. the
+            # ScanDBSink for issue #92) can open its session with the
+            # canonical label and wall-clock start used by the rest of
+            # the workflow.
+            session_start_ts = time.time()
+            if on_scan_start_fn is not None:
+                try:
+                    on_scan_start_fn(ts, session_start_ts)
+                except Exception:
+                    logger.exception("on_scan_start_fn callback raised")
             active_sides = []
             writer_threads: dict[str, threading.Thread] = {}
             writer_stops: dict[str, threading.Event] = {}
@@ -690,6 +704,38 @@ class ScanWorkflow:
                                 row_sum,
                                 temp,
                             )
+                        # Fan out to the issue #92 raw-frame hook. Reuse
+                        # extra_cols_fn (the same hook that feeds tcm/tcl/pdc
+                        # into the raw CSV writer) so the DB sees the same
+                        # telemetry values that land in the on-disk CSVs.
+                        if on_raw_frame_fn is not None:
+                            if extra_cols_fn is not None:
+                                try:
+                                    extras = extra_cols_fn()
+                                except Exception:
+                                    extras = []
+                            else:
+                                extras = []
+                            tcm = float(extras[0]) if len(extras) > 0 else 0.0
+                            tcl = float(extras[1]) if len(extras) > 1 else 0.0
+                            pdc = float(extras[2]) if len(extras) > 2 else 0.0
+                            try:
+                                on_raw_frame_fn(
+                                    current_side,
+                                    int(cam_id),
+                                    int(frame_id),
+                                    float(ts_val),
+                                    bytes(hist),
+                                    float(temp) if temp is not None else 0.0,
+                                    int(row_sum) if row_sum is not None else 0,
+                                    tcm,
+                                    tcl,
+                                    pdc,
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "on_raw_frame_fn callback raised"
+                                )
                     return _on_row
 
                 _RAW_CSV_HEADERS = [
