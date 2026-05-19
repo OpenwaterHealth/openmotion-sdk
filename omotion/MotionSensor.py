@@ -1,4 +1,5 @@
 import logging
+import re
 import struct
 import threading
 import time
@@ -70,6 +71,34 @@ logger = logging.getLogger(f"{_log_root}.Sensor" if _log_root else "Sensor")
 
 # Firmware response types that indicate an error condition.
 _ERROR_TYPES = frozenset({OW_ERROR, OW_BAD_CRC, OW_BAD_PARSE, OW_UNKNOWN})
+
+
+# Matches the leading "MAJOR.MINOR.PATCH" of a firmware version, ignoring any
+# leading "v" and any pre-release / build / git-describe suffix that follows.
+# Examples that match: "v1.5.4", "1.5.4-dev", "1.5.4-dev.0-5-g1234abc-dirty",
+# "1.5.4+build.7". Strings with no leading numeric component (e.g. "unknown")
+# do not match.
+_VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)")
+
+
+def _parse_firmware_version(version_str: str) -> tuple[int, int, int]:
+    """Parse a sensor firmware version string into a ``(major, minor, patch)`` tuple.
+
+    Tolerates a leading ``v`` and any pre-release / build / git-describe suffix
+    (``-dev``, ``-rc.1``, ``-5-g1234abc``, ``-dirty``, ``+build.7``, etc.) by
+    matching only the leading numeric ``MAJOR.MINOR.PATCH`` segment. Sensor
+    firmware embeds ``git describe --tags --dirty --always`` as its version
+    string, so suffixes like these appear in every non-release build.
+
+    Raises ``ValueError`` if the string has no leading numeric component
+    (e.g. ``"unknown"``).
+    """
+    if version_str is None:
+        raise TypeError("version_str must be a string, got None")
+    m = _VERSION_RE.match(version_str)
+    if not m:
+        raise ValueError(f"unparseable firmware version {version_str!r}")
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
 
 
 class MotionSensor(SignalWrapper):
@@ -1152,10 +1181,10 @@ class MotionSensor(SignalWrapper):
         """
         import omotion.MotionProcessing as _mp
 
+        version_str = self.get_version()
         try:
-            version_str = self.get_version().lstrip("v")
-            parts = tuple(int(x) for x in version_str.split("."))
-        except Exception as e:
+            parts = _parse_firmware_version(version_str)
+        except (ValueError, TypeError) as e:
             logger.warning(
                 "Could not parse firmware version for pedestal selection: %s", e
             )
@@ -1164,7 +1193,7 @@ class MotionSensor(SignalWrapper):
         pedestal = 64.0 if parts <= (1, 5, 2) else 128.0
         _mp.PEDESTAL_HEIGHT = pedestal
         logger.info(
-            "Pedestal height set to %g based on sensor firmware v%s",
+            "Pedestal height set to %g based on sensor firmware %s",
             pedestal,
             version_str,
         )
