@@ -1149,8 +1149,8 @@ class SciencePipeline:
         # field (frame 10 looks like a light frame: u1≈200, std≈40).
         self._dark_integrity_max_u1_above_pedestal = float(dark_integrity_max_u1_above_pedestal)
         self._dark_integrity_max_std = float(dark_integrity_max_std)
-        # Populated by _check_dark_integrity. Callers (CalibrationWorkflow)
-        # query this after pipeline.stop() to fail loudly.
+        # Populated by _check_dark_integrity. Diagnostic only — surfaced
+        # on ScanResult but no longer fatal to calibration.
         self._dark_integrity_warnings: list[str] = []
         # Per (side, cam_id): deque of the last N uncorrected light Samples.
         # Populated lazily on first light sample for that key; empty when
@@ -1208,8 +1208,9 @@ class SciencePipeline:
         more frames as dark-by-schedule, but the actual measurement
         (u1, std) failed the dark heuristic — i.e. the firmware emitted
         a light frame in a slot the science pipeline expected to be
-        dark. Calibration callers should fail loudly when this is
-        non-empty since the dark interpolation will be polluted.
+        dark, OR the dark slot picked up significant ambient light.
+        Diagnostic only — the per-camera FT dark mean-max check is the
+        authoritative gate for ambient-light failure.
         """
         return list(self._dark_integrity_warnings)
 

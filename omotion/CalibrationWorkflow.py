@@ -828,18 +828,6 @@ def _run_subscan_capture(
         )
     if res.canceled:
         return "", "", [], []
-    # Loud failure: if the science pipeline detected dark-frame
-    # schedule/measurement disagreement, abort the calibration. The
-    # interpolated dark baseline would be polluted and the resulting
-    # C_max/I_max would be wrong.
-    if res.dark_integrity_warnings:
-        details = " | ".join(res.dark_integrity_warnings[:3])
-        if len(res.dark_integrity_warnings) > 3:
-            details += f" (+{len(res.dark_integrity_warnings) - 3} more)"
-        raise RuntimeError(
-            f"sub-scan dark integrity check failed ({len(res.dark_integrity_warnings)} "
-            f"warnings): {details}"
-        )
     captured.sort(key=lambda s: (s.side, s.cam_id, s.absolute_frame_id))
     dark.sort(key=lambda s: (s.side, s.cam_id, s.absolute_frame_id))
     return res.left_path or "", res.right_path or "", captured, dark

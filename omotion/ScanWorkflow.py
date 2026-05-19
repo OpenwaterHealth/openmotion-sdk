@@ -111,9 +111,9 @@ class ScanResult:
     telemetry_path: str = ""
     # Populated when the science pipeline detected schedule/measurement
     # disagreement on dark frames (firmware off-by-one, unwrapper
-    # alignment quirk, etc.). Empty on a clean scan. Calibration callers
-    # should fail loudly when this is non-empty since dark-frame
-    # interpolation will be polluted.
+    # alignment quirk, or significant ambient light in a dark slot).
+    # Empty on a clean scan. Diagnostic only — calibration no longer
+    # aborts on this; the per-camera FT dark mean-max check gates that.
     dark_integrity_warnings: list[str] = field(default_factory=list)
 
 
