@@ -275,7 +275,7 @@ git commit -m "refactor(stream-db): import ScanDatabase from omotion package"
 
 Build the skeleton. Just construction, session open, session close. The callbacks are no-ops at this task; they get filled in by Tasks 4 and 5.
 
-- [ ] **Step 1: Write the failing tests for construction, open, close**
+- [x] **Step 1: Write the failing tests for construction, open, close**
 
 Create `tests/test_scan_db_sink.py`:
 
@@ -346,7 +346,7 @@ def test_sink_raises_if_callbacks_called_before_open(tmp_path: Path) -> None:
         )
 ```
 
-- [ ] **Step 2: Run to confirm the tests fail**
+- [x] **Step 2: Run to confirm the tests fail**
 
 ```bash
 pytest tests/test_scan_db_sink.py -v
@@ -354,7 +354,7 @@ pytest tests/test_scan_db_sink.py -v
 
 Expected: ImportError on `from omotion import ScanDBSink` (`ScanDBSink` does not exist yet).
 
-- [ ] **Step 3: Create `omotion/ScanDBSink.py` with construction, open, close only**
+- [x] **Step 3: Create `omotion/ScanDBSink.py` with construction, open, close only**
 
 ```python
 """
@@ -490,7 +490,7 @@ class ScanDBSink:
         self._raw_buffer.clear()
 ```
 
-- [ ] **Step 4: Re-export `ScanDBSink` from the package**
+- [x] **Step 4: Re-export `ScanDBSink` from the package**
 
 Open `omotion/__init__.py` and add after `from .ScanDatabase import ScanDatabase`:
 
@@ -498,7 +498,7 @@ Open `omotion/__init__.py` and add after `from .ScanDatabase import ScanDatabase
 from .ScanDBSink import ScanDBSink
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 ```bash
 pytest tests/test_scan_db_sink.py -v
@@ -506,7 +506,7 @@ pytest tests/test_scan_db_sink.py -v
 
 Expected: all three tests PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add omotion/ScanDBSink.py omotion/__init__.py tests/test_scan_db_sink.py
