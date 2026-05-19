@@ -46,7 +46,7 @@
 
 This task is a pure move. No behavior changes — same class, same schema, same public API. The stream-db tool files are updated in Task 2.
 
-- [ ] **Step 1: Copy `stream-db/scan_db.py` to `omotion/ScanDatabase.py` verbatim**
+- [x] **Step 1: Copy `stream-db/scan_db.py` to `omotion/ScanDatabase.py` verbatim**
 
 ```bash
 cp stream-db/scan_db.py omotion/ScanDatabase.py
@@ -60,7 +60,7 @@ test -f omotion/ScanDatabase.py && echo "ok"
 
 Expected: `ok`
 
-- [ ] **Step 2: Re-export `ScanDatabase` from the package**
+- [x] **Step 2: Re-export `ScanDatabase` from the package**
 
 Open `omotion/__init__.py` and append just before the `try: __version__ = ...` block (i.e., after the `MotionConfig` import on line 25):
 
@@ -68,7 +68,7 @@ Open `omotion/__init__.py` and append just before the `try: __version__ = ...` b
 from .ScanDatabase import ScanDatabase
 ```
 
-- [ ] **Step 3: Sanity-check the import works**
+- [x] **Step 3: Sanity-check the import works**
 
 ```bash
 cd C:/Users/ethan/Projects/openmotion-sdk/.claude/worktrees/buzzing-forging-rainbow
@@ -77,7 +77,7 @@ python -c "from omotion import ScanDatabase; print(ScanDatabase.__module__)"
 
 Expected: `omotion.ScanDatabase`
 
-- [ ] **Step 4: Write a smoke test that opens an in-memory-like DB**
+- [x] **Step 4: Write a smoke test that opens an in-memory-like DB**
 
 Create `tests/test_scan_database.py`:
 
@@ -180,7 +180,7 @@ def test_session_meta_survives_unicode_and_none(tmp_db: ScanDatabase) -> None:
     assert session["session_meta"] == meta
 ```
 
-- [ ] **Step 5: Run the new tests to confirm the move is clean**
+- [x] **Step 5: Run the new tests to confirm the move is clean**
 
 ```bash
 pytest tests/test_scan_database.py -v
@@ -188,13 +188,13 @@ pytest tests/test_scan_database.py -v
 
 Expected: all tests PASS.
 
-- [ ] **Step 6: Delete the old file once tests are green**
+- [x] **Step 6: Delete the old file once tests are green**
 
 ```bash
 rm stream-db/scan_db.py
 ```
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add omotion/ScanDatabase.py omotion/__init__.py tests/test_scan_database.py stream-db/scan_db.py
@@ -213,7 +213,7 @@ git commit -m "refactor(sdk): move scan_db.py into omotion.ScanDatabase"
 
 Each of these currently does `from scan_db import ScanDatabase`. After Task 1 that import is broken. Switch each to `from omotion import ScanDatabase`. Because `stream-db/` is not on the Python path when running these scripts standalone, add a `sys.path` bootstrap to each file so they can locate the installed-or-local `omotion` package.
 
-- [ ] **Step 1: Verify the current import in each file**
+- [x] **Step 1: Verify the current import in each file**
 
 ```bash
 grep -n "from scan_db" stream-db/db_browser.py stream-db/db_validator.py stream-db/importer.py stream-db/sensor_module_simulator.py
@@ -221,7 +221,7 @@ grep -n "from scan_db" stream-db/db_browser.py stream-db/db_validator.py stream-
 
 Record the line numbers of each match — you'll replace them below.
 
-- [ ] **Step 2: Update `stream-db/db_browser.py`**
+- [x] **Step 2: Update `stream-db/db_browser.py`**
 
 Replace the existing `from scan_db import ScanDatabase` line with:
 
@@ -236,13 +236,13 @@ from omotion import ScanDatabase
 
 (If `import os` / `import sys` are already imported at the top of the file, don't duplicate them — just add the `sys.path.insert` line and the `from omotion import ScanDatabase` line.)
 
-- [ ] **Step 3: Update `stream-db/db_validator.py`** — same pattern as Step 2.
+- [x] **Step 3: Update `stream-db/db_validator.py`** — same pattern as Step 2.
 
-- [ ] **Step 4: Update `stream-db/importer.py`** — same pattern as Step 2.
+- [x] **Step 4: Update `stream-db/importer.py`** — same pattern as Step 2.
 
-- [ ] **Step 5: Update `stream-db/sensor_module_simulator.py`** — same pattern as Step 2.
+- [x] **Step 5: Update `stream-db/sensor_module_simulator.py`** — same pattern as Step 2.
 
-- [ ] **Step 6: Smoke-test each script can at least import**
+- [x] **Step 6: Smoke-test each script can at least import**
 
 ```bash
 python -c "import importlib.util,sys,os; sys.path.insert(0, 'stream-db'); [importlib.util.spec_from_file_location(n, os.path.join('stream-db', n + '.py')).loader.exec_module(importlib.util.module_from_spec(importlib.util.spec_from_file_location(n, os.path.join('stream-db', n + '.py')))) for n in ['db_browser','db_validator','importer','sensor_module_simulator']]" 2>&1 | tail -3
@@ -257,7 +257,7 @@ python stream-db/db_validator.py --help
 
 Expected: each prints a usage string. No `ModuleNotFoundError: No module named 'scan_db'`.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add stream-db/db_browser.py stream-db/db_validator.py stream-db/importer.py stream-db/sensor_module_simulator.py

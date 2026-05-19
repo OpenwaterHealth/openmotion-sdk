@@ -10,10 +10,16 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import sys
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional
+
+# Make the parent omotion-sdk repo importable when this script is run
+# standalone from inside stream-db/ (issue #92 — scan_db.py moved into
+# the omotion package).
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from importer import (
     ScanGroup,
@@ -23,7 +29,7 @@ from importer import (
     iter_frame_groups,
     read_notes,
 )
-from scan_db import ScanDatabase
+from omotion import ScanDatabase
 
 
 def main() -> int:
