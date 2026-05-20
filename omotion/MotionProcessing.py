@@ -617,6 +617,7 @@ def parse_histogram_stream(
     csv_deadline: float | None = None,
     on_csv_closed_fn: Callable[[], None] | None = None,
     csv_stop_event: threading.Event | None = None,
+    t0_normalizer: Callable[[float], float] | None = None,
 ) -> int:
     """
     Parse a histogram USB stream queue, feed the science pipeline, and
@@ -688,6 +689,15 @@ def parse_histogram_stream(
                         _ts_offset += _TIMESTAMP_ROLLOVER_S
                     sample.timestamp_s = raw_ts + _ts_offset
                     _ts_last = sample.timestamp_s
+                    # Normalize to per-scan t0 if a normalizer was supplied
+                    # (typically by ScanWorkflow). After this, sample.timestamp_s
+                    # is seconds since the first sample emitted in this scan,
+                    # so every downstream consumer — raw CSV, row handler /
+                    # on_raw_frame_fn callback, the science pipeline, and the
+                    # corrected outputs that flow from it — sees the same
+                    # 0-based per-scan time origin.
+                    if t0_normalizer is not None:
+                        sample.timestamp_s = t0_normalizer(sample.timestamp_s)
 
                     # Check CSV deadline before every row so the cutoff is
                     # accurate to within one sample period (~25 ms at 40 Hz).

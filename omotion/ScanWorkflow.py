@@ -321,7 +321,27 @@ class ScanWorkflow:
             _corr_fh = None
             _corr_csv = None
             _corr_lock = threading.Lock()
-            _corr_base_ts: float | None = None
+            # Per-scan time origin: captured from the first sample emitted by
+            # parse_histogram_stream (whichever side fires first wins) and
+            # subtracted from every subsequent sample's timestamp_s. Result:
+            # every downstream consumer — raw CSV, science pipeline,
+            # corrected CSV, on_uncorrected_fn / on_corrected_batch_fn /
+            # on_raw_frame_fn callbacks — sees the same 0-based per-scan
+            # time origin. Replaces the per-output `_corr_base_ts` offset
+            # the corrected CSV writer used to compute by itself.
+            _session_t0: float | None = None
+            _t0_lock = threading.Lock()
+
+            def _normalize_ts(ts: float) -> float:
+                """Capture-once t0 normalizer passed into parse_histogram_stream
+                so the first sample any writer thread sees defines t=0 for the
+                whole scan."""
+                nonlocal _session_t0
+                if _session_t0 is None:
+                    with _t0_lock:
+                        if _session_t0 is None:
+                            _session_t0 = float(ts)
+                return float(ts) - _session_t0
             if request.reduced_mode:
                 corrected_columns = [
                     "bfi_left", "bfi_right",
@@ -505,7 +525,10 @@ class ScanWorkflow:
                     def _on_corrected_batch(batch: CorrectedBatch):
                         # Fires once per (side, cam_id) per dark-frame interval
                         # with properly corrected BFI/BVI for that interval.
-                        nonlocal _corr_base_ts
+                        # Sample timestamps are already normalized to scan-start
+                        # at the source (parse_histogram_stream's t0_normalizer),
+                        # so the corrected CSV can write them directly without
+                        # its own per-output offset.
 
                         if request.reduced_mode:
                             # In reduced mode, average all cameras per side per
@@ -552,14 +575,9 @@ class ScanWorkflow:
                                             complete.append(fid)
 
                                     if complete and _corr_csv is not None:
-                                        if _corr_base_ts is None:
-                                            _corr_base_ts = min(
-                                                float(corrected_by_frame[fid]["timestamp_s"])
-                                                for fid in complete
-                                            )
                                         for fid in sorted(complete):
                                             entry = corrected_by_frame.pop(fid)
-                                            rel_ts = float(entry["timestamp_s"]) - _corr_base_ts
+                                            rel_ts = float(entry["timestamp_s"])
                                             accum = entry.get("_accum", {})
                                             left_acc = accum.get("left", {"bfi_sum": 0, "bvi_sum": 0, "count": 1})
                                             right_acc = accum.get("right", {"bfi_sum": 0, "bvi_sum": 0, "count": 1})
@@ -659,16 +677,9 @@ class ScanWorkflow:
                                         )
                                     ]
                                     if complete:
-                                        if _corr_base_ts is None:
-                                            _corr_base_ts = min(
-                                                float(corrected_by_frame[fid]["timestamp_s"])
-                                                for fid in complete
-                                            )
                                         for fid in sorted(complete):
                                             entry = corrected_by_frame.pop(fid)
-                                            rel_ts = (
-                                                float(entry["timestamp_s"]) - _corr_base_ts
-                                            )
+                                            rel_ts = float(entry["timestamp_s"])
                                             row = [fid, rel_ts]
                                             row.extend(
                                                 entry["values"].get(col, "")
@@ -847,6 +858,7 @@ class ScanWorkflow:
                                 csv_deadline=csv_deadline,
                                 csv_stop_event=csv_stop_evt,
                                 on_csv_closed_fn=_on_csv_closed if csv_deadline is not None else None,
+                                t0_normalizer=_normalize_ts,
                             )
                         except Exception as e:
                             _emit_log(f"Writer error ({os.path.basename(fp) if fp else s}): {e}")
@@ -1015,14 +1027,9 @@ class ScanWorkflow:
                 # contributed before the scan ended).
                 with _corr_lock:
                     if _corr_csv is not None and corrected_by_frame:
-                        if _corr_base_ts is None:
-                            _corr_base_ts = min(
-                                float(e["timestamp_s"])
-                                for e in corrected_by_frame.values()
-                            )
                         for fid in sorted(corrected_by_frame.keys()):
                             entry = corrected_by_frame[fid]
-                            rel_ts = float(entry["timestamp_s"]) - _corr_base_ts
+                            rel_ts = float(entry["timestamp_s"])
                             row = [fid, rel_ts]
                             row.extend(
                                 entry["values"].get(col, "") for col in corrected_columns
