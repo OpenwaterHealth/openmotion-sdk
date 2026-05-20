@@ -120,6 +120,7 @@ class ScanDatabase:
                                           ON DELETE SET NULL,
                 cam_id           INTEGER NOT NULL,
                 side             INTEGER NOT NULL CHECK(side IN (0, 1)),
+                frame_id         INTEGER NOT NULL DEFAULT -1,
                 timestamp_s      REAL    NOT NULL,
                 bfi              REAL,
                 bvi              REAL,
@@ -138,6 +139,24 @@ class ScanDatabase:
                 value          TEXT NOT NULL
             );
             """
+        )
+        # Issue #92 Step F: add session_data.frame_id to DBs created
+        # before the column existed. Rows from those older sessions get
+        # the sentinel value -1 ("frame_id unknown"); SessionPlayback
+        # treats that as "this session can't be played back from the DB
+        # — fall back to the corresponding _corrected.csv if present".
+        # The index creation is outside the if-block because fresh DBs
+        # (created with the new CREATE TABLE) also need it.
+        cols = {
+            r[1] for r in self._connection().execute("PRAGMA table_info('session_data')")
+        }
+        if "frame_id" not in cols:
+            self._connection().execute(
+                "ALTER TABLE session_data ADD COLUMN frame_id INTEGER NOT NULL DEFAULT -1"
+            )
+        self._connection().execute(
+            "CREATE INDEX IF NOT EXISTS idx_session_data_session_frame "
+            "ON session_data(session_id, frame_id)"
         )
         self._connection().commit()
 
@@ -440,25 +459,31 @@ class ScanDatabase:
         timestamp_s: float,
         *,
         session_raw_id: Optional[int] = None,
+        frame_id: int = -1,
         bfi: Optional[float] = None,
         bvi: Optional[float] = None,
         contrast: Optional[float] = None,
         mean: Optional[float] = None,
     ) -> int:
+        # frame_id defaults to the "unknown" sentinel (-1) so callers from
+        # before #92 Step F still work; new callers (ScanDBSink) pass the
+        # real absolute_frame_id so corrected-CSV playback can merge
+        # per-side samples exactly the way the CSV writer did.
         _validate_side(side)
         cursor = self._connection().execute(
             """
             INSERT INTO session_data (
                 session_id, session_raw_id, cam_id, side,
-                timestamp_s, bfi, bvi, contrast, mean
+                frame_id, timestamp_s, bfi, bvi, contrast, mean
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 session_id,
                 session_raw_id,
                 cam_id,
                 side,
+                int(frame_id),
                 timestamp_s,
                 bfi,
                 bvi,
@@ -479,6 +504,7 @@ class ScanDatabase:
                     row.get("session_raw_id"),
                     row["cam_id"],
                     row["side"],
+                    int(row.get("frame_id", -1)),
                     row["timestamp_s"],
                     row.get("bfi"),
                     row.get("bvi"),
@@ -491,9 +517,9 @@ class ScanDatabase:
             """
             INSERT INTO session_data (
                 session_id, session_raw_id, cam_id, side,
-                timestamp_s, bfi, bvi, contrast, mean
+                frame_id, timestamp_s, bfi, bvi, contrast, mean
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             params,
         )

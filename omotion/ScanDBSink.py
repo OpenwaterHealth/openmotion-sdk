@@ -142,6 +142,11 @@ class ScanDBSink(Sink):
                         "session_raw_id": None,
                         "cam_id": int(s.cam_id),
                         "side": side_int,
+                        # absolute_frame_id is the merge key the corrected
+                        # CSV writer uses (#92 Step F) — storing it lets
+                        # read_session() reproduce the exact per-frame
+                        # column layout for DB-only playback.
+                        "frame_id": int(s.absolute_frame_id),
                         # 6-decimal rounding matches the corrected CSV
                         # writer exactly — Task 9 relies on this for a
                         # clean cell-for-cell equivalence comparison.
