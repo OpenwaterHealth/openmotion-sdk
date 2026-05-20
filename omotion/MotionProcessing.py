@@ -1012,7 +1012,6 @@ class SciencePipeline:
         noise_floor: int = 10,
         log_dark_endpoints: bool = False,
         dark_integrity_max_u1_above_pedestal: float = 30.0,
-        dark_integrity_max_std: float = 20.0,
     ):
         self._bfi_c_min = bfi_c_min
         self._bfi_c_max = bfi_c_max
@@ -1026,11 +1025,10 @@ class SciencePipeline:
         self._rolling_avg_window = int(rolling_avg_window)
         self._log_dark_endpoints = bool(log_dark_endpoints)
         # Dark-integrity monitor: every frame stored in _dark_history is
-        # cross-checked against these bounds. The defaults catch the
+        # cross-checked against this bound. The default catches the
         # firmware off-by-one symptom we've actually observed in the
-        # field (frame 10 looks like a light frame: u1≈200, std≈40).
+        # field (frame 10 looks like a light frame: u1≈200).
         self._dark_integrity_max_u1_above_pedestal = float(dark_integrity_max_u1_above_pedestal)
-        self._dark_integrity_max_std = float(dark_integrity_max_std)
         # Populated by _check_dark_integrity. Diagnostic only — surfaced
         # on ScanResult but no longer fatal to calibration.
         self._dark_integrity_warnings: list[str] = []
@@ -1087,10 +1085,10 @@ class SciencePipeline:
         """Return the list of dark-integrity warnings collected so far.
 
         A non-empty list means the science pipeline classified one or
-        more frames as dark-by-schedule, but the actual measurement
-        (u1, std) failed the dark heuristic — i.e. the firmware emitted
-        a light frame in a slot the science pipeline expected to be
-        dark, OR the dark slot picked up significant ambient light.
+        more frames as dark-by-schedule, but the actual measurement u1
+        was above pedestal+max — i.e. the firmware emitted a light
+        frame in a slot the science pipeline expected to be dark, OR
+        the dark slot picked up significant ambient light.
         Diagnostic only — the per-camera FT dark mean-max check is the
         authoritative gate for ambient-light failure.
         """
@@ -1102,22 +1100,18 @@ class SciencePipeline:
         cam_id: int,
         absolute_frame: int,
         u1: float,
-        variance: float,
     ) -> None:
         """Verify a frame the schedule classified as dark actually
         looks dark. Logs at ERROR level and stores a warning string on
         the pipeline if not."""
-        std = float(np.sqrt(max(0.0, variance)))
         max_u1 = PEDESTAL_HEIGHT + self._dark_integrity_max_u1_above_pedestal
-        max_std = self._dark_integrity_max_std
-        if u1 <= max_u1 and std <= max_std:
+        if u1 <= max_u1:
             return
         msg = (
             f"DARK INTEGRITY FAILURE: {side} cam {cam_id} frame "
             f"{absolute_frame} was classified as dark by schedule, but "
-            f"its measurement looks like a light frame "
-            f"(u1={u1:.2f} > pedestal+{self._dark_integrity_max_u1_above_pedestal:.0f}={max_u1:.0f}? "
-            f"std={std:.2f} > {max_std:.0f}?). "
+            f"u1={u1:.2f} exceeds pedestal+"
+            f"{self._dark_integrity_max_u1_above_pedestal:.0f}={max_u1:.0f}. "
             "Probable cause: firmware off-by-one in NUM_DARK_FRAMES_AT_START "
             "or unwrapper alignment quirk. Dark-frame interpolation will be "
             "polluted; corrected stream values are unreliable."
@@ -1262,7 +1256,7 @@ class SciencePipeline:
                 # dark? If not, the schedule and the firmware disagree
                 # and we want to know about it.
                 self._check_dark_integrity(
-                    side, cam_id, absolute_frame, u1, variance,
+                    side, cam_id, absolute_frame, u1,
                 )
 
                 # With 2+ dark frames we can correct the preceding interval.
@@ -1435,7 +1429,7 @@ class SciencePipeline:
             # laser-off frame.
             self._check_dark_integrity(
                 key[0], key[1], terminal.absolute_frame_id,
-                terminal.u1, terminal_var,
+                terminal.u1,
             )
             self._emit_corrected_for_camera(key)
 
@@ -1666,7 +1660,6 @@ def create_science_pipeline(
     noise_floor: int = 10,
     log_dark_endpoints: bool = False,
     dark_integrity_max_u1_above_pedestal: float = 30.0,
-    dark_integrity_max_std: float = 20.0,
 ) -> SciencePipeline:
     """
     Factory for a ready-to-run unified science pipeline.
@@ -1728,7 +1721,6 @@ def create_science_pipeline(
         noise_floor=noise_floor,
         log_dark_endpoints=log_dark_endpoints,
         dark_integrity_max_u1_above_pedestal=dark_integrity_max_u1_above_pedestal,
-        dark_integrity_max_std=dark_integrity_max_std,
     )
     pipeline.start()
     return pipeline
