@@ -9,28 +9,50 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from omotion import ScanDatabase, ScanDBSink
+from omotion.ScanWorkflow import ScanRequest
+
+
+# ---------------------------------------------------------------------------
+# Helpers — construct the minimal ScanRequest the new Sink protocol needs.
+# ---------------------------------------------------------------------------
+
+def _fake_request(subject_id: str = "owTEST", notes: str = "") -> ScanRequest:
+    """Minimal ScanRequest the on_scan_start hook can read from."""
+    req = ScanRequest(
+        subject_id=subject_id,
+        duration_sec=60,
+        left_camera_mask=0xFF,
+        right_camera_mask=0xFF,
+        data_dir=".",
+        disable_laser=False,
+    )
+    req.notes = notes  # type: ignore[attr-defined]
+    return req
 
 
 def test_sink_opens_and_closes_session(tmp_path: Path) -> None:
     db_path = tmp_path / "scans.db"
     sink = ScanDBSink(str(db_path))
-    sid = sink.open(
-        label="20260414_120000_owTEST",
-        start_ts=1744632000.0,
-        notes="pytest run",
+    sid = sink.on_scan_start(
+        ts="20260414_120000",
+        session_start_ts=1744632000.0,
+        request=_fake_request(subject_id="owTEST", notes="pytest run"),
         meta={"subject_id": "owTEST"},
     )
     assert sid > 0
 
-    sink.close(end_ts=1744632010.0)
+    sink.on_complete()
 
-    # Verify row was persisted and end time was written.
+    # Verify row was persisted and end time was written (whatever
+    # time.time() returned inside on_complete — we just check it's
+    # >= start and was set).
     db = ScanDatabase(db_path=str(db_path))
     try:
         session = db.get_session(sid)
         assert session["session_label"] == "20260414_120000_owTEST"
         assert session["session_start"] == 1744632000.0
-        assert session["session_end"] == 1744632010.0
+        assert session["session_end"] is not None
+        assert session["session_end"] >= session["session_start"]
         assert session["session_notes"] == "pytest run"
         assert session["session_meta"] == {"subject_id": "owTEST"}
     finally:
@@ -39,14 +61,22 @@ def test_sink_opens_and_closes_session(tmp_path: Path) -> None:
 
 def test_sink_close_is_idempotent(tmp_path: Path) -> None:
     sink = ScanDBSink(str(tmp_path / "scans.db"))
-    sid = sink.open(label="x", start_ts=0.0, notes="", meta={})
-    sink.close(end_ts=1.0)
-    # Second close must not raise and must not bump session_end.
-    sink.close(end_ts=2.0)
-
+    sid = sink.on_scan_start(
+        ts="x", session_start_ts=0.0, request=_fake_request(), meta={},
+    )
+    sink.on_complete()
+    # Capture session_end after the first on_complete.
     db = ScanDatabase(db_path=str(tmp_path / "scans.db"))
     try:
-        assert db.get_session(sid)["session_end"] == 1.0
+        first_end = db.get_session(sid)["session_end"]
+    finally:
+        db.close()
+
+    # Second on_complete must not raise and must not bump session_end.
+    sink.on_complete()
+    db = ScanDatabase(db_path=str(tmp_path / "scans.db"))
+    try:
+        assert db.get_session(sid)["session_end"] == first_end
     finally:
         db.close()
 
@@ -64,7 +94,7 @@ def test_sink_raises_if_callbacks_called_before_open(tmp_path: Path) -> None:
         )
 
 
-# ----- Task 4: on_raw_frame ----------------------------------------------
+# ----- on_raw_frame ----------------------------------------------
 
 import threading
 
@@ -73,14 +103,16 @@ from omotion.MotionProcessing import CorrectedBatch
 
 def _make_sink(tmp_path, **kwargs):
     sink = ScanDBSink(str(tmp_path / "scans.db"), **kwargs)
-    sid = sink.open(label="lbl", start_ts=0.0, notes="", meta={})
+    sid = sink.on_scan_start(
+        ts="t", session_start_ts=0.0, request=_fake_request("lbl"), meta={},
+    )
     return sink, sid
 
 
 def test_on_raw_frame_is_noop_when_write_raw_false(tmp_path: Path) -> None:
     sink, sid = _make_sink(tmp_path, write_raw=False)
     sink.on_raw_frame("left", 0, 1, 0.0, b"\x00" * 4096, 25.0, 10, 0.0, 0.0, 0.0)
-    sink.close(end_ts=1.0)
+    sink.on_complete()
 
     db = ScanDatabase(db_path=str(tmp_path / "scans.db"))
     try:
@@ -95,7 +127,7 @@ def test_on_raw_frame_writes_one_row_per_call(tmp_path: Path) -> None:
     hist = b"\xab" * 4096
     for fid in range(5):
         sink.on_raw_frame("left", 0, fid, fid * 0.025, hist, 25.0, 100, 0.0, 0.0, 0.0)
-    sink.close(end_ts=1.0)
+    sink.on_complete()
 
     db = ScanDatabase(db_path=str(tmp_path / "scans.db"))
     try:
@@ -119,7 +151,7 @@ def test_on_raw_frame_flushes_on_batch_size(tmp_path: Path) -> None:
         assert len(rows) == 3
     finally:
         db.close()
-    sink.close(end_ts=1.0)
+    sink.on_complete()
 
 
 def test_on_raw_frame_concurrent_writers(tmp_path: Path) -> None:
@@ -138,7 +170,7 @@ def test_on_raw_frame_concurrent_writers(tmp_path: Path) -> None:
         t.start()
     for t in threads:
         t.join()
-    sink.close(end_ts=1.0)
+    sink.on_complete()
 
     db = ScanDatabase(db_path=str(tmp_path / "scans.db"))
     try:
@@ -183,7 +215,7 @@ def test_on_corrected_batch_writes_one_row_per_sample(tmp_path: Path) -> None:
         ],
     )
     sink.on_corrected_batch(batch)
-    sink.close(end_ts=1.0)
+    sink.on_complete()
 
     db = ScanDatabase(db_path=str(tmp_path / "scans.db"))
     try:
@@ -223,7 +255,7 @@ def test_on_corrected_batch_flushes_pending_raw_frames(tmp_path: Path) -> None:
         assert len(rows) == 5
     finally:
         db.close()
-    sink.close(end_ts=1.0)
+    sink.on_complete()
 
 
 def test_on_corrected_batch_empty_is_noop(tmp_path: Path) -> None:
@@ -231,7 +263,7 @@ def test_on_corrected_batch_empty_is_noop(tmp_path: Path) -> None:
     sink.on_corrected_batch(
         CorrectedBatch(dark_frame_start=0, dark_frame_end=0, samples=[])
     )
-    sink.close(end_ts=1.0)
+    sink.on_complete()
 
     db = ScanDatabase(db_path=str(tmp_path / "scans.db"))
     try:
@@ -259,7 +291,7 @@ def test_on_corrected_batch_rounds_floats_to_6_decimals(tmp_path: Path) -> None:
             ],
         )
     )
-    sink.close(end_ts=1.0)
+    sink.on_complete()
 
     db = ScanDatabase(db_path=str(tmp_path / "scans.db"))
     try:
@@ -287,7 +319,7 @@ def test_on_corrected_batch_skips_unknown_side(tmp_path: Path) -> None:
     sink.on_corrected_batch(
         CorrectedBatch(dark_frame_start=0, dark_frame_end=600, samples=samples)
     )
-    sink.close(end_ts=1.0)
+    sink.on_complete()
     assert sink.insert_errors >= 1
 
     db = ScanDatabase(db_path=str(tmp_path / "scans.db"))
@@ -311,7 +343,7 @@ def test_on_raw_frame_rounds_floats_to_6_decimals(tmp_path: Path) -> None:
         42,
         1.23456789, 2.34567891, 3.45678912,  # tcm/tcl/pdc
     )
-    sink.close(end_ts=1.0)
+    sink.on_complete()
 
     db = ScanDatabase(db_path=str(tmp_path / "scans.db"))
     try:

@@ -15,20 +15,23 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from typing import TYPE_CHECKING, Any, Optional
 
 from omotion import _log_root
 from omotion.ScanDatabase import ScanDatabase
+from omotion.Sink import Sink
 
 if TYPE_CHECKING:
     from omotion.MotionProcessing import CorrectedBatch
+    from omotion.ScanWorkflow import ScanRequest, ScanResult
 
 logger = logging.getLogger(
     f"{_log_root}.ScanDBSink" if _log_root else "ScanDBSink"
 )
 
 
-class ScanDBSink:
+class ScanDBSink(Sink):
     """Single-scan adapter: ScanWorkflow callbacks → ScanDatabase rows."""
 
     def __init__(
@@ -59,30 +62,36 @@ class ScanDBSink:
     def session_id(self) -> Optional[int]:
         return self._session_id
 
-    def open(
+    def on_scan_start(
         self,
         *,
-        label: str,
-        start_ts: float,
-        notes: str,
+        ts: str,
+        session_start_ts: float,
+        request: "ScanRequest",
         meta: dict,
     ) -> int:
+        """Open the session row. Returns the assigned session_id."""
+        label = f"{ts}_{request.subject_id}"
+        notes = getattr(request, "notes", "") or ""
         with self._lock:
             if self._db is not None:
-                raise RuntimeError("ScanDBSink.open called twice")
+                raise RuntimeError("ScanDBSink.on_scan_start called twice")
             self._db = ScanDatabase(
                 db_path=self._db_path,
                 compress_raw_hist=self._compress_raw_hist,
             )
             self._session_id = self._db.create_session(
                 session_label=label,
-                session_start=start_ts,
+                session_start=float(session_start_ts),
                 session_notes=notes,
                 session_meta=meta,
             )
             return self._session_id
 
-    def close(self, end_ts: float) -> None:
+    def on_complete(self, result: "ScanResult" = None) -> None:
+        """Flush any buffered raw frames, write session_end (wall-clock now),
+        and close the DB connection. Idempotent — second call is a no-op."""
+        end_ts = time.time()
         with self._lock:
             if self._closed:
                 return
@@ -92,7 +101,7 @@ class ScanDBSink:
                 if self._db is not None and self._session_id is not None:
                     self._db.close_session(self._session_id, end_ts)
             except Exception:
-                logger.exception("ScanDBSink.close failed while finalising session")
+                logger.exception("ScanDBSink.on_complete failed while finalising session")
             finally:
                 if self._db is not None:
                     try:
@@ -206,8 +215,8 @@ class ScanDBSink:
     def _require_open(self) -> None:
         if self._db is None or self._session_id is None:
             raise RuntimeError(
-                "ScanDBSink callback invoked before open() — "
-                "call open() to start the session first."
+                "ScanDBSink callback invoked before on_scan_start() — "
+                "call on_scan_start() to start the session first."
             )
 
     def _flush_raw_locked(self) -> None:

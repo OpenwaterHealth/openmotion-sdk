@@ -49,6 +49,7 @@ from .MotionSignal import MotionSignal
 from .MotionComposite import MotionComposite
 from .USBInterfaceBase import USBInterfaceBase
 from .MotionConfig import MotionConfig
+from .Sink import Sink
 from .ScanDatabase import ScanDatabase
 from .ScanDBSink import ScanDBSink
 from .Calibration import Calibration
@@ -77,6 +78,7 @@ __all__ = [
     "MotionComposite",
     "USBInterfaceBase",
     "MotionConfig",
+    "Sink",
     "ScanDatabase",
     "ScanDBSink",
     "Calibration",

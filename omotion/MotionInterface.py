@@ -400,15 +400,15 @@ class MotionInterface:
 
         def _on_scan_start(ts: str, start_ts: float) -> None:
             try:
-                sink.open(
-                    label=f"{ts}_{request.subject_id}",
-                    start_ts=start_ts,
-                    notes=getattr(request, "notes", "") or "",
+                sink.on_scan_start(
+                    ts=ts,
+                    session_start_ts=start_ts,
+                    request=request,
                     meta=_build_meta(),
                 )
             except Exception:
                 logger.exception(
-                    "ScanDBSink.open failed; DB writes disabled for this scan"
+                    "ScanDBSink.on_scan_start failed; DB writes disabled for this scan"
                 )
             if user_on_scan_start:
                 user_on_scan_start(ts, start_ts)
@@ -431,9 +431,9 @@ class MotionInterface:
 
         def _on_complete(result) -> None:
             try:
-                sink.close(end_ts=time.time())
+                sink.on_complete(result)
             except Exception:
-                logger.exception("ScanDBSink.close raised")
+                logger.exception("ScanDBSink.on_complete raised")
             if user_on_complete:
                 user_on_complete(result)
 
