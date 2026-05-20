@@ -96,7 +96,18 @@ class CsvSink(Sink):
     ScanWorkflow today.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        enable_corrected: bool = True,
+        enable_raw: bool = True,
+    ) -> None:
+        # Top-level toggles let ScanWorkflow cut the inline writers over
+        # to CsvSink incrementally — corrected in Step B4a, raw in B4b.
+        # Once both inline paths are removed these can go away.
+        self._enable_corrected = enable_corrected
+        self._enable_raw = enable_raw
+
         # State filled in by on_scan_start. None means "not started yet
         # or not configured for this output target".
         self._reduced_mode: bool = False
@@ -163,7 +174,7 @@ class CsvSink(Sink):
         right_mask = int(request.right_camera_mask)
 
         # --- corrected CSV --------------------------------------------------
-        if getattr(request, "write_corrected_csv", True):
+        if self._enable_corrected and getattr(request, "write_corrected_csv", True):
             self._corrected_columns = _corrected_columns(self._reduced_mode)
             self._expected_col_suffixes = _expected_col_suffixes(left_mask, right_mask)
             self._corrected_path = os.path.join(
@@ -188,7 +199,7 @@ class CsvSink(Sink):
                 self._corr_csv = None
 
         # --- raw CSVs (one per active side) --------------------------------
-        if getattr(request, "write_raw_csv", True):
+        if self._enable_raw and getattr(request, "write_raw_csv", True):
             raw_dur = getattr(request, "raw_csv_duration_sec", None)
             self._raw_duration_s = float(raw_dur) if raw_dur is not None else None
             for side, mask in (("left", left_mask), ("right", right_mask)):
