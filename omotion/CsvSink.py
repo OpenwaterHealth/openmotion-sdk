@@ -9,10 +9,9 @@ fans out, and writes:
 * ``{ts}_{subject}_{side}_mask{XX}_raw.csv``   — raw histogram, per side
 * ``{ts}_{subject}_telemetry.csv``             — console telemetry (developerMode)
 
-Today's ScanWorkflow still owns the telemetry CSV writer inline; this
-class is being introduced incrementally so each output target can land
-+ be exercised in isolation. See ``docs/ScanDatabase.md`` (Sink section)
-for the rollout plan.
+ScanWorkflow still owns the telemetry CSV writer inline. See
+``docs/ScanDatabase.md`` (Sink section) for how this class fits into
+the overall sink composition.
 
 The corrected-CSV merge logic (per-frame buffering, complete-row
 flushes, late-completion drain at scan end) is ported verbatim from
@@ -91,23 +90,12 @@ def _expected_col_suffixes(left_mask: int, right_mask: int) -> set[str]:
 class CsvSink(Sink):
     """Writes the SDK's existing per-scan CSV outputs.
 
-    Step B1: implements ``on_corrected_batch`` only. ``on_raw_frame`` and
-    the telemetry path land in later commits — they're still inline in
-    ScanWorkflow today.
+    Implements ``on_scan_start``, ``on_raw_frame``, ``on_corrected_batch``,
+    and ``on_complete``. The telemetry CSV writer is still inline in
+    ScanWorkflow today — see ``docs/ScanDatabase.md`` for context.
     """
 
-    def __init__(
-        self,
-        *,
-        enable_corrected: bool = True,
-        enable_raw: bool = True,
-    ) -> None:
-        # Top-level toggles let ScanWorkflow cut the inline writers over
-        # to CsvSink incrementally — corrected in Step B4a, raw in B4b.
-        # Once both inline paths are removed these can go away.
-        self._enable_corrected = enable_corrected
-        self._enable_raw = enable_raw
-
+    def __init__(self) -> None:
         # State filled in by on_scan_start. None means "not started yet
         # or not configured for this output target".
         self._reduced_mode: bool = False
@@ -174,7 +162,7 @@ class CsvSink(Sink):
         right_mask = int(request.right_camera_mask)
 
         # --- corrected CSV --------------------------------------------------
-        if self._enable_corrected and getattr(request, "write_corrected_csv", True):
+        if getattr(request, "write_corrected_csv", True):
             self._corrected_columns = _corrected_columns(self._reduced_mode)
             self._expected_col_suffixes = _expected_col_suffixes(left_mask, right_mask)
             self._corrected_path = os.path.join(
@@ -199,7 +187,7 @@ class CsvSink(Sink):
                 self._corr_csv = None
 
         # --- raw CSVs (one per active side) --------------------------------
-        if self._enable_raw and getattr(request, "write_raw_csv", True):
+        if getattr(request, "write_raw_csv", True):
             raw_dur = getattr(request, "raw_csv_duration_sec", None)
             self._raw_duration_s = float(raw_dur) if raw_dur is not None else None
             for side, mask in (("left", left_mask), ("right", right_mask)):
