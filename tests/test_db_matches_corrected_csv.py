@@ -151,12 +151,35 @@ def test_db_session_data_matches_corrected_pipeline(tmp_path: Path) -> None:
         f"DB row count {len(db_rows)} != pipeline sample count {len(emitted)}"
     )
 
-    # session_data rows are ordered by id (auto-increment), which matches
-    # insertion order, which matches the per-batch sample order.
-    for i, (sample, row) in enumerate(zip(emitted, db_rows)):
+    # Position-by-position comparison would assume the science pipeline
+    # emits batches in (left, right) order — but the dark-frame intervals
+    # for each side close independently, so batches can interleave. Index
+    # the DB rows by their (side, cam_id, timestamp_s) triple instead; the
+    # sink writes one row per emitted Sample, so each emitted Sample
+    # should match exactly one DB row.
+    by_key: dict[tuple[int, int, float], list[dict]] = {}
+    for row in db_rows:
+        key = (int(row["side"]), int(row["cam_id"]), round(float(row["timestamp_s"]), 6))
+        by_key.setdefault(key, []).append(row)
+
+    for i, sample in enumerate(emitted):
         side_int = 0 if sample.side == "left" else 1
-        assert row["cam_id"] == int(sample.cam_id),    f"row {i}: cam_id mismatch"
-        assert row["side"]   == side_int,              f"row {i}: side mismatch"
+        key = (
+            side_int,
+            int(sample.cam_id),
+            round(float(sample.timestamp_s), 6),
+        )
+        candidates = by_key.get(key)
+        assert candidates, (
+            f"row {i}: no DB row for (side={side_int}, cam={sample.cam_id}, "
+            f"ts={sample.timestamp_s})"
+        )
+        # Multiple emitted samples can share (side, cam, ts) when frame_id
+        # wraps (it doesn't, in the fixture, but the lookup is still
+        # robust to it by popping the first match).
+        row = candidates.pop(0)
+        if not candidates:
+            del by_key[key]
         # Sink rounds to 6 decimals at insert — same as the CSV writer.
         assert row["bfi"]      == round(float(sample.bfi), 6),      f"row {i}: bfi"
         assert row["bvi"]      == round(float(sample.bvi), 6),      f"row {i}: bvi"
