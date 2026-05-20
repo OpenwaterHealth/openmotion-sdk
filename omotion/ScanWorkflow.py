@@ -18,6 +18,7 @@ from omotion.MotionProcessing import (
     parse_histogram_stream,
 )
 from omotion.Calibration import Calibration
+from omotion.CsvSink import CsvSink
 
 if TYPE_CHECKING:
     from omotion.MotionInterface import MotionInterface
@@ -97,6 +98,12 @@ class ScanRequest:
     # excluded from the window.
     rolling_avg_enabled: bool = False
     rolling_avg_window: int = 10
+    # Database sink (issue #92, see docs/superpowers/specs/2026-04-14-scan-db-sink-design.md).
+    # The DB endpoint itself is opt-in at SDK construction via
+    # ``MotionInterface(db_path=...)``; these per-scan fields are only
+    # effective when that path is set.
+    write_raw_to_db: bool = False
+    notes: str = ""
 
 
 @dataclass
@@ -232,6 +239,10 @@ class ScanWorkflow:
         on_trigger_state_fn: Callable[[str], None] | None = None,
         on_uncorrected_fn: Callable[[object], None] | None = None,
         on_corrected_batch_fn: Callable[[object], None] | None = None,
+        # Hooks for the ScanDBSink (issue #92). The workflow itself stays
+        # DB-unaware — it just fires these callbacks if supplied.
+        on_raw_frame_fn: Callable[..., None] | None = None,
+        on_scan_start_fn: Callable[[str, float], None] | None = None,
         on_dark_frame_fn: Callable[[object], None] | None = None,
         on_rolling_avg_fn: Callable[[object], None] | None = None,
         on_error_fn: Callable[[Exception], None] | None = None,
@@ -270,6 +281,16 @@ class ScanWorkflow:
             corrected_path = ""
             telemetry_path = ""
             ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            # Fire the scan-start hook so a downstream sink (e.g. the
+            # ScanDBSink for issue #92) can open its session with the
+            # canonical label and wall-clock start used by the rest of
+            # the workflow.
+            session_start_ts = time.time()
+            if on_scan_start_fn is not None:
+                try:
+                    on_scan_start_fn(ts, session_start_ts)
+                except Exception:
+                    logger.exception("on_scan_start_fn callback raised")
             active_sides = []
             writer_threads: dict[str, threading.Thread] = {}
             writer_stops: dict[str, threading.Event] = {}
@@ -296,37 +317,41 @@ class ScanWorkflow:
             _telem_lock = threading.Lock()
             _telem_stop = threading.Event()
 
-            # Corrected CSV streaming state
-            corrected_by_frame: dict[int, dict] = {}
-            _corr_fh = None
-            _corr_csv = None
-            _corr_lock = threading.Lock()
-            _corr_base_ts: float | None = None
-            if request.reduced_mode:
-                corrected_columns = [
-                    "bfi_left", "bfi_right",
-                    "bvi_left", "bvi_right",
-                ]
-            else:
-                corrected_columns = (
-                    [f"bfi_l{i}" for i in range(1, 9)]
-                    + [f"bfi_r{i}" for i in range(1, 9)]
-                    + [f"bvi_l{i}" for i in range(1, 9)]
-                    + [f"bvi_r{i}" for i in range(1, 9)]
-                    + [f"mean_l{i}" for i in range(1, 9)]
-                    + [f"mean_r{i}" for i in range(1, 9)]
-                    + [f"contrast_l{i}" for i in range(1, 9)]
-                    + [f"contrast_r{i}" for i in range(1, 9)]
-                    + [f"temp_l{i}" for i in range(1, 9)]
-                    + [f"temp_r{i}" for i in range(1, 9)]
-                )
-            expected_col_suffixes: set[str] = set()
+            # CsvSink owns every per-scan CSV output (corrected + per-side
+            # raw). It opens its own files, builds the per-frame merge,
+            # enforces ``raw_csv_duration_sec``, and drains any partial
+            # corrected frames at scan end. ScanWorkflow fans events into
+            # it via the standard Sink hooks.
+            _csv_sink = CsvSink()
 
+            # Per-scan time origin: captured from the first sample emitted by
+            # parse_histogram_stream (whichever side fires first wins) and
+            # subtracted from every subsequent sample's timestamp_s. Result:
+            # every downstream consumer — raw CSV, science pipeline,
+            # corrected CSV, on_uncorrected_fn / on_corrected_batch_fn /
+            # on_raw_frame_fn callbacks — sees the same 0-based per-scan
+            # time origin. Replaces the per-output `_corr_base_ts` offset
+            # the corrected CSV writer used to compute by itself.
+            _session_t0: float | None = None
+            _t0_lock = threading.Lock()
+
+            def _normalize_ts(ts: float) -> float:
+                """Capture-once t0 normalizer passed into parse_histogram_stream
+                so the first sample any writer thread sees defines t=0 for the
+                whole scan."""
+                nonlocal _session_t0
+                if _session_t0 is None:
+                    with _t0_lock:
+                        if _session_t0 is None:
+                            _session_t0 = float(ts)
+                return float(ts) - _session_t0
             # Reduced-mode uncorrected sample accumulator: buffers per-camera
             # samples and emits a single averaged sample per side per frame.
             _reduced_uncorr_buf: dict[tuple[str, int], dict] = {}
             # Number of active cameras per side (computed after active_sides
-            # is resolved; filled in below).
+            # is resolved; filled in below). Used by the uncorrected-sample
+            # reduced-mode aggregation only — corrected CSV's own per-side
+            # cam counts live inside CsvSink.
             _reduced_cam_counts: dict[str, int] = {}
 
             try:
@@ -374,31 +399,32 @@ class ScanWorkflow:
                         "No active sensors to capture (both masks 0x00 or disconnected)."
                     )
 
-                # Compute expected column suffixes from the active camera masks.
+                # Per-side active camera counts for reduced-mode uncorrected
+                # aggregation. (CsvSink computes its own from the request
+                # masks; this one stays for the uncorrected-sample buffer.)
                 for _s, _m, _ in active_sides:
-                    _letter = _s[0]
                     _cam_count = 0
                     for _i in range(8):
                         if _m & (1 << _i):
-                            expected_col_suffixes.add(f"{_letter}{_i + 1}")
                             _cam_count += 1
                     _reduced_cam_counts[_s] = _cam_count
 
-                # Open corrected CSV immediately and write the header so data is
-                # on disk continuously rather than all-at-once after the scan.
-                if request.write_corrected_csv:
-                    try:
-                        _corr_fh = open(  # noqa: WPS515
-                            corrected_path, "w", newline="", encoding="utf-8"
-                        )
-                        _corr_csv = csv.writer(_corr_fh)
-                        _corr_csv.writerow(["frame_id", "timestamp_s", *corrected_columns])
-                        _corr_fh.flush()
-                    except Exception as _corr_open_err:
-                        _emit_log(f"Failed to open corrected CSV: {_corr_open_err}")
-                        corrected_path = ""
-                else:
-                    corrected_path = ""
+                # Corrected CSV is now owned by CsvSink (issue #92, Step B4a).
+                # It opens its own file handle, writes the header, and flushes
+                # complete rows as cameras contribute. We just hand it the
+                # scan-start context and read back the path it chose so
+                # ScanResult.corrected_path keeps the same meaning ("" when the
+                # writer is disabled or failed to open).
+                try:
+                    _csv_sink.on_scan_start(
+                        ts=ts,
+                        session_start_ts=session_start_ts,
+                        request=request,
+                        meta={},
+                    )
+                except Exception as _corr_open_err:
+                    _emit_log(f"Failed to open corrected CSV: {_corr_open_err}")
+                corrected_path = _csv_sink.corrected_path or ""
 
                 _emit_log("Preparing capture...")
 
@@ -485,81 +511,20 @@ class ScanWorkflow:
                     def _on_corrected_batch(batch: CorrectedBatch):
                         # Fires once per (side, cam_id) per dark-frame interval
                         # with properly corrected BFI/BVI for that interval.
-                        nonlocal _corr_base_ts
+                        # Sample timestamps are already normalized to scan-start
+                        # at the source (parse_histogram_stream's t0_normalizer),
+                        # so the corrected CSV can write them directly without
+                        # its own per-output offset.
+                        #
+                        # CSV merging + write logic lives in CsvSink (issue #92,
+                        # Step B4a). This function now only fans the batch out:
+                        # one copy to the sink for on-disk merging, one to the
+                        # user-facing callback (averaged in reduced mode).
+                        _csv_sink.on_corrected_batch(batch)
 
                         if request.reduced_mode:
-                            # In reduced mode, average all cameras per side per
-                            # frame and write only bfi_left/right, bvi_left/right.
-                            try:
-                                with _corr_lock:
-                                    for sample in batch.samples:
-                                        frame_key = int(sample.absolute_frame_id)
-                                        side = sample.side
-                                        frame_entry = corrected_by_frame.get(frame_key)
-                                        if frame_entry is None:
-                                            frame_entry = {
-                                                "timestamp_s": float(sample.timestamp_s),
-                                                "values": {},
-                                                "_accum": {},
-                                            }
-                                            corrected_by_frame[frame_key] = frame_entry
-                                        else:
-                                            frame_entry["timestamp_s"] = min(
-                                                float(frame_entry["timestamp_s"]),
-                                                float(sample.timestamp_s),
-                                            )
-                                        accum = frame_entry.setdefault("_accum", {})
-                                        side_acc = accum.get(side)
-                                        if side_acc is None:
-                                            side_acc = {"bfi_sum": 0.0, "bvi_sum": 0.0, "count": 0}
-                                            accum[side] = side_acc
-                                        side_acc["bfi_sum"] += float(sample.bfi)
-                                        side_acc["bvi_sum"] += float(sample.bvi)
-                                        side_acc["count"] += 1
-
-                                    # Flush frames where all expected sides are complete.
-                                    expected_sides = set(
-                                        _s for _s, _m, _ in active_sides
-                                    )
-                                    complete = []
-                                    for fid, entry in corrected_by_frame.items():
-                                        accum = entry.get("_accum", {})
-                                        if all(
-                                            accum.get(sd, {}).get("count", 0)
-                                            >= _reduced_cam_counts.get(sd, 1)
-                                            for sd in expected_sides
-                                        ):
-                                            complete.append(fid)
-
-                                    if complete and _corr_csv is not None:
-                                        if _corr_base_ts is None:
-                                            _corr_base_ts = min(
-                                                float(corrected_by_frame[fid]["timestamp_s"])
-                                                for fid in complete
-                                            )
-                                        for fid in sorted(complete):
-                                            entry = corrected_by_frame.pop(fid)
-                                            rel_ts = float(entry["timestamp_s"]) - _corr_base_ts
-                                            accum = entry.get("_accum", {})
-                                            left_acc = accum.get("left", {"bfi_sum": 0, "bvi_sum": 0, "count": 1})
-                                            right_acc = accum.get("right", {"bfi_sum": 0, "bvi_sum": 0, "count": 1})
-                                            vals = {
-                                                "bfi_left": round(left_acc["bfi_sum"] / max(1, left_acc["count"]), 6),
-                                                "bfi_right": round(right_acc["bfi_sum"] / max(1, right_acc["count"]), 6),
-                                                "bvi_left": round(left_acc["bvi_sum"] / max(1, left_acc["count"]), 6),
-                                                "bvi_right": round(right_acc["bvi_sum"] / max(1, right_acc["count"]), 6),
-                                            }
-                                            row = [fid, rel_ts]
-                                            row.extend(vals.get(col, "") for col in corrected_columns)
-                                            _corr_csv.writerow(row)
-                                        _corr_fh.flush()
-                            except Exception as agg_err:
-                                _emit_log(f"Corrected batch aggregation error: {agg_err}")
-
-                            # Emit averaged batch to UI
                             if on_corrected_batch_fn:
                                 from omotion.MotionProcessing import Sample
-                                # Group samples by (side, frame_id) and average
                                 _batch_buf: dict[tuple[str, int], dict] = {}
                                 for s in batch.samples:
                                     bk = (s.side, int(s.absolute_frame_id))
@@ -595,69 +560,6 @@ class ScanWorkflow:
                                 ))
                             return
 
-                        try:
-                            with _corr_lock:
-                                for sample in batch.samples:
-                                    frame_key = int(sample.absolute_frame_id)
-                                    col_suffix = f"{sample.side[0]}{int(sample.cam_id) + 1}"
-                                    frame_entry = corrected_by_frame.get(frame_key)
-                                    if frame_entry is None:
-                                        frame_entry = {
-                                            "timestamp_s": float(sample.timestamp_s),
-                                            "values": {},
-                                        }
-                                        corrected_by_frame[frame_key] = frame_entry
-                                    else:
-                                        frame_entry["timestamp_s"] = min(
-                                            float(frame_entry["timestamp_s"]),
-                                            float(sample.timestamp_s),
-                                        )
-                                    frame_entry["values"][f"bfi_{col_suffix}"] = round(
-                                        float(sample.bfi), 6
-                                    )
-                                    frame_entry["values"][f"bvi_{col_suffix}"] = round(
-                                        float(sample.bvi), 6
-                                    )
-                                    frame_entry["values"][f"mean_{col_suffix}"] = round(
-                                        float(sample.mean), 6
-                                    )
-                                    frame_entry["values"][f"contrast_{col_suffix}"] = round(
-                                        float(sample.contrast), 6
-                                    )
-                                    frame_entry["values"][f"temp_{col_suffix}"] = float(
-                                        sample.temperature_c
-                                    )
-
-                                # Flush frame rows that are complete (all cameras contributed).
-                                if _corr_csv is not None and expected_col_suffixes:
-                                    complete = [
-                                        fid
-                                        for fid, entry in corrected_by_frame.items()
-                                        if all(
-                                            f"bfi_{s}" in entry["values"]
-                                            for s in expected_col_suffixes
-                                        )
-                                    ]
-                                    if complete:
-                                        if _corr_base_ts is None:
-                                            _corr_base_ts = min(
-                                                float(corrected_by_frame[fid]["timestamp_s"])
-                                                for fid in complete
-                                            )
-                                        for fid in sorted(complete):
-                                            entry = corrected_by_frame.pop(fid)
-                                            rel_ts = (
-                                                float(entry["timestamp_s"]) - _corr_base_ts
-                                            )
-                                            row = [fid, rel_ts]
-                                            row.extend(
-                                                entry["values"].get(col, "")
-                                                for col in corrected_columns
-                                            )
-                                            _corr_csv.writerow(row)
-                                        _corr_fh.flush()
-                        except Exception as agg_err:
-                            _emit_log(f"Corrected batch aggregation error: {agg_err}")
                         if on_corrected_batch_fn:
                             on_corrected_batch_fn(batch)
 
@@ -690,29 +592,76 @@ class ScanWorkflow:
                                 row_sum,
                                 temp,
                             )
+                        # Resolve extras once; both sinks (the in-process
+                        # CsvSink and any externally-wired raw-frame hook
+                        # such as ScanDBSink) consume the same shape.
+                        if extra_cols_fn is not None:
+                            try:
+                                extras = extra_cols_fn()
+                            except Exception:
+                                extras = []
+                        else:
+                            extras = []
+                        tcm = float(extras[0]) if len(extras) > 0 else 0.0
+                        tcl = float(extras[1]) if len(extras) > 1 else 0.0
+                        pdc = float(extras[2]) if len(extras) > 2 else 0.0
+                        temp_f = float(temp) if temp is not None else 0.0
+                        row_sum_i = int(row_sum) if row_sum is not None else 0
+                        ts_f = float(ts_val)
+                        hist_b = bytes(hist)
+
+                        # Raw CSVs (#92 B4b — owned by CsvSink, which closes
+                        # its writer the first time it sees a frame past
+                        # ``raw_csv_duration_sec``).
+                        try:
+                            _csv_sink.on_raw_frame(
+                                current_side,
+                                int(cam_id),
+                                int(frame_id),
+                                ts_f,
+                                hist_b,
+                                temp_f,
+                                row_sum_i,
+                                tcm, tcl, pdc,
+                            )
+                        except Exception:
+                            logger.exception("CsvSink.on_raw_frame raised")
+
+                        # External raw-frame hook (ScanDBSink, user
+                        # callbacks). Honor the same duration cap so we
+                        # don't accumulate raw rows for hour-long scans
+                        # after the user-requested cap (#92, see commit
+                        # c06263d). The cap used to be plumbed via a
+                        # shared event set by the inline CSV writer when
+                        # it hit its deadline; the writer is gone now,
+                        # so we check the cap directly here.
+                        if on_raw_frame_fn is None:
+                            return
+                        raw_dur = request.raw_csv_duration_sec
+                        if raw_dur is not None and ts_f > float(raw_dur):
+                            return
+                        try:
+                            on_raw_frame_fn(
+                                current_side,
+                                int(cam_id),
+                                int(frame_id),
+                                ts_f,
+                                hist_b,
+                                temp_f,
+                                row_sum_i,
+                                tcm, tcl, pdc,
+                            )
+                        except Exception:
+                            logger.exception("on_raw_frame_fn callback raised")
                     return _on_row
 
-                _RAW_CSV_HEADERS = [
-                    "cam_id", "frame_id", "timestamp_s",
-                    *range(HISTO_SIZE_WORDS),
-                    "temperature", "sum",
-                    "tcm", "tcl", "pdc",
-                ]
-
-                # _trigger_armed_evt fires the moment start_trigger() succeeds
-                # so each writer computes its CSV deadline from real scan-start
-                # rather than from thread-spawn time (which is several seconds
-                # earlier, before cameras are enabled).  It is also set in the
-                # finally block so threads never hang if the trigger fails.
-                # _csv_stop_evt is broadcast by whichever thread hits its
-                # deadline first so every side stops writing at the same
-                # wall-clock instant, giving equal row counts across CSVs.
-                _trigger_armed_evt = threading.Event()
-                _csv_stop_evt = (
-                    threading.Event()
-                    if request.raw_csv_duration_sec is not None
-                    else None
-                )
+                # The CSV deadline used to be implemented with two events
+                # (_trigger_armed_evt + _csv_stop_evt) that gated the
+                # inline per-side raw-CSV writer. Raw CSV writing now
+                # lives in CsvSink (#92 B4b), which times its own cap
+                # from the first frame it sees, so neither event is
+                # needed anymore. parse_histogram_stream is called
+                # with no csv_writer / no deadline.
 
                 for side, mask, sensor in active_sides:
                     q = queue.Queue()
@@ -736,74 +685,31 @@ class ScanWorkflow:
 
                     _row_handler = _make_row_handler(side, science_pipeline)
 
-                    # Resolve CSV file path for this side. Issue #44:
-                    # raw histo CSVs now carry a ``_raw`` suffix so
-                    # they're visually distinct from the canonical
-                    # corrected output (which dropped ``_corrected``).
-                    if request.write_raw_csv:
-                        filename = f"{ts}_{request.subject_id}_{side}_mask{mask:02X}_raw.csv"
-                        filepath = os.path.join(request.data_dir, filename)
-                    else:
-                        filepath = ""
-
                     def _writer(
                         q=q,
                         stop_evt=stop_evt,
                         on_row_fn=_row_handler,
-                        fp=filepath,
-                        ecfn=extra_cols_fn,
                         s=side,
-                        dur=request.raw_csv_duration_sec,
-                        trigger_armed_evt=_trigger_armed_evt,
-                        csv_stop_evt=_csv_stop_evt,
                     ):
-                        # Wait for the hardware trigger to fire before starting
-                        # the CSV deadline countdown.  The data queue is empty
-                        # until FSYNC begins (cameras are enabled but not yet
-                        # clocked) so nothing is lost during the wait.
-                        # _trigger_armed_evt is also set in the finally block so
-                        # this wait never hangs on an error path.
-                        if dur is not None:
-                            trigger_armed_evt.wait()
-                            csv_deadline = time.monotonic() + float(dur)
-                        else:
-                            csv_deadline = None
-
+                        # The per-side thread used to open the raw CSV
+                        # itself; that's CsvSink's job now (#92, B4b).
+                        # All this thread still does is drive
+                        # parse_histogram_stream so the on_row_fn fires
+                        # for every frame coming off USB — the row
+                        # handler fans into CsvSink + the external
+                        # raw-frame hook (ScanDBSink, user callback).
                         rows_written = 0
-                        fh = None
                         try:
-                            if fp:
-                                fh = open(fp, "w", newline="", encoding="utf-8")  # noqa: WPS515
-                                real_writer = csv.writer(fh)
-                                real_writer.writerow(_RAW_CSV_HEADERS)
-                            else:
-                                real_writer = None
-
-                            def _on_csv_closed():
-                                _emit_log(
-                                    f"{s.capitalize()} histogram CSV closed after "
-                                    f"{dur:.0f}s limit"
-                                )
-
                             rows_written = parse_histogram_stream(
                                 q=q,
                                 stop_evt=stop_evt,
-                                csv_writer=real_writer,
                                 buffer_accumulator=bytearray(),
-                                extra_cols_fn=ecfn,
                                 on_row_fn=on_row_fn,
-                                csv_deadline=csv_deadline,
-                                csv_stop_event=csv_stop_evt,
-                                on_csv_closed_fn=_on_csv_closed if csv_deadline is not None else None,
+                                t0_normalizer=_normalize_ts,
                             )
                         except Exception as e:
-                            _emit_log(f"Writer error ({os.path.basename(fp) if fp else s}): {e}")
+                            _emit_log(f"Writer error ({s}): {e}")
                         finally:
-                            if fh is not None:
-                                try:
-                                    fh.close()
-                                except Exception:
-                                    pass
                             writer_row_counts[s] = rows_written
 
                     t = threading.Thread(target=_writer, daemon=True)
@@ -812,6 +718,10 @@ class ScanWorkflow:
                     writer_threads[side] = t
                     writer_stops[side] = stop_evt
 
+                    # CsvSink chose the path; surface it so the legacy
+                    # left_path / right_path / on_side_stream_fn contract
+                    # is preserved for ScanResult consumers.
+                    filepath = _csv_sink.raw_paths.get(side, "")
                     if side == "left":
                         left_path = filepath
                     elif side == "right":
@@ -843,8 +753,6 @@ class ScanWorkflow:
                     raise RuntimeError("Failed to start trigger.")
                 if on_trigger_state_fn:
                     on_trigger_state_fn("ON")
-                # Signal writer threads: trigger is live, start CSV countdowns now.
-                _trigger_armed_evt.set()
 
                 start_t = time.time()
                 last_emit = -1
@@ -928,10 +836,6 @@ class ScanWorkflow:
                         except Exception as _drain_err:
                             logger.warning("%s: post-stop drain error: %s", side, _drain_err)
 
-                # Unblock any writer thread still waiting on the trigger event
-                # (e.g. if an error occurred before start_trigger ran).
-                _trigger_armed_evt.set()
-
                 for stop_evt in writer_stops.values():
                     stop_evt.set()
                 for t in writer_threads.values():
@@ -959,30 +863,13 @@ class ScanWorkflow:
                 if science_pipeline is not None:
                     science_pipeline.stop()
 
-                # Flush any remaining corrected rows (partial — not all cameras
-                # contributed before the scan ended).
-                with _corr_lock:
-                    if _corr_csv is not None and corrected_by_frame:
-                        if _corr_base_ts is None:
-                            _corr_base_ts = min(
-                                float(e["timestamp_s"])
-                                for e in corrected_by_frame.values()
-                            )
-                        for fid in sorted(corrected_by_frame.keys()):
-                            entry = corrected_by_frame[fid]
-                            rel_ts = float(entry["timestamp_s"]) - _corr_base_ts
-                            row = [fid, rel_ts]
-                            row.extend(
-                                entry["values"].get(col, "") for col in corrected_columns
-                            )
-                            _corr_csv.writerow(row)
-                        corrected_by_frame.clear()
-                if _corr_fh is not None:
-                    try:
-                        _corr_fh.flush()
-                        _corr_fh.close()
-                    except Exception:
-                        pass
+                # Drain any partial corrected rows (frames where not all cameras
+                # reported before the scan ended) and close the file. Owned by
+                # CsvSink since #92 / Step B4a.
+                try:
+                    _csv_sink.on_complete()
+                except Exception as _close_err:
+                    _emit_log(f"Corrected CSV close error: {_close_err}")
                 if corrected_path:
                     _emit_log(
                         f"Corrected CSV created: {os.path.basename(corrected_path)}"
