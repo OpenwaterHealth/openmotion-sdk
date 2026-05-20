@@ -9,10 +9,9 @@ fans out, and writes:
 * ``{ts}_{subject}_{side}_mask{XX}_raw.csv``   — raw histogram, per side
 * ``{ts}_{subject}_telemetry.csv``             — console telemetry (developerMode)
 
-Today's ScanWorkflow still owns the raw + telemetry CSV writers inline;
-this class is being introduced incrementally so the corrected-CSV
-extraction can land + be exercised in isolation before the raw +
-telemetry paths follow. See ``docs/ScanDatabase.md`` (Sink section)
+Today's ScanWorkflow still owns the telemetry CSV writer inline; this
+class is being introduced incrementally so each output target can land
++ be exercised in isolation. See ``docs/ScanDatabase.md`` (Sink section)
 for the rollout plan.
 
 The corrected-CSV merge logic (per-frame buffering, complete-row
@@ -27,6 +26,7 @@ from __future__ import annotations
 import csv
 import logging
 import os
+import struct
 import threading
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -36,6 +36,23 @@ from omotion.Sink import Sink
 if TYPE_CHECKING:
     from omotion.MotionProcessing import CorrectedBatch
     from omotion.ScanWorkflow import ScanRequest, ScanResult
+
+
+# Raw CSV format — mirrors ScanWorkflow._RAW_CSV_HEADERS so the on-disk
+# output stays byte-identical after extraction. 3 housekeeping cells +
+# 1024 histogram bins + temperature + sum + 3 telemetry extras = 1032
+# columns total.
+_HISTO_BINS = 1024
+_RAW_CSV_HEADERS: list = [
+    "cam_id", "frame_id", "timestamp_s",
+    *list(range(_HISTO_BINS)),
+    "temperature", "sum",
+    "tcm", "tcl", "pdc",
+]
+# Unpack a 4096-byte (1024 × uint32 little-endian) histogram blob into
+# a Python list of 1024 ints. Mirrors ``HistogramSample.histogram.tolist()``
+# in the pre-extraction inline writer path.
+_HISTO_UNPACK = struct.Struct(f"<{_HISTO_BINS}I")
 
 logger = logging.getLogger(
     f"{_log_root}.CsvSink" if _log_root else "CsvSink"
@@ -93,6 +110,18 @@ class CsvSink(Sink):
         self._closed: bool = False
         self._rows_written: int = 0
 
+        # Raw CSV state — one writer per side. ``_raw_duration_s`` caps how
+        # long raw rows are persisted (matches the existing
+        # ``raw_csv_duration_sec`` semantics); we close that side's writer
+        # the first time we see a sample past the cap so the on-disk file
+        # ends at a real frame boundary.
+        self._raw_paths: dict[str, str] = {}
+        self._raw_fhs: dict[str, Any] = {}
+        self._raw_csvs: dict[str, Any] = {}
+        self._raw_lock = threading.Lock()
+        self._raw_duration_s: Optional[float] = None
+        self._raw_rows_written: dict[str, int] = {"left": 0, "right": 0}
+
     @property
     def corrected_path(self) -> Optional[str]:
         return self._corrected_path
@@ -100,6 +129,14 @@ class CsvSink(Sink):
     @property
     def rows_written(self) -> int:
         return self._rows_written
+
+    @property
+    def raw_paths(self) -> dict[str, str]:
+        return dict(self._raw_paths)
+
+    @property
+    def raw_rows_written(self) -> dict[str, int]:
+        return dict(self._raw_rows_written)
 
     # ------------------------------------------------------------------
     # Sink hooks
@@ -113,38 +150,127 @@ class CsvSink(Sink):
         request: "ScanRequest",
         meta: dict,
     ) -> None:
-        # No-op when the caller has opted out of the corrected CSV.
-        if not getattr(request, "write_corrected_csv", True):
+        # The two output paths (corrected + raw) are toggled
+        # independently by the request flags; the data_dir is shared.
+        try:
+            os.makedirs(request.data_dir, exist_ok=True)
+        except Exception:
+            logger.exception("CsvSink: could not create data_dir %s", request.data_dir)
             return
 
         self._reduced_mode = bool(getattr(request, "reduced_mode", False))
-        self._corrected_columns = _corrected_columns(self._reduced_mode)
-        self._expected_col_suffixes = _expected_col_suffixes(
-            int(request.left_camera_mask),
-            int(request.right_camera_mask),
-        )
+        left_mask  = int(request.left_camera_mask)
+        right_mask = int(request.right_camera_mask)
 
-        try:
-            os.makedirs(request.data_dir, exist_ok=True)
+        # --- corrected CSV --------------------------------------------------
+        if getattr(request, "write_corrected_csv", True):
+            self._corrected_columns = _corrected_columns(self._reduced_mode)
+            self._expected_col_suffixes = _expected_col_suffixes(left_mask, right_mask)
             self._corrected_path = os.path.join(
                 request.data_dir, f"{ts}_{request.subject_id}.csv"
             )
-            self._corr_fh = open(  # noqa: WPS515
-                self._corrected_path, "w", newline="", encoding="utf-8"
-            )
-            self._corr_csv = csv.writer(self._corr_fh)
-            self._corr_csv.writerow(
-                ["frame_id", "timestamp_s", *self._corrected_columns]
-            )
-        except Exception:
-            logger.exception(
-                "CsvSink: failed to open corrected CSV at %s — "
-                "corrected CSV disabled for this scan",
-                self._corrected_path,
-            )
-            self._corrected_path = None
-            self._corr_fh = None
-            self._corr_csv = None
+            try:
+                self._corr_fh = open(  # noqa: WPS515
+                    self._corrected_path, "w", newline="", encoding="utf-8"
+                )
+                self._corr_csv = csv.writer(self._corr_fh)
+                self._corr_csv.writerow(
+                    ["frame_id", "timestamp_s", *self._corrected_columns]
+                )
+            except Exception:
+                logger.exception(
+                    "CsvSink: failed to open corrected CSV at %s — "
+                    "corrected CSV disabled for this scan",
+                    self._corrected_path,
+                )
+                self._corrected_path = None
+                self._corr_fh = None
+                self._corr_csv = None
+
+        # --- raw CSVs (one per active side) --------------------------------
+        if getattr(request, "write_raw_csv", True):
+            raw_dur = getattr(request, "raw_csv_duration_sec", None)
+            self._raw_duration_s = float(raw_dur) if raw_dur is not None else None
+            for side, mask in (("left", left_mask), ("right", right_mask)):
+                if mask == 0:
+                    continue
+                mask_hex = f"{mask:02X}"
+                path = os.path.join(
+                    request.data_dir,
+                    f"{ts}_{request.subject_id}_{side}_mask{mask_hex}_raw.csv",
+                )
+                try:
+                    fh = open(path, "w", newline="", encoding="utf-8")  # noqa: WPS515
+                    w = csv.writer(fh)
+                    w.writerow(_RAW_CSV_HEADERS)
+                    self._raw_paths[side] = path
+                    self._raw_fhs[side] = fh
+                    self._raw_csvs[side] = w
+                except Exception:
+                    logger.exception(
+                        "CsvSink: failed to open %s raw CSV at %s — "
+                        "raw output for that side disabled",
+                        side, path,
+                    )
+
+    def on_raw_frame(
+        self,
+        side: str,
+        cam_id: int,
+        frame_id: int,
+        timestamp_s: float,
+        hist: bytes,
+        temp: float,
+        sum_counts: int,
+        tcm: float,
+        tcl: float,
+        pdc: float,
+    ) -> None:
+        with self._raw_lock:
+            w = self._raw_csvs.get(side)
+            if w is None:
+                return
+            # Duration cap: close that side's writer the first time we
+            # see a sample past the limit so the file ends cleanly on a
+            # frame boundary. ``timestamp_s`` is already 0-based per
+            # scan (parse_histogram_stream's t0_normalizer).
+            if self._raw_duration_s is not None and timestamp_s > self._raw_duration_s:
+                self._close_raw_locked(side)
+                return
+            # Unpack the 4096-byte histogram blob into 1024 ints. Mirrors
+            # ``sample.histogram.tolist()`` in the inline writer.
+            try:
+                bins = _HISTO_UNPACK.unpack(hist)
+            except struct.error:
+                logger.warning(
+                    "CsvSink: %s cam %d frame %d had unexpected hist len %d "
+                    "(expected %d); skipping row",
+                    side, cam_id, frame_id, len(hist), _HISTO_BINS * 4,
+                )
+                return
+            w.writerow([
+                int(cam_id),
+                int(frame_id),
+                float(timestamp_s),
+                *bins,
+                float(temp) if temp is not None else "",
+                int(sum_counts) if sum_counts is not None else "",
+                float(tcm),
+                float(tcl),
+                float(pdc),
+            ])
+            self._raw_rows_written[side] = self._raw_rows_written.get(side, 0) + 1
+
+    def _close_raw_locked(self, side: str) -> None:
+        """Caller holds ``self._raw_lock``."""
+        fh = self._raw_fhs.pop(side, None)
+        self._raw_csvs.pop(side, None)
+        if fh is not None:
+            try:
+                fh.flush()
+                fh.close()
+            except Exception:
+                logger.exception("CsvSink: %s raw CSV close failed", side)
 
     def on_corrected_batch(self, batch: "CorrectedBatch") -> None:
         if self._corr_csv is None:
@@ -322,3 +448,9 @@ class CsvSink(Sink):
                 logger.exception("CsvSink: corrected CSV close failed")
             self._corr_fh = None
             self._corr_csv = None
+
+        # Close any raw writers still open (writers that hit the duration
+        # cap are already closed via _close_raw_locked).
+        with self._raw_lock:
+            for side in list(self._raw_fhs.keys()):
+                self._close_raw_locked(side)

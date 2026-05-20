@@ -59,6 +59,8 @@ def _make_request(
     reduced_mode: bool = False,
     subject_id: str = "csvSinkTest",
     write_corrected_csv: bool = True,
+    write_raw_csv: bool = False,
+    raw_csv_duration_sec: float | None = None,
 ) -> ScanRequest:
     return ScanRequest(
         subject_id=subject_id,
@@ -68,6 +70,8 @@ def _make_request(
         data_dir=str(tmp_path),
         disable_laser=False,
         write_corrected_csv=write_corrected_csv,
+        write_raw_csv=write_raw_csv,
+        raw_csv_duration_sec=raw_csv_duration_sec,
         reduced_mode=reduced_mode,
     )
 
@@ -262,6 +266,146 @@ def test_csv_sink_reduced_mode_writes_averaged_columns(tmp_path: Path) -> None:
 
 # ---------------------------------------------------------------------------
 # Bit-identical equivalence with the inline ScanWorkflow path
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Raw CSV — standalone behavior
+# ---------------------------------------------------------------------------
+
+def _fake_hist_bytes(value: int = 0) -> bytes:
+    """1024 little-endian uint32 bins, all the same value."""
+    import struct
+    return struct.pack("<1024I", *([value] * 1024))
+
+
+def test_csv_sink_opens_raw_csvs_per_active_side(tmp_path: Path) -> None:
+    sink = CsvSink()
+    sink.on_scan_start(
+        ts="20260520_130000",
+        session_start_ts=0.0,
+        request=_make_request(
+            tmp_path, write_raw_csv=True,
+            left_mask=0x66, right_mask=0x42,
+        ),
+        meta={},
+    )
+    sink.on_complete()
+    left  = tmp_path / "20260520_130000_csvSinkTest_left_mask66_raw.csv"
+    right = tmp_path / "20260520_130000_csvSinkTest_right_mask42_raw.csv"
+    assert left.exists()
+    assert right.exists()
+    # Header row is the canonical raw CSV header.
+    with open(left, newline="") as fh:
+        header = next(csv.reader(fh))
+    assert header[:3] == ["cam_id", "frame_id", "timestamp_s"]
+    assert header[-3:] == ["tcm", "tcl", "pdc"]
+    assert len(header) == 3 + 1024 + 2 + 3  # = 1032
+
+
+def test_csv_sink_no_raw_csv_when_disabled(tmp_path: Path) -> None:
+    sink = CsvSink()
+    sink.on_scan_start(
+        ts="t", session_start_ts=0.0,
+        request=_make_request(tmp_path, write_raw_csv=False),
+        meta={},
+    )
+    sink.on_complete()
+    raw_files = list(tmp_path.glob("*_raw.csv"))
+    assert raw_files == []
+
+
+def test_csv_sink_no_raw_csv_for_inactive_side(tmp_path: Path) -> None:
+    """Mask=0 means no cameras → no file at all."""
+    sink = CsvSink()
+    sink.on_scan_start(
+        ts="t", session_start_ts=0.0,
+        request=_make_request(
+            tmp_path, write_raw_csv=True,
+            left_mask=0xFF, right_mask=0x00,
+        ),
+        meta={},
+    )
+    sink.on_complete()
+    files = sorted(tmp_path.glob("*_raw.csv"))
+    assert len(files) == 1
+    assert "left_mask" in files[0].name
+
+
+def test_csv_sink_writes_raw_row_per_call(tmp_path: Path) -> None:
+    sink = CsvSink()
+    sink.on_scan_start(
+        ts="t", session_start_ts=0.0,
+        request=_make_request(
+            tmp_path, write_raw_csv=True,
+            left_mask=0xFF, right_mask=0xFF,
+        ),
+        meta={},
+    )
+    hist = _fake_hist_bytes(42)
+    for fid in range(3):
+        sink.on_raw_frame(
+            "left", 0, fid, fid * 0.025, hist, 25.0, 100, 0.1, 0.2, 0.3,
+        )
+        sink.on_raw_frame(
+            "right", 0, fid, fid * 0.025, hist, 25.0, 100, 0.1, 0.2, 0.3,
+        )
+    sink.on_complete()
+    assert sink.raw_rows_written == {"left": 3, "right": 3}
+    with open(sink.raw_paths["left"], newline="") as fh:
+        reader = csv.reader(fh)
+        next(reader)  # header
+        rows = list(reader)
+    assert len(rows) == 3
+    # First row's housekeeping cells.
+    assert rows[0][0] == "0"   # cam_id
+    assert rows[0][1] == "0"   # frame_id
+    assert rows[0][2] == "0.0" # timestamp_s
+    # 1024 histogram bins all == 42
+    bin_cells = rows[0][3:3 + 1024]
+    assert len(bin_cells) == 1024
+    assert all(int(c) == 42 for c in bin_cells)
+    # Trailing telemetry cells.
+    assert rows[0][-3:] == ["0.1", "0.2", "0.3"]
+
+
+def test_csv_sink_raw_duration_cap(tmp_path: Path) -> None:
+    """Once a sample timestamp exceeds writeRawDataDurationSec, that
+    side's writer closes — additional calls don't append more rows."""
+    sink = CsvSink()
+    sink.on_scan_start(
+        ts="t", session_start_ts=0.0,
+        request=_make_request(
+            tmp_path, write_raw_csv=True,
+            left_mask=0xFF, right_mask=0xFF,
+            raw_csv_duration_sec=1.0,
+        ),
+        meta={},
+    )
+    hist = _fake_hist_bytes()
+    # 50 frames at 40 Hz spans 0.0..1.225 s. Cap=1.0 → only frames with
+    # ts <= 1.0 land in the file (frames 0..40 → 41 rows per side).
+    for fid in range(50):
+        ts = fid * 0.025
+        sink.on_raw_frame("left", 0, fid, ts, hist, 25.0, 0, 0, 0, 0)
+        sink.on_raw_frame("right", 0, fid, ts, hist, 25.0, 0, 0, 0, 0)
+    sink.on_complete()
+    # All ts <= 1.0 → frames 0..40 → 41 rows.
+    assert sink.raw_rows_written == {"left": 41, "right": 41}
+
+
+def test_csv_sink_raw_silent_when_not_started(tmp_path: Path) -> None:
+    """A late on_raw_frame call (e.g. after on_complete or with no
+    matching side writer) should be silently dropped, not raise."""
+    sink = CsvSink()
+    # No on_scan_start — no writers exist for any side.
+    sink.on_raw_frame("left", 0, 0, 0.0, _fake_hist_bytes(), 25.0, 0, 0, 0, 0)
+    sink.on_raw_frame("right", 0, 0, 0.0, _fake_hist_bytes(), 25.0, 0, 0, 0, 0)
+    sink.on_complete()
+    assert sink.raw_rows_written == {"left": 0, "right": 0}
+
+
+# ---------------------------------------------------------------------------
+# Bit-identical equivalence with the inline corrected-CSV writer
 # ---------------------------------------------------------------------------
 
 class _InlineCorrectedMirror:
