@@ -355,7 +355,7 @@ For every scan the sink runs, the SDK *also* writes the existing files:
 | `{ts}_{subject}_right_mask{XX}_raw.csv` | per-side raw stream | yes | scan start |
 | `{ts}_{subject}.csv` (corrected) | science pipeline | yes (per row) | scan start, merged across sides |
 | `{ts}_{subject}_telemetry.csv` (developerMode only) | telemetry poller | n/a | scan start |
-| `scans.db / session_data` | science pipeline | **no** | scan start, per-side |
+| `scans.db / session_data` | science pipeline | yes (Step F) | scan start, per-side |
 | `scans.db / session_raw` | per-side raw stream | yes | scan start, per-side |
 
 The most surprising difference is the **timestamp origin within a single
@@ -366,6 +366,46 @@ per-side rows can differ by a few milliseconds even within the same
 `frame_id`. Both representations are correct; the DB just preserves the
 per-side resolution that the CSV flattens away.
 
+## Playback — rebuild a corrected CSV from the DB
+
+`omotion.materialize_corrected_csv(db_path, session_id, output_path)`
+reads `session_data` for a session and writes a corrected-format CSV
+to disk that is **value-equivalent** to what `CsvSink` would have
+written live. This exists so a session recorded with `csvEnabled=false`
+(DB-only mode — no on-disk CSV) can still be fed to existing CSV-based
+tooling like `plot_corrected_scan.py`.
+
+```python
+from omotion import materialize_corrected_csv
+materialize_corrected_csv(
+    "scan_data/scans.db",
+    session_id=6,
+    output_path="scan_data/.playback_sid6.csv",
+)
+```
+
+What's preserved exactly:
+
+- Column ordering — full 82-col layout, or the reduced 6-col layout
+  (read from `session_meta.sdk_flags.reduced_mode`).
+- Per-frame row layout — one row per distinct `frame_id`, merged
+  across all (side, cam) cells.
+- Per-frame `timestamp_s` — minimum of all contributing samples,
+  same rule as `CsvSink`.
+- `bfi`, `bvi`, `contrast`, `mean` cell values — rounded to 6
+  decimals at sink-insert time, so playback is byte-identical to the
+  on-disk corrected CSV for these columns.
+
+What's *not* preserved:
+
+- `temp_*` cells are always empty (the DB doesn't carry temperature
+  in `session_data`). `plot_corrected_scan.py` ignores temperature,
+  so visualization still works.
+
+Pre-#92 Step F sessions raise `RuntimeError` — their `frame_id` rows
+are all the sentinel `-1`, so the row layout can't be reconstructed.
+Callers should fall back to the on-disk corrected CSV in that case.
+
 ## Notes on schema evolution
 
 There is no schema version column yet. The DB-only mode shipped recently
@@ -375,3 +415,16 @@ the convention will be to write a `schema_version` key into
 migration. Until then, existing DBs are safely opened by current code — the
 `CREATE TABLE IF NOT EXISTS` and `CREATE INDEX IF NOT EXISTS` clauses make
 every open idempotent.
+
+#### #92 Step F: `session_data.frame_id`
+
+`session_data` originally did not carry `frame_id`, only `timestamp_s`.
+Step F added the column so `materialize_corrected_csv` can merge by
+the same key the live CSV writer uses (per-side clock skew makes
+timestamp-based merging unreliable). `_init_schema()` runs an
+idempotent `ALTER TABLE … ADD COLUMN frame_id INTEGER NOT NULL
+DEFAULT -1` on legacy DBs; rows from pre-Step-F sessions get the
+sentinel value `-1` and `materialize_corrected_csv` refuses to
+reconstruct from them. Fresh DBs created on the post-Step-F SDK get
+the column natively and a `(session_id, frame_id)` index for fast
+lookups.

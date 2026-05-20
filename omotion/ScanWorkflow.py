@@ -317,12 +317,11 @@ class ScanWorkflow:
             _telem_lock = threading.Lock()
             _telem_stop = threading.Event()
 
-            # All scan-data CSVs (corrected + per-side raw) are now owned
-            # by CsvSink (issue #92, Steps B4a + B4b). The sink builds the
-            # corrected per-frame merge entries, opens the raw CSV per
-            # side, enforces ``raw_csv_duration_sec``, and drains any
-            # incomplete corrected frames at scan end. ScanWorkflow just
-            # fans events into it via the standard Sink hooks.
+            # CsvSink owns every per-scan CSV output (corrected + per-side
+            # raw). It opens its own files, builds the per-frame merge,
+            # enforces ``raw_csv_duration_sec``, and drains any partial
+            # corrected frames at scan end. ScanWorkflow fans events into
+            # it via the standard Sink hooks.
             _csv_sink = CsvSink()
 
             # Per-scan time origin: captured from the first sample emitted by
