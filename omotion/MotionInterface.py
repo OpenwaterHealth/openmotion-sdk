@@ -87,6 +87,21 @@ class MotionInterface:
         self._calibration_workflow = None
         self._monitor: Optional[ConnectionMonitor] = None
         self._started = False
+        # Set by ``_wrap_kwargs_with_db_sink`` for the duration of a
+        # DB-recorded scan; cleared in the sink's on_complete wrapper.
+        # ``active_db_session_id`` exposes its session id for post-scan
+        # note updates / status checks.
+        self._active_db_sink = None
+
+    @property
+    def active_db_session_id(self) -> Optional[int]:
+        """The DB session id for an in-progress scan, or None when no
+        scan is recording to the DB. Useful for callers who want to
+        update ``session_notes`` mid-/post-scan without re-querying the
+        DB by label.
+        """
+        s = self._active_db_sink
+        return s.session_id if s is not None else None
 
     @property
     def default_trigger_config(self) -> dict:
@@ -336,6 +351,11 @@ class MotionInterface:
             write_raw=bool(getattr(request, "write_raw_to_db", False)),
             compress_raw_hist=True,
         )
+        # Track the active sink so callers can read the current
+        # ``session_id`` (e.g. the bloodflow-app pushing post-scan
+        # notes edits back to ``session_notes``). Cleared in
+        # ``_on_complete``.
+        self._active_db_sink = sink
 
         def _active_cams(mask: int) -> list[int]:
             return [i + 1 for i in range(8) if (mask >> i) & 0x1]
@@ -434,6 +454,12 @@ class MotionInterface:
                 sink.on_complete(result)
             except Exception:
                 logger.exception("ScanDBSink.on_complete raised")
+            # Clear the active-sink pointer once the scan ends. The sink
+            # itself is kept inside the closure so any in-flight callback
+            # can still finish — only the public "is there an active
+            # session?" handle goes away.
+            if self._active_db_sink is sink:
+                self._active_db_sink = None
             if user_on_complete:
                 user_on_complete(result)
 
