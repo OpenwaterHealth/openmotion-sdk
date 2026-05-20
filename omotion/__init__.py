@@ -53,6 +53,7 @@ from .Sink import Sink
 from .CsvSink import CsvSink
 from .ScanDatabase import ScanDatabase
 from .ScanDBSink import ScanDBSink
+from .SessionPlayback import materialize_corrected_csv
 from .Calibration import Calibration
 from .CalibrationWorkflow import (
     CalibrationRequest,
@@ -83,6 +84,7 @@ __all__ = [
     "CsvSink",
     "ScanDatabase",
     "ScanDBSink",
+    "materialize_corrected_csv",
     "Calibration",
     "CalibrationRequest",
     "CalibrationResult",
