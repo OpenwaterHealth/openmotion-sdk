@@ -703,13 +703,8 @@ class ScanWorkflow:
                             rows_written = parse_histogram_stream(
                                 q=q,
                                 stop_evt=stop_evt,
-                                csv_writer=None,
                                 buffer_accumulator=bytearray(),
-                                extra_cols_fn=None,
                                 on_row_fn=on_row_fn,
-                                csv_deadline=None,
-                                csv_stop_event=None,
-                                on_csv_closed_fn=None,
                                 t0_normalizer=_normalize_ts,
                             )
                         except Exception as e:

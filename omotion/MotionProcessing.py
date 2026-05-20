@@ -609,54 +609,32 @@ def process_bin_file(
 def parse_histogram_stream(
     q: queue.Queue,
     stop_evt: threading.Event,
-    csv_writer,
     buffer_accumulator: bytearray,
-    extra_cols_fn: Callable[[], list] | None = None,
     on_row_fn: Callable[[int, int, float, np.ndarray, int, float], None] | None = None,
     expected_row_sum: int | None = None,
-    csv_deadline: float | None = None,
-    on_csv_closed_fn: Callable[[], None] | None = None,
-    csv_stop_event: threading.Event | None = None,
     t0_normalizer: Callable[[float], float] | None = None,
 ) -> int:
     """
-    Parse a histogram USB stream queue, feed the science pipeline, and
-    optionally write CSV rows.
-
-    ``on_row_fn`` is the primary output and is called for every valid parsed
-    sample regardless of CSV state.  CSV writing via ``csv_writer`` is
-    secondary and can be disabled entirely (``csv_writer=None``) or
-    automatically stopped after a wall-clock deadline (``csv_deadline``).
+    Parse a histogram USB stream queue and fire ``on_row_fn`` for every
+    valid sample.
 
     Parameters
     ----------
-    csv_writer
-        A ``csv.writer``-compatible object, or ``None`` to skip CSV output.
-    csv_deadline
-        ``time.monotonic()``-style deadline after which CSV writing stops but
-        ``on_row_fn`` continues.  ``None`` means write for the full duration.
-    on_csv_closed_fn
-        Called exactly once when ``csv_deadline`` is reached (or
-        ``csv_stop_event`` is set) and the writer is deactivated.  Useful
-        for emitting a log message to the caller.
-    csv_stop_event
-        A :class:`threading.Event` shared across all writer threads for the
-        same scan.  When any thread's deadline fires it sets this event so
-        every other thread stops writing on its next sample check, keeping
-        row counts equal across left/right CSVs.  ``None`` disables
-        cross-thread synchronisation.
     expected_row_sum
         Forwarded to ``parse_histogram_packet_structured``.  When not None,
         samples whose histogram bin sum does not match are silently dropped
-        from both the CSV and the ``on_row_fn`` callback.
+        from the ``on_row_fn`` callback.
+    t0_normalizer
+        Optional callback that converts an absolute firmware timestamp
+        into a per-scan-zero timestamp; invoked once per sample before
+        ``on_row_fn`` fires.
 
     Returns
     -------
     int
-        Number of rows written to ``csv_writer``.
+        Number of valid samples processed.
     """
-    rows_written = 0
-    _csv_active = csv_writer is not None
+    rows_processed = 0
 
     # Monotonic timestamp unwrapping: the firmware's 32-bit millisecond counter
     # rolls over every ~42949.67 s.  Track an offset so timestamps never go backwards.
@@ -699,29 +677,6 @@ def parse_histogram_stream(
                     if t0_normalizer is not None:
                         sample.timestamp_s = t0_normalizer(sample.timestamp_s)
 
-                    # Check CSV deadline before every row so the cutoff is
-                    # accurate to within one sample period (~25 ms at 40 Hz).
-                    if _csv_active and (
-                        (csv_deadline is not None and time.monotonic() >= csv_deadline)
-                        or (csv_stop_event is not None and csv_stop_event.is_set())
-                    ):
-                        _csv_active = False
-                        # Broadcast to peer writer threads sharing this event
-                        # so every side's CSV ends at the same sample boundary.
-                        if csv_stop_event is not None and not csv_stop_event.is_set():
-                            csv_stop_event.set()
-                        if on_csv_closed_fn:
-                            try:
-                                on_csv_closed_fn()
-                            except Exception:
-                                pass
-
-                    if _csv_active:
-                        extra_cols = extra_cols_fn() if extra_cols_fn else []
-                        row = sample.to_csv_row(extra_cols=extra_cols)
-                        csv_writer.writerow(row)
-                        rows_written += 1
-
                     if on_row_fn:
                         on_row_fn(
                             sample.cam_id,
@@ -731,6 +686,7 @@ def parse_histogram_stream(
                             sample.row_sum,
                             sample.temperature_c,
                         )
+                        rows_processed += 1
 
             except ValueError as e:
                 old_off = offset
@@ -773,11 +729,11 @@ def parse_histogram_stream(
     # that was recovered (or couldn't be parsed) so frame loss is visible in logs.
     if buffer_accumulator:
         logger.warning(
-            "parse_stream_to_csv: %d bytes remain in accumulator after "
+            "parse_histogram_stream: %d bytes remain in accumulator after "
             "stream end — attempting final parse pass",
             len(buffer_accumulator),
         )
-        rows_before_final_flush = rows_written
+        rows_before_final_flush = rows_processed
         offset = 0
         while offset + MIN_PACKET_ENVELOPE_SIZE <= len(buffer_accumulator):
             try:
@@ -792,27 +748,8 @@ def parse_histogram_stream(
                         _ts_offset += _TIMESTAMP_ROLLOVER_S
                     sample.timestamp_s = raw_ts + _ts_offset
                     _ts_last = sample.timestamp_s
-
-                    if _csv_active and (
-                        (csv_deadline is not None and time.monotonic() >= csv_deadline)
-                        or (csv_stop_event is not None and csv_stop_event.is_set())
-                    ):
-                        _csv_active = False
-                        # Broadcast to peer writer threads sharing this event
-                        # so every side's CSV ends at the same sample boundary.
-                        if csv_stop_event is not None and not csv_stop_event.is_set():
-                            csv_stop_event.set()
-                        if on_csv_closed_fn:
-                            try:
-                                on_csv_closed_fn()
-                            except Exception:
-                                pass
-
-                    if _csv_active:
-                        extra_cols = extra_cols_fn() if extra_cols_fn else []
-                        row = sample.to_csv_row(extra_cols=extra_cols)
-                        csv_writer.writerow(row)
-                        rows_written += 1
+                    if t0_normalizer is not None:
+                        sample.timestamp_s = t0_normalizer(sample.timestamp_s)
 
                     if on_row_fn:
                         on_row_fn(
@@ -823,6 +760,7 @@ def parse_histogram_stream(
                             sample.row_sum,
                             sample.temperature_c,
                         )
+                        rows_processed += 1
             except ValueError as e:
                 old_off = offset
                 search_from = offset + 1
@@ -842,7 +780,7 @@ def parse_histogram_stream(
                         offset = nxt
                         found_sync = True
                         logger.warning(
-                            "parse_stream_to_csv: final flush parser error at "
+                            "parse_histogram_stream: final flush parser error at "
                             "offset %d, resynced to %d (skipped %d bytes): %s",
                             old_off, nxt, nxt - old_off, e,
                         )
@@ -853,84 +791,18 @@ def parse_histogram_stream(
                 break
         if offset > 0:
             logger.info(
-                "parse_stream_to_csv: final flush recovered %d additional row(s)",
-                rows_written - rows_before_final_flush,
+                "parse_histogram_stream: final flush recovered %d additional row(s)",
+                rows_processed - rows_before_final_flush,
             )
             del buffer_accumulator[:offset]
         if buffer_accumulator:
             logger.warning(
-                "parse_stream_to_csv: %d bytes could not be parsed and were "
+                "parse_histogram_stream: %d bytes could not be parsed and were "
                 "discarded — likely an incomplete final packet",
                 len(buffer_accumulator),
             )
 
-    return rows_written
-
-
-def stream_queue_to_csv_file(
-    q: queue.Queue,
-    stop_evt: threading.Event,
-    filename: str,
-    *,
-    extra_headers: list[str] | None = None,
-    extra_cols_fn: Callable[[], list] | None = None,
-    on_row_fn: Callable[[int, int, float, np.ndarray, int, float], None] | None = None,
-    on_complete_fn: Callable[[int], None] | None = None,
-    on_error_fn: Callable[[Exception], None] | None = None,
-    expected_row_sum: int | None = None,
-) -> int:
-    """
-    High-level helper: parse stream queue data and write a CSV file end-to-end.
-
-    This owns file open/header/write/close so applications only pass:
-    - destination filename
-    - queue + stop event
-    - optional callbacks for extra columns and row handling.
-
-    Parameters
-    ----------
-    expected_row_sum
-        Forwarded to ``parse_histogram_stream`` / ``parse_histogram_packet_structured``.
-        Samples whose histogram bin sum does not match are dropped from both
-        the CSV and the ``on_row_fn`` callback before being written.
-    """
-    rows_written = 0
-    extra_headers = extra_headers or []
-
-    try:
-        with open(filename, "w", newline="", encoding="utf-8") as f:
-            csv_writer = csv.writer(f)
-            csv_writer.writerow(
-                [
-                    "cam_id",
-                    "frame_id",
-                    "timestamp_s",
-                    *range(HISTO_SIZE_WORDS),
-                    "temperature",
-                    "sum",
-                    *extra_headers,
-                ]
-            )
-
-            buffer_accumulator = bytearray()
-            rows_written = parse_histogram_stream(
-                q=q,
-                stop_evt=stop_evt,
-                csv_writer=csv_writer,
-                buffer_accumulator=buffer_accumulator,
-                extra_cols_fn=extra_cols_fn,
-                on_row_fn=on_row_fn,
-                expected_row_sum=expected_row_sum,
-            )
-    except Exception as e:
-        if on_error_fn:
-            on_error_fn(e)
-        logger.error("Writer error (%s): %s", filename, e, exc_info=True)
-        return rows_written
-
-    if on_complete_fn:
-        on_complete_fn(rows_written)
-    return rows_written
+    return rows_processed
 
 
 # ---------------------------------------------------------------------------
