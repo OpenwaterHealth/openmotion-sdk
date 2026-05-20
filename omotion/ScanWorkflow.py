@@ -725,6 +725,17 @@ class ScanWorkflow:
                         # extra_cols_fn (the same hook that feeds tcm/tcl/pdc
                         # into the raw CSV writer) so the DB sees the same
                         # telemetry values that land in the on-disk CSVs.
+                        #
+                        # Respect the raw-write duration cap: ``_csv_stop_evt``
+                        # is fired by ``parse_histogram_stream`` once any
+                        # writer thread reaches ``raw_csv_duration_sec``.
+                        # Without this gate, the DB sink would keep
+                        # accumulating raw frames for the full scan length
+                        # while the CSV correctly stopped at the cap —
+                        # producing tens of GB of raw rows for hour-long
+                        # scans even when the user set a 30 s cap (#92).
+                        if on_raw_frame_fn is not None and _csv_stop_evt is not None and _csv_stop_evt.is_set():
+                            return
                         if on_raw_frame_fn is not None:
                             if extra_cols_fn is not None:
                                 try:

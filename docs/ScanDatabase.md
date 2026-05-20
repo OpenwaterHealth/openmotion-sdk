@@ -38,7 +38,7 @@ The OpenMOTION Bloodflow app exposes this via two `app_config.json` keys:
 | --- | --- | --- | --- |
 | `scanDbEnabled` | bool | `false` | Toggles the SDK sink on. **Startup-only** — changing it at runtime requires an app restart because the path is fixed at `MotionInterface` construction. When `true`, the path is `<output_base>/scan_data/scans.db`. |
 | `writeRawData` | bool | `false` | Master raw-histogram persistence switch. Drives both raw-CSV writes and raw-DB writes when their respective targets are active. Live-toggleable from Settings → Developer → "Save raw data". |
-| `writeRawDataDurationSec` | float \| null | `null` | Cap for how long raw data is recorded per scan. Applies to whichever raw target(s) are active. `null` means full scan duration. |
+| `writeRawDataDurationSec` | float \| null | `null` | Cap for how long raw data is recorded per scan. Applies to **both** the raw CSV writer and the DB `session_raw` sink — once any writer-thread deadline fires, both targets stop accepting new raw frames so they capture the same window. `null` means full scan duration. **Important:** without this cap, a multi-hour scan with `writeRawData=true` and `scanDbEnabled=true` will write one `session_raw` row per camera per frame for the entire duration (roughly 320 rows/s × scan length × ~250 B of compressed histogram payload + ~80 B row meta), so a 12-hour scan produces ~7–8 GB of raw rows in the DB on top of the corrected data. |
 
 ## Schema
 
