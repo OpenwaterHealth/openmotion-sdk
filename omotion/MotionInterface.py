@@ -454,14 +454,16 @@ class MotionInterface:
                 sink.on_complete(result)
             except Exception:
                 logger.exception("ScanDBSink.on_complete raised")
-            # Clear the active-sink pointer once the scan ends. The sink
-            # itself is kept inside the closure so any in-flight callback
-            # can still finish — only the public "is there an active
-            # session?" handle goes away.
-            if self._active_db_sink is sink:
-                self._active_db_sink = None
+            # User callback fires BEFORE we clear the active-sink pointer
+            # — that's the only chance a synchronous on_complete handler
+            # has to read ``active_db_session_id`` (the bloodflow-app
+            # uses it to push post-scan notes back into session_notes).
+            # If we cleared first, the connector would read None and
+            # silently drop the notes write.
             if user_on_complete:
                 user_on_complete(result)
+            if self._active_db_sink is sink:
+                self._active_db_sink = None
 
         kwargs["on_scan_start_fn"] = _on_scan_start
         kwargs["on_raw_frame_fn"] = _on_raw_frame
