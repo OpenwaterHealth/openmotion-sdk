@@ -58,17 +58,17 @@ def _drive_through_first_dark(pipeline: SciencePipeline, dark_mean: float, dark_
 
 
 def test_dark_integrity_passes_for_real_dark():
-    """A frame whose u1 ≈ pedestal and std ≈ 5 should pass the integrity
-    check. No warnings produced."""
+    """A frame whose u1 ≈ pedestal should pass the integrity check
+    regardless of std. No warnings produced."""
     p = _make_pipeline()
     _drive_through_first_dark(p, dark_mean=PEDESTAL_HEIGHT, dark_std=5.0)
     assert p.dark_integrity_warnings == []
 
 
 def test_dark_integrity_flags_light_frame_in_dark_slot():
-    """A frame at the 'first dark' position whose u1 is high and std is
-    high (i.e. a real light frame, the firmware off-by-one symptom)
-    must produce a warning."""
+    """A frame at the 'first dark' position whose u1 is high (i.e. a
+    real light frame, the firmware off-by-one symptom) must produce a
+    warning."""
     p = _make_pipeline()
     _drive_through_first_dark(p, dark_mean=200.0, dark_std=40.0)
     warnings = p.dark_integrity_warnings
@@ -87,9 +87,10 @@ def test_dark_integrity_flags_high_u1_only():
     assert len(p.dark_integrity_warnings) >= 1
 
 
-def test_dark_integrity_flags_high_std_only():
-    """Frame with pedestal-ish u1 but unexpectedly high std (light leak,
-    speckle pattern) should flag."""
+def test_dark_integrity_ignores_high_std_when_u1_is_pedestal():
+    """High std alone must NOT flag the frame — std is too noisy a
+    signal across the scan (warms up over time on fw 1.5.3). The u1
+    bound is the sole criterion."""
     p = _make_pipeline()
     _drive_through_first_dark(p, dark_mean=PEDESTAL_HEIGHT, dark_std=30.0)
-    assert len(p.dark_integrity_warnings) >= 1
+    assert p.dark_integrity_warnings == []
