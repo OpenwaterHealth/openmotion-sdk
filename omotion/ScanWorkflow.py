@@ -317,15 +317,13 @@ class ScanWorkflow:
             _telem_lock = threading.Lock()
             _telem_stop = threading.Event()
 
-            # Corrected CSV streaming is owned by CsvSink (issue #92,
-            # Step B4a). The sink builds the per-frame merge entries,
-            # writes complete rows when all expected (side, cam) cells
-            # have reported, and drains any incomplete frames at scan
-            # end. Step B4a only cuts corrected over — raw CSV writing
-            # is still inline (each side's writer thread + parse_-
-            # histogram_stream csv_writer). Step B4b will flip
-            # enable_raw=True and remove the inline raw path.
-            _csv_sink = CsvSink(enable_raw=False)
+            # All scan-data CSVs (corrected + per-side raw) are now owned
+            # by CsvSink (issue #92, Steps B4a + B4b). The sink builds the
+            # corrected per-frame merge entries, opens the raw CSV per
+            # side, enforces ``raw_csv_duration_sec``, and drains any
+            # incomplete corrected frames at scan end. ScanWorkflow just
+            # fans events into it via the standard Sink hooks.
+            _csv_sink = CsvSink()
 
             # Per-scan time origin: captured from the first sample emitted by
             # parse_histogram_stream (whichever side fires first wins) and
@@ -595,72 +593,76 @@ class ScanWorkflow:
                                 row_sum,
                                 temp,
                             )
-                        # Fan out to the issue #92 raw-frame hook. Reuse
-                        # extra_cols_fn (the same hook that feeds tcm/tcl/pdc
-                        # into the raw CSV writer) so the DB sees the same
-                        # telemetry values that land in the on-disk CSVs.
-                        #
-                        # Respect the raw-write duration cap: ``_csv_stop_evt``
-                        # is fired by ``parse_histogram_stream`` once any
-                        # writer thread reaches ``raw_csv_duration_sec``.
-                        # Without this gate, the DB sink would keep
-                        # accumulating raw frames for the full scan length
-                        # while the CSV correctly stopped at the cap —
-                        # producing tens of GB of raw rows for hour-long
-                        # scans even when the user set a 30 s cap (#92).
-                        if on_raw_frame_fn is not None and _csv_stop_evt is not None and _csv_stop_evt.is_set():
-                            return
-                        if on_raw_frame_fn is not None:
-                            if extra_cols_fn is not None:
-                                try:
-                                    extras = extra_cols_fn()
-                                except Exception:
-                                    extras = []
-                            else:
-                                extras = []
-                            tcm = float(extras[0]) if len(extras) > 0 else 0.0
-                            tcl = float(extras[1]) if len(extras) > 1 else 0.0
-                            pdc = float(extras[2]) if len(extras) > 2 else 0.0
+                        # Resolve extras once; both sinks (the in-process
+                        # CsvSink and any externally-wired raw-frame hook
+                        # such as ScanDBSink) consume the same shape.
+                        if extra_cols_fn is not None:
                             try:
-                                on_raw_frame_fn(
-                                    current_side,
-                                    int(cam_id),
-                                    int(frame_id),
-                                    float(ts_val),
-                                    bytes(hist),
-                                    float(temp) if temp is not None else 0.0,
-                                    int(row_sum) if row_sum is not None else 0,
-                                    tcm,
-                                    tcl,
-                                    pdc,
-                                )
+                                extras = extra_cols_fn()
                             except Exception:
-                                logger.exception(
-                                    "on_raw_frame_fn callback raised"
-                                )
+                                extras = []
+                        else:
+                            extras = []
+                        tcm = float(extras[0]) if len(extras) > 0 else 0.0
+                        tcl = float(extras[1]) if len(extras) > 1 else 0.0
+                        pdc = float(extras[2]) if len(extras) > 2 else 0.0
+                        temp_f = float(temp) if temp is not None else 0.0
+                        row_sum_i = int(row_sum) if row_sum is not None else 0
+                        ts_f = float(ts_val)
+                        hist_b = bytes(hist)
+
+                        # Raw CSVs (#92 B4b — owned by CsvSink, which closes
+                        # its writer the first time it sees a frame past
+                        # ``raw_csv_duration_sec``).
+                        try:
+                            _csv_sink.on_raw_frame(
+                                current_side,
+                                int(cam_id),
+                                int(frame_id),
+                                ts_f,
+                                hist_b,
+                                temp_f,
+                                row_sum_i,
+                                tcm, tcl, pdc,
+                            )
+                        except Exception:
+                            logger.exception("CsvSink.on_raw_frame raised")
+
+                        # External raw-frame hook (ScanDBSink, user
+                        # callbacks). Honor the same duration cap so we
+                        # don't accumulate raw rows for hour-long scans
+                        # after the user-requested cap (#92, see commit
+                        # c06263d). The cap used to be plumbed via a
+                        # shared event set by the inline CSV writer when
+                        # it hit its deadline; the writer is gone now,
+                        # so we check the cap directly here.
+                        if on_raw_frame_fn is None:
+                            return
+                        raw_dur = request.raw_csv_duration_sec
+                        if raw_dur is not None and ts_f > float(raw_dur):
+                            return
+                        try:
+                            on_raw_frame_fn(
+                                current_side,
+                                int(cam_id),
+                                int(frame_id),
+                                ts_f,
+                                hist_b,
+                                temp_f,
+                                row_sum_i,
+                                tcm, tcl, pdc,
+                            )
+                        except Exception:
+                            logger.exception("on_raw_frame_fn callback raised")
                     return _on_row
 
-                _RAW_CSV_HEADERS = [
-                    "cam_id", "frame_id", "timestamp_s",
-                    *range(HISTO_SIZE_WORDS),
-                    "temperature", "sum",
-                    "tcm", "tcl", "pdc",
-                ]
-
-                # _trigger_armed_evt fires the moment start_trigger() succeeds
-                # so each writer computes its CSV deadline from real scan-start
-                # rather than from thread-spawn time (which is several seconds
-                # earlier, before cameras are enabled).  It is also set in the
-                # finally block so threads never hang if the trigger fails.
-                # _csv_stop_evt is broadcast by whichever thread hits its
-                # deadline first so every side stops writing at the same
-                # wall-clock instant, giving equal row counts across CSVs.
-                _trigger_armed_evt = threading.Event()
-                _csv_stop_evt = (
-                    threading.Event()
-                    if request.raw_csv_duration_sec is not None
-                    else None
-                )
+                # The CSV deadline used to be implemented with two events
+                # (_trigger_armed_evt + _csv_stop_evt) that gated the
+                # inline per-side raw-CSV writer. Raw CSV writing now
+                # lives in CsvSink (#92 B4b), which times its own cap
+                # from the first frame it sees, so neither event is
+                # needed anymore. parse_histogram_stream is called
+                # with no csv_writer / no deadline.
 
                 for side, mask, sensor in active_sides:
                     q = queue.Queue()
@@ -684,75 +686,36 @@ class ScanWorkflow:
 
                     _row_handler = _make_row_handler(side, science_pipeline)
 
-                    # Resolve CSV file path for this side. Issue #44:
-                    # raw histo CSVs now carry a ``_raw`` suffix so
-                    # they're visually distinct from the canonical
-                    # corrected output (which dropped ``_corrected``).
-                    if request.write_raw_csv:
-                        filename = f"{ts}_{request.subject_id}_{side}_mask{mask:02X}_raw.csv"
-                        filepath = os.path.join(request.data_dir, filename)
-                    else:
-                        filepath = ""
-
                     def _writer(
                         q=q,
                         stop_evt=stop_evt,
                         on_row_fn=_row_handler,
-                        fp=filepath,
-                        ecfn=extra_cols_fn,
                         s=side,
-                        dur=request.raw_csv_duration_sec,
-                        trigger_armed_evt=_trigger_armed_evt,
-                        csv_stop_evt=_csv_stop_evt,
                     ):
-                        # Wait for the hardware trigger to fire before starting
-                        # the CSV deadline countdown.  The data queue is empty
-                        # until FSYNC begins (cameras are enabled but not yet
-                        # clocked) so nothing is lost during the wait.
-                        # _trigger_armed_evt is also set in the finally block so
-                        # this wait never hangs on an error path.
-                        if dur is not None:
-                            trigger_armed_evt.wait()
-                            csv_deadline = time.monotonic() + float(dur)
-                        else:
-                            csv_deadline = None
-
+                        # The per-side thread used to open the raw CSV
+                        # itself; that's CsvSink's job now (#92, B4b).
+                        # All this thread still does is drive
+                        # parse_histogram_stream so the on_row_fn fires
+                        # for every frame coming off USB — the row
+                        # handler fans into CsvSink + the external
+                        # raw-frame hook (ScanDBSink, user callback).
                         rows_written = 0
-                        fh = None
                         try:
-                            if fp:
-                                fh = open(fp, "w", newline="", encoding="utf-8")  # noqa: WPS515
-                                real_writer = csv.writer(fh)
-                                real_writer.writerow(_RAW_CSV_HEADERS)
-                            else:
-                                real_writer = None
-
-                            def _on_csv_closed():
-                                _emit_log(
-                                    f"{s.capitalize()} histogram CSV closed after "
-                                    f"{dur:.0f}s limit"
-                                )
-
                             rows_written = parse_histogram_stream(
                                 q=q,
                                 stop_evt=stop_evt,
-                                csv_writer=real_writer,
+                                csv_writer=None,
                                 buffer_accumulator=bytearray(),
-                                extra_cols_fn=ecfn,
+                                extra_cols_fn=None,
                                 on_row_fn=on_row_fn,
-                                csv_deadline=csv_deadline,
-                                csv_stop_event=csv_stop_evt,
-                                on_csv_closed_fn=_on_csv_closed if csv_deadline is not None else None,
+                                csv_deadline=None,
+                                csv_stop_event=None,
+                                on_csv_closed_fn=None,
                                 t0_normalizer=_normalize_ts,
                             )
                         except Exception as e:
-                            _emit_log(f"Writer error ({os.path.basename(fp) if fp else s}): {e}")
+                            _emit_log(f"Writer error ({s}): {e}")
                         finally:
-                            if fh is not None:
-                                try:
-                                    fh.close()
-                                except Exception:
-                                    pass
                             writer_row_counts[s] = rows_written
 
                     t = threading.Thread(target=_writer, daemon=True)
@@ -761,6 +724,10 @@ class ScanWorkflow:
                     writer_threads[side] = t
                     writer_stops[side] = stop_evt
 
+                    # CsvSink chose the path; surface it so the legacy
+                    # left_path / right_path / on_side_stream_fn contract
+                    # is preserved for ScanResult consumers.
+                    filepath = _csv_sink.raw_paths.get(side, "")
                     if side == "left":
                         left_path = filepath
                     elif side == "right":
@@ -792,8 +759,6 @@ class ScanWorkflow:
                     raise RuntimeError("Failed to start trigger.")
                 if on_trigger_state_fn:
                     on_trigger_state_fn("ON")
-                # Signal writer threads: trigger is live, start CSV countdowns now.
-                _trigger_armed_evt.set()
 
                 start_t = time.time()
                 last_emit = -1
@@ -876,10 +841,6 @@ class ScanWorkflow:
                                 )
                         except Exception as _drain_err:
                             logger.warning("%s: post-stop drain error: %s", side, _drain_err)
-
-                # Unblock any writer thread still waiting on the trigger event
-                # (e.g. if an error occurred before start_trigger ran).
-                _trigger_armed_evt.set()
 
                 for stop_evt in writer_stops.values():
                     stop_evt.set()
