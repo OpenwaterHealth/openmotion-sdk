@@ -465,3 +465,55 @@ def test_request_average_full_scan_accepts_true():
         average_full_scan=True,
     )
     assert req.average_full_scan is True
+
+
+def test_test_scan_result_default_mode_is_test():
+    from omotion.CalibrationWorkflow import TestScanResult
+
+    r = TestScanResult(
+        ok=True, passed=True, canceled=False, error="",
+        csv_path="", json_path="", rows=[],
+        test_scan_left_path="", test_scan_right_path="",
+        started_timestamp="20260521_000000",
+    )
+    assert r.mode == "test"
+
+
+def test_write_result_json_records_mode():
+    import json
+    import tempfile
+    from pathlib import Path
+
+    from omotion.CalibrationWorkflow import write_result_json
+
+    class _StubInterface:
+        console = None
+        left = None
+        right = None
+
+    req = CalibrationRequest(
+        operator_id="op",
+        output_dir="/tmp",
+        left_camera_mask=0x01,
+        right_camera_mask=0x00,
+        thresholds=_thresholds(),
+        duration_sec=15,
+    )
+    with tempfile.TemporaryDirectory() as td:
+        path = str(Path(td) / "out.json")
+        write_result_json(
+            path,
+            started_timestamp="20260521_000000",
+            passed=True,
+            canceled=False,
+            error="",
+            request=req,
+            rows=[],
+            calibration=None,
+            scan_paths={},
+            interface=_StubInterface(),
+            mode="test",
+        )
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        assert data["mode"] == "test"

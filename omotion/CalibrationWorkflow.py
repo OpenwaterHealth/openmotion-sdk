@@ -138,6 +138,28 @@ class CalibrationResult:
     started_timestamp: str
 
 
+@dataclass
+class TestScanResult:
+    """Outcome of a stand-alone Test scan — phase 1 only, no calibration
+    write, no validation scan. Shape mirrors ``CalibrationResult`` so the
+    bloodflow-app's QML layer can re-use the row formatting code, but the
+    fields are scoped to what a test scan actually produces (no
+    ``calibration`` field — Test scans don't write to console EEPROM, no
+    ``validation_scan_*_path`` — there's no validation scan).
+    """
+    ok: bool
+    passed: bool
+    canceled: bool
+    error: str
+    csv_path: str
+    json_path: str
+    rows: list[CalibrationResultRow]
+    test_scan_left_path: str
+    test_scan_right_path: str
+    started_timestamp: str
+    mode: str = "test"
+
+
 # ---------------------------------------------------------------------------
 # Pure compute helpers — no hardware, no UART. Tested in
 # tests/test_calibration_workflow_compute.py.
@@ -589,6 +611,7 @@ def write_result_json(
     calibration: Optional[Calibration],
     scan_paths: dict,
     interface,
+    mode: str = "calibrate",
 ) -> None:
     """Write a self-describing JSON manifest of the calibration run.
 
@@ -612,6 +635,7 @@ def write_result_json(
 
     manifest = {
         "schema_version": _JSON_SCHEMA_VERSION,
+        "mode": mode,
         "started_timestamp": started_timestamp,
         "started_iso": started_iso,
         "passed": passed,
