@@ -11,15 +11,25 @@ Run from the openmotion-sdk directory:
 """
 from __future__ import annotations
 
+import argparse
+import csv
 import logging
 import threading
 import time
+from pathlib import Path
 
 from omotion.ConsoleTelemetry import PdcSample
 from omotion.MotionInterface import MotionInterface
+from omotion.ScanWorkflow import _TELEMETRY_HEADERS, _pdc_row
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--duration", type=float, default=5.0)
+    parser.add_argument("--csv", type=Path, default=None,
+                        help="Write samples to this telemetry CSV using ScanWorkflow's _pdc_row.")
+    args = parser.parse_args()
+
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     log = logging.getLogger("test_per_frame_pdc")
 
@@ -59,13 +69,27 @@ def main() -> int:
     })
     iface.console.start_trigger()
 
-    duration_s = 5.0
+    duration_s = args.duration
     log.info("Collecting for %.1f s…", duration_s)
     time.sleep(duration_s)
 
     log.info("Stopping trigger…")
     iface.console.stop_trigger()
     iface.console.telemetry.remove_pdc_listener(on_pdc)
+
+    # Optionally write a telemetry CSV using the same _pdc_row builder
+    # that ScanWorkflow uses. Slow columns are carry-forwarded from the
+    # poller's snapshot at the moment each PdcSample was received.
+    if args.csv is not None:
+        with samples_lock:
+            snap_for_csv = list(samples)
+        args.csv.parent.mkdir(parents=True, exist_ok=True)
+        with open(args.csv, "w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh)
+            w.writerow(_TELEMETRY_HEADERS)
+            for s in snap_for_csv:
+                w.writerow(_pdc_row(s, iface.console.telemetry.get_snapshot()))
+        log.info("Wrote %d rows to %s", len(snap_for_csv), args.csv)
 
     # Stats
     with samples_lock:
