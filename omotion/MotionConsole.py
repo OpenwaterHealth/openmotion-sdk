@@ -48,6 +48,7 @@ from omotion.config import (
     OW_CTRL_GET_FSYNC,
     OW_CTRL_GET_IND,
     OW_CTRL_GET_LSYNC,
+    OW_CTRL_GET_PDC_BUFFER,
     OW_CTRL_GET_TEMPS,
     OW_CTRL_GET_TRIG,
     OW_CTRL_I2C_RD,
@@ -1692,6 +1693,54 @@ class MotionConsole(SignalWrapper):
         except Exception as e:
             self._log_command_error("read_board_id", e)
             raise  # Re-raise the exception for the caller to handle
+
+    def get_pdc_buffer(self, max_samples: int = 64) -> tuple[int, list[tuple[int, int, int]]]:
+        """Drain up to ``max_samples`` per-frame PDC samples from the console firmware.
+
+        Returns ``(dropped_count_delta, samples)`` where ``samples`` is a list of
+        ``(frame_idx, pdc_raw, flags)`` tuples in FIFO order.  Flags bit 0 = dark_slot.
+        Returns ``(0, [])`` on transport error.
+        """
+        if max_samples < 1 or max_samples > 64:
+            raise ValueError(f"max_samples must be in [1,64], got {max_samples}")
+
+        try:
+            r = self.uart.send_packet(
+                id=None,
+                packetType=OW_CONTROLLER,
+                command=OW_CTRL_GET_PDC_BUFFER,
+                data=bytes([max_samples]),
+            )
+            self.uart.clear_buffer()
+
+            if r.packet_type == OW_ERROR:
+                logger.warning("get_pdc_buffer: console returned OW_ERROR")
+                return 0, []
+
+            if not r.data or r.data_len < 3:
+                return 0, []
+
+            dropped = int.from_bytes(r.data[0:2], "little")
+            count = r.data[2]
+            expected_len = 3 + count * 7
+            if r.data_len < expected_len:
+                logger.warning(
+                    "get_pdc_buffer: short response (got %d bytes, expected %d for count=%d)",
+                    r.data_len, expected_len, count,
+                )
+                return dropped, []
+
+            samples: list[tuple[int, int, int]] = []
+            for i in range(count):
+                offset = 3 + i * 7
+                frame_idx = int.from_bytes(r.data[offset:offset+4], "little")
+                pdc_raw = int.from_bytes(r.data[offset+4:offset+6], "little")
+                flags = r.data[offset+6]
+                samples.append((frame_idx, pdc_raw, flags))
+            return dropped, samples
+        except Exception as e:
+            logger.debug("get_pdc_buffer transport error: %s", e)
+            return 0, []
 
     def read_pdu_mon(self) -> Optional[PDUMon]:
         """
