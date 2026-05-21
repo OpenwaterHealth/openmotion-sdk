@@ -268,3 +268,132 @@ stream as a diagnostic channel:
 4. **Defer** to the optomechanical team on per-device PDC variance.
    Henry's polarization investigation + a unit teardown are the
    next steps, not a SW change.
+
+---
+
+## Appendix A — 2026-05-21 hardware verification of the per-frame PDC stream
+
+After the investigation closed, the per-frame PDC plumbing was finished
+and brought up on hardware. This appendix documents what we now know
+about the stream's behaviour end-to-end. It does **not** change any of
+the decisions above — it just substantiates point 3 (PDC kept as a
+diagnostic) with measured data.
+
+### Pipeline summary as deployed
+
+- **Console FW** samples the safety FPGA's `peak_power_value`
+  (mux 1 ch 7 addr 0x41 reg 0x1C, 2 B LE × 1.9 mA/LSB) once per camera
+  frame in `LSYNC_DelayElapsedCallback` (CC1 / rising edge of the laser
+  pulse). Frame index and `dark_slot` are tagged in-ISR and enqueued to
+  a 32-slot SPSC ring; the main loop's `pdc_poll_tick` waits ~2 ms for
+  the FPGA's averaging window and pushes a `pdc_sample_t` (7 bytes
+  packed) into a 256-entry SRAM ring buffer.
+- **SDK** drains the ring buffer at 10 Hz via the new
+  `OW_CTRL_GET_PDC_BUFFER` opcode (`0x25`) inside
+  `ConsoleTelemetryPoller._tick_once`. Samples fire through
+  `add_pdc_listener(PdcSample)`. The slow telemetry refresh continues
+  at 1 Hz on every 10th tick; the dedicated PDC I²C read in the slow
+  path was removed (`snap.pdc` is now sourced from the most recent
+  `PdcSample`).
+- **`ScanWorkflow`** writes one telemetry-CSV row per drained
+  `PdcSample` — 40 Hz steady state — with slow columns carry-forwarded
+  from the last `ConsoleTelemetry` snapshot. New appended columns:
+  `frame_idx, dark_slot, pdc_flags, pdc_dropped_delta, slow_age_ms`.
+
+### Verification scan — 600 s on bench
+
+`scripts/test_pdc_vs_mean.py --duration 600 --subject pdc_10min`
+
+Both sensors connected, masks `0xFF`/`0xFF`. Console firmware at
+``feature/per-frame-pdc`` (commit `b9f4d50`); SDK on the same branch.
+
+**Stream health:**
+
+| Metric | Value |
+|---|---|
+| PDC samples received | 24 005 (~ 40.0 Hz over 600 s) |
+| Firmware-side drops (`pdc_dropped_delta` sum) | 0 |
+| `frame_idx` monotonic gaps | 0 |
+| `frame_idx` backsteps | 0 |
+| `dark_slot` agreement with science pipeline (post-warmup) | 100 % |
+
+The dark-slot off-by-one flagged in the spec is fixed (`dark_slot`
+locally computed from `lsync_counter` in the LSYNC ISR — see
+`Core/Src/trigger.c` in the FW change). Periodic darks now land on
+`frame_idx ∈ {10, 601, 1201, …}`, matching the science pipeline's
+predicted dark-frame schedule exactly. Warmup-window mismatches at
+`frame_idx ∈ [1, discard_count]` are cosmetic: the FW marks them dark
+because the laser physically fires in long-slot during warmup, but the
+science pipeline discards those frames regardless.
+
+### Pearson r — per-frame PDC vs pedestal-subtracted image mean
+
+Image mean from `on_uncorrected_fn` `Sample.mean` (= `max(0, μ₁ − 64)`).
+PDC interpolated onto each camera's mean timestamps. n ≈ 24 000 unless
+noted.
+
+| Side | min r | median r | max r |
+|---|---|---|---|
+| Left  (8 cams) | 0.864 | 0.892 | 0.899 |
+| Right (8 cams) | 0.738 | 0.823 | 0.841 |
+
+Full table in `2026-05-21_10min_corr.csv`. Plots:
+
+- `2026-05-21_10min_timeseries.png` — top: PDC over 600 s. Bottom: all
+  16 image-mean traces. The PDC has a clear ~30–60 s oscillation
+  (drive-loop / TEC cycling) plus a slow downward drift across the
+  scan; the image-mean traces visibly lock to the same oscillation.
+- `2026-05-21_10min_scatter.png` — 4×4 grid of PDC-vs-mean scatter,
+  one panel per (side, cam_id), with r and n annotated.
+
+### How to reconcile this with the polarization-split mechanism
+
+The strong PDC ↔ mean correlation observed here does **not**
+contradict the investigation's central finding. There are two
+mechanisms that move PDC and fiber-output power, and they operate on
+different time scales:
+
+1. **Total-output variation** (TA seed-current, temperature) moves PDC
+   and fiber output **in the same direction.** This dominates fast
+   variation within a scan — the ~30–60 s oscillation seen in the
+   time-series plot is this mode. The 0.74–0.90 Pearson r we measure
+   is essentially this single-mode coupling.
+
+2. **Polarization-split variation** moves PDC and fiber output in
+   **opposite directions.** From the PDC Investigation deck (slide 15)
+   this manifests on a much slower time scale (~minutes to hours of TA
+   thermal soak) and shows up as anti-correlated oscillations between
+   the in-package PD and an external energy meter over a 1000 s window.
+
+A 10-minute scan on a single bench unit doesn't span enough TA-thermal
+drift to make mechanism (2) dominate, and we have no external energy
+meter to separate the two components from PDC alone. So **the high r
+here measures mechanism (1), not mechanism (1) ⊕ (2).** It does not
+license amplitude scaling — under polarization drift the residual
+between PDC and true fiber output is still arbitrary and a `pdc_ref /
+pdc_frame` correction can still actively worsen the result.
+
+What this measurement *does* establish: when polarization is stable
+(or drift is small relative to total-output variation, as in
+controlled bench conditions), PDC closely tracks the laser intensity
+illuminating the camera. That is exactly the regime where PDC is
+useful as a **laser-health diagnostic**: a sudden change in PDC almost
+certainly reflects a real intensity change worth investigating, not
+just a polarization-mode reshuffle.
+
+### Where this leaves the per-frame PDC stream
+
+The stream is operational and reliable. It is now safe to:
+
+- Persist `pdc_mA`, `dark_slot`, `frame_idx`, and the drop counter to
+  the telemetry CSV (already done on `feature/per-frame-pdc`) and to
+  the SQLite session sink whenever that gets enabled.
+- Surface live PDC in the engineering test app for laser-health
+  surveillance (sudden drop, plateau, mid-scan steps) — see the
+  bullets under "What per-frame PDC is still good for" above.
+- Use the stream as the input signal for any **anomaly-detection**
+  feature (e.g., flag scans where PDC drifts more than X mA from its
+  warmup steady state). Anomaly detection ≠ correction; this is fine.
+
+The stream is still **not** safe to feed into the BFI/BVI math. The
+investigation's decision #3 stands.
