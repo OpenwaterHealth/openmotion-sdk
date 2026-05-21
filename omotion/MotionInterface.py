@@ -308,9 +308,23 @@ class MotionInterface:
     def start_calibration(self, request, **kwargs) -> bool:
         return self.calibration_workflow.start_calibration(request, **kwargs)
 
+    def start_test_scan(self, request, **kw):
+        """Facade passthrough for CalibrationWorkflow.start_test_scan.
+        See that method for parameter and return-value documentation."""
+        return self.calibration_workflow.start_test_scan(request, **kw)
+
     def cancel_calibration(self, **kwargs) -> None:
         if self._calibration_workflow is not None:
             self._calibration_workflow.cancel_calibration(**kwargs)
+
+    def cancel_test_scan(self, *, join_timeout: float = 10.0) -> None:
+        """Cancel an in-progress test scan. Delegates to
+        ``cancel_calibration`` because both flows share the same
+        worker thread + stop-event on CalibrationWorkflow."""
+        if self._calibration_workflow is not None:
+            self._calibration_workflow.cancel_calibration(
+                join_timeout=join_timeout,
+            )
 
     def get_single_histogram(
         self,
