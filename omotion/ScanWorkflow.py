@@ -49,27 +49,6 @@ _TELEMETRY_HEADERS: list[str] = [
 ]
 
 
-def _snap_to_row(snap) -> list:
-    """Convert a ConsoleTelemetry snapshot to a flat CSV row."""
-    row: list = [
-        snap.timestamp,
-        snap.tcm, snap.tcl, snap.pdc,
-        snap.tec_v_raw, snap.tec_set_raw, snap.tec_curr_raw, snap.tec_volt_raw,
-        int(snap.tec_good),
-    ]
-    pdu_raws = snap.pdu_raws or []
-    pdu_volts = snap.pdu_volts or []
-    for i in range(16):
-        row.append(pdu_raws[i] if i < len(pdu_raws) else "")
-    for i in range(16):
-        row.append(pdu_volts[i] if i < len(pdu_volts) else "")
-    row.extend([
-        snap.safety_se, snap.safety_so, int(snap.safety_ok),
-        int(snap.read_ok), snap.error or "",
-    ])
-    return row
-
-
 def _pdc_row(sample, snap) -> list:
     """Build one telemetry-CSV row keyed by a PdcSample.
 
@@ -426,20 +405,21 @@ class ScanWorkflow:
                         _telem_csv.writerow(_TELEMETRY_HEADERS)
                         _telem_fh.flush()
 
-                        def _on_telemetry(snap):
+                        def _on_pdc(sample):
                             if _telem_stop.is_set():
                                 return
                             with _telem_lock:
                                 if _telem_stop.is_set():
                                     return
                                 try:
-                                    _telem_csv.writerow(_snap_to_row(snap))
+                                    snap = _telem_poller.get_snapshot()
+                                    _telem_csv.writerow(_pdc_row(sample, snap))
                                     _telem_fh.flush()
                                 except Exception as _te:
                                     logger.debug("Telemetry CSV write error: %s", _te)
 
-                        _telem_listener = _on_telemetry
-                        _telem_poller.add_listener(_telem_listener)
+                        _telem_listener = _on_pdc
+                        _telem_poller.add_pdc_listener(_telem_listener)
                     except Exception as _telem_err:
                         _emit_log(f"Failed to open telemetry CSV: {_telem_err}")
                         telemetry_path = ""
@@ -938,7 +918,7 @@ class ScanWorkflow:
                     pass  # acquire+release: ensures any in-flight write has exited
                 if _telem_poller is not None and _telem_listener is not None:
                     try:
-                        _telem_poller.remove_listener(_telem_listener)
+                        _telem_poller.remove_pdc_listener(_telem_listener)
                     except Exception:
                         pass
                 if _telem_fh is not None:
