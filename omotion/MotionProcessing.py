@@ -1002,6 +1002,7 @@ class SciencePipeline:
         bfi_i_max,
         on_uncorrected_fn: Callable[[Sample], None] | None = None,
         on_corrected_batch_fn: Callable[[CorrectedBatch], None] | None = None,
+        on_realtime_corrected_fn: Callable[[Sample], None] | None = None,
         on_dark_frame_fn: Callable[[Sample], None] | None = None,
         on_rolling_avg_fn: Callable[[Sample], None] | None = None,
         rolling_avg_enabled: bool = False,
@@ -1012,6 +1013,7 @@ class SciencePipeline:
         noise_floor: int = 10,
         log_dark_endpoints: bool = False,
         dark_integrity_max_u1_above_pedestal: float = 30.0,
+        realtime_dark_history_size: int = 4,
     ):
         self._bfi_c_min = bfi_c_min
         self._bfi_c_max = bfi_c_max
@@ -1019,6 +1021,7 @@ class SciencePipeline:
         self._bfi_i_max = bfi_i_max
         self._on_uncorrected_fn = on_uncorrected_fn
         self._on_corrected_batch_fn = on_corrected_batch_fn
+        self._on_realtime_corrected_fn = on_realtime_corrected_fn
         self._on_dark_frame_fn = on_dark_frame_fn
         self._on_rolling_avg_fn = on_rolling_avg_fn
         self._rolling_avg_enabled = bool(rolling_avg_enabled)
@@ -1066,6 +1069,17 @@ class SciencePipeline:
         # Stores the two most recent corrected samples per camera so that the
         # quadratic 4-point stencil can be applied at each dark frame position.
         self._last_corrected: dict[tuple[str, int], list[Sample]] = {}
+
+        # Real-time dark-correction state (see
+        # ``data-processing/dark-drift-study/online_estimators.md``).  Per
+        # (side, cam_id), a ring buffer of the most recent dark observations
+        # as ``(timestamp_s, u1, std)`` tuples.  Independent of the batched
+        # ``_dark_history`` above so the real-time path can evolve without
+        # disturbing the existing batched correction.
+        self._realtime_dark_history_size = int(realtime_dark_history_size)
+        self._realtime_dark_history: dict[
+            tuple[str, int], "deque[tuple[float, float, float]]"
+        ] = {}
 
         self._ingress_queue: queue.Queue = queue.Queue()
         self._stop_event = threading.Event()
@@ -1252,6 +1266,18 @@ class SciencePipeline:
                     absolute_frame, side, cam_id, len(dark_list),
                     u1, variance,
                 )
+
+                # Real-time predictor history — see online_estimators.md.
+                # u1 is averaged across the last 3 entries; std is the
+                # slope endpoint for linear extrapolation. We store std
+                # (not variance) so the extrapolation tracks the smooth
+                # std curve directly; the corrected arithmetic squares
+                # it back to variance at use time.
+                rt_hist = self._realtime_dark_history.get(key)
+                if rt_hist is None:
+                    rt_hist = deque(maxlen=self._realtime_dark_history_size)
+                    self._realtime_dark_history[key] = rt_hist
+                rt_hist.append((ts, u1, float(np.sqrt(variance))))
                 # Sanity-check: did this frame *actually* look like a
                 # dark? If not, the schedule and the firmware disagree
                 # and we want to know about it.
@@ -1330,6 +1356,22 @@ class SciencePipeline:
                     pass
 
             self._last_uncorrected[key] = uncorrected
+
+            # Real-time dark correction (issue: data-pipeline-tweaks).
+            # Fires per light frame, immediately, once the predictor's
+            # warmup is satisfied. Independent of the batched-interpolation
+            # path that feeds the saved CSV / session_data.
+            if self._on_realtime_corrected_fn is not None:
+                self._emit_realtime_corrected(
+                    key=key,
+                    raw_frame_id=raw_frame_id,
+                    absolute_frame=absolute_frame,
+                    ts=ts,
+                    u1=u1,
+                    u2=u2,
+                    row_sum=row_sum,
+                    temp=temp,
+                )
 
             # --- 7. Rolling-average over the last N uncorrected light samples ---
             # Placed in the light branch only, so dark-frame repeat samples
@@ -1432,6 +1474,95 @@ class SciencePipeline:
                 terminal.u1,
             )
             self._emit_corrected_for_camera(key)
+
+    def _emit_realtime_corrected(
+        self,
+        *,
+        key: tuple[str, int],
+        raw_frame_id: int,
+        absolute_frame: int,
+        ts: float,
+        u1: float,
+        u2: float,
+        row_sum: int,
+        temp: float,
+    ) -> None:
+        """Per light frame: predict dark u1 + std from the realtime history,
+        apply the same dark-subtraction + shot-noise + bfi/bvi calibration
+        the batched path uses, and emit one corrected ``Sample`` immediately.
+
+        Strategies are intentionally simple and validated in
+        ``data-processing/dark-drift-study/online_estimators.md``:
+
+          * u1   — mean of the last 3 darks (warmup uses fewer if needed).
+          * std  — linear extrapolation in time through the last 2 darks.
+
+        Returns silently when the predictor hasn't warmed up (need ≥ 2
+        darks for the std slope). During that window the caller keeps
+        seeing uncorrected samples via ``on_uncorrected_fn`` — same as
+        before this code path existed.
+        """
+        history = self._realtime_dark_history.get(key)
+        if history is None or len(history) < 2:
+            return  # warmup — need at least 2 darks for the std slope
+
+        # Predicted dark u1: average of the last 3 observed darks
+        # (truncated to whatever's available; len(history) is already ≥ 2).
+        u1_window = list(history)[-3:]
+        pred_dark_u1 = sum(p[1] for p in u1_window) / len(u1_window)
+
+        # Predicted dark std: extend the line through the last 2 (t, std).
+        a_t, _, a_std = history[-2]
+        b_t, _, b_std = history[-1]
+        dt = b_t - a_t
+        if dt <= 0:
+            pred_dark_std = b_std
+        else:
+            slope = (b_std - a_std) / dt
+            pred_dark_std = b_std + slope * (ts - b_t)
+
+        # Apply the same arithmetic the batched path uses in
+        # ``_emit_corrected_for_camera``. Predicted variance is just
+        # std² — the linear extrapolation operates on std because std
+        # is the smooth quantity over a dark interval.
+        pred_dark_var = max(0.0, pred_dark_std * pred_dark_std)
+        corrected_mean = u1 - pred_dark_u1
+        raw_var = u2 - u1 * u1
+        corrected_var = raw_var - pred_dark_var
+
+        # Shot-noise correction — same expression as the batched path.
+        cam_pos = int(key[1]) % 8
+        shot_noise_var = (
+            ADC_GAIN * max(0.0, corrected_mean) * CAMERA_GAIN_MAP[cam_pos]
+        )
+        corrected_var -= shot_noise_var
+
+        corrected_std = float(np.sqrt(max(0.0, corrected_var)))
+        corrected_contrast = (
+            corrected_std / corrected_mean if corrected_mean > 0 else 0.0
+        )
+        bfi, bvi = self._calibrate_bfi_bvi(
+            key[0], key[1], corrected_contrast, corrected_mean,
+        )
+        sample = Sample(
+            side=key[0],
+            cam_id=key[1],
+            frame_id=raw_frame_id,
+            absolute_frame_id=absolute_frame,
+            timestamp_s=ts,
+            row_sum=row_sum,
+            temperature_c=temp,
+            mean=float(corrected_mean),
+            std_dev=corrected_std,
+            contrast=float(corrected_contrast),
+            bfi=float(bfi),
+            bvi=float(bvi),
+            is_corrected=True,
+        )
+        try:
+            self._on_realtime_corrected_fn(sample)
+        except Exception:
+            logger.exception("Error in on_realtime_corrected_fn callback")
 
     def _is_dark_frame(self, absolute_frame: int) -> bool:
         """Return True if *absolute_frame* is a scheduled dark frame.
@@ -1650,6 +1781,7 @@ def create_science_pipeline(
     bfi_i_max,
     on_uncorrected_fn: Callable[[Sample], None] | None = None,
     on_corrected_batch_fn: Callable[[CorrectedBatch], None] | None = None,
+    on_realtime_corrected_fn: Callable[[Sample], None] | None = None,
     on_dark_frame_fn: Callable[[Sample], None] | None = None,
     on_rolling_avg_fn: Callable[[Sample], None] | None = None,
     rolling_avg_enabled: bool = False,
@@ -1660,6 +1792,7 @@ def create_science_pipeline(
     noise_floor: int = 10,
     log_dark_endpoints: bool = False,
     dark_integrity_max_u1_above_pedestal: float = 30.0,
+    realtime_dark_history_size: int = 4,
 ) -> SciencePipeline:
     """
     Factory for a ready-to-run unified science pipeline.
@@ -1671,6 +1804,21 @@ def create_science_pipeline(
     on_corrected_batch_fn
         Fires once per dark-frame interval with a ``CorrectedBatch``
         containing dark-frame-corrected samples for the entire interval.
+    on_realtime_corrected_fn
+        Fires per non-dark frame, immediately, once the real-time dark
+        predictor has warmed up (≥2 darks observed for that camera).
+        Receives a ``Sample`` with ``is_corrected=True`` whose dark
+        subtraction was applied using predicted darks (avg-last-3 for
+        u1, linear-extrapolation-of-last-2 for std) instead of the
+        observed-and-interpolated darks used by the batched path. See
+        ``data-processing/dark-drift-study/online_estimators.md`` for
+        the estimator design and validation. Default None (no realtime
+        stream emitted).
+    realtime_dark_history_size
+        Ring-buffer depth for the per-camera dark history used by the
+        realtime predictor (default 4 — supports avg-of-last-3 plus one
+        extra slot for stability). Ignored when
+        ``on_realtime_corrected_fn`` is None.
     on_dark_frame_fn
         Fires once per scheduled dark frame with a ``Sample`` whose
         ``is_dark=True``.  ``mean`` is pedestal-subtracted using
@@ -1711,6 +1859,7 @@ def create_science_pipeline(
         bfi_i_max=bfi_i_max,
         on_uncorrected_fn=on_uncorrected_fn,
         on_corrected_batch_fn=on_corrected_batch_fn,
+        on_realtime_corrected_fn=on_realtime_corrected_fn,
         on_dark_frame_fn=on_dark_frame_fn,
         on_rolling_avg_fn=on_rolling_avg_fn,
         rolling_avg_enabled=rolling_avg_enabled,
@@ -1721,6 +1870,7 @@ def create_science_pipeline(
         noise_floor=noise_floor,
         log_dark_endpoints=log_dark_endpoints,
         dark_integrity_max_u1_above_pedestal=dark_integrity_max_u1_above_pedestal,
+        realtime_dark_history_size=realtime_dark_history_size,
     )
     pipeline.start()
     return pipeline
