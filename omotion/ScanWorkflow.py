@@ -44,6 +44,8 @@ _TELEMETRY_HEADERS: list[str] = [
     *[f"pdu_volt_{i}" for i in range(16)],
     "safety_se", "safety_so", "safety_ok",
     "read_ok", "error",
+    # New per-frame columns (appended for backwards compatibility).
+    "frame_idx", "dark_slot", "pdc_flags", "pdc_dropped_delta", "slow_age_ms",
 ]
 
 
@@ -64,6 +66,54 @@ def _snap_to_row(snap) -> list:
     row.extend([
         snap.safety_se, snap.safety_so, int(snap.safety_ok),
         int(snap.read_ok), snap.error or "",
+    ])
+    return row
+
+
+def _pdc_row(sample, snap) -> list:
+    """Build one telemetry-CSV row keyed by a PdcSample.
+
+    Slow columns come from the last ConsoleTelemetry snapshot (carry-forward).
+    Pass snap=None before the first slow refresh has landed — slow columns will
+    be empty strings.
+    """
+    row: list = [
+        sample.host_recv_timestamp,            # timestamp
+        sample.frame_idx,                      # tcm (== frame_idx for PDC-driven rows)
+    ]
+    if snap is not None:
+        row.append(snap.tcl)                   # tcl carry-forward
+    else:
+        row.append("")
+    row.append(sample.pdc_mA)                  # pdc — this row's per-frame value
+
+    if snap is not None:
+        row.extend([
+            snap.tec_v_raw, snap.tec_set_raw, snap.tec_curr_raw,
+            snap.tec_volt_raw, int(snap.tec_good),
+        ])
+        pdu_raws = snap.pdu_raws or []
+        pdu_volts = snap.pdu_volts or []
+        for i in range(16):
+            row.append(pdu_raws[i] if i < len(pdu_raws) else "")
+        for i in range(16):
+            row.append(pdu_volts[i] if i < len(pdu_volts) else "")
+        row.extend([
+            snap.safety_se, snap.safety_so, int(snap.safety_ok),
+            int(snap.read_ok), snap.error or "",
+        ])
+        slow_age_ms = round((sample.host_recv_timestamp - snap.timestamp) * 1000)
+    else:
+        # 5 TEC + 16 pdu_raw + 16 pdu_volt + 3 safety + 2 health = 42 blanks
+        row.extend([""] * 42)
+        slow_age_ms = ""
+
+    row.extend([
+        sample.frame_idx,                      # frame_idx (explicit duplicate of tcm)
+        1 if sample.dark_slot else 0,
+        1 if sample.dark_slot else 0,          # pdc_flags bit 0
+        sample.dropped_delta,
+        slow_age_ms,
     ])
     return row
 
