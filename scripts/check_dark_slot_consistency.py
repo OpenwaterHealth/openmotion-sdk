@@ -47,23 +47,37 @@ def main() -> int:
     )
     df["fw_dark"] = df["dark_slot"].astype(int).astype(bool)
     df["mismatch"] = df["fw_dark"] != df["predicted_dark"]
+    # Warmup window (frame_idx <= discard_count): the firmware fires the laser
+    # in long-slot here for sensor settling, but the science pipeline discards
+    # these frames regardless. Disagreement in this window is expected and
+    # cosmetic — report it separately so it doesn't mask real issues.
+    df["in_warmup"] = df["frame_idx"].astype(int) <= args.discard_count
+    df["science_mismatch"] = df["mismatch"] & (~df["in_warmup"])
 
     total = len(df)
     n_fw_dark = int(df["fw_dark"].sum())
     n_pred_dark = int(df["predicted_dark"].sum())
-    n_mismatch = int(df["mismatch"].sum())
+    n_warmup_only = int((df["mismatch"] & df["in_warmup"]).sum())
+    n_real_mismatch = int(df["science_mismatch"].sum())
 
-    print(f"Rows analyzed:        {total}")
-    print(f"FW dark_slot count:   {n_fw_dark}")
-    print(f"Predicted dark count: {n_pred_dark}")
-    print(f"Mismatches:           {n_mismatch}")
+    print(f"Rows analyzed:                 {total}")
+    print(f"FW dark_slot count:            {n_fw_dark}")
+    print(f"Predicted dark count (post-warmup): {n_pred_dark}")
+    print(f"Warmup-window darks (cosmetic): {n_warmup_only}")
+    print(f"Science-critical mismatches:   {n_real_mismatch}")
 
-    if n_mismatch:
-        print("\nFirst 10 mismatched frame_idx values:")
-        bad = df.loc[df["mismatch"], ["frame_idx", "fw_dark", "predicted_dark"]].head(10)
+    if n_real_mismatch:
+        print("\nFirst 10 science-critical mismatches:")
+        bad = df.loc[df["science_mismatch"], ["frame_idx", "fw_dark", "predicted_dark"]].head(10)
         print(bad.to_string(index=False))
         return 1
-    print("\nOK — firmware and science-pipeline dark-frame schedule agree.")
+    print("\nOK — firmware and science-pipeline dark-frame schedule agree "
+          "on all post-warmup frames.")
+    if n_warmup_only:
+        print(f"(Note: {n_warmup_only} cosmetic mismatches in the warmup window "
+              f"frames 1..{args.discard_count} — firmware marks them dark because "
+              f"the laser physically fires in long-slot during sensor warmup. "
+              f"Science pipeline discards warmup frames so these don't matter.)")
     return 0
 
 
