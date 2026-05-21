@@ -1495,31 +1495,42 @@ class SciencePipeline:
         ``data-processing/dark-drift-study/online_estimators.md``:
 
           * u1   — mean of the last 3 darks (warmup uses fewer if needed).
-          * std  — linear extrapolation in time through the last 2 darks.
+          * std  — linear extrapolation in time through the last 2 darks,
+            with a zero-order-hold fallback when only 1 dark has been
+            observed.
 
-        Returns silently when the predictor hasn't warmed up (need ≥ 2
-        darks for the std slope). During that window the caller keeps
-        seeing uncorrected samples via ``on_uncorrected_fn`` — same as
-        before this code path existed.
+        Returns silently when no darks have been observed yet (typically
+        only the first ~0.25 s of the scan, before the discard-window
+        boundary at frame 10). After the first dark, fires every non-
+        dark frame using zero-order-hold for both u1 and std; switches
+        to the full avg-3 / linear-extrap predictors once the second
+        dark arrives ~15 s later. This trades a small amount of
+        accuracy in the first interval for an essentially instant
+        live-corrected stream.
         """
         history = self._realtime_dark_history.get(key)
-        if history is None or len(history) < 2:
-            return  # warmup — need at least 2 darks for the std slope
+        if not history:
+            return  # warmup — need at least 1 dark to subtract anything
 
         # Predicted dark u1: average of the last 3 observed darks
-        # (truncated to whatever's available; len(history) is already ≥ 2).
+        # (truncated to whatever's available; with 1 dark this collapses
+        # to ZOH).
         u1_window = list(history)[-3:]
         pred_dark_u1 = sum(p[1] for p in u1_window) / len(u1_window)
 
-        # Predicted dark std: extend the line through the last 2 (t, std).
-        a_t, _, a_std = history[-2]
-        b_t, _, b_std = history[-1]
-        dt = b_t - a_t
-        if dt <= 0:
-            pred_dark_std = b_std
+        # Predicted dark std: extend the line through the last 2 (t, std)
+        # when we have them; ZOH from the single dark otherwise.
+        if len(history) >= 2:
+            a_t, _, a_std = history[-2]
+            b_t, _, b_std = history[-1]
+            dt = b_t - a_t
+            if dt <= 0:
+                pred_dark_std = b_std
+            else:
+                slope = (b_std - a_std) / dt
+                pred_dark_std = b_std + slope * (ts - b_t)
         else:
-            slope = (b_std - a_std) / dt
-            pred_dark_std = b_std + slope * (ts - b_t)
+            pred_dark_std = history[-1][2]
 
         # Apply the same arithmetic the batched path uses in
         # ``_emit_corrected_for_camera``. Predicted variance is just
@@ -1805,15 +1816,20 @@ def create_science_pipeline(
         Fires once per dark-frame interval with a ``CorrectedBatch``
         containing dark-frame-corrected samples for the entire interval.
     on_realtime_corrected_fn
-        Fires per non-dark frame, immediately, once the real-time dark
-        predictor has warmed up (≥2 darks observed for that camera).
-        Receives a ``Sample`` with ``is_corrected=True`` whose dark
-        subtraction was applied using predicted darks (avg-last-3 for
-        u1, linear-extrapolation-of-last-2 for std) instead of the
-        observed-and-interpolated darks used by the batched path. See
-        ``data-processing/dark-drift-study/online_estimators.md`` for
-        the estimator design and validation. Default None (no realtime
-        stream emitted).
+        Fires per non-dark frame, immediately, once the first dark for
+        that camera has been observed (typically by frame 11, ~0.25 s
+        into the scan). Receives a ``Sample`` with ``is_corrected=True``
+        whose dark subtraction was applied using predicted darks
+        instead of the observed-and-interpolated darks used by the
+        batched path:
+
+          * With 1 dark observed: ZOH for both u1 and std.
+          * With ≥ 2 darks: avg-of-last-3 for u1, linear extrapolation
+            in time of the last 2 for std.
+
+        See ``data-processing/dark-drift-study/online_estimators.md``
+        for the estimator design and validation. Default None (no
+        realtime stream emitted).
     realtime_dark_history_size
         Ring-buffer depth for the per-camera dark history used by the
         realtime predictor (default 4 — supports avg-of-last-3 plus one
