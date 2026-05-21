@@ -239,6 +239,11 @@ class ScanWorkflow:
         on_trigger_state_fn: Callable[[str], None] | None = None,
         on_uncorrected_fn: Callable[[object], None] | None = None,
         on_corrected_batch_fn: Callable[[object], None] | None = None,
+        # Real-time dark-corrected stream (data-pipeline-tweaks). Fires
+        # per non-dark frame once the predictor has warmed up (~15 s in).
+        # Forwarded straight to ``create_science_pipeline``; pass None
+        # to keep today's behavior.
+        on_realtime_corrected_fn: Callable[[object], None] | None = None,
         # Hooks for the ScanDBSink (issue #92). The workflow itself stays
         # DB-unaware — it just fires these callbacks if supplied.
         on_raw_frame_fn: Callable[..., None] | None = None,
@@ -572,6 +577,7 @@ class ScanWorkflow:
                         bfi_i_max=self._calibration.i_max,
                         on_uncorrected_fn=_on_uncorrected_sample,
                         on_corrected_batch_fn=_on_corrected_batch,
+                        on_realtime_corrected_fn=on_realtime_corrected_fn,
                         on_dark_frame_fn=on_dark_frame_fn,
                         on_rolling_avg_fn=on_rolling_avg_fn,
                         rolling_avg_enabled=request.rolling_avg_enabled,
