@@ -436,8 +436,8 @@ class ConsoleTelemetryPoller:
             )
 
     def _read_analog(self, snap: ConsoleTelemetry) -> None:
-        # get_lsync_pulsecount swallows transient errors and returns None;
-        # default to 0 so a single bad poll doesn't raise TypeError.
+        """Refresh slow analog telemetry: lsync, tcl. PDC is now derived from
+        the most recent PdcSample drained from the firmware ring buffer."""
         lsync = self._console.get_lsync_pulsecount()
         snap.tcm = int(lsync) if lsync is not None else 0
 
@@ -448,26 +448,14 @@ class ConsoleTelemetryPoller:
             reg_addr=_TCL_REG,
             read_len=_TCL_LEN,
         )
-        pdc_raw, _ = self._console.read_i2c_packet(
-            mux_index=_MUX_IDX,
-            channel=_PDC_CHANNEL,
-            device_addr=_I2C_ADDR,
-            reg_addr=_PDC_REG,
-            read_len=_PDC_LEN,
-        )
-
-        # These I2C channels may not be populated in all hardware configurations.
-        # Leave tcl/pdc at their zero defaults and log at DEBUG — the UART layer
-        # already logged the underlying fault at a higher level.
         if not tcl_raw:
             logger.debug("Analog I2C tcl read (channel %d) returned no data", _TCL_CHANNEL)
         else:
             snap.tcl = int.from_bytes(tcl_raw[:_TCL_LEN], byteorder="little")
 
-        if not pdc_raw:
-            logger.debug("Analog I2C pdc read (channel %d) returned no data", _PDC_CHANNEL)
-        else:
-            snap.pdc = int.from_bytes(pdc_raw[:_PDC_LEN], byteorder="little") * _PDC_MA_PER_LSB
+        # pdc is now sourced from the high-rate PdcSample stream
+        last_pdc = self._last_pdc
+        snap.pdc = last_pdc.pdc_mA if last_pdc is not None else 0.0
 
     # ------------------------------------------------------------------
 

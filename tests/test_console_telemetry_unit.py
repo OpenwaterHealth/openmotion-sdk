@@ -135,3 +135,33 @@ def test_poller_attaches_dropped_delta_to_first_sample_only():
     poller._tick_once()
     assert received[0].dropped_delta == 7
     assert received[1].dropped_delta == 0
+
+
+def test_refresh_slow_does_not_issue_pdc_i2c_read():
+    """The dedicated PDC read in _read_analog must be gone; pdc comes from _last_pdc."""
+    console = _FakeConsoleForDrain([(0, [(99, 50, 0x00)])])
+    # Track I2C reads issued during slow refresh
+    real_read = console.read_i2c_packet
+    seen_regs: list[tuple] = []
+    def spy(mux_index, channel, device_addr, reg_addr, read_len):
+        seen_regs.append((mux_index, channel, device_addr, reg_addr, read_len))
+        return real_read(mux_index, channel, device_addr, reg_addr, read_len)
+    console.read_i2c_packet = spy
+
+    poller = ConsoleTelemetryPoller(console)
+    poller._tick_once()      # drains PDC, runs slow refresh (slow_phase starts at 0)
+
+    # Reg 0x1C (PDC) must NOT appear in the I2C reads during slow refresh.
+    assert (1, 7, 0x41, 0x1C, 2) not in seen_regs
+    # The snapshot's pdc field should be derived from the drained PdcSample.
+    snap = poller.get_snapshot()
+    assert snap is not None
+    assert snap.pdc == 50 * 1.9
+
+
+def test_snap_pdc_zero_before_any_drain():
+    console = _FakeConsoleForDrain([(0, [])])
+    poller = ConsoleTelemetryPoller(console)
+    poller._tick_once()
+    snap = poller.get_snapshot()
+    assert snap.pdc == 0.0
