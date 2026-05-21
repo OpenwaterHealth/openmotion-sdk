@@ -48,15 +48,16 @@ OW_CTRL_GET_PDC_BUFFER = 0x25,   /* next free slot after OW_CTRL_PDUMON = 0x24 *
 typedef struct __attribute__((packed)) {
     uint32_t frame_idx;   /* value of lsync_counter at the I2C read */
     uint16_t pdc_raw;     /* raw 16-bit safety FPGA reg 0x1C/0x1D */
-    uint8_t  flags;       /* bit 0 = long_slot (dark-frame timing) */
+    uint8_t  flags;       /* bit 0 = dark_slot (LASER_TIMER long-slot timing —
+                             pulse fired outside camera exposure) */
 } pdc_sample_t;
 ```
 
 **Ring buffer in `Core/Src/trigger.c` (or a new `pdc_buffer.c`):**
 
 - 256 entries, drop-oldest on overflow, monotonic `dropped_count` counter.
-- **Slot-tracking flag:** add a small `static volatile bool current_slot_is_long;` updated inside `FSYNC_PeriodElapsedCallback` at the same point the long/short ARR/CCR1 are loaded (`trigger.c:348-356`). This captures the slot type of the laser pulse that is about to fire and is read by the PDC sample handler.
-- **Producer ISR:** hook `LASER_TIMER`'s period-elapsed (`TIM_UPDATE`) callback — which fires on the **laser-pulse falling edge** — set a `pdc_sample_pending` flag and stash the current `lsync_counter` plus `current_slot_is_long`. (The existing `LSYNC_DelayElapsedCallback` fires on the *rising* edge, too early to read peak_power_value; we add a new callback for TIM_UPDATE on LASER_TIMER, leaving the rising-edge callback unchanged.)
+- **Slot-tracking flag:** add a small `static volatile bool current_slot_is_dark;` updated inside `FSYNC_PeriodElapsedCallback` at the same point the long/short ARR/CCR1 are loaded (`trigger.c:348-356`). `true` when the long-slot branch is taken (the upcoming pulse is a dark-frame pulse), `false` otherwise. Captures the slot type of the laser pulse that is about to fire; read by the PDC sample handler.
+- **Producer ISR:** hook `LASER_TIMER`'s period-elapsed (`TIM_UPDATE`) callback — which fires on the **laser-pulse falling edge** — set a `pdc_sample_pending` flag and stash the current `lsync_counter` plus `current_slot_is_dark`. (The existing `LSYNC_DelayElapsedCallback` fires on the *rising* edge, too early to read peak_power_value; we add a new callback for TIM_UPDATE on LASER_TIMER, leaving the rising-edge callback unchanged.)
 - **Main-loop task:** consumes the flag, waits ~1 ms for the FPGA's averaging window to settle, performs the I2C read of `0x41` reg `0x1C` for 2 bytes via the existing TCA9548 mux path, and pushes the tuple.
 - **Consumer:** handler for `OW_CTRL_GET_PDC_BUFFER`. Payload-in: `uint8 max_samples` (clamp to 64). Payload-out: `uint16 dropped_count_delta` + `uint8 sample_count` + `sample_count × 7-byte tuples`. `dropped_count_delta` is the count of drops since the previous drain (zero on first drain after boot).
 - All buffer mutations under a critical section (one short `__disable_irq()` window per push/pop).
@@ -76,8 +77,11 @@ typedef struct __attribute__((packed)) {
 class PdcSample:
     frame_idx: int        # console MCU lsync_counter at FW I2C read time
     pdc_mA: float         # raw_u16 * 1.9
-    long_slot: bool       # flags bit 0: True = laser pulse fired in the long-slot
-                          # (dark-frame timing — pulse outside camera exposure window)
+    dark_slot: bool       # flags bit 0: True = laser pulse fired in the long-slot
+                          # (dark-frame timing — pulse outside camera exposure window).
+                          # Matches the science pipeline's "dark frame" concept;
+                          # cross-checks against the histogram dark-frame schedule
+                          # in MotionProcessing.SciencePipeline.
     host_recv_timestamp: float  # time.time() when SDK received the drain response
     dropped_delta: int    # firmware-reported drops since last drain (attached to first sample of a drain batch; 0 otherwise)
 ```
@@ -117,7 +121,7 @@ tec_v_raw, tec_set_raw, tec_curr_raw, tec_volt_raw, tec_good,
 pdu_raw_0..15, pdu_volt_0..15,
 safety_se, safety_so, safety_ok,
 read_ok, error,
-frame_idx, pdc_flags, pdc_dropped_delta, slow_age_ms
+frame_idx, dark_slot, pdc_flags, pdc_dropped_delta, slow_age_ms
 ```
 
 Column notes:
@@ -129,7 +133,8 @@ Column notes:
 - TEC, PDU, safety — last known values from the slow snapshot (carry-forward). Empty string before the first slow tick lands.
 - `read_ok`, `error` — last known from the slow snapshot.
 - `frame_idx` — new column, same value as `tcm` (kept separate so the per-frame ID is unambiguously named for new consumers).
-- `pdc_flags` — int, bit 0 = `long_slot` (1 = dark-frame timing, laser pulse outside camera exposure; 0 = bright-frame timing, laser pulse inside camera exposure).
+- `dark_slot` — **the analyst-friendly dark-frame label.** `1` for rows whose laser pulse fired in the long-slot (dark-frame timing, pulse outside camera exposure); `0` otherwise. Bool int (0/1) so it survives CSV round-trip cleanly. This is the column to filter on for "give me only bright frames" or "give me only dark frames" — no bit shifting required. The bit also lives in `pdc_flags` for forward compatibility.
+- `pdc_flags` — int, bit 0 = `dark_slot` (same meaning as the dedicated column). Reserved for future per-frame status bits.
 - `pdc_dropped_delta` — firmware-reported drops since last drain. Non-zero only on the first row of a batch that follows a backlog.
 - `slow_age_ms` — milliseconds since the last successful slow refresh.
 
@@ -192,6 +197,15 @@ ScanWorkflow
 - Unit: drive the poller from a mocked console; verify 10 Hz drain cadence and 1 Hz slow re-read cadence, that `add_pdc_listener` fires once per parsed sample, and that `add_listener` fires once per second.
 - Unit: confirm `_read_analog` no longer issues the dedicated PDC I2C call (one fewer `read_i2c_packet` invocation per snapshot).
 - Hardware integration: 60-second scan, verify telemetry CSV row count ≈ 2400, monotonic `frame_idx`, slow columns populated from row 1 (or empty on first row when slow tick has not yet landed), `pdc_dropped_delta == 0` in steady state, `slow_age_ms` < 1200 for every row after row 40.
+
+## Two sources of dark-frame truth
+
+After this change, the dark-frame status of any given frame is observable through **two independent signals**, and they should agree:
+
+1. **`dark_slot` column in the per-frame telemetry CSV** — written from the console MCU's knowledge of which LASER_TIMER slot was loaded for this pulse (firmware truth, captured before the science pipeline sees anything).
+2. **Dark-frame schedule derived by `SciencePipeline`** (`omotion/MotionProcessing.py`, documented in `SciencePipeline.md` §4.2) — computed from `absolute_frame_id` via `n == discard_count + 1 OR (n > discard_count + 1 AND (n − 1) mod dark_interval == 0)`. This is what flows into the raw / corrected histogram CSVs and drives the science correction.
+
+Under nominal operation both should mark the same `frame_idx` as dark. They are computed from different state on different paths, so a disagreement is itself meaningful: it usually means firmware config has drifted from the science pipeline's defaults (e.g. `LaserPulseSkipInterval` ≠ 600), or an off-by-one between the FSYNC-time slot decision and the LASER_TIMER cycle it gates. The plan should include a small post-scan diagnostic that joins the telemetry CSV's `dark_slot` against the science pipeline's predicted dark-frame mask and flags any rows where they differ.
 
 ## Out of scope
 
