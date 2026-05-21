@@ -1,4 +1,13 @@
-# Dark-frame drift study — toward real-time dark correction
+# Dark-frame drift study — Phase 1: physics characterisation
+
+> **Status of recommendations in this document**: the "static per-camera
+> `f(T)` calibration" architecture proposed at the end of this file was
+> **superseded** by a no-calibration online estimator design in
+> [`online_estimators.md`](online_estimators.md). The physics findings
+> (drift magnitudes, temperature correlation, polynomial-fit residuals,
+> gain-normalisation behaviour) are still load-bearing — the online
+> estimator builds on them. The implementation plan that follows from
+> all of this is in [`integration_proposal.md`](integration_proposal.md).
 
 **Goal:** characterise how dark-frame mean (`u1`) and standard deviation (`std`)
 drift during a long scan, and decide whether they can be estimated in real
