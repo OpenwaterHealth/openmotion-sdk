@@ -437,3 +437,31 @@ def test_write_result_json_includes_dark(tmp_path):
     assert cam["dark"] == 1.5
     assert cam["max_dark"] == 3.0
     assert cam["dark_test"] == "PASS"
+
+
+def test_request_average_full_scan_defaults_false():
+    """The new request flag must default to False so existing callers
+    (everything in the wild today) keep getting the rolling-window
+    averaging they were getting before."""
+    req = CalibrationRequest(
+        operator_id="op",
+        output_dir="/tmp",
+        left_camera_mask=0x01,
+        right_camera_mask=0x00,
+        thresholds=_thresholds(),
+        duration_sec=15,
+    )
+    assert req.average_full_scan is False
+
+
+def test_request_average_full_scan_accepts_true():
+    req = CalibrationRequest(
+        operator_id="op",
+        output_dir="/tmp",
+        left_camera_mask=0x01,
+        right_camera_mask=0x00,
+        thresholds=_thresholds(),
+        duration_sec=15,
+        average_full_scan=True,
+    )
+    assert req.average_full_scan is True

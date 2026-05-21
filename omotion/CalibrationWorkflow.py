@@ -99,6 +99,7 @@ class CalibrationRequest:
     #   }
     trigger_config: Optional[dict] = None
     notes: str = ""
+    average_full_scan: bool = False
 
 
 @dataclass
