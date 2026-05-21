@@ -91,23 +91,37 @@ def test_no_callback_means_no_emit():
     pipe.stop()
 
 
-def test_warmup_no_emit_until_two_darks():
-    """The std predictor needs ≥ 2 darks for a slope estimate.
-    With 0 or 1 in history, _emit_realtime_corrected must return
-    silently."""
+def test_warmup_no_emit_with_zero_darks():
+    """With zero observed darks, _emit_realtime_corrected has nothing
+    to subtract and must return silently."""
     captured: list[Sample] = []
     pipe = _make_pipeline(captured)
-    # No darks yet.
     _emit_light(pipe, cam_id=0, abs_frame=11, t=0.275, u1=500.0, u2=260000.0)
     assert captured == []
-    # One dark — still warming up.
+    pipe.stop()
+
+
+def test_emits_with_single_dark_using_zoh():
+    """As soon as the first dark is observed, the realtime stream
+    fires — using ZOH for both u1 and std. This cuts the live-corrected
+    warmup from ~15 s (waiting for two darks) to ~0.25 s (waiting for
+    frame 10)."""
+    captured: list[Sample] = []
+    pipe = _make_pipeline(captured)
     _push_dark(pipe, cam_id=0, t=0.25, u1=128.0, std=4.0)
-    _emit_light(pipe, cam_id=0, abs_frame=12, t=0.300, u1=500.0, u2=260000.0)
-    assert captured == []
-    # Second dark — should emit on the next light frame.
-    _push_dark(pipe, cam_id=0, t=15.25, u1=128.05, std=4.5)
-    _emit_light(pipe, cam_id=0, abs_frame=600, t=15.300, u1=500.0, u2=260000.0)
+    # raw_var chosen so corrected_var is computable: light_u1 = dark_u1,
+    # so corrected_mean = 0 and shot_noise_var = 0. Then
+    # corrected_var = raw_var − pred_dark_var = raw_var − 4² = raw_var − 16.
+    _emit_light(
+        pipe, cam_id=0, abs_frame=11, t=0.300,
+        u1=128.0, u2=128.0 * 128.0 + 65.0,  # raw_var = 65
+    )
     assert len(captured) == 1
+    s = captured[0]
+    # ZOH means pred_dark_std = 4.0, pred_dark_var = 16. Corrected
+    # var = 65 − 16 = 49, corrected std = 7.
+    assert math.isclose(s.std_dev, 7.0, abs_tol=1e-6)
+    assert math.isclose(s.mean, 0.0, abs_tol=1e-6)
     pipe.stop()
 
 
