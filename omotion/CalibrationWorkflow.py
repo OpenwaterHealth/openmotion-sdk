@@ -912,6 +912,17 @@ class CalibrationWorkflow:
             # Bound the trailing edge to keep the firmware's terminal
             # dark frame (and any laser ramp-down) out of the average.
             window_frames = int(round(request.duration_sec * CAPTURE_HZ))
+            # Phase 1 (calibration scan) widens its averaging window
+            # to swallow every laser-on corrected sample after the
+            # leading scan_delay_sec skip when average_full_scan is set
+            # (#132 — "all of the corrected data ... averaged, not just
+            # the rolling average numbers"). Dark frames flow through
+            # on_dark_frame_fn, not on_corrected_batch, so they're not
+            # affected by this widening. Phase 4 (validation scan)
+            # keeps the original window.
+            phase1_window_frames = (
+                10 ** 9 if request.average_full_scan else window_frames
+            )
 
             def _flash_sensors() -> tuple[bool, str]:
                 """Re-flash the FPGA bitstream and reinitialize the
@@ -1025,6 +1036,13 @@ class CalibrationWorkflow:
                     request.duration_sec + request.scan_delay_sec,
                     request.duration_sec, request.scan_delay_sec,
                 )
+                if request.average_full_scan:
+                    logger.info(
+                        "Calibration phase 1: average_full_scan=True — "
+                        "averaging every laser-on corrected sample after "
+                        "the %d-frame leading skip (no upper-bound window).",
+                        skip_frames,
+                    )
                 _reset_firmware_trigger("phase 1 (pre-scan)")
                 # _cal_dark_samples deliberately discarded — the ambient
                 # check (#122) gates on validation-scan dark frames so it
@@ -1036,7 +1054,7 @@ class CalibrationWorkflow:
                     subject_id=f"calib1_{request.operator_id}",
                     duration_sec=request.duration_sec + request.scan_delay_sec,
                     skip_leading_frames=skip_frames,
-                    frame_window_count=window_frames,
+                    frame_window_count=phase1_window_frames,
                     stop_evt=self._stop_evt,
                 )
                 logger.info(
