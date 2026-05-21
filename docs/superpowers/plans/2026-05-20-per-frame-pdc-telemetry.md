@@ -2,6 +2,24 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Scope clarification (resolved 2026-05-21):** The per-frame PDC stream
+> shipped by this plan is for **diagnostic and characterization use only**.
+> It is **not** an amplitude-correction signal for BFI/BVI, and it must not
+> be wired into the corrected-stream math. See
+> [`data-processing/pdc-investigation/findings.md`](../../../data-processing/pdc-investigation/findings.md)
+> on `feature/data-pipeline-tweaks` for the foundation document. The short
+> version: the mPD sees one polarization at the laser package's PBS while
+> the fiber output carries the orthogonal polarization, so PDC and
+> fiber-output power are anti-correlated under polarization drift and PDC
+> alone cannot identify whether a change is "total power" or
+> "polarization-ratio shift". The laser-intensity-driven BFI bias is
+> addressed by the **existing shot-noise correction** in
+> `SciencePipeline._emit_corrected_for_camera` / `_emit_realtime_corrected`
+> (`ADC_GAIN`, `CAMERA_GAIN_MAP` — Omnivision-supplied constants, correct
+> as-is). Per-frame PDC is still valuable as a laser-health surveillance,
+> cross-device characterization, and anomaly-detection signal — that's
+> what this plan ships.
+
 **Goal:** Capture one photodiode-current (PDC) value per camera frame at 40 Hz on the console firmware, drain it from the host at 10 Hz, and write per-frame rows into the telemetry CSV — with an explicit `dark_slot` label so downstream analysis can distinguish bright vs. dark-slot pulses.
 
 **Architecture:**
