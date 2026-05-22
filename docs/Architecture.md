@@ -131,6 +131,13 @@ Always creates `CommInterface` in async mode. Claims all three on `connect()`, r
 6. Invoke application callbacks for logging, progress, and live sample display.
 7. Tear down on completion or cancellation.
 
+**`ScanDBSink` / `ScanDatabase`** — optional SQLite endpoint of the corrected
+pipeline. Off by default; enabled by constructing `MotionInterface(db_path=...)`.
+When set, every scan opens a row in a `sessions` table and writes per-camera
+corrected rows to `session_data` (and optionally raw frame blobs to
+`session_raw`). See [`ScanDatabase.md`](ScanDatabase.md) for schema, lifecycle,
+and how to query.
+
 ---
 
 ## Science pipeline algorithm

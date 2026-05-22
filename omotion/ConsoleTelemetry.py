@@ -19,9 +19,10 @@ logger = logging.getLogger(f"{_log_root}.ConsoleTelemetry" if _log_root else "Co
 # Constants
 # ---------------------------------------------------------------------------
 
-_POLL_INTERVAL_S: float = 1.0          # target cadence
+_POLL_INTERVAL_S: float = 0.1          # target cadence
 _MIN_SLEEP_S: float = 0.05             # floor to avoid tight spin
 _MAX_SLEEP_S: float = 1.0              # ceiling
+_SLOW_TICK_EVERY_N: int = 10  # every 10th 100 ms tick = 1 Hz slow refresh
 
 # I2C parameters for analog telemetry (from firmware knowledge)
 _MUX_IDX: int = 1
@@ -36,7 +37,10 @@ _TCL_LEN: int = 4
 _PDC_CHANNEL: int = 7
 _PDC_REG: int = 0x1C
 _PDC_LEN: int = 2
-_PDC_MA_PER_LSB: float = 1.9
+# Renamed to public for downstream PdcSample use; keep the private alias for
+# backwards source-compat with code referencing _PDC_MA_PER_LSB.
+PDC_MA_PER_LSB: float = 1.9
+_PDC_MA_PER_LSB = PDC_MA_PER_LSB
 
 # safety interlock on channels 6 and 7, register 0x24, 1 byte each
 _SAFETY_SE_CHANNEL: int = 6
@@ -99,6 +103,40 @@ class ConsoleTelemetry:
     error: Optional[str] = None     # last exception message if read_ok is False
 
 
+PDC_FLAG_DARK_SLOT: int = 1 << 0
+
+
+@dataclass
+class PdcSample:
+    """One per-frame photodiode-current measurement drained from the console
+    firmware's ring buffer.
+
+    See docs/superpowers/specs/2026-05-20-per-frame-pdc-telemetry-design.md.
+    """
+    frame_idx: int
+    pdc_mA: float
+    dark_slot: bool
+    host_recv_timestamp: float
+    dropped_delta: int = 0
+
+    @classmethod
+    def from_raw(
+        cls,
+        frame_idx: int,
+        pdc_raw: int,
+        flags: int,
+        host_recv_timestamp: float,
+        dropped_delta: int = 0,
+    ) -> "PdcSample":
+        return cls(
+            frame_idx=int(frame_idx),
+            pdc_mA=float(pdc_raw) * PDC_MA_PER_LSB,
+            dark_slot=bool(flags & PDC_FLAG_DARK_SLOT),
+            host_recv_timestamp=float(host_recv_timestamp),
+            dropped_delta=int(dropped_delta),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Poller
 # ---------------------------------------------------------------------------
@@ -125,6 +163,10 @@ class ConsoleTelemetryPoller:
         self._lock = threading.Lock()
         self._snapshot: Optional[ConsoleTelemetry] = None
         self._listeners: List[Callable[[ConsoleTelemetry], None]] = []
+
+        self._pdc_listeners: List[Callable[[PdcSample], None]] = []
+        self._last_pdc: Optional[PdcSample] = None
+        self._slow_phase: int = 0
 
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -184,6 +226,22 @@ class ConsoleTelemetryPoller:
             except ValueError:
                 pass
 
+    def add_pdc_listener(self, fn: Callable[[PdcSample], None]) -> None:
+        with self._lock:
+            if fn not in self._pdc_listeners:
+                self._pdc_listeners.append(fn)
+
+    def remove_pdc_listener(self, fn: Callable[[PdcSample], None]) -> None:
+        with self._lock:
+            try:
+                self._pdc_listeners.remove(fn)
+            except ValueError:
+                pass
+
+    def get_last_pdc_sample(self) -> Optional[PdcSample]:
+        with self._lock:
+            return self._last_pdc
+
     @property
     def is_running(self) -> bool:
         with self._lock:
@@ -196,42 +254,76 @@ class ConsoleTelemetryPoller:
     def _poll_loop(self) -> None:
         logger.debug("ConsoleTelemetryPoller poll loop entered")
         last_poll = 0.0
-
         while True:
             with self._lock:
                 if not self._running:
                     break
-
             now = time.time()
-            elapsed = now - last_poll
-            if elapsed >= _POLL_INTERVAL_S:
+            if (now - last_poll) >= _POLL_INTERVAL_S:
                 tick_start = time.time()
-                snap = self._read_all()
+                self._tick_once()
                 last_poll = tick_start
-
-                # Store snapshot and collect listeners under lock
-                listeners: List[Callable] = []
-                with self._lock:
-                    self._snapshot = snap
-                    listeners = list(self._listeners)
-
-                # Notify listeners outside the lock
-                for fn in listeners:
-                    try:
-                        fn(snap)
-                    except Exception as exc:
-                        logger.error("ConsoleTelemetry listener raised: %s", exc)
-
                 duration = time.time() - tick_start
                 logger.debug("ConsoleTelemetryPoller tick %.1f ms", duration * 1000.0)
-
-            # Smart sleep: wait until next scheduled tick, clamped
             sleep_s = _POLL_INTERVAL_S - (time.time() - last_poll)
             sleep_s = max(_MIN_SLEEP_S, min(_MAX_SLEEP_S, sleep_s))
             self._wake.wait(timeout=sleep_s)
             self._wake.clear()
-
         logger.debug("ConsoleTelemetryPoller poll loop exited")
+
+    def _tick_once(self) -> None:
+        """One scheduler tick: always drain PDC, occasionally refresh slow telemetry."""
+        self._drain_pdc()
+        if self._slow_phase == 0:
+            self._refresh_slow()
+        self._slow_phase = (self._slow_phase + 1) % _SLOW_TICK_EVERY_N
+
+    def _drain_pdc(self) -> None:
+        try:
+            dropped, raw_samples = self._console.get_pdc_buffer(max_samples=64)
+        except Exception as exc:
+            logger.warning("ConsoleTelemetryPoller drain failed: %s", exc)
+            return
+        if not raw_samples:
+            if dropped:
+                logger.info("ConsoleTelemetryPoller dropped %d samples in firmware", dropped)
+            return
+
+        host_ts = time.time()
+        samples: List[PdcSample] = []
+        for i, (frame_idx, pdc_raw, flags) in enumerate(raw_samples):
+            sample = PdcSample.from_raw(
+                frame_idx=frame_idx,
+                pdc_raw=pdc_raw,
+                flags=flags,
+                host_recv_timestamp=host_ts,
+                dropped_delta=dropped if i == 0 else 0,
+            )
+            samples.append(sample)
+
+        listeners: List[Callable] = []
+        with self._lock:
+            self._last_pdc = samples[-1]
+            listeners = list(self._pdc_listeners)
+
+        for sample in samples:
+            for fn in listeners:
+                try:
+                    fn(sample)
+                except Exception as exc:
+                    logger.error("ConsoleTelemetry pdc listener raised: %s", exc)
+
+    def _refresh_slow(self) -> None:
+        snap = self._read_all()
+        listeners: List[Callable] = []
+        with self._lock:
+            self._snapshot = snap
+            listeners = list(self._listeners)
+        for fn in listeners:
+            try:
+                fn(snap)
+            except Exception as exc:
+                logger.error("ConsoleTelemetry listener raised: %s", exc)
 
     def _read_all(self) -> ConsoleTelemetry:
         """Perform one complete poll; always returns a ConsoleTelemetry."""

@@ -609,53 +609,32 @@ def process_bin_file(
 def parse_histogram_stream(
     q: queue.Queue,
     stop_evt: threading.Event,
-    csv_writer,
     buffer_accumulator: bytearray,
-    extra_cols_fn: Callable[[], list] | None = None,
     on_row_fn: Callable[[int, int, float, np.ndarray, int, float], None] | None = None,
     expected_row_sum: int | None = None,
-    csv_deadline: float | None = None,
-    on_csv_closed_fn: Callable[[], None] | None = None,
-    csv_stop_event: threading.Event | None = None,
+    t0_normalizer: Callable[[float], float] | None = None,
 ) -> int:
     """
-    Parse a histogram USB stream queue, feed the science pipeline, and
-    optionally write CSV rows.
-
-    ``on_row_fn`` is the primary output and is called for every valid parsed
-    sample regardless of CSV state.  CSV writing via ``csv_writer`` is
-    secondary and can be disabled entirely (``csv_writer=None``) or
-    automatically stopped after a wall-clock deadline (``csv_deadline``).
+    Parse a histogram USB stream queue and fire ``on_row_fn`` for every
+    valid sample.
 
     Parameters
     ----------
-    csv_writer
-        A ``csv.writer``-compatible object, or ``None`` to skip CSV output.
-    csv_deadline
-        ``time.monotonic()``-style deadline after which CSV writing stops but
-        ``on_row_fn`` continues.  ``None`` means write for the full duration.
-    on_csv_closed_fn
-        Called exactly once when ``csv_deadline`` is reached (or
-        ``csv_stop_event`` is set) and the writer is deactivated.  Useful
-        for emitting a log message to the caller.
-    csv_stop_event
-        A :class:`threading.Event` shared across all writer threads for the
-        same scan.  When any thread's deadline fires it sets this event so
-        every other thread stops writing on its next sample check, keeping
-        row counts equal across left/right CSVs.  ``None`` disables
-        cross-thread synchronisation.
     expected_row_sum
         Forwarded to ``parse_histogram_packet_structured``.  When not None,
         samples whose histogram bin sum does not match are silently dropped
-        from both the CSV and the ``on_row_fn`` callback.
+        from the ``on_row_fn`` callback.
+    t0_normalizer
+        Optional callback that converts an absolute firmware timestamp
+        into a per-scan-zero timestamp; invoked once per sample before
+        ``on_row_fn`` fires.
 
     Returns
     -------
     int
-        Number of rows written to ``csv_writer``.
+        Number of valid samples processed.
     """
-    rows_written = 0
-    _csv_active = csv_writer is not None
+    rows_processed = 0
 
     # Monotonic timestamp unwrapping: the firmware's 32-bit millisecond counter
     # rolls over every ~42949.67 s.  Track an offset so timestamps never go backwards.
@@ -688,29 +667,15 @@ def parse_histogram_stream(
                         _ts_offset += _TIMESTAMP_ROLLOVER_S
                     sample.timestamp_s = raw_ts + _ts_offset
                     _ts_last = sample.timestamp_s
-
-                    # Check CSV deadline before every row so the cutoff is
-                    # accurate to within one sample period (~25 ms at 40 Hz).
-                    if _csv_active and (
-                        (csv_deadline is not None and time.monotonic() >= csv_deadline)
-                        or (csv_stop_event is not None and csv_stop_event.is_set())
-                    ):
-                        _csv_active = False
-                        # Broadcast to peer writer threads sharing this event
-                        # so every side's CSV ends at the same sample boundary.
-                        if csv_stop_event is not None and not csv_stop_event.is_set():
-                            csv_stop_event.set()
-                        if on_csv_closed_fn:
-                            try:
-                                on_csv_closed_fn()
-                            except Exception:
-                                pass
-
-                    if _csv_active:
-                        extra_cols = extra_cols_fn() if extra_cols_fn else []
-                        row = sample.to_csv_row(extra_cols=extra_cols)
-                        csv_writer.writerow(row)
-                        rows_written += 1
+                    # Normalize to per-scan t0 if a normalizer was supplied
+                    # (typically by ScanWorkflow). After this, sample.timestamp_s
+                    # is seconds since the first sample emitted in this scan,
+                    # so every downstream consumer — raw CSV, row handler /
+                    # on_raw_frame_fn callback, the science pipeline, and the
+                    # corrected outputs that flow from it — sees the same
+                    # 0-based per-scan time origin.
+                    if t0_normalizer is not None:
+                        sample.timestamp_s = t0_normalizer(sample.timestamp_s)
 
                     if on_row_fn:
                         on_row_fn(
@@ -721,6 +686,7 @@ def parse_histogram_stream(
                             sample.row_sum,
                             sample.temperature_c,
                         )
+                        rows_processed += 1
 
             except ValueError as e:
                 old_off = offset
@@ -763,11 +729,11 @@ def parse_histogram_stream(
     # that was recovered (or couldn't be parsed) so frame loss is visible in logs.
     if buffer_accumulator:
         logger.warning(
-            "parse_stream_to_csv: %d bytes remain in accumulator after "
+            "parse_histogram_stream: %d bytes remain in accumulator after "
             "stream end — attempting final parse pass",
             len(buffer_accumulator),
         )
-        rows_before_final_flush = rows_written
+        rows_before_final_flush = rows_processed
         offset = 0
         while offset + MIN_PACKET_ENVELOPE_SIZE <= len(buffer_accumulator):
             try:
@@ -782,27 +748,8 @@ def parse_histogram_stream(
                         _ts_offset += _TIMESTAMP_ROLLOVER_S
                     sample.timestamp_s = raw_ts + _ts_offset
                     _ts_last = sample.timestamp_s
-
-                    if _csv_active and (
-                        (csv_deadline is not None and time.monotonic() >= csv_deadline)
-                        or (csv_stop_event is not None and csv_stop_event.is_set())
-                    ):
-                        _csv_active = False
-                        # Broadcast to peer writer threads sharing this event
-                        # so every side's CSV ends at the same sample boundary.
-                        if csv_stop_event is not None and not csv_stop_event.is_set():
-                            csv_stop_event.set()
-                        if on_csv_closed_fn:
-                            try:
-                                on_csv_closed_fn()
-                            except Exception:
-                                pass
-
-                    if _csv_active:
-                        extra_cols = extra_cols_fn() if extra_cols_fn else []
-                        row = sample.to_csv_row(extra_cols=extra_cols)
-                        csv_writer.writerow(row)
-                        rows_written += 1
+                    if t0_normalizer is not None:
+                        sample.timestamp_s = t0_normalizer(sample.timestamp_s)
 
                     if on_row_fn:
                         on_row_fn(
@@ -813,6 +760,7 @@ def parse_histogram_stream(
                             sample.row_sum,
                             sample.temperature_c,
                         )
+                        rows_processed += 1
             except ValueError as e:
                 old_off = offset
                 search_from = offset + 1
@@ -832,7 +780,7 @@ def parse_histogram_stream(
                         offset = nxt
                         found_sync = True
                         logger.warning(
-                            "parse_stream_to_csv: final flush parser error at "
+                            "parse_histogram_stream: final flush parser error at "
                             "offset %d, resynced to %d (skipped %d bytes): %s",
                             old_off, nxt, nxt - old_off, e,
                         )
@@ -843,84 +791,18 @@ def parse_histogram_stream(
                 break
         if offset > 0:
             logger.info(
-                "parse_stream_to_csv: final flush recovered %d additional row(s)",
-                rows_written - rows_before_final_flush,
+                "parse_histogram_stream: final flush recovered %d additional row(s)",
+                rows_processed - rows_before_final_flush,
             )
             del buffer_accumulator[:offset]
         if buffer_accumulator:
             logger.warning(
-                "parse_stream_to_csv: %d bytes could not be parsed and were "
+                "parse_histogram_stream: %d bytes could not be parsed and were "
                 "discarded — likely an incomplete final packet",
                 len(buffer_accumulator),
             )
 
-    return rows_written
-
-
-def stream_queue_to_csv_file(
-    q: queue.Queue,
-    stop_evt: threading.Event,
-    filename: str,
-    *,
-    extra_headers: list[str] | None = None,
-    extra_cols_fn: Callable[[], list] | None = None,
-    on_row_fn: Callable[[int, int, float, np.ndarray, int, float], None] | None = None,
-    on_complete_fn: Callable[[int], None] | None = None,
-    on_error_fn: Callable[[Exception], None] | None = None,
-    expected_row_sum: int | None = None,
-) -> int:
-    """
-    High-level helper: parse stream queue data and write a CSV file end-to-end.
-
-    This owns file open/header/write/close so applications only pass:
-    - destination filename
-    - queue + stop event
-    - optional callbacks for extra columns and row handling.
-
-    Parameters
-    ----------
-    expected_row_sum
-        Forwarded to ``parse_histogram_stream`` / ``parse_histogram_packet_structured``.
-        Samples whose histogram bin sum does not match are dropped from both
-        the CSV and the ``on_row_fn`` callback before being written.
-    """
-    rows_written = 0
-    extra_headers = extra_headers or []
-
-    try:
-        with open(filename, "w", newline="", encoding="utf-8") as f:
-            csv_writer = csv.writer(f)
-            csv_writer.writerow(
-                [
-                    "cam_id",
-                    "frame_id",
-                    "timestamp_s",
-                    *range(HISTO_SIZE_WORDS),
-                    "temperature",
-                    "sum",
-                    *extra_headers,
-                ]
-            )
-
-            buffer_accumulator = bytearray()
-            rows_written = parse_histogram_stream(
-                q=q,
-                stop_evt=stop_evt,
-                csv_writer=csv_writer,
-                buffer_accumulator=buffer_accumulator,
-                extra_cols_fn=extra_cols_fn,
-                on_row_fn=on_row_fn,
-                expected_row_sum=expected_row_sum,
-            )
-    except Exception as e:
-        if on_error_fn:
-            on_error_fn(e)
-        logger.error("Writer error (%s): %s", filename, e, exc_info=True)
-        return rows_written
-
-    if on_complete_fn:
-        on_complete_fn(rows_written)
-    return rows_written
+    return rows_processed
 
 
 # ---------------------------------------------------------------------------
@@ -1120,6 +1002,7 @@ class SciencePipeline:
         bfi_i_max,
         on_uncorrected_fn: Callable[[Sample], None] | None = None,
         on_corrected_batch_fn: Callable[[CorrectedBatch], None] | None = None,
+        on_realtime_corrected_fn: Callable[[Sample], None] | None = None,
         on_dark_frame_fn: Callable[[Sample], None] | None = None,
         on_rolling_avg_fn: Callable[[Sample], None] | None = None,
         rolling_avg_enabled: bool = False,
@@ -1130,6 +1013,7 @@ class SciencePipeline:
         noise_floor: int = 10,
         log_dark_endpoints: bool = False,
         dark_integrity_max_u1_above_pedestal: float = 30.0,
+        realtime_dark_history_size: int = 4,
     ):
         self._bfi_c_min = bfi_c_min
         self._bfi_c_max = bfi_c_max
@@ -1137,6 +1021,7 @@ class SciencePipeline:
         self._bfi_i_max = bfi_i_max
         self._on_uncorrected_fn = on_uncorrected_fn
         self._on_corrected_batch_fn = on_corrected_batch_fn
+        self._on_realtime_corrected_fn = on_realtime_corrected_fn
         self._on_dark_frame_fn = on_dark_frame_fn
         self._on_rolling_avg_fn = on_rolling_avg_fn
         self._rolling_avg_enabled = bool(rolling_avg_enabled)
@@ -1184,6 +1069,17 @@ class SciencePipeline:
         # Stores the two most recent corrected samples per camera so that the
         # quadratic 4-point stencil can be applied at each dark frame position.
         self._last_corrected: dict[tuple[str, int], list[Sample]] = {}
+
+        # Real-time dark-correction state (see
+        # ``data-processing/dark-drift-study/online_estimators.md``).  Per
+        # (side, cam_id), a ring buffer of the most recent dark observations
+        # as ``(timestamp_s, u1, std)`` tuples.  Independent of the batched
+        # ``_dark_history`` above so the real-time path can evolve without
+        # disturbing the existing batched correction.
+        self._realtime_dark_history_size = int(realtime_dark_history_size)
+        self._realtime_dark_history: dict[
+            tuple[str, int], "deque[tuple[float, float, float]]"
+        ] = {}
 
         self._ingress_queue: queue.Queue = queue.Queue()
         self._stop_event = threading.Event()
@@ -1370,6 +1266,18 @@ class SciencePipeline:
                     absolute_frame, side, cam_id, len(dark_list),
                     u1, variance,
                 )
+
+                # Real-time predictor history — see online_estimators.md.
+                # u1 is averaged across the last 3 entries; std is the
+                # slope endpoint for linear extrapolation. We store std
+                # (not variance) so the extrapolation tracks the smooth
+                # std curve directly; the corrected arithmetic squares
+                # it back to variance at use time.
+                rt_hist = self._realtime_dark_history.get(key)
+                if rt_hist is None:
+                    rt_hist = deque(maxlen=self._realtime_dark_history_size)
+                    self._realtime_dark_history[key] = rt_hist
+                rt_hist.append((ts, u1, float(np.sqrt(variance))))
                 # Sanity-check: did this frame *actually* look like a
                 # dark? If not, the schedule and the firmware disagree
                 # and we want to know about it.
@@ -1448,6 +1356,22 @@ class SciencePipeline:
                     pass
 
             self._last_uncorrected[key] = uncorrected
+
+            # Real-time dark correction (issue: data-pipeline-tweaks).
+            # Fires per light frame, immediately, once the predictor's
+            # warmup is satisfied. Independent of the batched-interpolation
+            # path that feeds the saved CSV / session_data.
+            if self._on_realtime_corrected_fn is not None:
+                self._emit_realtime_corrected(
+                    key=key,
+                    raw_frame_id=raw_frame_id,
+                    absolute_frame=absolute_frame,
+                    ts=ts,
+                    u1=u1,
+                    u2=u2,
+                    row_sum=row_sum,
+                    temp=temp,
+                )
 
             # --- 7. Rolling-average over the last N uncorrected light samples ---
             # Placed in the light branch only, so dark-frame repeat samples
@@ -1550,6 +1474,106 @@ class SciencePipeline:
                 terminal.u1,
             )
             self._emit_corrected_for_camera(key)
+
+    def _emit_realtime_corrected(
+        self,
+        *,
+        key: tuple[str, int],
+        raw_frame_id: int,
+        absolute_frame: int,
+        ts: float,
+        u1: float,
+        u2: float,
+        row_sum: int,
+        temp: float,
+    ) -> None:
+        """Per light frame: predict dark u1 + std from the realtime history,
+        apply the same dark-subtraction + shot-noise + bfi/bvi calibration
+        the batched path uses, and emit one corrected ``Sample`` immediately.
+
+        Strategies are intentionally simple and validated in
+        ``data-processing/dark-drift-study/online_estimators.md``:
+
+          * u1   — mean of the last 3 darks (warmup uses fewer if needed).
+          * std  — linear extrapolation in time through the last 2 darks,
+            with a zero-order-hold fallback when only 1 dark has been
+            observed.
+
+        Returns silently when no darks have been observed yet (typically
+        only the first ~0.25 s of the scan, before the discard-window
+        boundary at frame 10). After the first dark, fires every non-
+        dark frame using zero-order-hold for both u1 and std; switches
+        to the full avg-3 / linear-extrap predictors once the second
+        dark arrives ~15 s later. This trades a small amount of
+        accuracy in the first interval for an essentially instant
+        live-corrected stream.
+        """
+        history = self._realtime_dark_history.get(key)
+        if not history:
+            return  # warmup — need at least 1 dark to subtract anything
+
+        # Predicted dark u1: average of the last 3 observed darks
+        # (truncated to whatever's available; with 1 dark this collapses
+        # to ZOH).
+        u1_window = list(history)[-3:]
+        pred_dark_u1 = sum(p[1] for p in u1_window) / len(u1_window)
+
+        # Predicted dark std: extend the line through the last 2 (t, std)
+        # when we have them; ZOH from the single dark otherwise.
+        if len(history) >= 2:
+            a_t, _, a_std = history[-2]
+            b_t, _, b_std = history[-1]
+            dt = b_t - a_t
+            if dt <= 0:
+                pred_dark_std = b_std
+            else:
+                slope = (b_std - a_std) / dt
+                pred_dark_std = b_std + slope * (ts - b_t)
+        else:
+            pred_dark_std = history[-1][2]
+
+        # Apply the same arithmetic the batched path uses in
+        # ``_emit_corrected_for_camera``. Predicted variance is just
+        # std² — the linear extrapolation operates on std because std
+        # is the smooth quantity over a dark interval.
+        pred_dark_var = max(0.0, pred_dark_std * pred_dark_std)
+        corrected_mean = u1 - pred_dark_u1
+        raw_var = u2 - u1 * u1
+        corrected_var = raw_var - pred_dark_var
+
+        # Shot-noise correction — same expression as the batched path.
+        cam_pos = int(key[1]) % 8
+        shot_noise_var = (
+            ADC_GAIN * max(0.0, corrected_mean) * CAMERA_GAIN_MAP[cam_pos]
+        )
+        corrected_var -= shot_noise_var
+
+        corrected_std = float(np.sqrt(max(0.0, corrected_var)))
+        corrected_contrast = (
+            corrected_std / corrected_mean if corrected_mean > 0 else 0.0
+        )
+        bfi, bvi = self._calibrate_bfi_bvi(
+            key[0], key[1], corrected_contrast, corrected_mean,
+        )
+        sample = Sample(
+            side=key[0],
+            cam_id=key[1],
+            frame_id=raw_frame_id,
+            absolute_frame_id=absolute_frame,
+            timestamp_s=ts,
+            row_sum=row_sum,
+            temperature_c=temp,
+            mean=float(corrected_mean),
+            std_dev=corrected_std,
+            contrast=float(corrected_contrast),
+            bfi=float(bfi),
+            bvi=float(bvi),
+            is_corrected=True,
+        )
+        try:
+            self._on_realtime_corrected_fn(sample)
+        except Exception:
+            logger.exception("Error in on_realtime_corrected_fn callback")
 
     def _is_dark_frame(self, absolute_frame: int) -> bool:
         """Return True if *absolute_frame* is a scheduled dark frame.
@@ -1768,6 +1792,7 @@ def create_science_pipeline(
     bfi_i_max,
     on_uncorrected_fn: Callable[[Sample], None] | None = None,
     on_corrected_batch_fn: Callable[[CorrectedBatch], None] | None = None,
+    on_realtime_corrected_fn: Callable[[Sample], None] | None = None,
     on_dark_frame_fn: Callable[[Sample], None] | None = None,
     on_rolling_avg_fn: Callable[[Sample], None] | None = None,
     rolling_avg_enabled: bool = False,
@@ -1778,6 +1803,7 @@ def create_science_pipeline(
     noise_floor: int = 10,
     log_dark_endpoints: bool = False,
     dark_integrity_max_u1_above_pedestal: float = 30.0,
+    realtime_dark_history_size: int = 4,
 ) -> SciencePipeline:
     """
     Factory for a ready-to-run unified science pipeline.
@@ -1789,6 +1815,26 @@ def create_science_pipeline(
     on_corrected_batch_fn
         Fires once per dark-frame interval with a ``CorrectedBatch``
         containing dark-frame-corrected samples for the entire interval.
+    on_realtime_corrected_fn
+        Fires per non-dark frame, immediately, once the first dark for
+        that camera has been observed (typically by frame 11, ~0.25 s
+        into the scan). Receives a ``Sample`` with ``is_corrected=True``
+        whose dark subtraction was applied using predicted darks
+        instead of the observed-and-interpolated darks used by the
+        batched path:
+
+          * With 1 dark observed: ZOH for both u1 and std.
+          * With ≥ 2 darks: avg-of-last-3 for u1, linear extrapolation
+            in time of the last 2 for std.
+
+        See ``data-processing/dark-drift-study/online_estimators.md``
+        for the estimator design and validation. Default None (no
+        realtime stream emitted).
+    realtime_dark_history_size
+        Ring-buffer depth for the per-camera dark history used by the
+        realtime predictor (default 4 — supports avg-of-last-3 plus one
+        extra slot for stability). Ignored when
+        ``on_realtime_corrected_fn`` is None.
     on_dark_frame_fn
         Fires once per scheduled dark frame with a ``Sample`` whose
         ``is_dark=True``.  ``mean`` is pedestal-subtracted using
@@ -1829,6 +1875,7 @@ def create_science_pipeline(
         bfi_i_max=bfi_i_max,
         on_uncorrected_fn=on_uncorrected_fn,
         on_corrected_batch_fn=on_corrected_batch_fn,
+        on_realtime_corrected_fn=on_realtime_corrected_fn,
         on_dark_frame_fn=on_dark_frame_fn,
         on_rolling_avg_fn=on_rolling_avg_fn,
         rolling_avg_enabled=rolling_avg_enabled,
@@ -1839,6 +1886,7 @@ def create_science_pipeline(
         noise_floor=noise_floor,
         log_dark_endpoints=log_dark_endpoints,
         dark_integrity_max_u1_above_pedestal=dark_integrity_max_u1_above_pedestal,
+        realtime_dark_history_size=realtime_dark_history_size,
     )
     pipeline.start()
     return pipeline

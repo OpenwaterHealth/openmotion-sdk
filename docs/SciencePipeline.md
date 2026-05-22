@@ -14,16 +14,20 @@ Each camera produces a 1024-bin histogram at 40 Hz.  The science pipeline:
 2. **Identifies dark frames** by a fixed schedule based on firmware timing.  Dark frames are acquired with the laser off and provide a measurement of the ambient + dark-current floor.
 3. **Zeroes noise-floor bins** — histogram bins below the noise floor threshold (default 10 counts) are zeroed before moment computation to suppress low-level dark noise.
 4. **Emits an uncorrected sample** for every non-dark frame immediately.  The emitted `mean` has the sensor pedestal (64 counts) subtracted so consumers see a zero-referenced intensity signal.  For dark frames, the previous non-dark frame's values are re-emitted so the live display shows no artefact.
-5. **Buffers** the raw (un-pedestal-subtracted) first and second moments of every non-dark frame for use in the corrected path.
-6. **When a second consecutive dark frame arrives**, linearly interpolates the dark baseline across the buffered interval, subtracts it frame-by-frame, recomputes corrected contrast and intensity, applies the per-camera BFI/BVI calibration, and emits a `CorrectedBatch`.  The leading dark frame of the interval also receives a corrected value derived from its four nearest non-dark neighbors using a quadratic stencil.
-7. **On scan stop**, performs a terminal dark flush so the corrected CSV is always populated even for scans shorter than one full dark interval (§8.6).
+5. **Emits a realtime dark-corrected sample** for every non-dark frame once at least one dark frame has been observed.  Uses a rolling-history predictor (avg-of-last-3 for the dark mean, linear-extrapolation for the dark std) to produce a best-effort dark-subtracted and shot-noise-corrected BFI/BVI immediately, without waiting for the next scheduled dark to close an interval (§7.4).
+6. **Buffers** the raw (un-pedestal-subtracted) first and second moments of every non-dark frame for use in the batched corrected path.
+7. **When a second consecutive dark frame arrives**, linearly interpolates the dark baseline across the buffered interval, subtracts it frame-by-frame, recomputes corrected contrast and intensity, applies the per-camera BFI/BVI calibration, and emits a `CorrectedBatch`.  The leading dark frame of the interval also receives a corrected value derived from its four nearest non-dark neighbors using a quadratic stencil.
+8. **On scan stop**, performs a terminal dark flush so the corrected CSV is always populated even for scans shorter than one full dark interval (§8.6).
 
 Consumers therefore receive:
 
-| Stream | Type | Rate | `is_corrected` | Destination |
-|---|---|---|---|---|
-| Uncorrected | `Sample` per camera | ~40 Hz (every non-dark + every dark) | `False` | Live plot |
-| Corrected batch | `CorrectedBatch` per camera | ~1 per 15 s (configurable) | `True` | Corrected CSV (streaming) + plot snap |
+| Stream | Type | Rate | `is_corrected` | Destination | Callback |
+|---|---|---|---|---|---|
+| Uncorrected | `Sample` per camera | ~40 Hz (every non-dark + every dark) | `False` | Live plot (raw) | `on_uncorrected_fn` |
+| Realtime corrected | `Sample` per camera | ~40 Hz (every non-dark, after first dark) | `True` | Live plot (best-effort corrected) | `on_realtime_corrected_fn` |
+| Corrected batch | `CorrectedBatch` per camera | ~1 per 15 s (configurable) | `True` | Corrected CSV (streaming) + plot snap | `on_corrected_batch_fn` |
+
+The realtime-corrected and batch-corrected samples both carry `is_corrected = True`; consumers distinguish them by which callback delivered the sample.
 
 ---
 
@@ -191,6 +195,73 @@ emit on_uncorrected_fn(dark_uncorrected)
 **Rationale:** A dark frame has anomalously low intensity and contrast because the laser is off.  Emitting the raw dark values would cause the live trace to drop sharply and then recover, appearing as a ~25 ms artefact every 15 seconds.  Repeating the previous value makes the dark frame invisible to the live display.
 
 If no preceding bright frame exists (i.e. the very first frame in the scan is a dark frame), no uncorrected sample is emitted for that dark frame.
+
+### 7.4 Realtime dark-corrected stream
+
+A third per-frame emission complements the uncorrected stream by applying a dark-baseline subtraction *predicted* from the rolling history of recent dark frames, rather than the linear interpolation used in the lagged batch path (§8). The realtime stream fires on the same ~40 Hz cadence as the uncorrected stream but emits samples with `is_corrected = True` whose dark subtraction reflects the **best estimate available now**, several seconds before the next scheduled dark frame closes a batch interval.
+
+**Implementation:** `SciencePipeline._emit_realtime_corrected()`. Reference: [`data-processing/dark-drift-study/online_estimators.md`](../data-processing/dark-drift-study/online_estimators.md).
+
+**When it fires.** Each non-dark frame, once at least one prior dark frame has been observed for that `(side, cam_id)`. Frames before the first dark do not produce a realtime-corrected sample (no baseline to subtract; warmup window is typically the first ~0.25 s of the scan until the first scheduled dark at frame 10).
+
+#### 7.4.1 Predictor algorithm
+
+Per `(side, cam_id)` pair, the pipeline maintains a rolling deque of recent dark observations `(timestamp_s, u1, std)` of size `realtime_dark_history_size` (default **4**).
+
+For a target light frame at time *t*, let *D* be the deque of recent darks for that camera. The predictor produces a baseline `(û₁, σ̂)`:
+
+```
+case |D| == 1 (warmup — only one dark seen):
+    û₁ = D[-1].u1                                    # zero-order hold
+    σ̂  = D[-1].σ                                     # zero-order hold
+
+case |D| >= 2 (steady state):
+    û₁ = mean( last min(3, |D|) entries of D.u1 )    # average of last 3 darks (fewer if |D| < 3)
+
+    let a = D[-2], b = D[-1]                          # two most recent darks
+    let Δt = b.t − a.t
+    if Δt <= 0:
+        σ̂ = b.σ                                       # degenerate timestamps → ZOH
+    else:
+        slope = (b.σ − a.σ) / Δt
+        σ̂ = b.σ + slope · (t − b.t)                  # linear extrapolation in time
+```
+
+In plain language: the **mean baseline** is an average of recent darks (stable against single-frame noise), while the **standard deviation baseline** is linearly extrapolated forward from the two most recent darks (tracks slow drift in dark noise across an interval). When fewer than two darks have been recorded — the warmup window immediately after scan start — both quantities fall back to a zero-order hold on whatever single dark is available, so a realtime-corrected sample can be emitted as soon as the very first dark has arrived (relaxed from a previous "wait for two darks" rule).
+
+The linear extrapolation operates on `std`, not on `variance`. `std` is the smooth quantity over a dark interval; predicted variance is recovered as `σ̂²` at the application step below.
+
+#### 7.4.2 Sample construction
+
+Given the predicted baseline `(û₁, σ̂)` and the current light frame's raw moments `(raw_μ₁(n), μ₂(n))` (the same raw, un-pedestal-subtracted moments stored in `_pending_moments`), the realtime-corrected sample carries:
+
+```
+μ̃₁(n)     = raw_μ₁(n) − û₁                          # predictor-corrected mean
+raw_σ²(n)  = μ₂(n) − raw_μ₁(n)²                       # raw variance
+σ̃²(n)     = raw_σ²(n) − σ̂² − σ²_shot(n)              # dark- and shot-noise-subtracted variance
+σ̃²(n)     = max(0, σ̃²(n))                            # clamp
+σ̃(n)      = √σ̃²(n)
+K̃(n)      = σ̃(n) / μ̃₁(n)     if μ̃₁(n) > 0
+            = 0.0                otherwise
+```
+
+with shot-noise variance identical to the batched path (§8.3):
+
+```
+σ²_shot(n) = ADC_GAIN · g_cam · max(0, μ̃₁(n))
+```
+
+BFI and BVI are computed from `K̃(n)` and `μ̃₁(n)` via the calibration mapping (§9). The pedestal cancels exactly in `raw_μ₁(n) − û₁` because the same pedestal is present in both terms; no explicit pedestal subtraction occurs in this stream.
+
+The emitted `Sample` has `is_corrected = True` — the same flag used for samples in a `CorrectedBatch`. Consumers distinguish realtime-corrected from batch-corrected samples by which callback delivered them (`on_realtime_corrected_fn` vs. `on_corrected_batch_fn`), not by a field on the sample.
+
+#### 7.4.3 Why predictor (realtime) vs. interpolator (batch)?
+
+The batch-corrected stream (§8) waits for both bounding dark frames of an interval before emitting, then linearly interpolates the dark baseline backward across the interval. This is accurate but lagged by up to one full dark interval (~15 s).
+
+The realtime stream emits immediately using a forward-extrapolated estimate of where the next dark *would* fall. The result is less accurate at the end of an interval (when the next dark is about to land and refute the prediction) but available now — suitable for live displays that show a "best-effort" dark-corrected BFI/BVI trace to the operator.
+
+A live plot reading the realtime-corrected stream sees a continuously updating dark-corrected trace; a saved corrected CSV reading the batch stream sees the accurate result that an offline analysis would reproduce.
 
 ---
 
@@ -393,9 +464,9 @@ For each `(side, cam_id)` pair, the very first frame received after pipeline sta
 
 ## 12. Threading model
 
-The pipeline runs a single background daemon thread (`SciencePipeline` thread).  All histogram samples are ingested via a `queue.Queue` (`_ingress_queue`).  The worker thread consumes from this queue and is the sole writer of all internal state (`_unwrappers`, `_dark_history`, `_pending_moments`, `_last_uncorrected`, `_last_corrected`).  No locks are needed for pipeline-internal state.
+The pipeline runs a single background daemon thread (`SciencePipeline` thread).  All histogram samples are ingested via a `queue.Queue` (`_ingress_queue`).  The worker thread consumes from this queue and is the sole writer of all internal state (`_unwrappers`, `_dark_history`, `_realtime_dark_history`, `_pending_moments`, `_last_uncorrected`, `_last_corrected`).  No locks are needed for pipeline-internal state.
 
-Callbacks (`on_uncorrected_fn`, `on_corrected_batch_fn`) are invoked on the science thread.  Implementations that touch UI state must marshal to the UI thread (e.g. via a Qt signal).
+Callbacks (`on_uncorrected_fn`, `on_realtime_corrected_fn`, `on_corrected_batch_fn`) are invoked on the science thread.  Implementations that touch UI state must marshal to the UI thread (e.g. via a Qt signal).
 
 ---
 
@@ -444,15 +515,24 @@ _science_worker (single background thread)
      Store _StoredFrameMoments(raw_μ₁, μ₂) → _pending_moments[key]   │
      (raw values preserved for dark subtraction; pedestal cancels)    │
                                                                        │
-     compute_realtime_metrics() → Sample                              │
+     compute_realtime_metrics() → Sample (uncorrected)                │
        mean_val = max(0, raw_μ₁ − 64)  ← pedestal subtracted         │
        σ² from raw_μ₁ (variance is shift-invariant)                  │
-       K = σ / mean_val  (no shot-noise correction in live stream)    │
+       K = σ / mean_val  (no shot-noise correction; uncorrected)      │
        BFI/BVI via calibration mapping                                │
                                                                        │
      Emit Sample(is_corrected=False)                                  │
        → on_uncorrected_fn()                                          │
        → _last_uncorrected[key]                                       │
+                                                                       │
+     If _realtime_dark_history[key] has ≥1 entry:                    │
+       _emit_realtime_corrected() → Sample (realtime corrected)       │
+         û₁ = avg of last 3 darks (ZOH with 1)                       │
+         σ̂  = linear extrap through last 2 darks (ZOH with 1)        │
+         μ̃₁ = raw_μ₁ − û₁                                            │
+         σ̃² = (μ₂ − raw_μ₁²) − σ̂² − ADC_GAIN·g_cam·μ̃₁  (clamp ≥0)  │
+         BFI/BVI via calibration; is_corrected=True                   │
+       → on_realtime_corrected_fn()                                   │
                                                               ◄────────┘
 
 [queue drained after stop_event]
@@ -473,6 +553,7 @@ _science_worker (single background thread)
 | `discard_count` | 9 | Warmup frames dropped at start |
 | `dark_interval` | 600 | Frames between dark acquisitions (15 s at 40 Hz) |
 | `noise_floor` | 10 | Bins below this count are zeroed before moment computation |
+| `realtime_dark_history_size` | 4 | Max dark observations kept in the realtime predictor's ring buffer (§7.4) |
 | `PEDESTAL_HEIGHT` | 64.0 | ADC zero-light bias subtracted from mean in the uncorrected stream |
 | `ADC_GAIN` | (1024−64)/11000 ≈ 0.0873 DN/e⁻ | Sensor ADC gain used for shot-noise correction |
 | `CAMERA_GAIN_MAP` | [16,4,2,1,1,2,4,16] | Per-camera analog gain (index = cam position 0–7) |

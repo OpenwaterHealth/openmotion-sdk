@@ -23,13 +23,20 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import os
 import struct
+import sys
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional
 
-from scan_db import ScanDatabase
+# Make the parent omotion-sdk repo importable when this script is run
+# standalone from inside stream-db/ (issue #92 — scan_db.py moved into
+# the omotion package).
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from omotion import ScanDatabase
 
 
 FILENAME_RE = (

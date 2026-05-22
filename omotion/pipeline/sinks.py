@@ -1,0 +1,573 @@
+"""Sink protocol + ScanMetadata.
+
+Concrete sink implementations (CsvSink, ScanDBSink, QtUiSink) live below
+the protocol definitions.
+"""
+
+from __future__ import annotations
+
+import collections
+import csv
+import logging
+import os
+from dataclasses import dataclass
+from typing import Any, Optional, Protocol, runtime_checkable
+
+logger = logging.getLogger("omotion.pipeline.sinks")
+
+
+@dataclass(frozen=True)
+class ScanMetadata:
+    """Per-scan metadata handed to every sink at on_scan_start."""
+    scan_id:               str
+    subject_id:            str
+    operator:              str
+    started_at_iso:        str
+    duration_sec:          int
+    left_camera_mask:      int
+    right_camera_mask:     int
+    reduced_mode:          bool
+    write_raw_csv:         bool
+    raw_csv_duration_sec:  Optional[float]
+
+
+@runtime_checkable
+class Sink(Protocol):
+    """A consumer of pipeline output.
+
+    Channels in this pipeline:
+        "raw"          — per-frame, all non-stale frames including warmup
+        "live"         — per-frame, best-effort corrected (light + dark)
+        "rolling"      — per-frame, rolling-averaged for test/calibration
+        "final"        — per-dark-interval, accurately corrected CorrectedBatch
+        "diagnostics"  — out-of-band events (DarkIntegrityWarning, etc.)
+    """
+    channels: set[str]
+
+    def on_scan_start(self, meta: ScanMetadata) -> None: ...
+
+    def consume(self, channel: str, payload: Any) -> None: ...
+
+    def on_complete(self) -> None: ...
+
+
+# ---------------------------------------------------------------------------
+# Concrete sinks
+# ---------------------------------------------------------------------------
+
+_HISTO_BINS = 1024
+
+# Raw CSV column order: cam_id, frame_id, timestamp_s, type, 0..1023, temperature, sum, tcm, tcl, pdc
+_RAW_PIPELINE_HEADERS: list = [
+    "cam_id", "frame_id", "timestamp_s", "type",
+    *list(range(_HISTO_BINS)),
+    "temperature", "sum",
+    "tcm", "tcl", "pdc",
+]
+
+
+def _corrected_headers_normal() -> list[str]:
+    """82-column legacy corrected CSV header."""
+    cols = ["frame_id", "timestamp_s"]
+    for metric in ("bfi", "bvi", "mean", "contrast", "temp"):
+        for side in ("l", "r"):
+            for cam in range(1, 9):
+                cols.append(f"{metric}_{side}{cam}")
+    return cols
+
+
+def _corrected_headers_reduced() -> list[str]:
+    """6-column reduced corrected CSV header."""
+    return ["frame_id", "timestamp_s", "bfi_left", "bfi_right", "bvi_left", "bvi_right"]
+
+
+# Build the column-index lookup once at module load time.
+_NORMAL_HEADERS = _corrected_headers_normal()
+_REDUCED_HEADERS = _corrected_headers_reduced()
+
+# Maps (metric, side_char, cam_1indexed) -> column index in _NORMAL_HEADERS
+_NORMAL_COL_IDX: dict[tuple[str, str, int], int] = {
+    (metric, side, cam): _NORMAL_HEADERS.index(f"{metric}_{side}{cam}")
+    for metric in ("bfi", "bvi", "mean", "contrast", "temp")
+    for side in ("l", "r")
+    for cam in range(1, 9)
+}
+
+
+class CsvSink:
+    """Channel-based CSV sink for the pipeline.
+
+    Channels:
+        "raw"   — per-frame raw histograms (gated by meta.write_raw_csv)
+        "final" — per-interval corrected output
+
+    Raw file naming: ``{scan_id}_{subject_id}_{side}_mask{XX}_raw.csv``
+    Corrected file naming: ``{scan_id}_corrected.csv``
+
+    Normal mode corrected CSV: 82-column wide format matching legacy SciencePipeline
+    output (frame_id, timestamp_s, bfi_l1..bfi_r8, bvi_l1..bvi_r8,
+    mean_l1..mean_r8, contrast_l1..contrast_r8, temp_l1..temp_r8).
+
+    Reduced mode corrected CSV: 6 columns (frame_id, timestamp_s,
+    bfi_left, bfi_right, bvi_left, bvi_right).
+
+    Files are created lazily on first "final" / "raw" consume call.
+    """
+
+    channels = {"raw", "final"}
+
+    def __init__(self, output_dir) -> None:
+        self._output_dir = str(output_dir)
+        self._meta: Optional[ScanMetadata] = None
+        self._raw_fhs: dict[str, Any] = {}    # side -> file handle
+        self._raw_csvs: dict[str, Any] = {}   # side -> csv.writer
+        self._corrected_fh: Optional[Any] = None
+        self._corrected_csv: Optional[Any] = None
+        self._closed = False
+        # Per-frame accumulator: abs_frame_id -> {"t": float, "row": list}
+        self._corrected_acc: "dict[int, dict]" = {}
+        self._corrected_n_cols: int = 0
+        self._corrected_reduced: bool = False
+        self._expected_cams: "dict[str, set[int]]" = {}  # side -> set of cam_ids
+
+    def on_scan_start(self, meta: ScanMetadata) -> None:
+        self._meta = meta
+        self._closed = False
+        self._corrected_fh = None
+        self._corrected_csv = None
+        self._corrected_acc = {}
+        self._corrected_reduced = meta.reduced_mode
+        # Build set of expected cam_ids per side from masks
+        self._expected_cams = {
+            "left":  {c for c in range(8) if meta.left_camera_mask  & (1 << c)},
+            "right": {c for c in range(8) if meta.right_camera_mask & (1 << c)},
+        }
+        if meta.reduced_mode:
+            self._corrected_n_cols = len(_REDUCED_HEADERS)
+        else:
+            self._corrected_n_cols = len(_NORMAL_HEADERS)
+
+    def consume(self, channel: str, payload: Any) -> None:
+        if channel == "raw":
+            self._consume_raw(payload)
+        elif channel == "final":
+            self._consume_final(payload)
+
+    def on_complete(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        # Flush any partial rows (cameras that didn't all contribute)
+        for abs_id in sorted(self._corrected_acc.keys()):
+            entry = self._corrected_acc[abs_id]
+            row = entry["row"]
+            row[0] = abs_id
+            row[1] = round(entry["t"], 9)
+            self._write_corrected_row(row)
+        self._corrected_acc.clear()
+        for side, fh in list(self._raw_fhs.items()):
+            try:
+                fh.flush()
+                fh.close()
+            except Exception:
+                logger.exception("CsvSink: failed to close %s raw CSV", side)
+        self._raw_fhs.clear()
+        self._raw_csvs.clear()
+        if self._corrected_fh is not None:
+            try:
+                self._corrected_fh.flush()
+                self._corrected_fh.close()
+            except Exception:
+                logger.exception("CsvSink: failed to close corrected CSV")
+            self._corrected_fh = None
+            self._corrected_csv = None
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _consume_raw(self, batch) -> None:
+        """Write raw histogram rows for each frame in the batch."""
+        meta = self._meta
+        if meta is None or not meta.write_raw_csv:
+            return
+
+        import numpy as np
+        from .batch import FrameBatch
+
+        n = len(batch.cam_ids)
+        for i in range(n):
+            cam_id = int(batch.cam_ids[i])
+            frame_id = int(batch.frame_ids[i])
+            ts = float(batch.timestamp_s[i])
+
+            # Duration cap: skip this frame if it's past the limit
+            if meta.raw_csv_duration_sec is not None and ts > meta.raw_csv_duration_sec:
+                continue
+
+            frame_type = ""
+            if batch.frame_type is not None:
+                frame_type = str(batch.frame_type[i])
+
+            temp = float(batch.temperature_c[i, 0, cam_id]) if batch.temperature_c is not None else ""
+            pdc_val = float(batch.pdc[i]) if batch.pdc is not None else ""
+            tcm_val = float(batch.tcm[i]) if batch.tcm is not None else ""
+            tcl_val = float(batch.tcl[i]) if batch.tcl is not None else ""
+
+            # Determine side from cam_id: left=side 0, right=side 1
+            # The batch has shape (N, 2, 8, 1024) for raw_histograms.
+            # We write one row per frame/cam using side=0 if left_camera_mask
+            # has this cam bit set, side=1 for right_camera_mask.
+            for side_idx, (side_name, mask) in enumerate(
+                [("left", meta.left_camera_mask), ("right", meta.right_camera_mask)]
+            ):
+                if mask == 0:
+                    continue
+                if not (mask & (1 << cam_id)):
+                    continue
+                w = self._get_or_open_raw_writer(side_name, mask)
+                if w is None:
+                    continue
+                histo = batch.raw_histograms[i, side_idx, cam_id, :]
+                histo_list = histo.tolist()
+                histo_sum = int(np.sum(histo))
+                w.writerow([
+                    cam_id,
+                    frame_id,
+                    ts,
+                    frame_type,
+                    *histo_list,
+                    temp,
+                    histo_sum,
+                    tcm_val,
+                    tcl_val,
+                    pdc_val,
+                ])
+
+    def _consume_final(self, interval) -> None:
+        """Accumulate EnrichedCorrectedFrames; flush complete rows to CSV."""
+        from .stages.dark import EnrichedCorrectedFrame
+        for frame in interval.frames:
+            abs_id = int(frame.abs_frame_id)
+            acc = self._corrected_acc
+            if abs_id not in acc:
+                row = [""] * self._corrected_n_cols
+                acc[abs_id] = {"t": float(frame.t), "row": row}
+            entry = acc[abs_id]
+            row = entry["row"]
+
+            if self._corrected_reduced:
+                # Reduced mode: accumulate per-side bfi/bvi, flush when we
+                # have seen contributions from both expected sides.
+                side = frame.side
+                if isinstance(frame, EnrichedCorrectedFrame):
+                    bfi_val = round(float(frame.bfi), 9)
+                    bvi_val = round(float(frame.bvi), 9)
+                else:
+                    # Fallback for plain CorrectedFrame (no enrichment)
+                    bfi_val = ""
+                    bvi_val = ""
+                if side == "left":
+                    row[2] = bfi_val
+                    row[4] = bvi_val
+                else:
+                    row[3] = bfi_val
+                    row[5] = bvi_val
+            else:
+                # Normal mode: wide per-cam columns
+                side_char = "l" if frame.side == "left" else "r"
+                cam_1 = int(frame.cam_id) % 8 + 1
+                if isinstance(frame, EnrichedCorrectedFrame):
+                    for metric, val in (
+                        ("bfi",      frame.bfi),
+                        ("bvi",      frame.bvi),
+                        ("mean",     frame.mean),
+                        ("contrast", frame.contrast),
+                    ):
+                        col_idx = _NORMAL_COL_IDX[(metric, side_char, cam_1)]
+                        row[col_idx] = round(float(val), 9)
+                else:
+                    # Fallback: only mean/std available
+                    for metric, val in (("mean", frame.mean),):
+                        col_idx = _NORMAL_COL_IDX[(metric, side_char, cam_1)]
+                        row[col_idx] = round(float(val), 9)
+                # temp: leave empty (not propagated through corrected path yet)
+
+            # Check whether this frame is complete (all expected cams seen for
+            # sides that have non-empty masks).
+            self._maybe_flush_row(abs_id)
+
+    def _maybe_flush_row(self, abs_id: int) -> None:
+        """Flush a completed accumulator row to the CSV writer."""
+        entry = self._corrected_acc.get(abs_id)
+        if entry is None:
+            return
+        row = entry["row"]
+        t = entry["t"]
+        # Determine if the row is complete enough to flush.
+        # We check that all expected camera positions for each active side
+        # have contributed at least the mean column (non-empty).
+        if self._corrected_reduced:
+            # For reduced mode, check bfi_left and bfi_right presence
+            sides_done = set()
+            if self._expected_cams["left"]:
+                if row[2] != "":
+                    sides_done.add("left")
+            else:
+                sides_done.add("left")  # no left cameras expected
+            if self._expected_cams["right"]:
+                if row[3] != "":
+                    sides_done.add("right")
+            else:
+                sides_done.add("right")
+            if len(sides_done) == 2:
+                row[0] = abs_id
+                row[1] = round(t, 9)
+                self._write_corrected_row(row)
+                del self._corrected_acc[abs_id]
+        else:
+            # Normal mode: check mean columns for all expected cam positions
+            all_done = True
+            for side_name, side_char in (("left", "l"), ("right", "r")):
+                for cam_id in self._expected_cams[side_name]:
+                    cam_1 = cam_id % 8 + 1
+                    col_idx = _NORMAL_COL_IDX[("mean", side_char, cam_1)]
+                    if row[col_idx] == "":
+                        all_done = False
+                        break
+                if not all_done:
+                    break
+            if all_done:
+                row[0] = abs_id
+                row[1] = round(t, 9)
+                self._write_corrected_row(row)
+                del self._corrected_acc[abs_id]
+
+    def _write_corrected_row(self, row: list) -> None:
+        w = self._get_or_open_corrected_writer()
+        if w is None:
+            return
+        w.writerow(row)
+        if self._corrected_fh is not None:
+            self._corrected_fh.flush()
+
+    def _get_or_open_corrected_writer(self):
+        if self._corrected_csv is not None:
+            return self._corrected_csv
+        meta = self._meta
+        if meta is None:
+            return None
+        try:
+            os.makedirs(self._output_dir, exist_ok=True)
+            filename = f"{meta.scan_id}_corrected.csv"
+            path = os.path.join(self._output_dir, filename)
+            fh = open(path, "w", newline="", encoding="utf-8")
+            w = csv.writer(fh)
+            if self._corrected_reduced:
+                w.writerow(_REDUCED_HEADERS)
+            else:
+                w.writerow(_NORMAL_HEADERS)
+            self._corrected_fh = fh
+            self._corrected_csv = w
+            return w
+        except Exception:
+            logger.exception("CsvSink: failed to open corrected CSV")
+            return None
+
+    def _get_or_open_raw_writer(self, side: str, mask: int):
+        if side in self._raw_csvs:
+            return self._raw_csvs[side]
+        meta = self._meta
+        if meta is None:
+            return None
+        try:
+            os.makedirs(self._output_dir, exist_ok=True)
+            mask_hex = f"{mask:02X}"
+            filename = f"{meta.scan_id}_{meta.subject_id}_{side}_mask{mask_hex}_raw.csv"
+            path = os.path.join(self._output_dir, filename)
+            fh = open(path, "w", newline="", encoding="utf-8")
+            w = csv.writer(fh)
+            w.writerow(_RAW_PIPELINE_HEADERS)
+            self._raw_fhs[side] = fh
+            self._raw_csvs[side] = w
+            return w
+        except Exception:
+            logger.exception("CsvSink: failed to open raw CSV for side=%s", side)
+            return None
+
+
+class ScanDBSink:
+    """Channel-based SQLite sink for the pipeline.
+
+    Channels:
+        "raw"   — per-frame raw histograms (gated by meta.write_raw_csv)
+        "final" — per-interval corrected output (placeholder; wired in PR 3)
+    """
+
+    channels = {"raw", "final"}
+
+    def __init__(self, db_path: str, *, raw_batch_size: int = 200) -> None:
+        self._db_path = db_path
+        self._raw_batch_size = max(1, int(raw_batch_size))
+        self._db = None
+        self._session_id: Optional[int] = None
+        self._meta: Optional[ScanMetadata] = None
+        self._raw_buffer: list = []
+        self._closed = False
+
+    def on_scan_start(self, meta: ScanMetadata) -> None:
+        from omotion.ScanDatabase import ScanDatabase
+        import time
+        self._meta = meta
+        self._closed = False
+        label = f"{meta.scan_id}_{meta.subject_id}"
+        self._db = ScanDatabase(db_path=self._db_path)
+        self._session_id = self._db.create_session(
+            session_label=label,
+            session_start=time.time(),
+            session_notes=None,
+            session_meta={"scan_id": meta.scan_id, "operator": meta.operator},
+        )
+
+    def consume(self, channel: str, payload: Any) -> None:
+        if channel == "raw":
+            self._consume_raw(payload)
+        elif channel == "final":
+            self._consume_final(payload)
+
+    def on_complete(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        import time
+        try:
+            self._flush_raw()
+            if self._db is not None and self._session_id is not None:
+                self._db.close_session(self._session_id, time.time())
+        except Exception:
+            logger.exception("ScanDBSink.on_complete: failed to finalise session")
+        finally:
+            if self._db is not None:
+                try:
+                    self._db.close()
+                except Exception:
+                    logger.exception("ScanDBSink: error closing ScanDatabase")
+                self._db = None
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _consume_final(self, interval) -> None:
+        """Write CorrectedFrames from a CorrectedInterval to session_data.
+
+        The session_data table holds: cam_id, side, frame_id, timestamp_s,
+        mean, bfi, bvi, contrast. For CorrectedFrames we don't have cam_id
+        or side metadata (they're aggregated by DarkCorrectionStage at the
+        per-camera level). We write cam_id=-1, side=0 (left sentinel) so the
+        rows are query-able; PR 3 will carry per-cam data through the interval.
+        """
+        if self._db is None or self._session_id is None:
+            return
+        rows = []
+        for frame in interval.frames:
+            mean_val = float(frame.mean)
+            std_val = float(frame.std)
+            contrast_val = (std_val / mean_val) if mean_val > 0 else None
+            rows.append({
+                "session_id": self._session_id,
+                "session_raw_id": None,
+                "cam_id": -1,
+                "side": 0,
+                "frame_id": int(frame.abs_frame_id),
+                "timestamp_s": round(frame.t, 6),
+                "mean": round(mean_val, 9),
+                "contrast": round(contrast_val, 9) if contrast_val is not None else None,
+                "bfi": None,
+                "bvi": None,
+            })
+        if rows:
+            try:
+                self._db.insert_session_data_rows(rows)
+            except Exception:
+                logger.exception(
+                    "ScanDBSink: failed to insert %d corrected frames", len(rows)
+                )
+
+    def _consume_raw(self, batch) -> None:
+        meta = self._meta
+        if meta is None or not meta.write_raw_csv:
+            return
+        if self._db is None or self._session_id is None:
+            return
+
+        import struct
+        import numpy as np
+
+        _pack = struct.Struct(f"<{_HISTO_BINS}I")
+
+        n = len(batch.cam_ids)
+        for i in range(n):
+            cam_id = int(batch.cam_ids[i])
+            frame_id = int(batch.frame_ids[i])
+            ts = float(batch.timestamp_s[i])
+            temp = float(batch.temperature_c[i, 0, cam_id]) if batch.temperature_c is not None else None
+            pdc_val = float(batch.pdc[i]) if batch.pdc is not None else 0.0
+            tcm_val = float(batch.tcm[i]) if batch.tcm is not None else 0.0
+            tcl_val = float(batch.tcl[i]) if batch.tcl is not None else 0.0
+
+            for side_idx, side_name in enumerate(("left", "right")):
+                mask = meta.left_camera_mask if side_idx == 0 else meta.right_camera_mask
+                if mask == 0 or not (mask & (1 << cam_id)):
+                    continue
+                histo = batch.raw_histograms[i, side_idx, cam_id, :]
+                hist_bytes = _pack.pack(*histo.tolist())
+                histo_sum = int(np.sum(histo))
+                self._raw_buffer.append({
+                    "session_id": self._session_id,
+                    "side": side_name,
+                    "cam_id": cam_id,
+                    "frame_id": frame_id,
+                    "timestamp_s": round(ts, 6),
+                    "hist": hist_bytes,
+                    "temp": round(temp, 6) if temp is not None else None,
+                    "sum_counts": histo_sum,
+                    "tcm": round(tcm_val, 6),
+                    "tcl": round(tcl_val, 6),
+                    "pdc": round(pdc_val, 6),
+                })
+
+        if len(self._raw_buffer) >= self._raw_batch_size:
+            self._flush_raw()
+
+    def _flush_raw(self) -> None:
+        if not self._raw_buffer or self._db is None:
+            self._raw_buffer.clear()
+            return
+        try:
+            self._db.insert_raw_frames(self._raw_buffer)
+        except Exception:
+            logger.exception("ScanDBSink: failed to flush %d raw frames", len(self._raw_buffer))
+        finally:
+            self._raw_buffer.clear()
+
+
+class QtUiSink:
+    """Forwards live-channel batches as Qt signals for the app's plot widget.
+
+    PR 1 ships a stub that records calls (for testability). PR 3 wires
+    against PyQt6 signals in motion_connector.py.
+    """
+
+    channels = {"live"}
+
+    def __init__(self):
+        self.live_batches = []
+
+    def on_scan_start(self, meta): pass
+
+    def consume(self, channel: str, payload: Any) -> None:
+        if channel == "live":
+            self.live_batches.append(payload)
+
+    def on_complete(self): pass

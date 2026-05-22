@@ -36,6 +36,7 @@ dev = [
   "pytest>=8.0",
   "pytest-html>=4.0",
   "pytest-timeout>=2.3",
+  "pytest-benchmark>=4.0",
 ]
 
 [project.urls]
