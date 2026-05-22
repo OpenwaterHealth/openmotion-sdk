@@ -54,9 +54,9 @@ def start_scan(self, request: ScanRequest) -> bool: ...
 
 The 6 legacy `on_*_fn` kwargs are removed entirely. Sinks now travel **on the `ScanRequest` itself** — see §3.1.1 below.
 
-### 3.1.1 `ScanRequest` carries sinks and the optional telemetry source
+### 3.1.1 `ScanRequest` carries only sinks (sources are SDK-managed)
 
-`ScanRequest` gains `sinks` and `telemetry_source` fields. The single dataclass captures the entire "what to do with this scan" contract: scan parameters + raw-save behavior + where the output goes + whether to capture console telemetry:
+`ScanRequest` gains a `sinks` field. The single dataclass captures the "what to do with this scan" contract: scan parameters + raw-save behavior + where the output goes. **Sources are SDK infrastructure** — `start_scan` builds them, including auxiliary probes like the telemetry source, based on which channels the sinks subscribe to (see §3.6):
 
 ```python
 @dataclass
@@ -70,7 +70,6 @@ class ScanRequest:
     rolling_avg_window:  Optional[int] = None
     batch_size_frames:   Optional[int] = None
     sinks:               list[Sink] = field(default_factory=list)
-    telemetry_source:    Optional["ConsoleTelemetrySource"] = None  # see §3.6
     # ... other scan parameters
 ```
 
@@ -138,9 +137,18 @@ def start_scan(self, request):
         metadata=meta,
     )
 
+    # Auxiliary sources are auto-wired based on which channels the sinks subscribe to.
+    # Today: telemetry. Future: IMU, ambient light, etc. — same pattern.
+    subscribed_channels = {ch for s in request.sinks for ch in s.channels}
+    telemetry_source = None
+    if "telemetry" in subscribed_channels:
+        telemetry_source = ConsoleTelemetrySource(
+            console=self._interface.console, poll_interval_s=0.1,
+        )
+
     self._runner = ScanRunner(
         source=source, pipeline=pipeline, sinks=request.sinks,
-        telemetry_source=request.telemetry_source,
+        telemetry_source=telemetry_source,
     )
     self._scan_thread = threading.Thread(target=self._runner.run, daemon=True)
     self._scan_thread.start()
@@ -481,22 +489,17 @@ Same `_safe_consume` exception isolation as the main dispatch path.
 
 #### 3.6.3 App composition (gated on developer_mode)
 
+The app's contract is: **declare what you want via sinks**. The SDK auto-wires the matching source based on which channels are subscribed.
+
 ```python
 # In bloodflow-app motion_connector.py:
 sinks = [
     _LivePlotSink(connector=self),
-    _ContactQualityCheckSink(connector=self),
     CsvSink(output_dir=app_config.data_directory),
 ]
 if app_config.scan_db_enabled:
     sinks.append(ScanDBSink(db_path=app_config.scan_db_path))
-
-telemetry_source = None
 if app_config.developer_mode:
-    telemetry_source = ConsoleTelemetrySource(
-        console=self._interface.console,
-        poll_interval_s=0.1,
-    )
     sinks.append(TelemetrySink(output_path=os.path.join(
         app_config.data_directory, f"{scan_id}_telemetry.csv",
     )))
@@ -505,18 +508,26 @@ request = ScanRequest(
     subject_id="...", duration_sec=300, ...,
     raw_save_max_duration_s=raw_max,
     sinks=sinks,
-    telemetry_source=telemetry_source,
 )
 self._interface.start_scan(request)
 ```
 
-The construction gate sits at the app: only build `ConsoleTelemetrySource` when developer mode is on. That way the underlying poller isn't running in production scans where nobody consumes the events.
+**Auto-wiring inside `start_scan`:**
+
+```python
+subscribed_channels = {ch for s in request.sinks for ch in s.channels}
+telemetry_source = None
+if "telemetry" in subscribed_channels:
+    telemetry_source = ConsoleTelemetrySource(console=self._interface.console)
+```
+
+When no `TelemetrySink` is in the request, no source runs — no USB chatter, no thread, no work. The app can't accidentally enable the source without a consumer (because it doesn't construct the source at all) and can't accidentally add a `TelemetrySink` without enabling the source (because the source is auto-wired).
 
 #### 3.6.4 Why a separate source instead of folding into LiveUsbSource
 
 The telemetry stream is **not** synchronized to the histogram stream — it's polled by the SDK over UART at a different cadence and has its own packet format. Coupling them into one source would force one cadence on both. Keeping them as parallel inputs to `ScanRunner` preserves their independence; the only shared concept is per-scan t=0 normalization (each source maintains its own `_t0`).
 
-This also makes the design more general: any future second probe (IMU stream, ambient-light sensor, etc.) can follow the same pattern as another parallel source on `ScanRequest`.
+This generalizes for future probes: when an IMU source or ambient-light source lands, it follows the same pattern. The IMU source's sink subscribes to `"imu"`; `ScanWorkflow.start_scan` detects the channel and auto-wires the source. No changes to `ScanRequest`'s public shape.
 
 ### 3.7 Test-scan support (from feature/132)
 
