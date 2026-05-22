@@ -162,9 +162,14 @@ class Interval:
 class CorrectedFrame:
     """One corrected sample, output of batch correction."""
     abs_frame_id: int
-    t:    float
-    mean: float
-    std:  float
+    t:             float
+    side:          str       # "left" or "right"
+    cam_id:        int       # 0..7
+    mean:          float     # dark-subtracted u1 (no shot-noise yet)
+    std:           float     # dark-subtracted std (no shot-noise yet)
+    raw_u1:        float     # original raw mean (for shot-noise use by downstream)
+    raw_var:       float     # u2 - u1^2 (raw variance before dark sub)
+    dark_var:      float     # interpolated dark baseline variance
 
 
 @dataclass
@@ -219,7 +224,8 @@ class LinearInterpolation:
     See docs/SciencePipeline.md §8.1–§8.3.
     """
 
-    def correct_interval(self, interval: Interval) -> CorrectedInterval:
+    def correct_interval(self, interval: Interval, *,
+                         side: str, cam_id: int) -> CorrectedInterval:
         d_prev = interval.left.obs
         d_next = interval.right.obs
         dt = d_next.t - d_prev.t
@@ -233,10 +239,13 @@ class LinearInterpolation:
             mean = lf.u1 - baseline_u1
             raw_var = max(0.0, lf.u2 - lf.u1 ** 2)
             corrected_var = max(0.0, raw_var - baseline_var)
-            std = float(max(0.0, corrected_var) ** 0.5)
+            std = float(corrected_var ** 0.5)
 
             corrected_frames.append(CorrectedFrame(
-                abs_frame_id=lf.abs_frame_id, t=lf.t, mean=mean, std=std,
+                abs_frame_id=lf.abs_frame_id, t=lf.t,
+                side=side, cam_id=cam_id,
+                mean=mean, std=std,
+                raw_u1=lf.u1, raw_var=raw_var, dark_var=baseline_var,
             ))
 
         return CorrectedInterval(
@@ -355,7 +364,9 @@ class DarkCorrectionStage:
                     if pi.is_closed():
                         interval = pi.flush()
                         # After flush, pi's left has rolled to the just-flushed right.
-                        corrected = self._batch.correct_interval(interval)
+                        corrected = self._batch.correct_interval(
+                            interval, side=side, cam_id=cam_id,
+                        )
                         batch.events.append(IntervalClosed(corrected_batch=corrected))
 
             else:  # light
@@ -403,5 +414,7 @@ class DarkCorrectionStage:
             )
             pi.set_right_dark(terminal, abs_frame_id=last_light.abs_frame_id)
             interval = pi.flush()
-            corrected = self._batch.correct_interval(interval)
+            corrected = self._batch.correct_interval(
+                interval, side=side, cam_id=cam_id,
+            )
             batch.events.append(IntervalClosed(corrected_batch=corrected))

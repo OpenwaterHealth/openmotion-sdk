@@ -84,14 +84,20 @@ def test_linear_interpolation_dark_baseline_across_interval():
 
     interval = pi.flush()
     interp = LinearInterpolation()
-    corrected = interp.correct_interval(interval)
+    corrected = interp.correct_interval(interval, side="left", cam_id=0)
     f = corrected.frames[0]
     assert f.abs_frame_id == 11
+    assert f.side == "left"
+    assert f.cam_id == 0
     assert f.mean == pytest.approx(350.0)
     raw_var = 260_000.0 - 500.0 ** 2
     # t_frac=0.5: baseline_var = 10**2 + 0.5*(20**2 - 10**2) = 100 + 150 = 250
     expected_var = max(0.0, raw_var - 250.0)
     assert f.std == pytest.approx(np.sqrt(expected_var))
+    # Raw moment fields
+    assert f.raw_u1 == pytest.approx(500.0)
+    assert f.raw_var == pytest.approx(raw_var)
+    assert f.dark_var == pytest.approx(250.0)
 
 
 def test_stencil_full_4_point_when_all_neighbours_present():
