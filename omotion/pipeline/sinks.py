@@ -189,3 +189,122 @@ class CsvSink:
         except Exception:
             logger.exception("CsvSink: failed to open raw CSV for side=%s", side)
             return None
+
+
+class ScanDBSink:
+    """Channel-based SQLite sink for the pipeline.
+
+    Channels:
+        "raw"   — per-frame raw histograms (gated by meta.write_raw_csv)
+        "final" — per-interval corrected output (placeholder; wired in PR 3)
+    """
+
+    channels = {"raw", "final"}
+
+    def __init__(self, db_path: str, *, raw_batch_size: int = 200) -> None:
+        self._db_path = db_path
+        self._raw_batch_size = max(1, int(raw_batch_size))
+        self._db = None
+        self._session_id: Optional[int] = None
+        self._meta: Optional[ScanMetadata] = None
+        self._raw_buffer: list = []
+        self._closed = False
+
+    def on_scan_start(self, meta: ScanMetadata) -> None:
+        from omotion.ScanDatabase import ScanDatabase
+        import time
+        self._meta = meta
+        self._closed = False
+        label = f"{meta.scan_id}_{meta.subject_id}"
+        self._db = ScanDatabase(db_path=self._db_path)
+        self._session_id = self._db.create_session(
+            session_label=label,
+            session_start=time.time(),
+            session_notes=None,
+            session_meta={"scan_id": meta.scan_id, "operator": meta.operator},
+        )
+
+    def consume(self, channel: str, payload: Any) -> None:
+        if channel == "raw":
+            self._consume_raw(payload)
+        # "final" channel: placeholder until PR 3
+
+    def on_complete(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        import time
+        try:
+            self._flush_raw()
+            if self._db is not None and self._session_id is not None:
+                self._db.close_session(self._session_id, time.time())
+        except Exception:
+            logger.exception("ScanDBSink.on_complete: failed to finalise session")
+        finally:
+            if self._db is not None:
+                try:
+                    self._db.close()
+                except Exception:
+                    logger.exception("ScanDBSink: error closing ScanDatabase")
+                self._db = None
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _consume_raw(self, batch) -> None:
+        meta = self._meta
+        if meta is None or not meta.write_raw_csv:
+            return
+        if self._db is None or self._session_id is None:
+            return
+
+        import struct
+        import numpy as np
+
+        _pack = struct.Struct(f"<{_HISTO_BINS}I")
+
+        n = len(batch.cam_ids)
+        for i in range(n):
+            cam_id = int(batch.cam_ids[i])
+            frame_id = int(batch.frame_ids[i])
+            ts = float(batch.timestamp_s[i])
+            temp = float(batch.temperature_c[i, 0, cam_id]) if batch.temperature_c is not None else None
+            pdc_val = float(batch.pdc[i]) if batch.pdc is not None else 0.0
+            tcm_val = float(batch.tcm[i]) if batch.tcm is not None else 0.0
+            tcl_val = float(batch.tcl[i]) if batch.tcl is not None else 0.0
+
+            for side_idx, side_name in enumerate(("left", "right")):
+                mask = meta.left_camera_mask if side_idx == 0 else meta.right_camera_mask
+                if mask == 0 or not (mask & (1 << cam_id)):
+                    continue
+                histo = batch.raw_histograms[i, side_idx, cam_id, :]
+                hist_bytes = _pack.pack(*histo.tolist())
+                histo_sum = int(np.sum(histo))
+                self._raw_buffer.append({
+                    "session_id": self._session_id,
+                    "side": side_name,
+                    "cam_id": cam_id,
+                    "frame_id": frame_id,
+                    "timestamp_s": round(ts, 6),
+                    "hist": hist_bytes,
+                    "temp": round(temp, 6) if temp is not None else None,
+                    "sum_counts": histo_sum,
+                    "tcm": round(tcm_val, 6),
+                    "tcl": round(tcl_val, 6),
+                    "pdc": round(pdc_val, 6),
+                })
+
+        if len(self._raw_buffer) >= self._raw_batch_size:
+            self._flush_raw()
+
+    def _flush_raw(self) -> None:
+        if not self._raw_buffer or self._db is None:
+            self._raw_buffer.clear()
+            return
+        try:
+            self._db.insert_raw_frames(self._raw_buffer)
+        except Exception:
+            logger.exception("ScanDBSink: failed to flush %d raw frames", len(self._raw_buffer))
+        finally:
+            self._raw_buffer.clear()
