@@ -42,7 +42,7 @@ def default_pipeline(*,
 
     return Pipeline([
         FrameClassificationStage(discard_count=discard_count, dark_interval=dark_interval),
-        Tee("raw", filter=None),
+        Tee("raw", filter=lambda ft: ft != "stale"),
 
         NoiseFloorStage(threshold=noise_floor_threshold),
         MomentsStage(),
