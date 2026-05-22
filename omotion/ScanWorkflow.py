@@ -74,19 +74,14 @@ class ScanRequest:
     duration_sec: int
     left_camera_mask: int
     right_camera_mask: int
-    data_dir: str
     disable_laser: bool
+    data_dir: str = ""
     expected_size: int = 32837
     # CSV output flags — all enabled by default.  Flip to False once the
     # corresponding downstream consumer no longer needs the file, so the
     # pipeline avoids unnecessary disk I/O.
-    write_raw_csv: bool = True
     write_corrected_csv: bool = True
     write_telemetry_csv: bool = True
-    # Maximum number of seconds for which raw histogram CSVs are written.
-    # None (default) means write for the full scan duration.
-    # Has no effect when write_raw_csv is False.
-    raw_csv_duration_sec: float | None = None
     # When True, the pipeline averages all active cameras per side into
     # single left/right BFI/BVI values.  The corrected CSV contains only
     # bfi_left, bfi_right, bvi_left, bvi_right columns.  Uncorrected
@@ -104,6 +99,15 @@ class ScanRequest:
     # effective when that path is set.
     write_raw_to_db: bool = False
     notes: str = ""
+    # Pipeline sinks list — will be injected by the runner at start_scan time.
+    # Normally managed by the SDK at MotionInterface construction (data_dir, scan_db_path).
+    sinks: list = field(default_factory=list)
+    # Skip injecting default storage sinks (CSV, DB). Set to True when
+    # a caller supplies all sinks via the sinks list.
+    skip_default_storage: bool = False
+    # Duration cap for raw histogram output. If set and > 0, includes Tee("raw")
+    # with max_duration_s. If 0 or negative, omits raw output.
+    raw_save_max_duration_s: float | None = None
 
 
 @dataclass
