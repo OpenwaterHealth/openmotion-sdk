@@ -797,7 +797,8 @@ def _run_subscan_capture(
         right_camera_mask=request.right_camera_mask,
         data_dir=request.output_dir,
         disable_laser=False,
-        write_raw_csv=True,         # keep the raw artifact for audit
+        # Note: raw CSV gating is now controlled by Tee("raw") in the
+        # pipeline, not by ScanRequest flags. SDK outputs default sinks.
         write_corrected_csv=False,
         write_telemetry_csv=False,
         reduced_mode=False,
