@@ -201,7 +201,7 @@ def start_scan(self, request):
     return True
 ```
 
-**Apps construct their own storage sinks** including `CsvSink` and `ScanDBSink` and pass them as part of the `ScanRequest.sinks` list. Sinks are dumb consumers; they write everything they receive on subscribed channels. The raw-save *gate* lives on the pipeline's `Tee("raw")` (see §3.2.1).
+Storage sinks (`CsvSink`, `ScanDBSink`) are SDK-managed and auto-injected per §3.0 — apps never construct them. Apps only contribute their own UI / dev-mode sinks via `request.sinks`. Sinks are dumb consumers; they write everything they receive on subscribed channels. The raw-save *gate* lives on the pipeline's `Tee("raw")` (see §3.2.1).
 
 ### 3.2.1 Raw-save gating moves from sinks to the Tee
 
@@ -543,13 +543,11 @@ Same `_safe_consume` exception isolation as the main dispatch path.
 The app's contract is: **declare what you want via sinks**. The SDK auto-wires the matching source based on which channels are subscribed.
 
 ```python
-# In bloodflow-app motion_connector.py:
-sinks = [
-    _LivePlotSink(connector=self),
-    CsvSink(output_dir=app_config.data_directory),
-]
-if app_config.scan_db_enabled:
-    sinks.append(ScanDBSink(db_path=app_config.scan_db_path))
+# In bloodflow-app motion_connector.py.
+# Storage sinks (CsvSink, ScanDBSink) are SDK-managed — apps never construct
+# them; MotionInterface(data_dir=..., scan_db_path=...) wires them once at
+# init time (see §3.0).
+sinks = [_LivePlotSink(connector=self)]
 if app_config.developer_mode:
     sinks.append(TelemetrySink(output_path=os.path.join(
         app_config.data_directory, f"{scan_id}_telemetry.csv",
