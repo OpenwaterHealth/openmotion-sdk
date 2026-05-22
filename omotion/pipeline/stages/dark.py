@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Deque, Optional
+from typing import Any, Deque, Optional
 
 import numpy as np
 
@@ -180,6 +180,28 @@ class CorrectedInterval:
     frames:    list[CorrectedFrame]
 
 
+@dataclass
+class EnrichedCorrectedFrame:
+    """CorrectedFrame after shot-noise correction + BFI/BVI calibration."""
+    abs_frame_id: int
+    t:        float
+    side:     str
+    cam_id:   int
+    mean:     float
+    std:      float     # post-shot-noise std
+    contrast: float
+    bfi:      float
+    bvi:      float
+
+
+@dataclass
+class EnrichedCorrectedInterval:
+    """Output of the enrichment pass (parallel to CorrectedInterval)."""
+    left_abs:  int
+    right_abs: int
+    frames:    list[EnrichedCorrectedFrame]
+
+
 class PendingInterval:
     """Buffers non-dark frames between two bounding darks."""
 
@@ -314,7 +336,11 @@ class DarkCorrectionStage:
                  batch_estimator: LinearInterpolation,
                  pedestals: Optional[SensorPedestals] = None,
                  realtime_history_size: int = 4,
-                 integrity_max_above_pedestal: float = 30.0):
+                 integrity_max_above_pedestal: float = 30.0,
+                 # Optional enrichment params (shot-noise + BFI/BVI)
+                 adc_gain: Optional[float] = None,
+                 camera_gain_map: Optional[np.ndarray] = None,
+                 calibration: "Optional[Any]" = None):
         self._realtime = realtime_estimator
         self._batch = batch_estimator
         self._pedestals = pedestals or SensorPedestals(left=64.0, right=64.0)
@@ -322,6 +348,77 @@ class DarkCorrectionStage:
         self._pending: dict[tuple[str, int], PendingInterval] = {}
         self._guard = DarkIntegrityGuard(
             max_above_pedestal=integrity_max_above_pedestal
+        )
+        # Enrichment (shot-noise + calibration) — None means emit raw CorrectedInterval
+        self._adc_gain: Optional[float] = float(adc_gain) if adc_gain is not None else None
+        self._gain_map: Optional[np.ndarray] = (
+            np.asarray(camera_gain_map, dtype=np.float32) if camera_gain_map is not None else None
+        )
+        if calibration is not None:
+            self._c_min = np.asarray(calibration.c_min, dtype=np.float32)
+            self._c_max = np.asarray(calibration.c_max, dtype=np.float32)
+            self._i_min = np.asarray(calibration.i_min, dtype=np.float32)
+            self._i_max = np.asarray(calibration.i_max, dtype=np.float32)
+        else:
+            self._c_min = self._c_max = self._i_min = self._i_max = None
+
+    # ------------------------------------------------------------------
+    # Enrichment helpers (shot-noise + BFI/BVI calibration)
+    # ------------------------------------------------------------------
+
+    def _can_enrich(self) -> bool:
+        return (self._adc_gain is not None
+                and self._gain_map is not None
+                and self._c_min is not None)
+
+    def _enrich_corrected_frame(self, f: "CorrectedFrame") -> "EnrichedCorrectedFrame":
+        """Apply shot-noise correction + BFI/BVI calibration to a CorrectedFrame."""
+        side_idx = 0 if f.side == "left" else 1
+        cam_pos = int(f.cam_id) % 8
+        g_cam = float(self._gain_map[cam_pos])
+
+        # Shot-noise variance: §8.3 — use dark-corrected mean (f.mean)
+        shot_var = self._adc_gain * max(0.0, f.mean) * g_cam
+        corrected_var = max(0.0, f.std ** 2 - shot_var)
+        shot_corrected_std = corrected_var ** 0.5
+
+        if f.mean > 0:
+            contrast = shot_corrected_std / f.mean
+        else:
+            contrast = 0.0
+
+        # BFI/BVI calibration §9
+        c_min = float(self._c_min.reshape(2, 8)[side_idx, cam_pos])
+        c_max = float(self._c_max.reshape(2, 8)[side_idx, cam_pos])
+        i_min = float(self._i_min.reshape(2, 8)[side_idx, cam_pos])
+        i_max = float(self._i_max.reshape(2, 8)[side_idx, cam_pos])
+        c_span = c_max - c_min
+        i_span = i_max - i_min
+
+        if c_span > 0:
+            bfi = (1.0 - (contrast - c_min) / c_span) * 10.0
+        else:
+            bfi = contrast * 10.0
+        if i_span > 0:
+            bvi = (1.0 - (f.mean - i_min) / i_span) * 10.0
+        else:
+            bvi = f.mean * 10.0
+
+        return EnrichedCorrectedFrame(
+            abs_frame_id=f.abs_frame_id, t=f.t,
+            side=f.side, cam_id=f.cam_id,
+            mean=float(f.mean),
+            std=float(shot_corrected_std),
+            contrast=float(contrast),
+            bfi=float(bfi),
+            bvi=float(bvi),
+        )
+
+    def _enrich_interval(self, ci: "CorrectedInterval") -> "EnrichedCorrectedInterval":
+        return EnrichedCorrectedInterval(
+            left_abs=ci.left_abs,
+            right_abs=ci.right_abs,
+            frames=[self._enrich_corrected_frame(f) for f in ci.frames],
         )
 
     def process(self, batch: FrameBatch) -> FrameBatch:
@@ -367,7 +464,8 @@ class DarkCorrectionStage:
                         corrected = self._batch.correct_interval(
                             interval, side=side, cam_id=cam_id,
                         )
-                        batch.events.append(IntervalClosed(corrected_batch=corrected))
+                        emit = self._enrich_interval(corrected) if self._can_enrich() else corrected
+                        batch.events.append(IntervalClosed(corrected_batch=emit))
 
             else:  # light
                 pred = self._realtime.predict(
@@ -417,4 +515,5 @@ class DarkCorrectionStage:
             corrected = self._batch.correct_interval(
                 interval, side=side, cam_id=cam_id,
             )
-            batch.events.append(IntervalClosed(corrected_batch=corrected))
+            emit = self._enrich_interval(corrected) if self._can_enrich() else corrected
+            batch.events.append(IntervalClosed(corrected_batch=emit))

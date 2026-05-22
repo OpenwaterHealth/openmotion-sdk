@@ -15,6 +15,7 @@ from .stages.moments import MomentsStage
 from .stages.pedestal_sub import PedestalSubtractionStage
 from .stages.dark import (
     DarkCorrectionStage, HybridRealtimePredictor, LinearInterpolation,
+    EnrichedCorrectedFrame, EnrichedCorrectedInterval,
 )
 from .stages.shot_noise import ShotNoiseCorrectionStage
 from .stages.bfi_bvi import BfiBviStage
@@ -53,6 +54,9 @@ def default_pipeline(*,
             batch_estimator=LinearInterpolation(),
             pedestals=pedestals,
             realtime_history_size=realtime_dark_history_size,
+            adc_gain=ADC_GAIN,
+            camera_gain_map=CAMERA_GAIN_MAP,
+            calibration=calibration,
         ),
 
         ShotNoiseCorrectionStage(adc_gain=ADC_GAIN, camera_gain_map=CAMERA_GAIN_MAP),
