@@ -178,30 +178,37 @@ PR 1 had each sink self-gate on `meta.write_raw_csv` + `meta.raw_csv_duration_se
 
 ### 3.3 LiveUsbSource wiring
 
-The PR-1 skeleton's `_reader_loop` raises `NotImplementedError`. Fill it in by consuming the existing `StreamInterface` packet queue:
+The PR-1 skeleton's `_reader_loop` raises `NotImplementedError`. Fill it in by delegating to the legacy `parse_histogram_stream` helper (which we keep in `MotionProcessing.py` — see §3.4): the helper handles byte-buffer accumulation, multi-sample packets, 32-bit timestamp rollover, and row-sum validation. The source's only job is to convert the per-row callback into per-side `FrameBatch` objects.
 
 ```python
 class LiveUsbSource(_BaseSource):
+    """Per-side packet queues + per-side reader threads → shared batch queue."""
+
     def __init__(self, *, console, left, right, batch_size_frames=10,
-                 flush_interval_s=0.25, queue_size=64, metadata):
+                 flush_interval_s=0.25, packet_queue_size=64, metadata):
         super().__init__(metadata=metadata)
         self._console = console
-        self._left = left
-        self._right = right
+        self._sensors = {"left": left, "right": right}
         self._batch_size = batch_size_frames
         self._flush_interval = flush_interval_s
-        self._packet_queue: queue.Queue = queue.Queue(maxsize=queue_size)
+
+        # One packet queue per active side. StreamInterface pushes raw bytes
+        # in; the per-side reader_loop pulls them out.
+        self._packet_queues = {
+            side: queue.Queue(maxsize=packet_queue_size)
+            for side, sensor in self._sensors.items() if sensor is not None
+        }
+        # Shared FrameBatch queue — reader threads push, __iter__ pulls.
+        # Kept shallow because batches are bulky (10 frames × 2 × 8 × 1024 × 4B ≈ 640 KB).
         self._batch_queue: queue.Queue = queue.Queue(maxsize=4)
         self._stop = threading.Event()
         self._reader_threads: list[threading.Thread] = []
 
     def __iter__(self) -> Iterator[FrameBatch]:
-        # Start per-side StreamInterface streaming into _packet_queue
-        for side_name, sensor in (("left", self._left), ("right", self._right)):
-            if sensor is None:
-                continue
-            sensor.histo_stream.start_streaming(
-                self._packet_queue, expected_size=HISTO_PACKET_BYTES,
+        for side_name in self._packet_queues:
+            self._sensors[side_name].histo_stream.start_streaming(
+                self._packet_queues[side_name],
+                expected_size=HISTO_PACKET_BYTES,
             )
             t = threading.Thread(
                 target=self._reader_loop, args=(side_name,),
@@ -220,32 +227,37 @@ class LiveUsbSource(_BaseSource):
             yield batch
 
     def _reader_loop(self, side_name: str) -> None:
-        """Pull parsed HistogramSamples from _packet_queue, accumulate, yield FrameBatches."""
-        from omotion.MotionProcessing import parse_histogram_packet_structured
+        """Per-side reader: delegates packet parsing to parse_histogram_stream,
+        batches the resulting samples, and pushes FrameBatches to the shared
+        batch queue.
+        """
+        from omotion.MotionProcessing import parse_histogram_stream
 
-        accumulated: list[HistogramSample] = []
+        side_idx = 0 if side_name == "left" else 1
+        accumulated: list = []  # list of (cam_id, frame_id, ts, histogram, row_sum, temp)
         last_flush = time.monotonic()
-        while not self._stop.is_set():
-            try:
-                raw_bytes = self._packet_queue.get(timeout=self._flush_interval)
-            except queue.Empty:
-                if accumulated:
-                    self._batch_queue.put(self._build_batch(side_name, accumulated))
-                    accumulated.clear()
-                    last_flush = time.monotonic()
-                continue
 
-            sample = parse_histogram_packet_structured(raw_bytes)
-            if sample is None:
-                continue   # corrupt packet; logged by parser
-            accumulated.append(sample)
-
+        def on_row(cam_id, frame_id, ts, histogram, row_sum, temp):
+            nonlocal last_flush
+            accumulated.append((cam_id, frame_id, ts, histogram, row_sum, temp))
             now = time.monotonic()
             if (len(accumulated) >= self._batch_size or
                     now - last_flush >= self._flush_interval):
-                self._batch_queue.put(self._build_batch(side_name, accumulated))
+                self._batch_queue.put(self._build_batch(side_idx, accumulated))
                 accumulated.clear()
                 last_flush = now
+
+        buf = bytearray()
+        parse_histogram_stream(
+            self._packet_queues[side_name], self._stop, buf,
+            on_row_fn=on_row,
+            expected_row_sum=EXPECTED_HISTOGRAM_SUM,
+            t0_normalizer=self._t0_normalize,  # inherited from _BaseSource
+        )
+        # When parse_histogram_stream returns (stop set + queue drained),
+        # flush any remaining accumulated samples as a final batch.
+        if accumulated:
+            self._batch_queue.put(self._build_batch(side_idx, accumulated))
 
     def _build_batch(self, side_name: str, samples: list) -> FrameBatch:
         """Convert N HistogramSamples into one FrameBatch.
@@ -290,10 +302,10 @@ Two reader threads (one per side) push parsed samples into a shared `_batch_queu
 - `_calibrate_bfi_bvi` (now `BfiBviStage`)
 - `_flush_terminal_dark` (now `DarkCorrectionStage.on_scan_stop`)
 - `create_science_pipeline` factory
-- `parse_histogram_stream` (per-stream parser/queue glue — not needed; sources do this now)
 
 **Retained (consumed by `omotion.pipeline.sources.LiveUsbSource`):**
-- `parse_histogram_packet_structured()` — the per-packet parser
+- `parse_histogram_stream()` — per-stream parser+buffer accumulator. `LiveUsbSource._reader_loop` delegates to this so it inherits byte-buffer accumulation, multi-sample packet handling, 32-bit timestamp rollover unwrapping, row-sum validation, and the `t0_normalizer` hook for scan-relative time (see §3.3).
+- `parse_histogram_packet_structured()` — the per-packet parser (called internally by `parse_histogram_stream`)
 - `_rle_decompress()`, `_util_crc16()` — packet validation helpers
 - `EXPECTED_HISTOGRAM_SUM`, `HISTO_SIZE_WORDS`, `HISTOGRAM_BYTES` constants
 - `Sample`, `CorrectedBatch` dataclasses (legacy emit shapes; new pipeline still uses these in places, and external scripts may import them)
