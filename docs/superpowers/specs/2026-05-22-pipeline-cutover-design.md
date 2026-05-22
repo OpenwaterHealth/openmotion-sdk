@@ -61,6 +61,8 @@ The 6 legacy `on_*_fn` kwargs are removed entirely.
 
 ### 3.2 Sink composition inside `start_scan()`
 
+The SDK constructs only the Source and the Pipeline. **All sinks** (UI, contact-quality, storage) are app-provided via the `sinks=` kwarg:
+
 ```python
 def start_scan(self, request, sinks=None, ...):
     meta = ScanMetadata(
@@ -70,8 +72,10 @@ def start_scan(self, request, sinks=None, ...):
         left_camera_mask=request.left_camera_mask,
         right_camera_mask=request.right_camera_mask,
         reduced_mode=request.reduced_mode,
-        write_raw_csv=request.write_raw_csv,
-        raw_csv_duration_sec=request.raw_csv_duration_sec,
+        # ScanMetadata no longer carries write_raw_csv / raw_csv_duration_sec —
+        # those are app-level config, not scan-request parameters. The raw-tee
+        # time gate is configured on the pipeline (see below); the sinks
+        # themselves are dumb consumers.
     )
 
     # Calibration is loaded from console EEPROM at connection time and lives on
@@ -81,19 +85,18 @@ def start_scan(self, request, sinks=None, ...):
     pedestals = SensorPedestals.from_sensors(
         left=self._interface.left, right=self._interface.right,
     )
-    pipeline = default_pipeline(metadata=meta, calibration=calibration,
-                                 pedestals=pedestals,
-                                 rolling_avg_window=request.rolling_avg_window or 10)
 
-    # Storage sinks constructed internally based on request
-    storage_sinks: list[Sink] = [
-        CsvSink(output_dir=request.data_dir),
-    ]
-    if request.scan_db_enabled:
-        storage_sinks.append(ScanDBSink(db_path=request.scan_db_path))
-
-    user_sinks = sinks or []
-    all_sinks = storage_sinks + user_sinks
+    # raw_save_max_duration_s comes from the request (which the app populated
+    # from its own config). None ⇒ raw tee emits for entire scan; positive
+    # float ⇒ stops emitting after that many seconds of scan time; 0 or
+    # negative ⇒ raw tee is dropped from the pipeline entirely (no raw save).
+    pipeline = default_pipeline(
+        metadata=meta,
+        calibration=calibration,
+        pedestals=pedestals,
+        rolling_avg_window=request.rolling_avg_window or 10,
+        raw_save_max_duration_s=request.raw_save_max_duration_s,
+    )
 
     source = LiveUsbSource(
         console=self._interface.console,
@@ -103,11 +106,45 @@ def start_scan(self, request, sinks=None, ...):
         metadata=meta,
     )
 
-    self._runner = ScanRunner(source=source, pipeline=pipeline, sinks=all_sinks)
+    user_sinks = sinks or []
+    self._runner = ScanRunner(source=source, pipeline=pipeline, sinks=user_sinks)
     self._scan_thread = threading.Thread(target=self._runner.run, daemon=True)
     self._scan_thread.start()
     return True
 ```
+
+**Apps construct their own storage sinks**, including `CsvSink` and `ScanDBSink`. Sinks are dumb consumers; they write everything they receive on subscribed channels. The raw-save *gate* lives on the pipeline's `Tee("raw")` (see §3.2.1).
+
+### 3.2.1 Raw-save gating moves from sinks to the Tee
+
+PR 1 had each sink self-gate on `meta.write_raw_csv` + `meta.raw_csv_duration_sec`. That created two problems: duplicate config per sink, and only CSV-specific semantics (CsvSink had the gate; ScanDBSink had its own copy). PR 2 lifts the gate to the pipeline's raw tee so **every** sink subscribed to `"raw"` honors the same setting uniformly.
+
+**Changes:**
+
+1. **`Tee` class** gains an optional `max_duration_s: float | None = None` constructor parameter. When set, the Tee checks the first frame's `batch.timestamp_s[0]` (per PR 1's source-normalized scan-relative time, t=0 at scan start) against `max_duration_s` and skips emission for any batch whose first frame is past the budget.
+
+2. **`default_pipeline()` factory** gains a `raw_save_max_duration_s: float | None = None` parameter. The factory:
+   - `None` → adds `Tee("raw", filter=None, max_duration_s=None)` (emit for entire scan)
+   - `> 0` → adds `Tee("raw", filter=None, max_duration_s=value)` (emit until cap)
+   - `0 or negative` → omits the `Tee("raw")` from the pipeline entirely (no raw save anywhere)
+
+3. **`ScanMetadata`** drops `write_raw_csv` and `raw_csv_duration_sec` fields. The Sink protocol still receives `ScanMetadata` at `on_scan_start`, but the dataclass is now just identification + scan parameters.
+
+4. **`CsvSink`** drops `write_raw_csv` / `raw_csv_duration_sec` from its self-gating logic. Constructor becomes `CsvSink(output_dir)`. Inside `consume("raw", batch)` it always writes — the gate is upstream.
+
+5. **`ScanDBSink`** same — constructor becomes `ScanDBSink(db_path)` with no save flags.
+
+6. **`ScanRequest`** gains one new field: `raw_save_max_duration_s: float | None` (semantics above). It drops the two old `write_raw_csv` / `raw_csv_duration_sec` fields. The app computes this single field from its `appConfig.writeRawData` and `appConfig.rawDataDurationSec`:
+   ```python
+   raw_save_max_duration_s = (
+       None if not appConfig.writeRawData and appConfig.rawDataDurationSec is None
+       else 0 if not appConfig.writeRawData
+       else appConfig.rawDataDurationSec   # None or positive float
+   )
+   ```
+   *(In practice apps will likely just pass `appConfig.rawDataDurationSec if appConfig.writeRawData else 0`.)*
+
+**Edge case explicitly out of scope:** different save rules per sink (e.g., CSV writes raw forever but DB only first 60s). PR 2 doesn't support this — the gate is unified at the Tee. If needed later, a custom filter sink can add per-sink filtering on top.
 
 ### 3.3 LiveUsbSource wiring
 
@@ -323,10 +360,23 @@ class _ContactQualityCheckSink:
 
 
 # In start_scan call site (replaces the 4-callback kwarg call):
+# The app constructs storage sinks itself with destination paths from config.
 sinks = [
     _LivePlotSink(connector=self),
     _ContactQualityCheckSink(connector=self),
+    CsvSink(output_dir=self._app_config.data_directory),
 ]
+if self._app_config.scan_db_enabled:
+    sinks.append(ScanDBSink(db_path=self._app_config.scan_db_path))
+
+# Raw-save gate is computed from app config and lives on the request — the
+# SDK passes it to default_pipeline so the Tee("raw") enforces it uniformly
+# across CsvSink, ScanDBSink, and any other sink subscribed to "raw".
+request.raw_save_max_duration_s = (
+    self._app_config.raw_data_duration_sec
+    if self._app_config.write_raw_data else 0
+)
+
 self._interface.start_scan(request, sinks=sinks)
 ```
 
