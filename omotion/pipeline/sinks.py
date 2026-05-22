@@ -308,3 +308,24 @@ class ScanDBSink:
             logger.exception("ScanDBSink: failed to flush %d raw frames", len(self._raw_buffer))
         finally:
             self._raw_buffer.clear()
+
+
+class QtUiSink:
+    """Forwards live-channel batches as Qt signals for the app's plot widget.
+
+    PR 1 ships a stub that records calls (for testability). PR 3 wires
+    against PyQt6 signals in motion_connector.py.
+    """
+
+    channels = {"live"}
+
+    def __init__(self):
+        self.live_batches = []
+
+    def on_scan_start(self, meta): pass
+
+    def consume(self, channel: str, payload: Any) -> None:
+        if channel == "live":
+            self.live_batches.append(payload)
+
+    def on_complete(self): pass
