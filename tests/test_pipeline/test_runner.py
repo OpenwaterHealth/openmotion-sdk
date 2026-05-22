@@ -123,3 +123,27 @@ def test_runner_isolates_sink_exceptions():
     )
     runner.run()
     assert len(good_sink.consumed) == 1
+
+
+def test_runner_calls_on_scan_stop_and_dispatches_flush_events():
+    """Stage.on_scan_stop() must be called after source exhausts; any events
+    it appends (e.g. IntervalClosed from terminal dark flush) must be
+    dispatched to the appropriate sinks."""
+
+    class _OnScanStopStage:
+        name = "stop_stage"
+        def process(self, batch):
+            return batch
+        def reset(self):
+            pass
+        def on_scan_stop(self, batch):
+            batch.events.append(IntervalClosed(corrected_batch="terminal_payload"))
+
+    final_sink = _RecordingSink(channels={"final"})
+    runner = ScanRunner(
+        source=_FakeSource([_empty_batch()], _meta()),
+        pipeline=Pipeline([_OnScanStopStage()]),
+        sinks=[final_sink],
+    )
+    runner.run()
+    assert ("final", "terminal_payload") in final_sink.consumed

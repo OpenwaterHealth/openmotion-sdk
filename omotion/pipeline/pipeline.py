@@ -46,3 +46,10 @@ class Pipeline:
         stage exception during a scan."""
         for stage in self.stages:
             stage.reset()
+
+    def on_scan_stop(self, batch: FrameBatch) -> None:
+        """Lifecycle hook for stages that need to do end-of-scan cleanup
+        (e.g. DarkCorrectionStage's terminal dark flush)."""
+        for stage in self.stages:
+            if hasattr(stage, "on_scan_stop"):
+                stage.on_scan_stop(batch)

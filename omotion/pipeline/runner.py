@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import logging
 
+import numpy as np
+
 from .batch import FrameBatch, LiveEmit, IntervalClosed, BatchEvent
 from .pipeline import Pipeline
 from .sinks import Sink
@@ -12,6 +14,18 @@ from .sources import Source
 
 
 logger = logging.getLogger("omotion.pipeline.runner")
+
+
+def _empty_batch_for_flush() -> FrameBatch:
+    """Build an empty FrameBatch for the terminal on_scan_stop flush."""
+    return FrameBatch(
+        cam_ids=np.zeros(0, dtype=np.int8),
+        frame_ids=np.zeros(0, dtype=np.uint8),
+        raw_histograms=np.zeros((0, 2, 8, 1024), dtype=np.uint32),
+        temperature_c=np.zeros((0, 2, 8), dtype=np.float32),
+        timestamp_s=np.zeros(0, dtype=np.float64),
+        pdc=None, tcm=None, tcl=None,
+    )
 
 
 class ScanRunner:
@@ -46,6 +60,10 @@ class ScanRunner:
                     self.pipeline.reset()
                     continue
                 self._dispatch(result)
+
+            flush_batch = _empty_batch_for_flush()
+            self.pipeline.on_scan_stop(flush_batch)
+            self._dispatch(flush_batch)
         finally:
             for sink in self.sinks:
                 try:
