@@ -34,8 +34,27 @@ class Source(Protocol):
 class _BaseSource:
     """Shared scaffolding for concrete sources."""
 
-    def __init__(self, *, metadata: ScanMetadata):
+    def __init__(self, *, metadata: ScanMetadata,
+                 normalize_timestamps: bool = True):
         self.metadata = metadata
+        self._normalize_timestamps = normalize_timestamps
+        self._t0: Optional[float] = None
+
+    def _apply_timestamp_normalization(self, timestamp_s: np.ndarray) -> np.ndarray:
+        """Subtract the first observed timestamp so scans always start at t=0.
+
+        The offset is set on the first batch and held fixed for all subsequent
+        batches in the same scan. Thread-safety is not a concern here because
+        sources are consumed by a single thread.
+        """
+        if not self._normalize_timestamps:
+            return timestamp_s
+        if self._t0 is None:
+            if len(timestamp_s) > 0:
+                self._t0 = float(timestamp_s[0])
+            else:
+                return timestamp_s
+        return timestamp_s - self._t0
 
     def close(self) -> None:
         pass
@@ -55,8 +74,9 @@ class CsvReplaySource(_BaseSource):
                  raw_csv_left: Optional[Path],
                  raw_csv_right: Optional[Path],
                  batch_size_frames: int = 100,
-                 metadata: ScanMetadata):
-        super().__init__(metadata=metadata)
+                 metadata: ScanMetadata,
+                 normalize_timestamps: bool = True):
+        super().__init__(metadata=metadata, normalize_timestamps=normalize_timestamps)
         self._paths = {"left": raw_csv_left, "right": raw_csv_right}
         self._batch_size = int(batch_size_frames)
 
@@ -84,6 +104,7 @@ class CsvReplaySource(_BaseSource):
         cam_ids     = np.array([int(r["cam_id"])        for r in rows], dtype=np.int8)
         frame_ids   = np.array([int(r["frame_id"])      for r in rows], dtype=np.uint8)
         timestamp_s = np.array([float(r["timestamp_s"]) for r in rows], dtype=np.float64)
+        timestamp_s = self._apply_timestamp_normalization(timestamp_s)
 
         raw_hist = np.zeros((n, 2, 8, 1024), dtype=np.uint32)
         temp_arr = np.zeros((n, 2, 8), dtype=np.float32)
@@ -113,8 +134,9 @@ class DbReplaySource(_BaseSource):
 
     def __init__(self, *, db_path: str, session_id: int,
                  batch_size_frames: int = 100,
-                 metadata: ScanMetadata):
-        super().__init__(metadata=metadata)
+                 metadata: ScanMetadata,
+                 normalize_timestamps: bool = True):
+        super().__init__(metadata=metadata, normalize_timestamps=normalize_timestamps)
         self._db_path = db_path
         self._session_id = int(session_id)
         self._batch_size = int(batch_size_frames)
@@ -158,6 +180,8 @@ class DbReplaySource(_BaseSource):
             raw_hist[i, side_idx, int(cam_id)] = hist_arr
             if temp is not None:
                 temp_arr[i, side_idx, int(cam_id)] = float(temp)
+
+        timestamp_s = self._apply_timestamp_normalization(timestamp_s)
 
         return FrameBatch(
             cam_ids=cam_ids, frame_ids=frame_ids,
