@@ -1,8 +1,11 @@
 """HybridRealtimePredictor — avg-of-3 u1 + linear-extrap std + ZOH fallback."""
 
+import numpy as np
 import pytest
 from omotion.pipeline.stages.dark import (
     DarkHistory, HybridRealtimePredictor,
+    PendingInterval, LinearInterpolation, DarkFrameQuadraticStencil,
+    DarkObservation,
 )
 
 
@@ -55,3 +58,68 @@ def test_zoh_std_when_two_darks_have_same_timestamp():
     pred = HybridRealtimePredictor()
     u1, std = pred.predict("left", 0, history=h, target_t=15.0)
     assert std == 20.0
+
+
+def test_pending_interval_collects_frames_between_darks():
+    pi = PendingInterval()
+    pi.set_left_dark(DarkObservation(t=0.0, u1=100.0, std=10.0), abs_frame_id=10)
+    pi.add_light(abs_frame_id=11, t=0.025, u1=500.0, u2=260_000.0)
+    pi.add_light(abs_frame_id=12, t=0.050, u1=510.0, u2=265_000.0)
+    pi.add_light(abs_frame_id=13, t=0.075, u1=520.0, u2=275_000.0)
+    assert not pi.is_closed()
+
+    pi.set_right_dark(DarkObservation(t=0.100, u1=105.0, std=11.0), abs_frame_id=14)
+    assert pi.is_closed()
+    interval = pi.flush()
+    assert interval.left_abs == 10
+    assert interval.right_abs == 14
+    assert len(interval.light_frames) == 3
+
+
+def test_linear_interpolation_dark_baseline_across_interval():
+    pi = PendingInterval()
+    pi.set_left_dark(DarkObservation(t=0.0, u1=100.0, std=10.0), abs_frame_id=10)
+    pi.add_light(abs_frame_id=11, t=5.0, u1=500.0, u2=260_000.0)
+    pi.set_right_dark(DarkObservation(t=10.0, u1=200.0, std=20.0), abs_frame_id=12)
+
+    interval = pi.flush()
+    interp = LinearInterpolation()
+    corrected = interp.correct_interval(interval)
+    f = corrected.frames[0]
+    assert f.abs_frame_id == 11
+    assert f.mean == pytest.approx(350.0)
+    raw_var = 260_000.0 - 500.0 ** 2
+    expected_var = max(0.0, raw_var - 15.0 ** 2)
+    assert f.std == pytest.approx(np.sqrt(expected_var))
+
+
+def test_stencil_full_4_point_when_all_neighbours_present():
+    stencil = DarkFrameQuadraticStencil()
+    v = stencil.interpolate_dark_value(
+        v_minus_2=1.0, v_minus_1=2.0, v_plus_1=4.0, v_plus_2=5.0,
+    )
+    assert v == pytest.approx(3.0)
+
+
+def test_stencil_falls_back_to_right_only_when_no_left_neighbours():
+    stencil = DarkFrameQuadraticStencil()
+    v = stencil.interpolate_dark_value(
+        v_minus_2=None, v_minus_1=None, v_plus_1=4.0, v_plus_2=5.0,
+    )
+    assert v == pytest.approx(4.5)
+
+
+def test_stencil_falls_back_to_simple_avg_when_only_immediate_neighbours():
+    stencil = DarkFrameQuadraticStencil()
+    v = stencil.interpolate_dark_value(
+        v_minus_2=None, v_minus_1=2.0, v_plus_1=4.0, v_plus_2=None,
+    )
+    assert v == pytest.approx(3.0)
+
+
+def test_stencil_falls_back_to_repeat_right_when_only_right_available():
+    stencil = DarkFrameQuadraticStencil()
+    v = stencil.interpolate_dark_value(
+        v_minus_2=None, v_minus_1=None, v_plus_1=4.0, v_plus_2=None,
+    )
+    assert v == pytest.approx(4.0)
