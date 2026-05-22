@@ -10,9 +10,11 @@ for the scan. Concrete sources:
 from __future__ import annotations
 
 import csv
+import queue
 import sqlite3
+import threading
 from pathlib import Path
-from typing import Iterator, Optional, Protocol, runtime_checkable
+from typing import Any, Iterator, Optional, Protocol, runtime_checkable
 
 import numpy as np
 
@@ -162,4 +164,61 @@ class DbReplaySource(_BaseSource):
             raw_histograms=raw_hist, temperature_c=temp_arr,
             timestamp_s=timestamp_s,
             pdc=None, tcm=None, tcl=None,
+        )
+
+
+class LiveUsbSource(_BaseSource):
+    """Reads histogram packets from USB on background threads, batches them
+    into FrameBatch objects, hands them to the runner via a queue.
+
+    PR 1 ships the skeleton; the reader loop body (which parses USB packets
+    via the existing omotion.MotionProcessing.parse_histogram_packet_structured)
+    is wired up in PR 2. Until then, _reader_loop raises NotImplementedError.
+    """
+
+    def __init__(self, *,
+                 console: Any, left: Any, right: Any,
+                 batch_size_frames: int = 10,
+                 flush_interval_s: float = 0.25,
+                 queue_size: int = 4,
+                 metadata: ScanMetadata):
+        super().__init__(metadata=metadata)
+        self._console = console
+        self._left = left
+        self._right = right
+        self._batch_size = int(batch_size_frames)
+        self._flush_interval = float(flush_interval_s)
+        self._queue: queue.Queue = queue.Queue(maxsize=queue_size)
+        self._stop = threading.Event()
+        self._threads: list[threading.Thread] = []
+
+    def __iter__(self) -> Iterator[FrameBatch]:
+        for side_name, sensor in (("left", self._left), ("right", self._right)):
+            if sensor is None:
+                continue
+            t = threading.Thread(
+                target=self._reader_loop, args=(side_name, sensor),
+                name=f"LiveUsbSource-{side_name}", daemon=True,
+            )
+            t.start()
+            self._threads.append(t)
+
+        while not self._stop.is_set():
+            try:
+                batch = self._queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            if batch is None:
+                break
+            yield batch
+
+    def close(self) -> None:
+        self._stop.set()
+        for t in self._threads:
+            t.join(timeout=2.0)
+
+    def _reader_loop(self, side_name: str, sensor: Any) -> None:
+        """Per-side reader. Body deferred to PR 2."""
+        raise NotImplementedError(
+            "LiveUsbSource reader loop — wired up in PR 2 against omotion.StreamInterface."
         )

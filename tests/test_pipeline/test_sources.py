@@ -8,7 +8,7 @@ import time
 import numpy as np
 import pytest
 
-from omotion.pipeline.sources import Source, _BaseSource, CsvReplaySource, DbReplaySource
+from omotion.pipeline.sources import Source, _BaseSource, CsvReplaySource, DbReplaySource, LiveUsbSource
 from omotion.pipeline.sinks import ScanMetadata
 
 
@@ -169,3 +169,37 @@ def test_db_replay_empty_session_yields_nothing(tmp_path):
         metadata=_meta(),
     )
     assert list(src) == []
+
+
+# ---------------------------------------------------------------------------
+# Task 22: LiveUsbSource skeleton
+# ---------------------------------------------------------------------------
+
+def test_live_usb_source_is_a_source():
+    """LiveUsbSource satisfies the Source protocol."""
+    src = LiveUsbSource(
+        console=None, left=None, right=None,
+        metadata=_meta(),
+    )
+    assert isinstance(src, Source)
+
+
+def test_live_usb_source_close_stops_event():
+    """close() sets the stop event."""
+    src = LiveUsbSource(
+        console=None, left=None, right=None,
+        metadata=_meta(),
+    )
+    assert not src._stop.is_set()
+    src.close()
+    assert src._stop.is_set()
+
+
+def test_live_usb_source_reader_loop_raises_not_implemented():
+    """_reader_loop raises NotImplementedError (body deferred to PR 2)."""
+    src = LiveUsbSource(
+        console=None, left=None, right=None,
+        metadata=_meta(),
+    )
+    with pytest.raises(NotImplementedError):
+        src._reader_loop("left", object())
