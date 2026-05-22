@@ -89,7 +89,8 @@ def test_linear_interpolation_dark_baseline_across_interval():
     assert f.abs_frame_id == 11
     assert f.mean == pytest.approx(350.0)
     raw_var = 260_000.0 - 500.0 ** 2
-    expected_var = max(0.0, raw_var - 15.0 ** 2)
+    # t_frac=0.5: baseline_var = 10**2 + 0.5*(20**2 - 10**2) = 100 + 150 = 250
+    expected_var = max(0.0, raw_var - 250.0)
     assert f.std == pytest.approx(np.sqrt(expected_var))
 
 

@@ -87,7 +87,7 @@ class DarkIntegrityGuard:
             events.append(DarkIntegrityWarning(
                 side=side, cam_id=int(cam_id), abs_frame_id=int(abs_frame_id),
                 u1=float(u1), pedestal=float(pedestal),
-                threshold=float(self.max_above_pedestal),
+                threshold=float(threshold),
             ))
             return False
         return True
@@ -228,12 +228,12 @@ class LinearInterpolation:
         for lf in interval.light_frames:
             t_frac = (lf.t - d_prev.t) / dt if dt > 0 else 0.0
             baseline_u1  = d_prev.u1  + t_frac * (d_next.u1  - d_prev.u1)
-            baseline_std = d_prev.std + t_frac * (d_next.std - d_prev.std)
+            baseline_var = d_prev.std ** 2 + t_frac * (d_next.std ** 2 - d_prev.std ** 2)
 
             mean = lf.u1 - baseline_u1
             raw_var = max(0.0, lf.u2 - lf.u1 ** 2)
-            corrected_var = max(0.0, raw_var - baseline_std ** 2)
-            std = float(corrected_var ** 0.5)
+            corrected_var = max(0.0, raw_var - baseline_var)
+            std = float(max(0.0, corrected_var) ** 0.5)
 
             corrected_frames.append(CorrectedFrame(
                 abs_frame_id=lf.abs_frame_id, t=lf.t, mean=mean, std=std,
@@ -391,12 +391,17 @@ class DarkCorrectionStage:
                 continue
             if self._history.size(side, cam_id) < 1:
                 continue
-            last = pi._light[-1]
+            last_dark = self._history.recent(side, cam_id, n=1)[0]
+            last_light = pi._light[-1]
+            # Synthesize terminal dark at the last light frame's timestamp,
+            # reusing the most recent observed dark's moments (since we have no
+            # better information for the terminal dark in a truncated scan).
             terminal = DarkObservation(
-                t=last.t, u1=last.u1,
-                std=(last.u2 - last.u1 ** 2) ** 0.5,
+                t=last_light.t,
+                u1=last_dark.u1,
+                std=last_dark.std,
             )
-            pi.set_right_dark(terminal, abs_frame_id=last.abs_frame_id)
+            pi.set_right_dark(terminal, abs_frame_id=last_light.abs_frame_id)
             interval = pi.flush()
             corrected = self._batch.correct_interval(interval)
             batch.events.append(IntervalClosed(corrected_batch=corrected))
