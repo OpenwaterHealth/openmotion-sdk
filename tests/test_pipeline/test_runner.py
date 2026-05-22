@@ -124,6 +124,56 @@ def test_runner_isolates_sink_exceptions():
     assert len(good_sink.consumed) == 1
 
 
+def test_runner_telemetry_source_routes_events_to_aggregator_and_sinks():
+    from omotion.pipeline.batch import TelemetryEvent
+    from omotion.pipeline.telemetry import TelemetryAggregator
+
+    class _FakeTelemetrySource:
+        def __init__(self, events):
+            self._events = events
+            self._stop = False
+        def __iter__(self):
+            for e in self._events:
+                if self._stop:
+                    break
+                yield e
+        def close(self):
+            self._stop = True
+
+    fake_events = [
+        TelemetryEvent(timestamp_s=0.0, pdc_samples=[1.0], tec_setpoint_c=25,
+                       tec_actual_c=25, console_temp_c=37, fan_rpm=2400, safety_status=0),
+        TelemetryEvent(timestamp_s=0.1, pdc_samples=[1.05], tec_setpoint_c=25,
+                       tec_actual_c=25, console_temp_c=37, fan_rpm=2400, safety_status=0),
+    ]
+    telemetry_sink = _RecordingSink(channels={"telemetry"})
+    agg = TelemetryAggregator()
+    pipeline = Pipeline([_EmitTagsStage([])], telemetry_aggregator=agg)
+
+    runner = ScanRunner(
+        source=_FakeSource([_empty_batch()], _meta()),
+        pipeline=pipeline,
+        sinks=[telemetry_sink],
+        telemetry_source=_FakeTelemetrySource(fake_events),
+    )
+    runner.run()
+
+    assert agg.size() == 2
+    assert [c for c, _ in telemetry_sink.consumed] == ["telemetry", "telemetry"]
+
+
+def test_runner_no_telemetry_source_means_no_telemetry_thread():
+    sink = _RecordingSink(channels={"live"})
+    runner = ScanRunner(
+        source=_FakeSource([_empty_batch()], _meta()),
+        pipeline=Pipeline([_EmitTagsStage(["live"])]),
+        sinks=[sink],
+        telemetry_source=None,
+    )
+    runner.run()
+    assert len(sink.consumed) == 1
+
+
 def test_runner_calls_on_scan_stop_and_dispatches_flush_events():
     """Stage.on_scan_stop() must be called after source exhausts; any events
     it appends (e.g. IntervalClosed from terminal dark flush) must be
