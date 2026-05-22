@@ -1,0 +1,45 @@
+"""Public API surface — symbols documented as importable from omotion.pipeline."""
+
+from __future__ import annotations
+
+
+def test_public_api_symbols_importable() -> None:
+    """All symbols in __all__ must be importable from the top-level package."""
+    from omotion.pipeline import (
+        Pipeline, Stage,
+        FrameBatch, BatchEvent, IntervalClosed, LiveEmit,
+        DarkIntegrityWarning, StencilFallback,
+        ScanRunner,
+        Source, LiveUsbSource, CsvReplaySource, DbReplaySource,
+        Sink, ScanMetadata,
+        CsvSink, ScanDBSink, QtUiSink,
+        Tee, default_pipeline,
+        SensorPedestals,
+    )
+    for sym in (
+        Pipeline, Stage, FrameBatch, BatchEvent, IntervalClosed, LiveEmit,
+        DarkIntegrityWarning, StencilFallback, ScanRunner,
+        Source, LiveUsbSource, CsvReplaySource, DbReplaySource,
+        Sink, ScanMetadata, CsvSink, ScanDBSink, QtUiSink,
+        Tee, default_pipeline, SensorPedestals,
+    ):
+        assert sym is not None
+
+
+def test_public_api_all_list_complete() -> None:
+    """__all__ must enumerate every publicly exported symbol."""
+    import omotion.pipeline as pkg
+
+    expected = {
+        "FrameBatch", "BatchEvent", "IntervalClosed", "LiveEmit",
+        "DarkIntegrityWarning", "StencilFallback",
+        "Pipeline", "Stage", "Tee",
+        "ScanRunner",
+        "default_pipeline",
+        "SensorPedestals",
+        "Sink", "ScanMetadata",
+        "CsvSink", "ScanDBSink", "QtUiSink",
+        "Source", "LiveUsbSource", "CsvReplaySource", "DbReplaySource",
+    }
+
+    assert set(pkg.__all__) == expected
