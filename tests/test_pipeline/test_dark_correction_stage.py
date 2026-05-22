@@ -133,3 +133,178 @@ def test_reset_clears_dark_history_and_pending():
                     std_raw=np.full((1, 2, 8), 20.0, dtype=np.float32))
     stage.process(batch2)
     assert np.isnan(batch2.mean_dc_rt[0, 0, 0])
+
+
+def _make_stage_with_cal():
+    """Return a DarkCorrectionStage wired with trivial calibration."""
+    @dataclass
+    class _TrivialCal:
+        c_min: np.ndarray
+        c_max: np.ndarray
+        i_min: np.ndarray
+        i_max: np.ndarray
+
+    cal = _TrivialCal(
+        c_min=np.zeros((2, 8), dtype=np.float32),
+        c_max=np.ones((2, 8), dtype=np.float32),
+        i_min=np.zeros((2, 8), dtype=np.float32),
+        i_max=np.full((2, 8), 500.0, dtype=np.float32),
+    )
+    adc_gain = (1024 - 64) / 11_000
+    gain_map = np.array([16, 4, 2, 1, 1, 2, 4, 16], dtype=np.float32)
+    return DarkCorrectionStage(
+        realtime_estimator=HybridRealtimePredictor(),
+        batch_estimator=LinearInterpolation(),
+        adc_gain=adc_gain,
+        camera_gain_map=gain_map,
+        calibration=cal,
+    )
+
+
+def test_dark_frame_included_in_interval_via_stencil():
+    """After a second interval closes, D_prev gets a stencil-interpolated row.
+
+    Scenario: dark@10, lights@11-12, dark@30, lights@31-32, dark@50.
+    When interval [30, 50] closes, dark@30 should appear in the emitted
+    EnrichedCorrectedInterval as an EnrichedCorrectedFrame with abs_frame_id=30.
+    """
+    stage = _make_stage_with_cal()
+    n = 7  # dark, light, light, dark, light, light, dark
+    types   = ["dark",  "light", "light", "dark",  "light", "light", "dark"]
+    abs_ids = [10,      11,      12,      30,      31,      32,      50]
+    ts      = [i * 0.025 for i in range(n)]
+    mean_v  = [100.0,  500.0,  510.0,  102.0,  505.0,  508.0,  101.0]
+    std_v   = [10.0,    20.0,   21.0,   10.5,   20.5,   21.5,   10.2]
+
+    mean_raw = np.zeros((n, 2, 8), dtype=np.float32)
+    std_raw  = np.zeros((n, 2, 8), dtype=np.float32)
+    raw_hist = np.zeros((n, 2, 8, 1024), dtype=np.uint32)
+    raw_hist[:, 0, 0, 0] = 1  # side=0, cam=0 active
+
+    for i in range(n):
+        mean_raw[i, 0, 0] = mean_v[i]
+        std_raw[i, 0, 0]  = std_v[i]
+
+    batch = FrameBatch(
+        cam_ids=np.zeros(n, dtype=np.int8),
+        frame_ids=np.arange(n, dtype=np.uint8),
+        raw_histograms=raw_hist,
+        temperature_c=np.zeros((n, 2, 8), dtype=np.float32),
+        timestamp_s=np.array(ts, dtype=np.float64),
+        pdc=None, tcm=None, tcl=None,
+        abs_frame_ids=np.array(abs_ids, dtype=np.int64),
+        frame_type=np.array(types, dtype="<U8"),
+        mean_raw=mean_raw, std_raw=std_raw,
+    )
+
+    stage.process(batch)
+
+    intervals = [e.corrected_batch for e in batch.events
+                 if isinstance(e, IntervalClosed)]
+    assert len(intervals) >= 2, (
+        "Expected at least 2 intervals (one for [10,30] and one for [30,50])"
+    )
+
+    # First interval [10, 30]: D_prev=10, no left neighbours → stencil fallback
+    iv0 = intervals[0]
+    assert isinstance(iv0, EnrichedCorrectedInterval)
+    dark_frame_ids_iv0 = [f.abs_frame_id for f in iv0.frames
+                          if f.abs_frame_id == 10]
+    assert dark_frame_ids_iv0, (
+        "Dark frame at abs_id=10 missing from first interval"
+    )
+    df0 = next(f for f in iv0.frames if f.abs_frame_id == 10)
+    assert isinstance(df0, EnrichedCorrectedFrame)
+    # Stencil fallback (no left neighbours): avg of right1 and right2 or repeat
+    assert np.isfinite(df0.bfi), "Dark frame bfi should be finite"
+    assert np.isfinite(df0.mean), "Dark frame mean should be finite"
+
+    # Second interval [30, 50]: D_prev=30, has left neighbours from [10,30]
+    iv1 = intervals[1]
+    assert isinstance(iv1, EnrichedCorrectedInterval)
+    dark_frame_ids_iv1 = [f.abs_frame_id for f in iv1.frames
+                          if f.abs_frame_id == 30]
+    assert dark_frame_ids_iv1, (
+        "Dark frame at abs_id=30 missing from second interval"
+    )
+    df1 = next(f for f in iv1.frames if f.abs_frame_id == 30)
+    assert isinstance(df1, EnrichedCorrectedFrame)
+    assert np.isfinite(df1.bfi), "Dark frame bfi in second interval should be finite"
+
+    # Dark frame row should be chronologically FIRST in each interval
+    assert iv0.frames[0].abs_frame_id == 10, (
+        "Dark frame should be prepended (first in interval)"
+    )
+    assert iv1.frames[0].abs_frame_id == 30, (
+        "Dark frame should be prepended (first in second interval)"
+    )
+
+
+def test_terminal_flush_does_not_emit_terminal_dark_as_light():
+    """on_scan_stop: the last buffered light is the terminal dark — it should
+    NOT appear as a corrected frame in the emitted interval.
+
+    Scenario: dark@10, lights@11-12, then scan ends. The last frame (12) is
+    promoted to the terminal dark boundary. Since no lights remain after
+    removing 12, the interval emits only the stencil value for dark@10.
+    """
+    stage = _make_stage_with_cal()
+    n = 3
+    types   = ["dark", "light", "light"]
+    abs_ids = [10, 11, 12]
+    mean_raw = np.array([[[100.0]*8]*2, [[500.0]*8]*2, [[510.0]*8]*2], dtype=np.float32)
+    std_raw  = np.array([[[10.0]*8]*2,  [[20.0]*8]*2,  [[21.0]*8]*2],  dtype=np.float32)
+    raw_hist = np.zeros((n, 2, 8, 1024), dtype=np.uint32)
+    raw_hist[:, 0, 0, 0] = 1
+
+    process_batch = FrameBatch(
+        cam_ids=np.zeros(n, dtype=np.int8),
+        frame_ids=np.arange(n, dtype=np.uint8),
+        raw_histograms=raw_hist,
+        temperature_c=np.zeros((n, 2, 8), dtype=np.float32),
+        timestamp_s=np.arange(n, dtype=np.float64) * 0.025,
+        pdc=None, tcm=None, tcl=None,
+        abs_frame_ids=np.array(abs_ids, dtype=np.int64),
+        frame_type=np.array(types, dtype="<U8"),
+        mean_raw=mean_raw, std_raw=std_raw,
+    )
+    stage.process(process_batch)
+
+    # No interval should have closed during process (only 1 dark seen so far)
+    closed_in_process = [e for e in process_batch.events
+                         if isinstance(e, IntervalClosed)]
+    assert len(closed_in_process) == 0
+
+    # Fire terminal flush
+    stop_batch = FrameBatch(
+        cam_ids=np.zeros(1, dtype=np.int8),
+        frame_ids=np.zeros(1, dtype=np.uint8),
+        raw_histograms=np.zeros((1, 2, 8, 1024), dtype=np.uint32),
+        temperature_c=np.zeros((1, 2, 8), dtype=np.float32),
+        timestamp_s=np.zeros(1, dtype=np.float64),
+        pdc=None, tcm=None, tcl=None,
+        abs_frame_ids=np.zeros(1, dtype=np.int64),
+        frame_type=np.array(["dark"], dtype="<U8"),
+        mean_raw=np.zeros((1, 2, 8), dtype=np.float32),
+        std_raw=np.zeros((1, 2, 8), dtype=np.float32),
+    )
+    stage.on_scan_stop(stop_batch)
+
+    closed_on_stop = [e for e in stop_batch.events
+                      if isinstance(e, IntervalClosed)]
+    assert len(closed_on_stop) == 1, (
+        f"Expected 1 IntervalClosed from on_scan_stop, got {len(closed_on_stop)}"
+    )
+    iv = closed_on_stop[0].corrected_batch
+    abs_ids_in_iv = [f.abs_frame_id for f in iv.frames]
+
+    # abs_id=12 was the terminal dark — must NOT appear as a light frame
+    assert 12 not in abs_ids_in_iv, (
+        f"Terminal dark abs_id=12 should not be emitted as a corrected light frame. "
+        f"abs_ids in interval: {abs_ids_in_iv}"
+    )
+    # abs_id=11 was a genuine light frame — should appear
+    assert 11 in abs_ids_in_iv, (
+        f"Light frame abs_id=11 should be in the corrected interval. "
+        f"abs_ids in interval: {abs_ids_in_iv}"
+    )

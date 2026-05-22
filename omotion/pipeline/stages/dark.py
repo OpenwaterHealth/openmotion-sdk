@@ -321,9 +321,14 @@ class DarkCorrectionStage:
     appropriate PendingInterval, and emits an IntervalClosed event when an
     interval bookends.
 
-    on_scan_stop(batch) performs the terminal-dark flush — for short scans
-    that end before a second scheduled dark, synthesizes a dark from the
-    last buffered moment so a corrected batch can still be emitted.
+    When an interval closes, the leading dark frame D_prev is given a
+    corrected value via DarkFrameQuadraticStencil (§8.4) and prepended to
+    the interval's frame list before emission.
+
+    on_scan_stop(batch) performs the terminal-dark flush — per §8.6, the
+    last buffered light frame is the firmware-guaranteed terminal dark frame;
+    it is promoted to a dark boundary, removed from the light list, and the
+    remaining lights (if any) plus the D_prev stencil value are emitted.
 
     See docs/SciencePipeline.md §7.4 (realtime) and §8 (batched).
     """
@@ -349,6 +354,11 @@ class DarkCorrectionStage:
         self._guard = DarkIntegrityGuard(
             max_above_pedestal=integrity_max_above_pedestal
         )
+        self._stencil = DarkFrameQuadraticStencil()
+        # Ring buffer (≤2 entries) of the last two EnrichedCorrectedFrames from
+        # the previous interval, keyed by (side, cam_id).  Used as the left
+        # neighbours v(D-1) and v(D-2) for the quadratic stencil (§8.4).
+        self._prev_interval_tail: dict[tuple[str, int], list[EnrichedCorrectedFrame]] = {}
         # Enrichment (shot-noise + calibration) — None means emit raw CorrectedInterval
         self._adc_gain: Optional[float] = float(adc_gain) if adc_gain is not None else None
         self._gain_map: Optional[np.ndarray] = (
@@ -421,6 +431,105 @@ class DarkCorrectionStage:
             frames=[self._enrich_corrected_frame(f) for f in ci.frames],
         )
 
+    def _apply_dark_stencil(
+        self,
+        key: "tuple[str, int]",
+        d_prev_abs: int,
+        d_prev_t: float,
+        enriched_frames: "list[EnrichedCorrectedFrame]",
+    ) -> "Optional[EnrichedCorrectedFrame]":
+        """Compute the stencil-interpolated corrected value for the dark frame D_prev.
+
+        Uses the quadratic 4-point stencil (§8.4):
+            v(D) = (-1/6)*v(D-2) + (2/3)*v(D-1) + (2/3)*v(D+1) + (-1/6)*v(D+2)
+
+        Left neighbours  v(D-1), v(D-2) come from self._prev_interval_tail[key].
+        Right neighbours v(D+1), v(D+2) come from the first two frames of enriched_frames.
+
+        Falls back gracefully when fewer neighbours are available (see
+        DarkFrameQuadraticStencil.interpolate_dark_value for the fallback chain).
+
+        Returns None if there is no v(D+1) (interval has no corrected light frames).
+        Updates self._prev_interval_tail[key] after producing the stencil value.
+        """
+        if not enriched_frames:
+            return None
+
+        side, cam_id = key
+        right1 = enriched_frames[0]
+        right2 = enriched_frames[1] if len(enriched_frames) >= 2 else None
+        prev_tail = self._prev_interval_tail.get(key, [])
+        left1 = prev_tail[-1] if len(prev_tail) >= 1 else None
+        left2 = prev_tail[-2] if len(prev_tail) >= 2 else None
+
+        def _interp(attr: str) -> float:
+            r1 = getattr(right1, attr)
+            r2 = getattr(right2, attr) if right2 is not None else None
+            l1 = getattr(left1,  attr) if left1  is not None else None
+            l2 = getattr(left2,  attr) if left2  is not None else None
+            return self._stencil.interpolate_dark_value(
+                v_minus_2=l2, v_minus_1=l1,
+                v_plus_1=r1, v_plus_2=r2,
+            )
+
+        dark_frame = EnrichedCorrectedFrame(
+            abs_frame_id=d_prev_abs,
+            t=d_prev_t,
+            side=side,
+            cam_id=cam_id,
+            mean=_interp("mean"),
+            std=_interp("std"),
+            contrast=_interp("contrast"),
+            bfi=_interp("bfi"),
+            bvi=_interp("bvi"),
+        )
+        return dark_frame
+
+    def _emit_interval(
+        self,
+        key: "tuple[str, int]",
+        interval: "Interval",
+        events: list,
+    ) -> None:
+        """Correct interval, apply stencil for D_prev, emit IntervalClosed.
+
+        Mutates self._prev_interval_tail[key] to store the tail of the emitted
+        interval for the next stencil application.
+        """
+        side, cam_id = key
+        corrected = self._batch.correct_interval(interval, side=side, cam_id=cam_id)
+
+        if self._can_enrich():
+            enriched = self._enrich_interval(corrected)
+        else:
+            # No enrichment — we cannot produce an EnrichedCorrectedFrame for
+            # the stencil.  Emit the raw interval without a dark-frame row.
+            events.append(IntervalClosed(corrected_batch=corrected))
+            return
+
+        # Apply the quadratic stencil for the dark frame D_prev (§8.4).
+        d_prev_abs = interval.left_abs
+        d_prev_t   = interval.left.obs.t
+        dark_ef = self._apply_dark_stencil(key, d_prev_abs, d_prev_t, enriched.frames)
+
+        # Prepend the dark-frame corrected row (chronological order).
+        all_frames: list[EnrichedCorrectedFrame] = []
+        if dark_ef is not None:
+            all_frames.append(dark_ef)
+        all_frames.extend(enriched.frames)
+
+        # Update the tail for the NEXT interval's stencil (last two frames of
+        # this interval, excluding the prepended dark row itself).
+        tail = enriched.frames[-2:] if len(enriched.frames) >= 2 else enriched.frames[-1:]
+        self._prev_interval_tail[key] = list(tail)
+
+        emit = EnrichedCorrectedInterval(
+            left_abs=enriched.left_abs,
+            right_abs=enriched.right_abs,
+            frames=all_frames,
+        )
+        events.append(IntervalClosed(corrected_batch=emit))
+
     def process(self, batch: FrameBatch) -> FrameBatch:
         n = batch.frame_ids.shape[0]
         baseline_rt = np.full((n, 2, 8), np.nan, dtype=np.float32)
@@ -461,11 +570,9 @@ class DarkCorrectionStage:
                     if pi.is_closed():
                         interval = pi.flush()
                         # After flush, pi's left has rolled to the just-flushed right.
-                        corrected = self._batch.correct_interval(
-                            interval, side=side, cam_id=cam_id,
-                        )
-                        emit = self._enrich_interval(corrected) if self._can_enrich() else corrected
-                        batch.events.append(IntervalClosed(corrected_batch=emit))
+                        # _emit_interval applies the stencil for D_prev and appends
+                        # the IntervalClosed event (§8.4).
+                        self._emit_interval((side, cam_id), interval, batch.events)
 
             else:  # light
                 pred = self._realtime.predict(
@@ -492,28 +599,50 @@ class DarkCorrectionStage:
     def reset(self) -> None:
         self._history.clear()
         self._pending.clear()
+        self._prev_interval_tail.clear()
 
     def on_scan_stop(self, batch: FrameBatch) -> None:
-        """Terminal dark flush — see SciencePipeline.md §8.6."""
+        """Terminal dark flush — see SciencePipeline.md §8.6.
+
+        The firmware guarantees the last frame of every scan is a dark (laser-
+        off) frame.  That frame may not fall on a scheduled dark position, so
+        the pipeline receives it as a buffered light in pi._light.
+
+        Following the legacy SciencePipeline._flush_terminal_dark logic:
+          1. Pop the last entry from pi._light — that is the terminal dark.
+          2. Use the terminal dark's actual data (not the last scheduled dark's)
+             as the right boundary of the synthetic interval.
+          3. Remove it from the light list so it is not double-counted.
+          4. Call _emit_interval with the remaining lights (which may be empty).
+             The stencil for D_prev is applied as normal; if there are no lights,
+             D_prev cannot be stencilled (no right neighbours) and is skipped.
+        """
         for (side, cam_id), pi in self._pending.items():
             if not pi._light:
                 continue
             if self._history.size(side, cam_id) < 1:
                 continue
+
+            # The last buffered frame is the hardware-guaranteed terminal dark.
+            terminal_light = pi._light[-1]
+
+            # Build the terminal dark observation from the LAST SCHEDULED dark's
+            # u1/std (reuse moments since we have no independent measurement),
+            # but stamp it at the terminal frame's actual timestamp.
             last_dark = self._history.recent(side, cam_id, n=1)[0]
-            last_light = pi._light[-1]
-            # Synthesize terminal dark at the last light frame's timestamp,
-            # reusing the most recent observed dark's moments (since we have no
-            # better information for the terminal dark in a truncated scan).
-            terminal = DarkObservation(
-                t=last_light.t,
+            terminal_obs = DarkObservation(
+                t=terminal_light.t,
                 u1=last_dark.u1,
                 std=last_dark.std,
             )
-            pi.set_right_dark(terminal, abs_frame_id=last_light.abs_frame_id)
+
+            # Remove the terminal frame from pi._light so it is not emitted as
+            # a corrected light frame (mirrors legacy _pending_moments[key][:-1]).
+            pi._light = pi._light[:-1]
+
+            # Close the synthetic interval [D_prev, terminal_dark].
+            pi.set_right_dark(terminal_obs, abs_frame_id=terminal_light.abs_frame_id)
             interval = pi.flush()
-            corrected = self._batch.correct_interval(
-                interval, side=side, cam_id=cam_id,
-            )
-            emit = self._enrich_interval(corrected) if self._can_enrich() else corrected
-            batch.events.append(IntervalClosed(corrected_batch=emit))
+
+            # _emit_interval applies the stencil for D_prev and emits the event.
+            self._emit_interval((side, cam_id), interval, batch.events)
