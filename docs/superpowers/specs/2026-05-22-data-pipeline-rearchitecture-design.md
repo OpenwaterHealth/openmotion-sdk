@@ -106,7 +106,7 @@ default_pipeline = Pipeline([
 
     # ── dark correction (dual-output: realtime predictor + batch interpolation) ──
     DarkCorrectionStage(
-        realtime_estimator=AvgOf3Estimator(),
+        realtime_estimator=HybridRealtimePredictor(),
         batch_estimator=LinearInterpolation(),
         realtime_history_size=4,
         integrity_max_above_pedestal=30.0,
@@ -399,10 +399,22 @@ Sub-modules inside `dark.py`:
 
 - `DarkHistory` — ring buffer of recent dark observations, vectorized over `(2, 8)`
 - `DarkIntegrityGuard` — checks u1 > pedestal+30, emits warning event
-- `DarkEstimator` strategies: `ZohEstimator`, `AvgOf3Estimator`, `LinearInterpolation`, `QuadraticPerCameraEstimator`
+- `DarkEstimator` strategies: `ZohEstimator`, `HybridRealtimePredictor`, `LinearInterpolation`, `QuadraticPerCameraEstimator`
 - `DarkFrameQuadraticStencil` — 4-point interpolation with documented fallback chain
 
-`AvgOf3Estimator` and `LinearInterpolation` together preserve the realtime + batch dual-output behavior the user just shipped in commits `86539f7` (real-time dark correction) and `1dcb588` (1-dark warmup relaxation).
+`HybridRealtimePredictor` and `LinearInterpolation` together preserve the realtime + batch dual-output behavior shipped in commits `86539f7` (real-time dark correction) and `1dcb588` (1-dark warmup relaxation).
+
+`HybridRealtimePredictor` is the realtime estimator and is genuinely hybrid — it applies a different algorithm to each of the two quantities it predicts:
+
+```
+u1 (mean):  average of the most recent 3 dark observations
+std:        linear extrapolation through the last 2 dark observations
+fallback:   zero-order hold (most recent dark, applied to BOTH u1 and std)
+            when fewer than 2 darks are available — covers the warmup
+            window right after scan start
+```
+
+The single-class form (rather than two separate u1 + std estimator classes) is deliberate: both halves consume the same `DarkHistory`, share the same ZOH fallback condition, and don't usefully vary independently in practice. Documented in one place; auditor reads `HybridRealtimePredictor` and sees the whole realtime-prediction policy.
 
 ## 10. Per-stage details and numpy vectorization
 
