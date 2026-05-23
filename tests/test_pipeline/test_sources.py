@@ -352,34 +352,38 @@ def test_csv_replay_no_normalization_when_disabled(tmp_path):
 
 
 def test_console_telemetry_source_yields_events_until_stopped():
-    """The source wraps the console's poll_telemetry API; yields TelemetryEvents
+    """The source wraps the console.telemetry.get_snapshot API; yields TelemetryEvents
     with scan-relative timestamps."""
     from omotion.pipeline.sources import ConsoleTelemetrySource
     from omotion.pipeline.batch import TelemetryEvent
     from types import SimpleNamespace
 
-    class _FakeConsole:
+    class _FakeTelemetryPoller:
         def __init__(self):
             self._snapshots = [
-                SimpleNamespace(absolute_t=100.0, pdc=[1.10],
-                                tec_setpoint=25.0, tec_actual=25.0,
-                                console_temp=37.0, fan_rpm=2400, safety_status=0),
-                SimpleNamespace(absolute_t=100.1, pdc=[1.11],
-                                tec_setpoint=25.0, tec_actual=25.0,
-                                console_temp=37.0, fan_rpm=2400, safety_status=0),
-                SimpleNamespace(absolute_t=100.2, pdc=[1.12],
-                                tec_setpoint=25.0, tec_actual=25.0,
-                                console_temp=37.0, fan_rpm=2400, safety_status=0),
+                SimpleNamespace(timestamp=100.0, pdc=1.10,
+                                tec_set_raw=25.0, tec_v_raw=25.0,
+                                safety_ok=True),
+                SimpleNamespace(timestamp=100.1, pdc=1.11,
+                                tec_set_raw=25.0, tec_v_raw=25.0,
+                                safety_ok=True),
+                SimpleNamespace(timestamp=100.2, pdc=1.12,
+                                tec_set_raw=25.0, tec_v_raw=25.0,
+                                safety_ok=True),
                 None,
             ]
             self._i = 0
 
-        def poll_telemetry(self, timeout):
+        def get_snapshot(self):
             if self._i < len(self._snapshots):
                 snap = self._snapshots[self._i]
                 self._i += 1
                 return snap
             return None
+
+    class _FakeConsole:
+        def __init__(self):
+            self.telemetry = _FakeTelemetryPoller()
 
     src = ConsoleTelemetrySource(console=_FakeConsole(), poll_interval_s=0.01)
     events = []

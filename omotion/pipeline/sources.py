@@ -314,7 +314,7 @@ class LiveUsbSource(_BaseSource):
 
 
 class ConsoleTelemetrySource:
-    """Polls MotionConsole at fixed cadence; yields TelemetryEvent with
+    """Polls MotionConsole.telemetry at fixed cadence; yields TelemetryEvent with
     scan-relative timestamps.
 
     Used as the optional `telemetry_source` on ScanRunner. Doesn't produce
@@ -330,19 +330,24 @@ class ConsoleTelemetrySource:
 
     def __iter__(self):
         while not self._stop.is_set():
-            snap = self._console.poll_telemetry(timeout=self._poll_interval_s)
+            snap = self._console.telemetry.get_snapshot()
             if snap is None:
+                time.sleep(self._poll_interval_s)
                 continue
             if self._t0 is None:
-                self._t0 = snap.absolute_t
+                self._t0 = snap.timestamp
+            # Map ConsoleTelemetry fields to TelemetryEvent.
+            # tec_set_raw / tec_v_raw are raw ADC voltages; app converts to °C
+            # For now, pass raw values (they'll be converted by the sink/aggregator).
+            # safety_ok is a bool; convert to int (0=ok, 1=fault) for safety_status.
             yield TelemetryEvent(
-                timestamp_s=snap.absolute_t - self._t0,
-                pdc_samples=list(snap.pdc),
-                tec_setpoint_c=snap.tec_setpoint,
-                tec_actual_c=snap.tec_actual,
-                console_temp_c=snap.console_temp,
-                fan_rpm=snap.fan_rpm,
-                safety_status=snap.safety_status,
+                timestamp_s=snap.timestamp - self._t0,
+                pdc_samples=[snap.pdc],  # pdc is a single float (mA), wrap in list
+                tec_setpoint_c=snap.tec_set_raw,  # raw setpoint voltage (app converts)
+                tec_actual_c=snap.tec_v_raw,      # raw measured voltage (app converts)
+                console_temp_c=0.0,                # not available in ConsoleTelemetry snapshot
+                fan_rpm=0,                         # not available in ConsoleTelemetry snapshot
+                safety_status=0 if snap.safety_ok else 1,  # 0=ok, 1=fault
             )
 
     def close(self) -> None:
