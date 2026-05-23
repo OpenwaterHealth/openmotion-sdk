@@ -225,9 +225,11 @@ class LiveUsbSource(_BaseSource):
     def __iter__(self) -> Iterator[FrameBatch]:
         from omotion.MotionProcessing import HISTOGRAM_BYTES
 
+        self._expected_size = HISTOGRAM_BYTES
+
         for side_name in self._packet_queues:
             sensor = self._sensors[side_name]
-            sensor.histo_stream.start_streaming(
+            sensor.uart.histo.start_streaming(
                 self._packet_queues[side_name],
                 expected_size=HISTOGRAM_BYTES,
             )
@@ -248,11 +250,33 @@ class LiveUsbSource(_BaseSource):
             yield batch
 
     def close(self) -> None:
+        # Match the legacy stop sequence: stop_streaming → drain_final.
+        # ScanWorkflow handles the trigger-off + ~0.35s DMA-flush wait before
+        # calling close(); here we just shut down the USB stream and feed any
+        # late-arriving final transfer back through the parser before the
+        # reader threads exit.
         self._stop.set()
-        for sensor in self._sensors.values():
-            if sensor is not None and getattr(sensor, "histo_stream", None) is not None:
+        expected_size = getattr(self, "_expected_size", None)
+        for side_name, sensor in self._sensors.items():
+            if sensor is None or getattr(sensor, "uart", None) is None:
+                continue
+            histo = getattr(sensor.uart, "histo", None)
+            if histo is None:
+                continue
+            try:
+                histo.stop_streaming()
+            except Exception:
+                pass
+            if expected_size is not None:
                 try:
-                    sensor.histo_stream.stop_streaming()
+                    final_chunks = histo.drain_final(expected_size=expected_size)
+                    q = self._packet_queues.get(side_name)
+                    if q is not None and final_chunks:
+                        for chunk in final_chunks:
+                            try:
+                                q.put(chunk, timeout=0.5)
+                            except queue.Full:
+                                pass
                 except Exception:
                     pass
         for t in self._reader_threads:

@@ -429,6 +429,16 @@ class ScanWorkflow:
                         if self._stop_evt.is_set():
                             break
                         time.sleep(0.2)
+                    # Stop the trigger BEFORE closing the source so the MCU
+                    # flushes its final DMA buffer (~250 ms latency) while the
+                    # stream is still running. Without this, the last frame
+                    # lands in the host endpoint after stop_streaming() has
+                    # already torn down the reader thread.
+                    try:
+                        self._interface.console.stop_trigger()
+                    except Exception:
+                        logger.warning("stop_trigger raised in duration guard", exc_info=True)
+                    time.sleep(0.35)
                     source.close()
 
                 guard_thread = threading.Thread(

@@ -230,8 +230,13 @@ def test_live_usb_source_reader_loop_builds_batches_from_packet_queue(monkeypatc
                 pass
             def stop_streaming(self):
                 pass
+            def drain_final(self, expected_size):
+                return []
+        class _FakeUart:
+            def __init__(self, stream):
+                self.histo = stream
         def __init__(self):
-            self.histo_stream = self._FakeStream()
+            self.uart = self._FakeUart(self._FakeStream())
 
     meta = ScanMetadata(
         scan_id="x", subject_id="y", operator="z",
