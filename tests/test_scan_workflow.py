@@ -106,28 +106,31 @@ def test_start_scan_skips_default_storage_when_request_opts_out(tmp_path):
     assert all(not isinstance(s, CsvSink) for s in motion.scan_workflow._runner.sinks)
 
 
-def test_start_scan_auto_wires_telemetry_source_when_telemetry_sink_present():
-    from omotion.pipeline.sinks import TelemetrySink
-    from omotion.pipeline.sources import ConsoleTelemetrySource
-    motion = _build_motion_with_data_dir(None)
-    sink = TelemetrySink(output_path="/tmp/cq_telemetry.csv")
-    request = ScanRequest(
-        subject_id="x", duration_sec=1,
-        left_camera_mask=0xFF, right_camera_mask=0, reduced_mode=False,
-        sinks=[sink],
-    )
-    motion.scan_workflow.start_scan(request)
-    assert isinstance(motion.scan_workflow._runner.telemetry_source, ConsoleTelemetrySource)
+def test_start_scan_does_not_auto_wire_pipeline_telemetry_source():
+    class _TelemetryChannelSink:
+        channels = {"telemetry"}
+        def on_scan_start(self, meta): pass
+        def consume(self, channel, payload): pass
+        def on_complete(self): pass
 
-
-def test_start_scan_no_telemetry_source_when_no_telemetry_sink():
     motion = _build_motion_with_data_dir(None)
     request = ScanRequest(
         subject_id="x", duration_sec=1,
         left_camera_mask=0xFF, right_camera_mask=0, reduced_mode=False,
+        sinks=[_TelemetryChannelSink()],
     )
     motion.scan_workflow.start_scan(request)
-    assert motion.scan_workflow._runner.telemetry_source is None
+    assert not hasattr(motion.scan_workflow._runner, "telemetry_source")
+
+
+def test_start_scan_runner_has_no_telemetry_source_attribute():
+    motion = _build_motion_with_data_dir(None)
+    request = ScanRequest(
+        subject_id="x", duration_sec=1,
+        left_camera_mask=0xFF, right_camera_mask=0, reduced_mode=False,
+    )
+    motion.scan_workflow.start_scan(request)
+    assert not hasattr(motion.scan_workflow._runner, "telemetry_source")
 
 
 # ---------------------------------------------------------------------------

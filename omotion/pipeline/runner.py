@@ -4,7 +4,6 @@ dispatches batch events to the right Sinks via channel subscriptions."""
 from __future__ import annotations
 
 import logging
-import threading
 
 import numpy as np
 
@@ -31,13 +30,10 @@ def _empty_batch_for_flush() -> FrameBatch:
 
 
 class ScanRunner:
-    def __init__(self, *, source: Source, pipeline: Pipeline, sinks: list[Sink],
-                 telemetry_source=None):
+    def __init__(self, *, source: Source, pipeline: Pipeline, sinks: list[Sink]):
         self.source = source
         self.pipeline = pipeline
         self.sinks = list(sinks)
-        self.telemetry_source = telemetry_source
-        self._telemetry_thread = None
         # Sinks whose on_scan_start raised. They're left in self.sinks for
         # introspection but skipped by _sinks_for / on_complete dispatch so
         # consume() never runs against a partially-initialized sink
@@ -67,13 +63,6 @@ class ScanRunner:
                 )
                 self._failed_sinks.add(sink)
 
-        if self.telemetry_source is not None:
-            self._telemetry_thread = threading.Thread(
-                target=self._telemetry_loop, daemon=True,
-                name="ScanRunner-telemetry",
-            )
-            self._telemetry_thread.start()
-
         try:
             for batch in self.source:
                 try:
@@ -88,10 +77,6 @@ class ScanRunner:
             self.pipeline.on_scan_stop(flush_batch)
             self._dispatch(flush_batch)
         finally:
-            if self.telemetry_source is not None:
-                self.telemetry_source.close()
-                if self._telemetry_thread is not None:
-                    self._telemetry_thread.join(timeout=2.0)
             for sink in self.sinks:
                 if sink in self._failed_sinks:
                     # on_scan_start raised — sink is partially initialized;
@@ -102,13 +87,6 @@ class ScanRunner:
                     sink.on_complete()
                 except Exception:
                     logger.exception("sink %r raised in on_complete", type(sink).__name__)
-
-    def _telemetry_loop(self) -> None:
-        for event in self.telemetry_source:
-            if self.pipeline.telemetry_aggregator is not None:
-                self.pipeline.telemetry_aggregator.update(event)
-            for sink in self._sinks_for("telemetry"):
-                self._safe_consume(sink, "telemetry", event)
 
     def _dispatch(self, batch: FrameBatch) -> None:
         for event in batch.events:

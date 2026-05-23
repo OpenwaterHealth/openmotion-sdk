@@ -6,8 +6,8 @@ Usage (from repo root):
 This script:
 1. Generates a synthetic raw CSV (50 frames, 1 camera, 1 side) with
    realistic histogram moments. The sequence includes warmup + first dark +
-   light frames + second dark, so DarkCorrectionStage emits one
-   IntervalClosed event.
+   light frames + second dark + a terminal dark-like final frame, so
+   DarkCorrectionStage emits closed and terminal-flushed intervals.
 2. Runs the pipeline once against that raw CSV (dark_interval=20 so the
    second dark falls at frame 30 within 50 frames).
 3. Saves the raw CSV as ``normal_short_scan.raw.csv`` and the pipeline's
@@ -90,8 +90,9 @@ def _write_raw_csv(path: pathlib.Path) -> None:
             is_warmup = frame_num <= discard_count
             is_dark_10 = (frame_num == discard_count + 1)
             is_dark_30 = (frame_num > discard_count + 1) and ((frame_num - 1) % _DARK_INTERVAL == 0)
+            is_terminal_dark = frame_num == _N_FRAMES
 
-            if is_dark_10 or is_dark_30:
+            if is_dark_10 or is_dark_30 or is_terminal_dark:
                 u1 = _PEDESTAL + rng.uniform(2.0, 5.0)
                 std = 3.0 + rng.uniform(0.0, 1.0)
             elif is_warmup:
@@ -131,8 +132,6 @@ def _run_pipeline(raw_csv: pathlib.Path, out_dir: pathlib.Path) -> pathlib.Path:
         left_camera_mask=0x01,   # camera 0 only
         right_camera_mask=0,
         reduced_mode=False,
-        write_raw_csv=False,
-        raw_csv_duration_sec=None,
     )
 
     from dataclasses import dataclass

@@ -37,7 +37,9 @@ class CamCQResult:
     cam_id:      int    # 0-based camera index within module
     passed:      bool
     light_avg_dn: float # mean of rolling-window light-frame display_mean (NaN when no data)
+    light_std_dn: float # mean of rolling-window light-frame std_raw (NaN when no data)
     dark_max_dn:  float # max of dark-frame display_mean (NaN when no data)
+    dark_std_dn:  float # std_raw recorded with dark_max_dn (NaN when no data)
     reason:      str    # "ok" | "poor_contact" | "ambient_light" | "no_signal"
 
 
@@ -72,8 +74,12 @@ class _ContactQualitySink:
         self._window_size = max(1, int(rolling_window))
         # (side, cam_id) -> deque[float]   (light-frame display_mean values)
         self._light_window: dict = {}
+        # (side, cam_id) -> deque[float]   (light-frame std_raw values)
+        self._light_std_window: dict = {}
         # (side, cam_id) -> float          (max dark-frame display_mean seen)
         self._dark_max: dict = {}
+        # (side, cam_id) -> float          (std_raw paired with max dark frame)
+        self._dark_std: dict = {}
         # (side, cam_id) -> int            (count of light-frame samples seen)
         self._light_count: dict = {}
         # (side, cam_id) -> float          (running sum of light display_mean)
@@ -81,7 +87,9 @@ class _ContactQualitySink:
 
     def on_scan_start(self, meta) -> None:
         self._light_window.clear()
+        self._light_std_window.clear()
         self._dark_max.clear()
+        self._dark_std.clear()
         self._light_count.clear()
         self._light_sum.clear()
 
@@ -105,18 +113,28 @@ class _ContactQualitySink:
                     v = float(batch.display_mean[i, side_idx, cam_id])
                     if not math.isfinite(v):
                         continue
+                    std_v = float("nan")
+                    if getattr(batch, "std_raw", None) is not None:
+                        std_v = float(batch.std_raw[i, side_idx, cam_id])
                     key = (side, cam_id)
                     if ft == "dark":
                         prev = self._dark_max.get(key, float("-inf"))
                         if v > prev:
                             self._dark_max[key] = v
+                            self._dark_std[key] = std_v
                     else:
                         # Light or unclassified — treat as light for CQ purposes.
                         w = self._light_window.get(key)
                         if w is None:
                             w = collections.deque(maxlen=self._window_size)
                             self._light_window[key] = w
+                        sw = self._light_std_window.get(key)
+                        if sw is None:
+                            sw = collections.deque(maxlen=self._window_size)
+                            self._light_std_window[key] = sw
                         w.append(v)
+                        if math.isfinite(std_v):
+                            sw.append(std_v)
                         self._light_sum[key]   = self._light_sum.get(key, 0.0) + v
                         self._light_count[key] = self._light_count.get(key, 0) + 1
 
@@ -145,8 +163,14 @@ class _ContactQualitySink:
                     light_avg = float(sum(window) / len(window))
                 else:
                     light_avg = float("nan")
+                std_window = self._light_std_window.get(key)
+                if std_window is not None and len(std_window) > 0:
+                    light_std = float(sum(std_window) / len(std_window))
+                else:
+                    light_std = float("nan")
 
                 dark_max = self._dark_max.get(key, float("nan"))
+                dark_std = self._dark_std.get(key, float("nan"))
 
                 dark_threshold = (
                     self._dark[cam_id] if cam_id < len(self._dark) else float("inf")
@@ -168,7 +192,9 @@ class _ContactQualitySink:
                     cam_id=cam_id,
                     passed=passed,
                     light_avg_dn=light_avg,
+                    light_std_dn=light_std,
                     dark_max_dn=dark_max,
+                    dark_std_dn=dark_std,
                     reason=reason,
                 )
         return ContactQualityResult(
@@ -232,7 +258,7 @@ class ContactQualityWorkflow:
             right_camera_mask=right_camera_mask,
             disable_laser=False,
             reduced_mode=False,
-            rolling_avg_enabled=True,
+            rolling_avg_enabled=False,
             rolling_avg_window=rolling_window,
             sinks=[sink],
             skip_default_storage=True,

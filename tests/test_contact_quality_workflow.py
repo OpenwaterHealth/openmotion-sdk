@@ -27,6 +27,7 @@ from omotion.ContactQualityWorkflow import (
 class _FakeFrameBatch:
     """Minimal FrameBatch stub for sink unit tests (display_mean only)."""
     display_mean: np.ndarray            # shape (n_frames, 2, 8) — DN, pedestal-subtracted
+    std_raw:      Optional[np.ndarray] = None
     frame_type:   Optional[np.ndarray] = None
 
 
@@ -40,6 +41,7 @@ def _dn_batch(
         frame_types = ["light"] * n_frames
     return _FakeFrameBatch(
         display_mean=np.full((n_frames, 2, 8), dn_value, dtype=np.float32),
+        std_raw=np.full((n_frames, 2, 8), 2.5, dtype=np.float32),
         frame_type=np.array(frame_types, dtype="<U8"),
     )
 
@@ -77,6 +79,27 @@ def test_cq_sink_fails_camera_below_light_threshold():
     cam = result.per_camera[("left", 0)]
     assert cam.passed is False
     assert cam.reason == "poor_contact"
+
+
+def test_cq_sink_records_light_std_without_thresholding_it():
+    sink = _ContactQualitySink(
+        dark_thresholds=[3.0] * 8,
+        light_thresholds=[15.0] * 8,
+    )
+    sink.on_scan_start(None)
+    batch = _FakeFrameBatch(
+        display_mean=np.full((2, 2, 8), 20.0, dtype=np.float32),
+        std_raw=np.full((2, 2, 8), 500.0, dtype=np.float32),
+        frame_type=np.array(["light", "light"], dtype="<U8"),
+    )
+    sink.consume("live", batch)
+
+    result = sink.result(left_mask=0x01, right_mask=0, duration_sec=1.0)
+
+    cam = result.per_camera[("left", 0)]
+    assert cam.passed is True
+    assert cam.reason == "ok"
+    assert cam.light_std_dn == pytest.approx(500.0)
 
 
 def test_cq_sink_fails_camera_when_dark_frame_exceeds_threshold():
@@ -251,7 +274,7 @@ def test_cq_workflow_check_uses_skip_default_storage():
     req = captured.get("req")
     assert req is not None
     assert req.skip_default_storage is True
-    assert req.rolling_avg_enabled is True
+    assert req.rolling_avg_enabled is False
     cq_sinks = [s for s in req.sinks if isinstance(s, CQSink)]
     assert len(cq_sinks) == 1
 

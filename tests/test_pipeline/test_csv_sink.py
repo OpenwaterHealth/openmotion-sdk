@@ -1,6 +1,7 @@
 """New CsvSink — channel-based, with the 'type' column in raw output."""
 
 import csv
+import logging
 import numpy as np
 import pytest
 from dataclasses import dataclass
@@ -75,6 +76,48 @@ def test_csv_sink_raw_always_writes_data_rows(tmp_path):
         rows = list(csv.reader(fh))
     # Header + at least one data row (one cam per frame that has mask bit set)
     assert len(rows) >= 2
+
+
+def test_csv_sink_skips_stale_raw_rows_and_logs(tmp_path, caplog):
+    sink = CsvSink(output_dir=tmp_path)
+    sink.on_scan_start(_meta_simple())
+
+    batch = _dummy_raw_batch()
+    batch.frame_type = np.array(["stale"], dtype="<U8")
+    with caplog.at_level(logging.WARNING, logger="omotion.pipeline.sinks"):
+        sink.consume("raw", batch)
+    sink.on_complete()
+
+    raw_files = list(tmp_path.glob("*raw*.csv"))
+    assert raw_files == []
+    assert "stale raw frame skipped" in caplog.text
+
+
+def test_csv_sink_uses_source_side_ids_for_raw_rows(tmp_path):
+    meta = ScanMetadata(
+        scan_id="side_test", subject_id="s", operator="op",
+        started_at_iso="2026-05-22T00:00:00Z", duration_sec=60,
+        left_camera_mask=0x01,
+        right_camera_mask=0x01,
+        reduced_mode=False,
+    )
+    batch = _dummy_raw_batch()
+    batch.side_ids = np.array([1], dtype=np.int8)
+    batch.raw_histograms[0, 0, 0, :] = 0
+    batch.raw_histograms[0, 1, 0, 12] = 99
+
+    sink = CsvSink(output_dir=tmp_path)
+    sink.on_scan_start(meta)
+    sink.consume("raw", batch)
+    sink.on_complete()
+
+    files = sorted(tmp_path.glob("*raw*.csv"))
+    assert len(files) == 1
+    assert "_right_" in files[0].name
+    with open(files[0]) as fh:
+        rows = list(csv.reader(fh))
+    assert len(rows) == 2
+    assert int(rows[1][4 + 12]) == 99
 
 
 def test_csv_sink_channels_attribute():

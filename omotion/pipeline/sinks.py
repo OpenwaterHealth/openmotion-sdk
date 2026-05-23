@@ -89,10 +89,8 @@ _REDUCED_HEADERS = _corrected_headers_reduced()
 def _scalar_or_blank(arr, i):
     """Pull arr[i] as a float, returning "" for missing/None/NaN values.
 
-    Used for raw-CSV cells where ``""`` is the schema's "no telemetry"
-    marker. TelemetryIngestStage now populates np.ndarrays with NaN where
-    no telemetry snapshot was available; CSV writers should emit blank for
-    those cells.
+    Used for raw-CSV optional cells where ``""`` is the schema's missing-value
+    marker.
     """
     if arr is None:
         return ""
@@ -120,6 +118,40 @@ def _scalar_or_default(arr, i, default=0.0):
     if v != v:  # NaN
         return default
     return v
+
+
+def _batch_frame_type(batch, i: int) -> str:
+    if getattr(batch, "frame_type", None) is None:
+        return ""
+    return str(batch.frame_type[i])
+
+
+def _source_side_indices(batch, i: int, cam_id: int, meta: ScanMetadata):
+    """Yield the active source side(s) for one raw row.
+
+    New live sources set ``side_ids`` per row; when absent, keep the older
+    mask-based fallback for replay/test batches that have not been migrated.
+    """
+    masks = (meta.left_camera_mask, meta.right_camera_mask)
+    names = ("left", "right")
+    side_ids = getattr(batch, "side_ids", None)
+    if side_ids is not None:
+        side_idx = int(side_ids[i])
+        if side_idx not in (0, 1):
+            logger.warning(
+                "raw frame skipped with invalid side_id=%s cam_id=%d frame_id=%s",
+                side_idx, cam_id, int(batch.frame_ids[i]),
+            )
+            return
+        mask = masks[side_idx]
+        if mask and (mask & (1 << cam_id)):
+            yield side_idx, names[side_idx], mask
+        return
+
+    for side_idx, side_name in enumerate(names):
+        mask = masks[side_idx]
+        if mask and (mask & (1 << cam_id)):
+            yield side_idx, side_name, mask
 
 # Maps (metric, side_char, cam_1indexed) -> column index in _NORMAL_HEADERS
 _NORMAL_COL_IDX: dict[tuple[str, str, int], int] = {
@@ -237,25 +269,20 @@ class CsvSink:
             frame_id = int(batch.frame_ids[i])
             ts = float(batch.timestamp_s[i])
 
-            frame_type = ""
-            if batch.frame_type is not None:
-                frame_type = str(batch.frame_type[i])
+            frame_type = _batch_frame_type(batch, i)
+            if frame_type == "stale":
+                logger.warning(
+                    "stale raw frame skipped cam_id=%d frame_id=%d abs_frame_id=%s",
+                    cam_id, frame_id,
+                    "" if batch.abs_frame_ids is None else int(batch.abs_frame_ids[i]),
+                )
+                continue
 
             pdc_val = _scalar_or_blank(batch.pdc, i)
             tcm_val = _scalar_or_blank(batch.tcm, i)
             tcl_val = _scalar_or_blank(batch.tcl, i)
 
-            # Determine side from cam_id: left=side 0, right=side 1
-            # The batch has shape (N, 2, 8, 1024) for raw_histograms.
-            # We write one row per frame/cam using side=0 if left_camera_mask
-            # has this cam bit set, side=1 for right_camera_mask.
-            for side_idx, (side_name, mask) in enumerate(
-                [("left", meta.left_camera_mask), ("right", meta.right_camera_mask)]
-            ):
-                if mask == 0:
-                    continue
-                if not (mask & (1 << cam_id)):
-                    continue
+            for side_idx, side_name, mask in _source_side_indices(batch, i, cam_id, meta):
                 w = self._get_or_open_raw_writer(side_name, mask)
                 if w is None:
                     continue
@@ -546,14 +573,19 @@ class ScanDBSink:
             cam_id = int(batch.cam_ids[i])
             frame_id = int(batch.frame_ids[i])
             ts = float(batch.timestamp_s[i])
+            frame_type = _batch_frame_type(batch, i)
+            if frame_type == "stale":
+                logger.warning(
+                    "stale raw frame skipped cam_id=%d frame_id=%d abs_frame_id=%s",
+                    cam_id, frame_id,
+                    "" if batch.abs_frame_ids is None else int(batch.abs_frame_ids[i]),
+                )
+                continue
             pdc_val = _scalar_or_default(batch.pdc, i, 0.0)
             tcm_val = _scalar_or_default(batch.tcm, i, 0.0)
             tcl_val = _scalar_or_default(batch.tcl, i, 0.0)
 
-            for side_idx, side_name in enumerate(("left", "right")):
-                mask = meta.left_camera_mask if side_idx == 0 else meta.right_camera_mask
-                if mask == 0 or not (mask & (1 << cam_id)):
-                    continue
+            for side_idx, side_name, _mask in _source_side_indices(batch, i, cam_id, meta):
                 temp = (
                     float(batch.temperature_c[i, side_idx, cam_id])
                     if batch.temperature_c is not None else None
@@ -588,49 +620,6 @@ class ScanDBSink:
             logger.exception("ScanDBSink: failed to flush %d raw frames", len(self._raw_buffer))
         finally:
             self._raw_buffer.clear()
-
-
-class TelemetrySink:
-    """Subscribes to 'telemetry' channel; writes one row per TelemetryEvent.
-    See spec §3.6.1."""
-    channels = {"telemetry"}
-
-    def __init__(self, output_path: str):
-        self._output_path = output_path
-        self._fh = None
-        self._writer = None
-
-    def on_scan_start(self, meta: ScanMetadata) -> None:
-        self._fh = open(self._output_path, "w", newline="")
-        self._writer = csv.writer(self._fh)
-        self._writer.writerow([
-            "timestamp_s", "pdc_samples_ma",
-            "tec_setpoint_c", "tec_actual_c",
-            "tec_setpoint_raw", "tec_actual_raw",
-            "tcm", "tcl", "safety_status",
-        ])
-
-    def consume(self, channel: str, payload: Any) -> None:
-        if channel != "telemetry":
-            return
-        event = payload
-        self._writer.writerow([
-            f"{event.timestamp_s:.4f}",
-            ";".join(f"{s:.3f}" for s in event.pdc_samples),
-            f"{event.tec_setpoint_c:.4f}",
-            f"{event.tec_actual_c:.4f}",
-            f"{event.tec_setpoint_raw:.6f}",
-            f"{event.tec_actual_raw:.6f}",
-            event.tcm, event.tcl, event.safety_status,
-        ])
-
-    def on_complete(self) -> None:
-        if self._fh:
-            self._fh.flush()
-            self._fh.close()
-            self._fh = None
-            self._writer = None
-
 
 class QtUiSink:
     """Forwards live-channel batches as Qt signals for the app's plot widget.

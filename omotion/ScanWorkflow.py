@@ -254,8 +254,7 @@ class ScanWorkflow:
 
         Constructs ScanMetadata, default_pipeline, LiveUsbSource,
         auto-injects default storage sinks (unless request.skip_default_storage),
-        auto-wires a ConsoleTelemetrySource if any sink subscribes to
-        'telemetry', and spawns a worker thread that runs the ScanRunner.
+        and spawns a worker thread that runs the ScanRunner.
 
         Sets ``self._runner`` synchronously before the thread starts so
         callers can inspect runner attributes immediately after this method
@@ -273,7 +272,7 @@ class ScanWorkflow:
             )
         from omotion.pipeline.factory import default_pipeline
         from omotion.pipeline.runner import ScanRunner
-        from omotion.pipeline.sources import LiveUsbSource, ConsoleTelemetrySource
+        from omotion.pipeline.sources import LiveUsbSource
         from omotion.pipeline.sinks import CsvSink as PipelineCsvSink, ScanDBSink, ScanMetadata
         from omotion.pipeline.pedestal import SensorPedestals, pedestal_for_fw
 
@@ -341,17 +340,6 @@ class ScanWorkflow:
                 default_sinks.append(ScanDBSink(db_path=scan_db_path))
         all_sinks = default_sinks + list(request.sinks)
 
-        # ── Auto-wire telemetry source ─────────────────────────────────────
-        subscribed_channels = {
-            ch for s in all_sinks for ch in getattr(s, "channels", set())
-        }
-        telemetry_source: Optional["ConsoleTelemetrySource"] = None
-        if "telemetry" in subscribed_channels:
-            telemetry_source = ConsoleTelemetrySource(
-                console=self._interface.console,
-                poll_interval_s=0.1,
-            )
-
         # ── Build source + runner (set self._runner synchronously) ─────────
         source = LiveUsbSource(
             console=self._interface.console,
@@ -364,7 +352,6 @@ class ScanWorkflow:
             source=source,
             pipeline=pipeline,
             sinks=all_sinks,
-            telemetry_source=telemetry_source,
         )
 
         # Anchor for TriggerStateEvent timestamps. Set before the worker
@@ -565,9 +552,8 @@ class ScanWorkflow:
     def cancel(self) -> None:
         """Signal the running scan to stop.
 
-        Closes the source (stopping the USB reader loops) and the telemetry
-        source if one is wired. The worker thread's duration guard exits on
-        the next poll and the runner's finally block fires.
+        Closes the source (stopping the USB reader loops). The worker thread's
+        duration guard exits on the next poll and the runner's finally block fires.
         """
         self._stop_evt.set()
         if self._runner is not None:
@@ -575,11 +561,6 @@ class ScanWorkflow:
                 self._runner.source.close()
             except Exception:
                 pass
-            if self._runner.telemetry_source is not None:
-                try:
-                    self._runner.telemetry_source.close()
-                except Exception:
-                    pass
 
     def cancel_scan(self, *, join_timeout: float = 5.0) -> None:
         self.cancel()

@@ -100,6 +100,23 @@ def test_linear_interpolation_dark_baseline_across_interval():
     assert f.dark_var == pytest.approx(250.0)
 
 
+def test_linear_interpolation_uses_absolute_frame_position_not_timestamp():
+    pi = PendingInterval()
+    pi.set_left_dark(DarkObservation(t=0.0, u1=100.0, std=10.0), abs_frame_id=10)
+    pi.add_light(abs_frame_id=15, t=1.0, u1=500.0, u2=260_000.0)
+    pi.set_right_dark(DarkObservation(t=10.0, u1=200.0, std=20.0), abs_frame_id=20)
+
+    interval = pi.flush()
+    corrected = LinearInterpolation().correct_interval(interval, side="left", cam_id=0)
+
+    f = corrected.frames[0]
+    assert f.mean == pytest.approx(350.0)
+    raw_var = 260_000.0 - 500.0 ** 2
+    expected_dark_var = 10.0 ** 2 + 0.5 * (20.0 ** 2 - 10.0 ** 2)
+    assert f.dark_var == pytest.approx(expected_dark_var)
+    assert f.std == pytest.approx(np.sqrt(max(0.0, raw_var - expected_dark_var)))
+
+
 def test_stencil_full_4_point_when_all_neighbours_present():
     stencil = DarkFrameQuadraticStencil()
     v = stencil.interpolate_dark_value(

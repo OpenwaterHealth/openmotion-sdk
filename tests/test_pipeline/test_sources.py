@@ -356,55 +356,6 @@ def test_csv_replay_no_normalization_when_disabled(tmp_path):
     assert batches[0].timestamp_s[0] == pytest.approx(630.915)
 
 
-def test_console_telemetry_source_yields_events_until_stopped():
-    """The source wraps the console.telemetry.get_snapshot API; yields TelemetryEvents
-    with scan-relative timestamps."""
-    from omotion.pipeline.sources import ConsoleTelemetrySource
-    from omotion.pipeline.batch import TelemetryEvent
-    from types import SimpleNamespace
-
-    class _FakeTelemetryPoller:
-        def __init__(self):
-            self._snapshots = [
-                SimpleNamespace(timestamp=100.0, pdc=1.10,
-                                tec_set_raw=0.612, tec_v_raw=0.615,
-                                safety_ok=True, tcm=10, tcl=100),
-                SimpleNamespace(timestamp=100.1, pdc=1.11,
-                                tec_set_raw=0.612, tec_v_raw=0.615,
-                                safety_ok=True, tcm=11, tcl=110),
-                SimpleNamespace(timestamp=100.2, pdc=1.12,
-                                tec_set_raw=0.612, tec_v_raw=0.615,
-                                safety_ok=True, tcm=12, tcl=120),
-                None,
-            ]
-            self._i = 0
-
-        def get_snapshot(self):
-            if self._i < len(self._snapshots):
-                snap = self._snapshots[self._i]
-                self._i += 1
-                return snap
-            return None
-
-    class _FakeConsole:
-        def __init__(self):
-            self.telemetry = _FakeTelemetryPoller()
-
-    src = ConsoleTelemetrySource(console=_FakeConsole(), poll_interval_s=0.01)
-    events = []
-    for ev in src:
-        events.append(ev)
-        if len(events) == 3:
-            src.close()
-            break
-
-    assert len(events) == 3
-    assert events[0].timestamp_s == 0.0
-    assert abs(events[1].timestamp_s - 0.1) < 1e-9
-    assert abs(events[2].timestamp_s - 0.2) < 1e-9
-    assert events[0].pdc_samples == [1.10]
-
-
 def test_db_replay_normalizes_timestamps_to_zero(tmp_path):
     """DbReplaySource normalizes timestamps on replay."""
     import time as _time

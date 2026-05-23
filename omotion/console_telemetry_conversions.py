@@ -4,7 +4,7 @@ The console firmware reports TEC thermistor / current / voltage as raw ADC
 LSBs from a resistor-divider network. Bloodflow-app historically owned the
 conversion (V_REF, R_1..R_3, R_s, and a Steinhart-Hart-ish lookup table for
 the 10K3CG_R-T thermistor). It now lives in the SDK so every consumer
-(bloodflow-app live display, TelemetryEvent °C fields, post-hoc analysis)
+    (bloodflow-app live display, SDK telemetry displays, post-hoc analysis)
 applies the same formula.
 
 The RT lookup table is shipped as a CSV next to this module
