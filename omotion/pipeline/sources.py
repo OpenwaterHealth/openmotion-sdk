@@ -19,7 +19,7 @@ from typing import Any, Iterator, Optional, Protocol, runtime_checkable
 
 import numpy as np
 
-from .batch import FrameBatch, TelemetryEvent
+from .batch import FrameBatch
 from .sinks import ScanMetadata
 
 
@@ -261,23 +261,22 @@ class LiveUsbSource(_BaseSource):
             yield batch
 
     def close(self) -> None:
-        # Ordering matters here. The legacy SciencePipeline lost the final
-        # frame if stop_streaming ran before the MCU's DMA flushed; we
-        # additionally have to guarantee the parser thread sees the drained
-        # bytes AND that the runner thread sees the resulting FrameBatch
-        # before iteration ends.
+        # Idempotent + race-safe with ScanWorkflow's cancel/duration guard.
+        # Set self._stop FIRST so any concurrent caller (e.g. the duration
+        # guard waking up while cancel() is mid-close, or a redundant
+        # cancel from the worker's finally block) sees source already
+        # closing and short-circuits. Without this gate we'd call
+        # stop_streaming/drain_final twice per side and double-log the
+        # stop banner.
         #
-        # Sequence:
-        #   1. stop_streaming + drain_final on each side. The drained chunks
-        #      are pushed into the per-side packet queue while the parser is
-        #      still running (no stop signal yet) so the parser will consume
-        #      them on its next iteration.
-        #   2. Set self._stop so parse_histogram_stream's `not stop_evt or
-        #      not q.empty()` loop drains its queue then exits.
-        #   3. Join the per-side reader threads — by now they've batched the
-        #      drained chunks and pushed any final FrameBatch to _batch_queue.
-        #   4. Push a None sentinel to _batch_queue so __iter__ exits cleanly
-        #      after delivering the last batch to the runner.
+        # parse_histogram_stream still drains its queue via
+        # `not stop_evt.is_set() or not q.empty()`, so setting stop early
+        # does NOT lose drained bytes — the per-side packet queue is
+        # populated with drain_final chunks below before the parser
+        # exits.
+        if self._stop.is_set():
+            return  # already closing or closed
+        self._stop.set()
         expected_size = getattr(self, "_expected_size", None)
         for side_name, sensor in self._sensors.items():
             if sensor is None or getattr(sensor, "uart", None) is None:
@@ -301,7 +300,6 @@ class LiveUsbSource(_BaseSource):
                                 pass
                 except Exception:
                     pass
-        self._stop.set()
         for t in self._reader_threads:
             t.join(timeout=5.0)
         try:
@@ -364,45 +362,3 @@ class LiveUsbSource(_BaseSource):
             timestamp_s=timestamp_s, pdc=None, tcm=None, tcl=None,
         )
 
-
-class ConsoleTelemetrySource:
-    """Polls MotionConsole.telemetry at fixed cadence; yields TelemetryEvent with
-    scan-relative timestamps.
-
-    Used as the optional `telemetry_source` on ScanRunner. Doesn't produce
-    FrameBatch — parallel input that flows to "telemetry"-channel sinks
-    and feeds the pipeline's TelemetryAggregator.
-    """
-
-    def __init__(self, *, console, poll_interval_s: float = 0.1):
-        self._console = console
-        self._poll_interval_s = poll_interval_s
-        self._stop = threading.Event()
-        self._t0 = None
-
-    def __iter__(self):
-        from omotion.console_telemetry_conversions import (
-            tec_thermistor_voltage_to_celsius,
-        )
-
-        while not self._stop.is_set():
-            snap = self._console.telemetry.get_snapshot()
-            if snap is None:
-                time.sleep(self._poll_interval_s)
-                continue
-            if self._t0 is None:
-                self._t0 = snap.timestamp
-            yield TelemetryEvent(
-                timestamp_s=snap.timestamp - self._t0,
-                pdc_samples=[snap.pdc],
-                tec_setpoint_c=tec_thermistor_voltage_to_celsius(snap.tec_set_raw),
-                tec_actual_c=tec_thermistor_voltage_to_celsius(snap.tec_v_raw),
-                tec_setpoint_raw=float(snap.tec_set_raw),
-                tec_actual_raw=float(snap.tec_v_raw),
-                safety_status=0 if snap.safety_ok else 1,
-                tcm=int(snap.tcm),
-                tcl=int(snap.tcl),
-            )
-
-    def close(self) -> None:
-        self._stop.set()
