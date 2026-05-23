@@ -224,3 +224,114 @@ def test_phase1_scan_failure_aborts_before_write(interface, request_obj):
     assert r.ok is False
     assert "USB lost" in r.error
     interface.write_calibration.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Task 13: _run_subscan_capture passes collector sink + skip_default_storage
+# ---------------------------------------------------------------------------
+
+def test_subscan_uses_collector_sink_and_skip_default_storage(interface, request_obj):
+    """_run_subscan_capture (called by start_calibration) must attach a
+    _CalibrationCollectorSink to each ScanRequest and set
+    skip_default_storage=True.  Verifies the new sink-based API shape
+    added in Phase D of the pipeline cutover (Task 13).
+    """
+    from omotion.CalibrationWorkflow import _CalibrationCollectorSink
+
+    captured_requests: list = []
+
+    def _capture_and_complete(req, *, on_complete_fn=None, on_corrected_batch_fn=None,
+                               on_dark_frame_fn=None, **kw):
+        captured_requests.append(req)
+        # Satisfy the existing callback contract so the workflow doesn't hang.
+        threading.Thread(
+            target=lambda: on_complete_fn(ScanResult(
+                ok=True, error="", left_path="", right_path="",
+                canceled=False, scan_timestamp="20260101_000000",
+            )) if on_complete_fn else None,
+            daemon=True,
+        ).start()
+        return True
+
+    interface.scan_workflow.start_scan = _capture_and_complete
+    interface.write_calibration = MagicMock(
+        return_value=Calibration(
+            c_min=np.zeros((2, 8)), c_max=np.full((2, 8), 0.5),
+            i_min=np.zeros((2, 8)), i_max=np.full((2, 8), 200.0),
+            source="console",
+        )
+    )
+
+    done = threading.Event()
+    box: list[CalibrationResult] = []
+
+    interface.start_calibration(
+        request_obj,
+        on_complete_fn=lambda r: (box.append(r), done.set()),
+    )
+    assert done.wait(timeout=15.0), "calibration did not complete"
+
+    # The calibration workflow makes at least 2 sub-scans (phase 1 + phase 4).
+    assert len(captured_requests) >= 1, "No ScanRequests were captured"
+
+    for req in captured_requests:
+        assert req.skip_default_storage is True, (
+            f"ScanRequest.skip_default_storage should be True; got {req.skip_default_storage}"
+        )
+        collector_sinks = [
+            s for s in req.sinks
+            if isinstance(s, _CalibrationCollectorSink)
+        ]
+        assert len(collector_sinks) >= 1, (
+            f"Expected a _CalibrationCollectorSink in req.sinks; got {req.sinks}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Task 16: start_test_scan also uses collector sink + skip_default_storage
+# ---------------------------------------------------------------------------
+
+def test_start_test_scan_uses_collector_sink_and_skip_default_storage(
+    interface, request_obj
+):
+    """start_test_scan's sub-scan must also carry the collector sink and
+    skip_default_storage=True.  Same shape as the calibration sub-scan
+    (Task 16 of the pipeline cutover)."""
+    from omotion.CalibrationWorkflow import _CalibrationCollectorSink, TestScanResult
+
+    captured_requests: list = []
+
+    def _capture_and_complete(req, *, on_complete_fn=None, **kw):
+        captured_requests.append(req)
+        threading.Thread(
+            target=lambda: on_complete_fn(ScanResult(
+                ok=True, error="", left_path="", right_path="",
+                canceled=False, scan_timestamp="20260101_000000",
+            )) if on_complete_fn else None,
+            daemon=True,
+        ).start()
+        return True
+
+    interface.scan_workflow.start_scan = _capture_and_complete
+
+    done = threading.Event()
+    box: list[TestScanResult] = []
+    interface.start_test_scan(
+        request_obj,
+        on_complete_fn=lambda r: (box.append(r), done.set()),
+    )
+    assert done.wait(timeout=15.0), "test scan did not complete"
+
+    assert len(captured_requests) >= 1, "No ScanRequests were captured"
+
+    for req in captured_requests:
+        assert req.skip_default_storage is True, (
+            f"ScanRequest.skip_default_storage should be True; got {req.skip_default_storage}"
+        )
+        collector_sinks = [
+            s for s in req.sinks
+            if isinstance(s, _CalibrationCollectorSink)
+        ]
+        assert len(collector_sinks) >= 1, (
+            f"Expected a _CalibrationCollectorSink in req.sinks; got {req.sinks}"
+        )

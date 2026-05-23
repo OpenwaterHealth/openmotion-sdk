@@ -933,6 +933,19 @@ class ScanWorkflow:
         self._thread.start()
         return True
 
+    def await_complete(self, *, timeout_sec: float | None = None) -> None:
+        """Block until the current scan worker thread finishes (or the
+        optional timeout elapses).  Useful for callers that start a scan
+        without an ``on_complete_fn`` callback and want synchronous
+        completion — notably the sink-based workflow helpers added in
+        Phase D of the pipeline cutover.
+
+        Does nothing if no scan is running.
+        """
+        t = self._thread
+        if t is not None and t.is_alive():
+            t.join(timeout=timeout_sec)
+
     def cancel_scan(self, *, join_timeout: float = 5.0) -> None:
         self._stop_evt.set()
         try:

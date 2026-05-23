@@ -753,6 +753,39 @@ def _format_result_rows_table(
 
 
 # ---------------------------------------------------------------------------
+# Calibration collector sink
+# ---------------------------------------------------------------------------
+
+
+class _CalibrationCollectorSink:
+    """Internal: collects CorrectedBatch objects emitted via the pipeline's
+    "final" channel during a calibration or test sub-scan.
+
+    Phase D scaffolding — the sink is attached to each ScanRequest so the
+    request shape is correct (``sinks``, ``skip_default_storage=True``).
+    Actual data routing through sinks happens in Phase E when start_scan is
+    rewritten.  For now the calibration math still receives data via the
+    legacy ``on_corrected_batch_fn`` callback; once Phase E wires the new
+    pipeline the same math will run on ``self.batches`` instead.
+    """
+
+    channels: set = frozenset({"final"})
+
+    def __init__(self) -> None:
+        self.batches: list = []
+
+    def on_scan_start(self, meta) -> None:  # noqa: D401
+        self.batches.clear()
+
+    def consume(self, channel: str, payload) -> None:
+        if channel == "final":
+            self.batches.append(payload)
+
+    def on_complete(self) -> None:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Orchestration class
 # ---------------------------------------------------------------------------
 
@@ -790,6 +823,13 @@ def _run_subscan_capture(
     on scan failure. Honors ``stop_evt`` by calling ``cancel_scan``
     and returning empty paths + empty lists.
     """
+    # Attach a collector sink so the ScanRequest carries the new
+    # sink-based API shape (``sinks``, ``skip_default_storage=True``).
+    # Phase D scaffolding: the actual corrected data is still delivered
+    # via the legacy on_corrected_batch_fn / on_dark_frame_fn callbacks
+    # below until Phase E rewrites start_scan to route through sinks.
+    _collector = _CalibrationCollectorSink()
+
     scan_req = ScanRequest(
         subject_id=subject_id,
         duration_sec=duration_sec,
@@ -802,6 +842,8 @@ def _run_subscan_capture(
         write_corrected_csv=False,
         write_telemetry_csv=False,
         reduced_mode=False,
+        sinks=[_collector],
+        skip_default_storage=True,
     )
 
     upper_bound = skip_leading_frames + int(frame_window_count)
