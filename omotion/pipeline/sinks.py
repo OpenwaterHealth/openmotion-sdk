@@ -548,6 +548,43 @@ class ScanDBSink:
             self._raw_buffer.clear()
 
 
+class TelemetrySink:
+    """Subscribes to 'telemetry' channel; writes one row per TelemetryEvent.
+    See spec §3.6.1."""
+    channels = {"telemetry"}
+
+    def __init__(self, output_path: str):
+        self._output_path = output_path
+        self._fh = None
+        self._writer = None
+
+    def on_scan_start(self, meta: ScanMetadata) -> None:
+        self._fh = open(self._output_path, "w", newline="")
+        self._writer = csv.writer(self._fh)
+        self._writer.writerow([
+            "timestamp_s", "pdc_samples_ma", "tec_setpoint_c",
+            "tec_actual_c", "console_temp_c", "fan_rpm", "safety_status",
+        ])
+
+    def consume(self, channel: str, payload: Any) -> None:
+        if channel != "telemetry":
+            return
+        event = payload
+        self._writer.writerow([
+            f"{event.timestamp_s:.4f}",
+            ";".join(f"{s:.3f}" for s in event.pdc_samples),
+            event.tec_setpoint_c, event.tec_actual_c,
+            event.console_temp_c, event.fan_rpm, event.safety_status,
+        ])
+
+    def on_complete(self) -> None:
+        if self._fh:
+            self._fh.flush()
+            self._fh.close()
+            self._fh = None
+            self._writer = None
+
+
 class QtUiSink:
     """Forwards live-channel batches as Qt signals for the app's plot widget.
 
