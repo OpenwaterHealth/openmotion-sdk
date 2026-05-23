@@ -4,7 +4,7 @@ A Source produces an iterator of FrameBatch and carries the ScanMetadata
 for the scan. Concrete sources:
   - CsvReplaySource  — replays raw histogram CSVs (Task 20)
   - DbReplaySource   — replays scan-DB session_raw rows (Task 21)
-  - LiveUsbSource    — reads from USB on background threads (Task 22, skeleton)
+  - LiveUsbSource    — reads from USB on background threads (Task 22)
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import csv
 import queue
 import sqlite3
 import threading
+import time
 from pathlib import Path
 from typing import Any, Iterator, Optional, Protocol, runtime_checkable
 
@@ -192,44 +193,54 @@ class DbReplaySource(_BaseSource):
 
 
 class LiveUsbSource(_BaseSource):
-    """Reads histogram packets from USB on background threads, batches them
-    into FrameBatch objects, hands them to the runner via a queue.
+    """Per-side packet queues + per-side reader threads → shared batch queue.
 
-    PR 1 ships the skeleton; the reader loop body (which parses USB packets
-    via the existing omotion.MotionProcessing.parse_histogram_packet_structured)
-    is wired up in PR 2. Until then, _reader_loop raises NotImplementedError.
+    Each StreamInterface (one per side) pushes raw bytes into its own
+    _packet_queues[side] entry.  A per-side reader thread runs
+    parse_histogram_stream against that queue, accumulating the parsed
+    HistogramSamples into FrameBatch objects which it pushes to the
+    shared _batch_queue.  The runner pulls FrameBatches off _batch_queue
+    via __iter__.
     """
 
     def __init__(self, *,
                  console: Any, left: Any, right: Any,
                  batch_size_frames: int = 10,
                  flush_interval_s: float = 0.25,
-                 queue_size: int = 4,
+                 packet_queue_size: int = 64,
                  metadata: ScanMetadata):
         super().__init__(metadata=metadata)
         self._console = console
-        self._left = left
-        self._right = right
+        self._sensors: dict[str, Any] = {"left": left, "right": right}
         self._batch_size = int(batch_size_frames)
         self._flush_interval = float(flush_interval_s)
-        self._queue: queue.Queue = queue.Queue(maxsize=queue_size)
+        self._packet_queues: dict[str, queue.Queue] = {
+            side: queue.Queue(maxsize=packet_queue_size)
+            for side, sensor in self._sensors.items() if sensor is not None
+        }
+        self._batch_queue: queue.Queue = queue.Queue(maxsize=4)
         self._stop = threading.Event()
-        self._threads: list[threading.Thread] = []
+        self._reader_threads: list[threading.Thread] = []
 
     def __iter__(self) -> Iterator[FrameBatch]:
-        for side_name, sensor in (("left", self._left), ("right", self._right)):
-            if sensor is None:
-                continue
+        from omotion.MotionProcessing import HISTOGRAM_BYTES
+
+        for side_name in self._packet_queues:
+            sensor = self._sensors[side_name]
+            sensor.histo_stream.start_streaming(
+                self._packet_queues[side_name],
+                expected_size=HISTOGRAM_BYTES,
+            )
             t = threading.Thread(
-                target=self._reader_loop, args=(side_name, sensor),
+                target=self._reader_loop, args=(side_name,),
                 name=f"LiveUsbSource-{side_name}", daemon=True,
             )
             t.start()
-            self._threads.append(t)
+            self._reader_threads.append(t)
 
         while not self._stop.is_set():
             try:
-                batch = self._queue.get(timeout=1.0)
+                batch = self._batch_queue.get(timeout=1.0)
             except queue.Empty:
                 continue
             if batch is None:
@@ -238,13 +249,67 @@ class LiveUsbSource(_BaseSource):
 
     def close(self) -> None:
         self._stop.set()
-        for t in self._threads:
+        for sensor in self._sensors.values():
+            if sensor is not None and getattr(sensor, "histo_stream", None) is not None:
+                try:
+                    sensor.histo_stream.stop_streaming()
+                except Exception:
+                    pass
+        for t in self._reader_threads:
             t.join(timeout=2.0)
 
-    def _reader_loop(self, side_name: str, sensor: Any) -> None:
-        """Per-side reader. Body deferred to PR 2."""
-        raise NotImplementedError(
-            "LiveUsbSource reader loop — wired up in PR 2 against omotion.StreamInterface."
+    def _reader_loop(self, side_name: str) -> None:
+        """Per-side reader. Delegates packet parsing to parse_histogram_stream;
+        accumulates HistogramSamples into FrameBatches and pushes them to the
+        shared batch queue.
+        """
+        from omotion.MotionProcessing import (
+            parse_histogram_stream, EXPECTED_HISTOGRAM_SUM,
+        )
+
+        side_idx = 0 if side_name == "left" else 1
+        accumulated: list = []
+        last_flush = time.monotonic()
+
+        def on_row(cam_id, frame_id, ts, histogram, row_sum, temp):
+            nonlocal last_flush
+            accumulated.append((cam_id, frame_id, ts, histogram, row_sum, temp))
+            now = time.monotonic()
+            if (len(accumulated) >= self._batch_size
+                    or now - last_flush >= self._flush_interval):
+                self._batch_queue.put(self._build_batch(side_idx, accumulated))
+                accumulated.clear()
+                last_flush = now
+
+        buf = bytearray()
+        parse_histogram_stream(
+            self._packet_queues[side_name], self._stop, buf,
+            on_row_fn=on_row,
+            expected_row_sum=EXPECTED_HISTOGRAM_SUM,
+            t0_normalizer=getattr(self, "_t0_normalize", None),
+        )
+        # Flush any remaining samples after parse_histogram_stream returns
+        if accumulated:
+            self._batch_queue.put(self._build_batch(side_idx, accumulated))
+
+    def _build_batch(self, side_idx: int, samples: list) -> FrameBatch:
+        """Convert a list of (cam_id, frame_id, ts, histogram, row_sum, temp)
+        tuples into one FrameBatch with (N, 2, 8, 1024) shape, populating the
+        (side_idx, cam_id) slot in the histograms array for each row.
+        """
+        n = len(samples)
+        cam_ids     = np.array([s[0] for s in samples], dtype=np.int8)
+        frame_ids   = np.array([s[1] for s in samples], dtype=np.uint8)
+        timestamp_s = np.array([s[2] for s in samples], dtype=np.float64)
+        raw_hist    = np.zeros((n, 2, 8, 1024), dtype=np.uint32)
+        temps       = np.zeros((n, 2, 8), dtype=np.float32)
+        for i, (cam_id, _, _, histogram, _, temp) in enumerate(samples):
+            raw_hist[i, side_idx, cam_id] = histogram
+            temps[i, side_idx, cam_id] = temp
+        return FrameBatch(
+            cam_ids=cam_ids, frame_ids=frame_ids,
+            raw_histograms=raw_hist, temperature_c=temps,
+            timestamp_s=timestamp_s, pdc=None, tcm=None, tcl=None,
         )
 
 
