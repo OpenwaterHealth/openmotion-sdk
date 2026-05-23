@@ -1,738 +1,777 @@
-# OpenMotion Science Pipeline — Technical Reference
+# Open-Motion Science Pipeline — Technical Reference
 
-**Audience:** Scientists and engineers who need a complete, unambiguous description of every data transformation that occurs between the raw FPGA histogram output and the BFI/BVI values that appear in the corrected CSV and live display.
+**Implementation:** `omotion/pipeline/` — a stage-based, channel-dispatched pipeline package. The entry point is `omotion.pipeline.factory.default_pipeline()`, which composes the canonical chain of stages used by every live scan, CSV replay, and DB replay.
 
-**Implementation:** `omotion/MotionProcessing.py` — class `SciencePipeline` and supporting functions.
+**Audience:**
 
----
-
-## 1. Summary
-
-Each camera produces a 1024-bin histogram at 40 Hz.  The science pipeline:
-
-1. **Discards** the first 9 frames from every camera (hardware warmup).
-2. **Identifies dark frames** by a fixed schedule based on firmware timing.  Dark frames are acquired with the laser off and provide a measurement of the ambient + dark-current floor.
-3. **Zeroes noise-floor bins** — histogram bins below the noise floor threshold (default 10 counts) are zeroed before moment computation to suppress low-level dark noise.
-4. **Emits an uncorrected sample** for every non-dark frame immediately.  The emitted `mean` has the sensor pedestal (64 counts) subtracted so consumers see a zero-referenced intensity signal.  For dark frames, the previous non-dark frame's values are re-emitted so the live display shows no artefact.
-5. **Emits a realtime dark-corrected sample** for every non-dark frame once at least one dark frame has been observed.  Uses a rolling-history predictor (avg-of-last-3 for the dark mean, linear-extrapolation for the dark std) to produce a best-effort dark-subtracted and shot-noise-corrected BFI/BVI immediately, without waiting for the next scheduled dark to close an interval (§7.4).
-6. **Buffers** the raw (un-pedestal-subtracted) first and second moments of every non-dark frame for use in the batched corrected path.
-7. **When a second consecutive dark frame arrives**, linearly interpolates the dark baseline across the buffered interval, subtracts it frame-by-frame, recomputes corrected contrast and intensity, applies the per-camera BFI/BVI calibration, and emits a `CorrectedBatch`.  The leading dark frame of the interval also receives a corrected value derived from its four nearest non-dark neighbors using a quadratic stencil.
-8. **On scan stop**, performs a terminal dark flush so the corrected CSV is always populated even for scans shorter than one full dark interval (§8.6).
-
-Consumers therefore receive:
-
-| Stream | Type | Rate | `is_corrected` | Destination | Callback |
-|---|---|---|---|---|---|
-| Uncorrected | `Sample` per camera | ~40 Hz (every non-dark + every dark) | `False` | Live plot (raw) | `on_uncorrected_fn` |
-| Realtime corrected | `Sample` per camera | ~40 Hz (every non-dark, after first dark) | `True` | Live plot (best-effort corrected) | `on_realtime_corrected_fn` |
-| Corrected batch | `CorrectedBatch` per camera | ~1 per 15 s (configurable) | `True` | Corrected CSV (streaming) + plot snap | `on_corrected_batch_fn` |
-
-The realtime-corrected and batch-corrected samples both carry `is_corrected = True`; consumers distinguish them by which callback delivered the sample.
+1. **Scientists and engineers** who need a mathematically precise description of every transformation between the FPGA's raw 1024-bin histogram and the BFI/BVI values that appear in the corrected CSV, the scan DB, and the live UI.
+2. **Contributors** extending a stage, adding a new sink, or wiring a new source. The "Architecture overview", "Stages", "Channels", and "Sinks" sections describe the contracts you must satisfy.
+3. **Auditors** who need a static, end-to-end account of how raw acquisition data becomes the clinical output. Every transformation, every fallback, and every guard rail described below is implemented in the cited file at the cited line; the field-ownership table (§2) lists which stage is permitted to write each field of the in-flight `FrameBatch`.
 
 ---
 
-## 2. Hardware context
+## 1. Architecture overview
 
-- **Cameras:** Up to 8 OV2312 cameras per sensor module, up to 2 sensor modules (left + right), for a maximum of 16 cameras total.
-- **Frame rate:** 40 Hz (camera frame sync controlled by the console MCU).
-- **Histogram:** 1024 bins, each bin is a 32-bit count value.  A counts-per-electron-volt conversion factor is available but not applied within the pipeline.  The total count per frame is fixed at **2,457,606** (validated by `EXPECTED_HISTOGRAM_SUM`): the OV2312 sensor is 1920 × 1280 = 2,457,600 pixels, plus a sentinel value of 6 added by the firmware.
-- **Dark frame protocol:** The firmware periodically cuts laser illumination for one frame cycle so the camera captures only ambient light and dark current.  The pipeline never has to infer whether a frame is dark from the data — it follows a deterministic schedule (§4).
-- **Frame ID:** The firmware embeds an 8-bit rolling counter (0–255) in the last word of each histogram.  The pipeline unwraps this to a monotonic **absolute frame index** (§3).
+A scan is driven by a `ScanRunner` (`omotion/pipeline/runner.py`). It pulls `FrameBatch` objects from a `Source`, passes each batch through a `Pipeline` of `Stage`s, and dispatches the resulting events to subscribed `Sink`s on named channels.
+
+```
+                                 ┌──────────────────────────────┐
+                                 │      ConsoleTelemetrySource  │
+                                 │      (~10 Hz snapshots)      │
+                                 └──────────────┬───────────────┘
+                                                │  TelemetryEvent
+                                                │  (separate runner thread)
+                                                ▼
+┌────────────┐   FrameBatch  ┌─────────────────────────────────────────┐
+│   Source   ├──────────────►│           Pipeline (Stage list)         │
+│ (live USB, │  N frames per │ Parse → Classify → TelemetryIngest →    │
+│ CSV, DB)   │  batch        │ Tee(raw) → NoiseFloor → Moments →       │
+└────────────┘               │ PedestalSub → DarkCorrection →          │
+                             │ ShotNoise → BfiBvi → SideAvg →          │
+                             │ Tee(live) → RollingAvg → Tee(rolling)   │
+                             └──────────────┬──────────────────────────┘
+                                            │ batch.events (LiveEmit /
+                                            │ IntervalClosed / diagnostics)
+                                            ▼
+                              ┌──────────────────────────┐
+                              │       ScanRunner         │
+                              │  channel-based dispatch  │
+                              └─┬─────┬─────┬─────┬─────┬┘
+                                │     │     │     │     │
+                              raw  live rolling final telemetry  diagnostics
+                                │     │     │     │     │
+                                ▼     ▼     ▼     ▼     ▼
+                                  Sinks (CsvSink, ScanDBSink,
+                                  QtUiSink, TelemetrySink, …)
+```
+
+The pipeline is **pure transformation**: stages mutate a typed `FrameBatch` dataclass in place and append events to `batch.events`. They never perform I/O. All side effects — file writes, UI emission, DB inserts — happen in sinks downstream of the runner.
+
+Three things characterise this design and make it auditable:
+
+- **One owner per field.** Each field on `FrameBatch` is written by exactly one stage. The ownership table (§2) is part of the contract; tests assert it.
+- **No global mutable state.** Per-scan state (pedestal values, calibration arrays, dark history, rolling-average rings) is constructor-injected into stages and reset by `Pipeline.reset()` at scan start.
+- **Channel-based output.** Sinks declare which channels they care about (`channels: set[str]`). The runner dispatches each `LiveEmit` / `IntervalClosed` event to the matching sinks. Adding a new consumer is a class with a `channels` set and a `consume(channel, payload)` method; no pipeline code changes.
 
 ---
 
-## 3. Frame ID unwrapping
+## 2. The FrameBatch
 
-**Class:** `FrameIdUnwrapper` — one instance per `(side, cam_id)` pair.
+`omotion/pipeline/batch.py` defines `FrameBatch`, the typed data carrier that flows through every stage. All per-frame fields are NumPy arrays of shape `(N, …)`, where N is the batch size (typically 10–100 frames). Stages mutate the batch in place for performance — no per-batch allocation churn.
 
-The firmware's 8-bit counter wraps from 255 → 0.  The unwrapper maintains an epoch counter that increments on each detected rollover:
+### 2.1 Field ownership
+
+| Field | Shape | Owner stage | Meaning |
+|---|---|---|---|
+| `cam_ids` | `(N,)` int8 | Source (parse) | Camera index 0..7 |
+| `frame_ids` | `(N,)` uint8 | Source (parse) | Firmware rolling 8-bit counter |
+| `raw_histograms` | `(N, 2, 8, 1024)` uint32 | Source (parse) | Raw 1024-bin histogram per side × cam; mutated in place by NoiseFloorStage |
+| `temperature_c` | `(N, 2, 8)` float32 | Source (parse) | Sensor-reported temperature |
+| `timestamp_s` | `(N,)` float64 | Source (parse) | Sensor timestamp; normalised to scan start by `_BaseSource` |
+| `pdc` | `(N,)` float32 \| None | TelemetryIngestStage | Mean PDC reading (mA) at the frame's timestamp |
+| `tcm` | `(N,)` int64 \| None | TelemetryIngestStage | MCU trigger counter (lsync pulses) |
+| `tcl` | `(N,)` int64 \| None | TelemetryIngestStage | Laser trigger counter |
+| `abs_frame_ids` | `(N,)` int64 | FrameClassificationStage | Monotonic unwrapped frame counter |
+| `frame_type` | `(N,)` `<U8` | FrameClassificationStage | One of `"warmup"`, `"dark"`, `"light"`, `"stale"` |
+| `mean_raw` | `(N, 2, 8)` float32 | MomentsStage | First moment μ₁ of raw histogram (NaN where count == 0) |
+| `std_raw` | `(N, 2, 8)` float32 | MomentsStage | √(μ₂ − μ₁²) of raw histogram |
+| `contrast_raw` | always `None` | MomentsStage | Reserved; pedestal-subtracted contrast is computed downstream |
+| `display_mean` | `(N, 2, 8)` float32 | PedestalSubtractionStage | `max(0, mean_raw − pedestal)` |
+| `dark_baseline_rt` | `(N, 2, 8)` float32 | DarkCorrectionStage | Realtime-predicted dark baseline û₁ (NaN before first dark) |
+| `mean_dc_rt` | `(N, 2, 8)` float32 | DarkCorrectionStage | `mean_raw − û₁` (best-effort dark-subtracted mean) |
+| `std_dc_rt` | `(N, 2, 8)` float32 | DarkCorrectionStage | √(std_raw² − σ̂²) (best-effort dark-subtracted std) |
+| `std_sn_rt` | `(N, 2, 8)` float32 | ShotNoiseCorrectionStage | std after Poisson shot-noise removal |
+| `contrast_sn_rt` | `(N, 2, 8)` float32 | ShotNoiseCorrectionStage | `std_sn_rt / mean_dc_rt`, 0 where mean ≤ 0 |
+| `bfi_live` | `(N, 2, 8)` float32 | BfiBviStage | BFI from realtime corrected (K, μ₁) via calibration |
+| `bvi_live` | `(N, 2, 8)` float32 | BfiBviStage | BVI from realtime corrected mean via calibration |
+| `bfi_live_side` | `(N, 2)` float32 \| None | SideAveragingStage | Per-side BFI mean (reduced mode only) |
+| `bvi_live_side` | `(N, 2)` float32 \| None | SideAveragingStage | Per-side BVI mean (reduced mode only) |
+| `bfi_rolling` | `(N, 2, 8)` float32 | RollingAverageStage | Sliding-window mean of `bfi_live` |
+| `bvi_rolling` | `(N, 2, 8)` float32 | RollingAverageStage | Sliding-window mean of `bvi_live` |
+| `events` | `list[BatchEvent]` | Stages append | Out-of-band events: `LiveEmit`, `IntervalClosed`, diagnostics |
+
+### 2.2 BatchEvent types
+
+Stages produce events when something doesn't fit cleanly into per-frame arrays. The runner inspects `batch.events` after the pipeline returns and dispatches each event to the right channel.
+
+| Event | Producer | Routed to |
+|---|---|---|
+| `LiveEmit(channel, payload)` | `Tee` stages | The named channel's sinks |
+| `IntervalClosed(corrected_batch)` | `DarkCorrectionStage` | `"final"` channel sinks |
+| `DarkIntegrityWarning(...)` | `DarkIntegrityGuard` (inside DarkCorrectionStage) | `"diagnostics"` |
+| `StencilFallback(...)` | `DarkFrameQuadraticStencil` | `"diagnostics"` |
+| `TelemetryEvent(...)` | `ConsoleTelemetrySource` (out of band) | `"telemetry"` and `TelemetryAggregator` |
+
+---
+
+## 3. The Stage protocol
+
+`omotion/pipeline/pipeline.py` defines the contract:
 
 ```python
-delta = (raw_frame_id - last_raw) & 0xFF   # unsigned 8-bit forward distance
+@runtime_checkable
+class Stage(Protocol):
+    name: str
+    def process(self, batch: FrameBatch) -> FrameBatch: ...
+    def reset(self) -> None: ...
+```
 
+Stages may also implement an optional `on_scan_stop(batch)` lifecycle hook (used by `DarkCorrectionStage` for the terminal-dark flush — see §6.6).
+
+`Pipeline.process(batch)` calls each stage's `process()` in order. `Pipeline.reset()` calls every stage's `reset()` and is invoked at scan start and whenever any stage raises during a scan (`ScanRunner.run()` then continues with the next batch).
+
+The full chain assembled by `default_pipeline()` is:
+
+```
+FrameClassificationStage
+TelemetryIngestStage
+Tee("raw", filter=ft != "stale", max_duration_s=…)   # conditional
+NoiseFloorStage
+MomentsStage
+PedestalSubtractionStage
+DarkCorrectionStage
+ShotNoiseCorrectionStage
+BfiBviStage
+SideAveragingStage      (enabled only in reduced mode)
+Tee("live", filter=ft not in {"warmup","stale"})
+RollingAverageStage
+Tee("rolling", filter=ft not in {"warmup","stale"})
+```
+
+---
+
+## 4. Hardware context
+
+- **Cameras:** up to 8 OV2312 cameras per sensor module, up to 2 sensor modules (left + right), 16 cameras max.
+- **Frame rate:** 40 Hz, frame sync controlled by the console MCU.
+- **Histogram:** 1024 bins per camera per frame, 32-bit counts. The expected total count per valid frame is **2,457,606** (= 1920 × 1280 pixels + 6 sentinel counts), validated as `EXPECTED_HISTOGRAM_SUM` in `omotion/MotionProcessing.py`. Frames whose sum does not match are dropped by the parser before they ever reach the pipeline.
+- **Dark frame protocol:** the firmware deterministically cuts laser illumination on a fixed schedule (see §5.2). The pipeline never has to infer dark/light from the data.
+- **Frame ID:** each histogram packet carries an 8-bit rolling counter (0–255). The pipeline unwraps this per `(side, cam_id)` pair (§5.1).
+- **Pedestal:** the camera-reported value at zero illumination. Per-side, firmware-version-keyed: 64.0 DN for sensor firmware ≤ 1.5.2, 128.0 DN after. `omotion/pipeline/pedestal.py` resolves this from the connected sensors at scan start (`SensorPedestals.from_sensors(left, right)`).
+
+---
+
+## 5. Stage reference
+
+The remaining sections describe each stage's math and side effects. The order matches the pipeline order built by `default_pipeline()`.
+
+### 5.1 FrameClassificationStage
+
+**File:** `omotion/pipeline/stages/classify.py`. **Writes:** `abs_frame_ids`, `frame_type`.
+
+Per `(side, cam_id)` pair, the stage maintains a `_FrameUnwrapper` (the side is inferred from `argmax` of the per-side histogram sum, since each packet's payload lives in only one of the two side slots).
+
+**Frame-ID unwrap.** The firmware's 8-bit counter wraps from 255 → 0. The unwrapper maintains an epoch counter:
+
+```
+delta = (raw_frame_id - last_raw) & 0xFF
 if delta <= 128 and raw_frame_id < last_raw:
-    epoch += 1  # genuine rollover crossing
-
-absolute_frame_id = epoch * 256 + raw_frame_id
+    epoch += 1
+abs_frame_id = epoch * 256 + raw_frame_id
 ```
 
-A `delta > 128` (apparent large backward jump) is treated as a packet anomaly and the epoch is left unchanged.  The `absolute_frame_id` is therefore strictly monotonic for normal packet delivery and weakly monotonic under anomalies.
+A `delta > 128` (apparent large backward jump) is treated as a packet anomaly and the epoch is left unchanged.
 
-All downstream logic uses `absolute_frame_id`.  The raw `frame_id` is retained only for CSV column compatibility.
+**Stale-first guard.** The very first frame received for any `(side, cam_id)` must have `raw_frame_id == 1`. Anything else is a leftover packet from a previous scan; the unwrapper flags it and any subsequent frames whose `abs_frame_id == raw_frame_id` (i.e. epoch still 0) are labelled `"stale"` so they are dropped by the `Tee("raw", filter=ft != "stale")` and live tees.
 
----
+**Frame-type labelling.** With `d = discard_count` (default 9) and `Δ = dark_interval` (default 600):
 
-## 4. Frame classification
-
-### 4.1 Warmup discard
-
-Frames with `absolute_frame_id` ∈ {1, 2, …, `discard_count`} (default `discard_count = 9`) are silently dropped.  These frames correspond to the first 9 camera trigger cycles after the pipeline starts, during which the sensor's internal state (AGC, PLL, etc.) has not yet settled.
-
-No callback is fired and no data is stored for these frames.
-
-### 4.2 Dark frame schedule
-
-A frame at absolute index *n* is classified as a **dark frame** if and only if:
-
-```
-n == discard_count + 1                         # first dark (frame 10 by default)
-OR
-n > discard_count + 1  AND  (n − 1) mod dark_interval == 0
-```
-
-where `dark_interval` defaults to 600 (= 15 seconds at 40 Hz).  Under the defaults the dark frames occur at:
-
-> n = 10, 601, 1201, 1801, …
-
-Every other frame with `n > discard_count` is a **bright (non-dark) frame**.
-
-Note that frame n = 1 satisfies the formula `(n−1) mod 600 == 0` but is already discarded as a warmup frame, so it is never observed by the pipeline.
-
----
-
-## 5. Noise floor decimation
-
-Before moment computation, bins with a count strictly below `noise_floor` (default **10**) are zeroed:
-
-```python
-below = hist < noise_floor
-if below.any():
-    hist = hist.copy()
-    hist[below] = 0
-    row_sum = int(hist.sum())
-```
-
-This suppresses low-level dark noise that would otherwise bias the mean and variance estimates.  The recalculated `row_sum` is used for all subsequent moment math.  This step runs on both dark and bright frames.
-
----
-
-## 6. Moment computation
-
-For every frame that passes the discard and dark-schedule checks, the pipeline computes the first two moments of the (noise-floor-decimated) histogram.  Let **h** = (h₀, h₁, …, h₁₀₂₃) be the bin values (in counts) and *N* = Σ_k h_k the total count after decimation.
-
-```
-μ₁ = (1/N) Σ_{k=0}^{1023} k · h_k          # first moment (mean bin index)
-μ₂ = (1/N) Σ_{k=0}^{1023} k² · h_k         # second moment
-σ² = μ₂ − μ₁²                               # variance  (always ≥ 0 by construction)
-```
-
-In NumPy:
-
-```python
-HISTO_BINS    = np.arange(1024, dtype=np.float64)
-HISTO_BINS_SQ = HISTO_BINS ** 2
-
-μ₁ = np.dot(hist, HISTO_BINS)    / row_sum
-μ₂ = np.dot(hist, HISTO_BINS_SQ) / row_sum
-σ² = max(0.0, μ₂ - μ₁**2)
-```
-
-These are computed identically for both dark and bright frames.  Speckle contrast is derived from these moments in §7 (uncorrected stream) and §8 (corrected batch), where pedestal and shot-noise corrections are applied first.
-
----
-
-## 7. Uncorrected stream
-
-### 7.1 Pedestal subtraction
-
-The camera sensor ADC settles at bin index **64** when no photons reach the sensor — a fixed DC bias called the **pedestal**.  The pedestal is present in every frame (both bright and dark) and must be removed before the mean is meaningful as an intensity signal.
-
-Let `raw_μ₁` be the histogram mean as computed in §6.  The pedestal-adjusted mean used for uncorrected output is:
-
-```
-mean_val = max(0.0, raw_μ₁ − PEDESTAL_HEIGHT)     PEDESTAL_HEIGHT = 64.0
-```
-
-Variance is **invariant** to a constant shift of bin indices (subtracting a constant C from every bin centre shifts the mean by C but leaves E[X²]−E[X]² unchanged).  Therefore:
-
-```
-σ² = max(0.0, μ₂ − raw_μ₁²)    # computed from raw_μ₁, not mean_val
-σ  = √σ²
-K  = σ / mean_val               # contrast denominator uses pedestal-adjusted mean
-```
-
-This means contrast — and therefore BFI — reflects the relative fluctuation above the true signal baseline, not above the pedestal floor.
-
-**Important:** the raw `u1` and `u2` values stored in `_pending_moments` and `_dark_history` for later dark-frame correction are **not** pedestal-adjusted.  Both the bright-frame `fm.u1` and the dark-frame `dark_u1` carry the same pedestal, so it cancels exactly in the dark-subtracted corrected stream:
-
-```
-corrected_mean = fm.u1 − dark_u1      # pedestal present in both, cancels
-```
-
-No explicit pedestal subtraction is performed anywhere in the corrected path.
-
-### 7.2 Bright frames
-
-For each bright frame *n*, the pipeline immediately constructs and emits a `Sample` with `is_corrected = False`:
-
-| Field | Value |
+| Condition | `frame_type` |
 |---|---|
-| `mean` | `mean_val` = max(0, raw_μ₁(n) − 64) |
-| `std_dev` | σ(n) — computed from raw_μ₁ (pedestal-invariant) |
-| `contrast` | K(n) = σ(n) / mean_val |
-| `bfi` | BFI(K(n), mean_val) — see §9 |
-| `bvi` | BVI(K(n), mean_val) — see §9 |
-| `is_corrected` | `False` |
+| `first_was_stale` and `abs_id == raw_id` | `"stale"` |
+| `abs_id ≤ d` | `"warmup"` |
+| `abs_id == d + 1` OR (`abs_id > d + 1` AND `(abs_id - 1) mod Δ == 0`) | `"dark"` |
+| otherwise | `"light"` |
 
-This fires the `on_uncorrected_fn` callback immediately, before any dark-frame correction is available.
+Under the defaults, dark frames occur at `n = 10, 601, 1201, 1801, …`. Every other frame with `n > d` is `"light"`.
 
-The **raw** moments `u1 = raw_μ₁(n)` and `u2 = μ₂(n)` (without pedestal subtraction) are stored in `_pending_moments[key]` as a `_StoredFrameMoments` object for later dark-frame correction.
+### 5.2 TelemetryIngestStage
 
-### 7.3 Dark frames — live display masking
+**File:** `omotion/pipeline/telemetry.py`. **Writes:** `pdc`, `tcm`, `tcl`.
 
-**Rule:** When a dark frame *D* arrives, the `on_uncorrected_fn` callback receives a `Sample` whose metric values (`mean`, `std_dev`, `contrast`, `bfi`, `bvi`) are copied from the immediately preceding bright frame's `Sample`.  Only `frame_id`, `absolute_frame_id`, and `timestamp_s` are updated to reflect the dark frame's true position.
+Reads the most recent `TelemetryEvent` (timestamp ≤ frame timestamp) from the pipeline's `TelemetryAggregator` and stamps each frame with:
 
-```python
-# Pseudo-code
-dark_uncorrected = copy(last_uncorrected[key])
-dark_uncorrected.frame_id          = D_raw
-dark_uncorrected.absolute_frame_id = D
-dark_uncorrected.timestamp_s       = ts
-dark_uncorrected.is_corrected      = False
-emit on_uncorrected_fn(dark_uncorrected)
-```
+- `pdc[i]` = mean of `event.pdc_samples` (in mA) — a per-frame scalar best representing laser power over the frame's exposure
+- `tcm[i]` = MCU trigger counter
+- `tcl[i]` = laser trigger counter
 
-**Rationale:** A dark frame has anomalously low intensity and contrast because the laser is off.  Emitting the raw dark values would cause the live trace to drop sharply and then recover, appearing as a ~25 ms artefact every 15 seconds.  Repeating the previous value makes the dark frame invisible to the live display.
+When no telemetry has been observed yet, fields remain `np.nan` / 0. When the pipeline is constructed without an aggregator (e.g. tests, replay sources without telemetry), the stage is a no-op.
 
-If no preceding bright frame exists (i.e. the very first frame in the scan is a dark frame), no uncorrected sample is emitted for that dark frame.
+`reset()` deliberately does **not** clear the aggregator — telemetry history is owned by the source and must outlive any transient pipeline exception. See §10.
 
-### 7.4 Realtime dark-corrected stream
+### 5.3 Tee("raw")
 
-A third per-frame emission complements the uncorrected stream by applying a dark-baseline subtraction *predicted* from the rolling history of recent dark frames, rather than the linear interpolation used in the lagged batch path (§8). The realtime stream fires on the same ~40 Hz cadence as the uncorrected stream but emits samples with `is_corrected = True` whose dark subtraction reflects the **best estimate available now**, several seconds before the next scheduled dark frame closes a batch interval.
+**File:** `omotion/pipeline/tee.py`. **Writes:** appends `LiveEmit(channel="raw", payload=batch)`.
 
-**Implementation:** `SciencePipeline._emit_realtime_corrected()`. Reference: [`data-processing/dark-drift-study/online_estimators.md`](../data-processing/dark-drift-study/online_estimators.md).
+Positional marker. Routes the full FrameBatch — including warmup frames — to any sink subscribed to `"raw"` (e.g. `CsvSink`, `ScanDBSink`). Two predicates can suppress emission:
 
-**When it fires.** Each non-dark frame, once at least one prior dark frame has been observed for that `(side, cam_id)`. Frames before the first dark do not produce a realtime-corrected sample (no baseline to subtract; warmup window is typically the first ~0.25 s of the scan until the first scheduled dark at frame 10).
+- `filter=lambda ft: ft != "stale"` — never emit batches whose every frame is stale
+- `max_duration_s` — once the batch's first timestamp exceeds this cap, no further raw emission (used to bound raw-CSV file size on long clinical scans)
 
-#### 7.4.1 Predictor algorithm
+If `raw_save_max_duration_s=0` is passed to `default_pipeline()`, the raw tee is omitted entirely.
 
-Per `(side, cam_id)` pair, the pipeline maintains a rolling deque of recent dark observations `(timestamp_s, u1, std)` of size `realtime_dark_history_size` (default **4**).
+### 5.4 NoiseFloorStage
 
-For a target light frame at time *t*, let *D* be the deque of recent darks for that camera. The predictor produces a baseline `(û₁, σ̂)`:
+**File:** `omotion/pipeline/stages/noise_floor.py`. **Writes:** mutates `raw_histograms` in place (no new field).
+
+Zeroes histogram bins whose count is strictly below `threshold` (default 10). Implemented as a single `np.putmask`:
 
 ```
-case |D| == 1 (warmup — only one dark seen):
-    û₁ = D[-1].u1                                    # zero-order hold
-    σ̂  = D[-1].σ                                     # zero-order hold
+np.putmask(raw_histograms, raw_histograms < threshold, 0)
+```
 
-case |D| >= 2 (steady state):
-    û₁ = mean( last min(3, |D|) entries of D.u1 )    # average of last 3 darks (fewer if |D| < 3)
+**Rationale:** low-count bins are dominated by read noise. Zeroing them before moment computation tightens μ₁ and σ against detector noise tails without affecting bins carrying real photon counts.
 
-    let a = D[-2], b = D[-1]                          # two most recent darks
+### 5.5 MomentsStage
+
+**File:** `omotion/pipeline/stages/moments.py`. **Writes:** `mean_raw`, `std_raw`. Leaves `contrast_raw = None`.
+
+Fully vectorised across `(N, 2, 8)`:
+
+```
+k          = arange(1024)
+counts     = h.sum(axis=-1)                    # (N, 2, 8)
+safe       = where(counts > 0, counts, 1)
+μ₁         = einsum('nsci,i->nsc', h, k)    / safe
+μ₂         = einsum('nsci,i->nsc', h, k²)   / safe
+var        = max(μ₂ − μ₁², 0)                  # numerical floor
+σ          = √var
+mean_raw   = where(counts > 0, μ₁, NaN)
+std_raw    = σ
+```
+
+`contrast_raw` is intentionally left `None`. The valid speckle contrast definition is `K = σ / (μ₁ − pedestal)`, and MomentsStage doesn't know the pedestal; pedestal-subtracted contrast is computed downstream by `ShotNoiseCorrectionStage` (after `mean_dc_rt` is available).
+
+### 5.6 PedestalSubtractionStage
+
+**File:** `omotion/pipeline/stages/pedestal_sub.py`. **Writes:** `display_mean`.
+
+Per-side pedestal subtraction with a clamp at zero:
+
+```
+display_mean = max(0, mean_raw − pedestal)        # per-side broadcast (1, 2, 1)
+```
+
+`display_mean` is what the live UI plots as "intensity" and what `ContactQualityWorkflow` thresholds against (§11). The dark-correction path uses `mean_raw` (un-pedestal-subtracted) directly, because the pedestal cancels exactly when you subtract one dark mean from one light mean — both terms carry the same pedestal.
+
+### 5.7 DarkCorrectionStage
+
+**File:** `omotion/pipeline/stages/dark.py`. **Writes:** `dark_baseline_rt`, `mean_dc_rt`, `std_dc_rt`. Appends `IntervalClosed` and `DarkIntegrityWarning` events.
+
+This is the largest stage. It runs **two parallel corrections**:
+
+- **Realtime (per-frame, predicted)** — produces `dark_baseline_rt`, `mean_dc_rt`, `std_dc_rt` on every light frame using the rolling dark history. Available immediately; lower fidelity at interval boundaries. Used by the live UI.
+- **Batched (per dark-interval, interpolated)** — buffers all light frames in the open interval, and when the closing dark arrives, emits `IntervalClosed(EnrichedCorrectedInterval)` containing fully dark-subtracted, shot-noise-corrected, BFI/BVI-calibrated frames. Used by the corrected CSV, the scan DB, and any consumer that needs reproducible offline-grade output.
+
+The realtime predictor and the batched corrector share one `DarkHistory` (a per-`(side, cam_id)` ring buffer of `DarkObservation(t, u1, std)`, default capacity 4).
+
+#### 5.7.1 DarkIntegrityGuard (dark frames)
+
+A genuine dark frame's μ₁ should be within ~30 DN of the sensor pedestal. Any higher and the laser likely wasn't actually off (firmware off-by-one, unwrapper alignment quirk). The guard appends a `DarkIntegrityWarning(side, cam_id, abs_frame_id, u1, pedestal, threshold)` event — a diagnostic, not a drop signal. The frame is still appended to history and used downstream.
+
+#### 5.7.2 HybridRealtimePredictor — realtime baseline
+
+**Why this exists.** The batched corrector waits for both bounding darks of an interval before emitting, then linearly interpolates the dark baseline backward across the interval. That's accurate but lagged by up to one full dark interval (~15 s at default settings). The realtime stream emits **immediately** with a forward-estimate of where the next dark *would* fall, so the operator's live trace is continuously dark-corrected.
+
+**Algorithm.** Given the rolling history `D` for one camera and a target light-frame time `t`:
+
+```
+case |D| == 0  (warmup, no darks yet):
+    no realtime correction emitted for this frame
+    (mean_dc_rt[i, side, cam] = NaN)
+
+case |D| == 1  (warmup, one dark):
+    û₁ = D[-1].u1                              # zero-order hold
+    σ̂  = D[-1].std                             # zero-order hold
+
+case |D| >= 2  (steady state):
+    û₁ = mean( last min(3, |D|) entries of D.u1 )      # avg of last 3 (ZOH if fewer)
+    let a = D[-2], b = D[-1]
     let Δt = b.t − a.t
     if Δt <= 0:
-        σ̂ = b.σ                                       # degenerate timestamps → ZOH
+        σ̂ = b.std                              # degenerate timestamps → ZOH
     else:
-        slope = (b.σ − a.σ) / Δt
-        σ̂ = b.σ + slope · (t − b.t)                  # linear extrapolation in time
+        slope = (b.std − a.std) / Δt
+        σ̂ = b.std + slope · (t − b.t)         # linear extrapolation in time
 ```
 
-In plain language: the **mean baseline** is an average of recent darks (stable against single-frame noise), while the **standard deviation baseline** is linearly extrapolated forward from the two most recent darks (tracks slow drift in dark noise across an interval). When fewer than two darks have been recorded — the warmup window immediately after scan start — both quantities fall back to a zero-order hold on whatever single dark is available, so a realtime-corrected sample can be emitted as soon as the very first dark has arrived (relaxed from a previous "wait for two darks" rule).
+In plain terms: the **mean baseline** is an average of the last few darks (stable against single-frame noise); the **std baseline** is linearly extrapolated forward from the two most recent darks (tracks slow drift in dark noise across an interval). When only one dark exists, both fall back to a zero-order hold so a realtime sample can be emitted as soon as the very first scheduled dark has arrived (relaxed from a prior "wait for two darks" rule).
 
-The linear extrapolation operates on `std`, not on `variance`. `std` is the smooth quantity over a dark interval; predicted variance is recovered as `σ̂²` at the application step below.
-
-#### 7.4.2 Sample construction
-
-Given the predicted baseline `(û₁, σ̂)` and the current light frame's raw moments `(raw_μ₁(n), μ₂(n))` (the same raw, un-pedestal-subtracted moments stored in `_pending_moments`), the realtime-corrected sample carries:
+**Application.** Given the predicted `(û₁, σ̂)`:
 
 ```
-μ̃₁(n)     = raw_μ₁(n) − û₁                          # predictor-corrected mean
-raw_σ²(n)  = μ₂(n) − raw_μ₁(n)²                       # raw variance
-σ̃²(n)     = raw_σ²(n) − σ̂² − σ²_shot(n)              # dark- and shot-noise-subtracted variance
-σ̃²(n)     = max(0, σ̃²(n))                            # clamp
-σ̃(n)      = √σ̃²(n)
-K̃(n)      = σ̃(n) / μ̃₁(n)     if μ̃₁(n) > 0
-            = 0.0                otherwise
+mean_dc_rt[i, side, cam]      = mean_raw − û₁
+σ²_raw                          = std_raw²
+σ²_dc                           = max(0, σ²_raw − σ̂²)
+std_dc_rt[i, side, cam]        = √σ²_dc
+dark_baseline_rt[i, side, cam] = û₁
 ```
 
-with shot-noise variance identical to the batched path (§8.3):
+`mean_dc_rt` and `std_dc_rt` feed ShotNoiseCorrectionStage (§5.8) and ultimately BfiBviStage (§5.9), producing the per-frame realtime BFI/BVI seen by the live UI.
+
+The pedestal cancels exactly in `mean_raw − û₁` because both terms carry the same pedestal; no explicit pedestal subtraction occurs in this path.
+
+#### 5.7.3 PendingInterval — batched buffering
+
+For each `(side, cam_id)` the stage holds a `PendingInterval` with:
+
+- `_left: _DarkBoundary` — the most recent dark observation (sets the interval's left edge)
+- `_light: list[_LightSample]` — all light frames received since `_left` was set
+- `_right: _DarkBoundary` — the next dark observation (closes the interval)
+
+On every dark frame: append to history and either set `_left` (first dark) or set `_right` and flush. On every light frame: append to `_light`.
+
+When `_right` is set, `flush()` returns a closed `Interval` and rolls `_left ← _right` for the next pass.
+
+#### 5.7.4 LinearInterpolation — batched correction (§8.1, §8.2)
+
+For each light frame `lf` in the closed interval `[D_prev, D_next]`:
 
 ```
-σ²_shot(n) = ADC_GAIN · g_cam · max(0, μ̃₁(n))
+t_frac        = (lf.t − D_prev.t) / (D_next.t − D_prev.t)        ∈ [0, 1]
+baseline_u1   = D_prev.u1  + t_frac · (D_next.u1  − D_prev.u1)
+baseline_var  = D_prev.std² + t_frac · (D_next.std² − D_prev.std²)
+
+mean          = lf.u1 − baseline_u1
+raw_var       = max(0, lf.u2 − lf.u1²)
+corrected_var = max(0, raw_var − baseline_var)
+std           = √corrected_var
 ```
 
-BFI and BVI are computed from `K̃(n)` and `μ̃₁(n)` via the calibration mapping (§9). The pedestal cancels exactly in `raw_μ₁(n) − û₁` because the same pedestal is present in both terms; no explicit pedestal subtraction occurs in this stream.
+The two clamps to zero prevent imaginary standard deviations when dark subtraction over-corrects due to statistical fluctuations. The result is a `CorrectedFrame(abs_frame_id, t, side, cam_id, mean, std, raw_u1, raw_var, dark_var)`.
 
-The emitted `Sample` has `is_corrected = True` — the same flag used for samples in a `CorrectedBatch`. Consumers distinguish realtime-corrected from batch-corrected samples by which callback delivered them (`on_realtime_corrected_fn` vs. `on_corrected_batch_fn`), not by a field on the sample.
+#### 5.7.5 Enrichment — shot-noise correction + BFI/BVI calibration
 
-#### 7.4.3 Why predictor (realtime) vs. interpolator (batch)?
+After linear interpolation, the stage applies **shot-noise correction** and **BFI/BVI calibration** in-line to produce `EnrichedCorrectedFrame`s. Same math as the dedicated downstream stages (§5.8, §5.9) but performed once per interval rather than once per batch — needed here because the dark-frame stencil (§5.7.6) interpolates already-enriched values, not raw means.
 
-The batch-corrected stream (§8) waits for both bounding dark frames of an interval before emitting, then linearly interpolates the dark baseline backward across the interval. This is accurate but lagged by up to one full dark interval (~15 s).
-
-The realtime stream emits immediately using a forward-extrapolated estimate of where the next dark *would* fall. The result is less accurate at the end of an interval (when the next dark is about to land and refute the prediction) but available now — suitable for live displays that show a "best-effort" dark-corrected BFI/BVI trace to the operator.
-
-A live plot reading the realtime-corrected stream sees a continuously updating dark-corrected trace; a saved corrected CSV reading the batch stream sees the accurate result that an offline analysis would reproduce.
-
----
-
-## 8. Corrected batch computation
-
-The corrected batch is computed and emitted by `_emit_corrected_for_camera(key)`, which is called each time a second (or later) consecutive dark frame arrives for a given `(side, cam_id)` pair.
-
-Let the two bounding dark frames be at absolute positions **D_prev** and **D_next**, with:
-
-- μ₁(D_prev), σ²(D_prev) — moments of the earlier dark frame
-- μ₁(D_next), σ²(D_next) — moments of the later dark frame
-- Δ = D_next − D_prev — interval width in frames
-
-### 8.1 Baseline interpolation
-
-For each bright frame *n* ∈ (D_prev, D_next) (i.e. strictly between the two dark frames), the dark baseline is linearly interpolated:
+For one corrected frame `f`:
 
 ```
-t(n) = (n − D_prev) / Δ            ∈ (0, 1)
+g_cam         = CAMERA_GAIN_MAP[cam_id % 8]
+shot_var      = ADC_GAIN · max(0, f.mean) · g_cam
+corr_var      = max(0, f.std² − shot_var)
+shot_std      = √corr_var
 
-μ̄₁(n) = μ₁(D_prev) + t(n) · [μ₁(D_next) − μ₁(D_prev)]
-σ̄²(n) = σ²(D_prev) + t(n) · [σ²(D_next) − σ²(D_prev)]
+contrast      = shot_std / f.mean       if f.mean > 0 else 0
+bfi           = (1 − (contrast − c_min) / (c_max − c_min)) · 10
+bvi           = (1 − (f.mean   − i_min) / (i_max − i_min)) · 10
 ```
 
-`t(n)` is 0 at the first dark and 1 at the second dark, so the interpolation assigns more dark-frame weight to frames closer in time to that dark measurement.
+When `c_min == c_max` (degenerate calibration), the fallback is identity scaling: `bfi = contrast · 10`, `bvi = mean · 10`. Constants:
 
-### 8.2 Dark-subtracted moments
-
-```
-μ̃₁(n) = μ₁(n) − μ̄₁(n)                   # corrected mean
-
-raw_σ²(n) = μ₂(n) − μ₁(n)²               # raw variance (from stored moments)
-σ̃²(n)  = raw_σ²(n) − σ̄²(n) − σ²_shot(n) # dark- and shot-noise-corrected variance
-σ̃²(n)  = max(0, σ̃²(n))                   # clamp to prevent imaginary std
-σ̃(n)   = √σ̃²(n)
-
-K̃(n) = σ̃(n) / μ̃₁(n)    if μ̃₁(n) > 0
-      = 0.0               otherwise
-```
-
-The three subtractions remove: (1) the interpolated dark baseline variance, (2) the expected photon shot noise — see §8.3 below.
-
-Clamping `σ̃²` to zero prevents imaginary standard deviations when dark subtraction or shot-noise removal over-corrects due to statistical fluctuations.
-
-### 8.3 Shot-noise correction
-
-Photon shot noise follows Poisson statistics: the variance (in electrons) equals the mean (in electrons).  After converting to digital-number (DN) units and accounting for each camera's analog gain:
-
-```
-σ²_shot(n) = ADC_GAIN · g_cam · max(0, μ̃₁(n))
-```
-
-where:
-
-| Symbol | Value | Meaning |
-|---|---|---|
-| `ADC_GAIN` | (1024 − 64) / 11 000 ≈ 0.0873 DN/e⁻ | Sensor ADC gain: full-scale DN range above pedestal divided by electrons at full scale |
-| `g_cam` | `CAMERA_GAIN_MAP[cam_pos]` | Per-camera analog gain (see table below) |
-| `μ̃₁(n)` | corrected mean (DN) | Dark-subtracted mean; clamped to 0 so a slightly negative corrected mean does not inflate σ² |
-
-**`CAMERA_GAIN_MAP`** — analog gain by camera position within the 8-camera array:
-
-| Position | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
-|---|---|---|---|---|---|---|---|---|
-| Gain | 16 | 4 | 2 | 1 | 1 | 2 | 4 | 16 |
-
-Outer cameras (positions 0 and 7) use higher analog gain to compensate for reduced illumination at the array periphery; central cameras (positions 3 and 4) run at unity gain.
-
-**Rationale:** After dark subtraction the remaining variance contains both the true speckle signal and Poisson shot noise.  Subtracting the expected shot-noise contribution isolates the speckle variance, yielding a contrast `K̃` that is independent of mean photon flux.  Without this correction, higher-intensity frames would appear to have artificially lower contrast.
-
-### 8.3 Corrected BFI/BVI
-
-BFI and BVI are computed from K̃(n) and μ̃₁(n) via the calibration mapping (§9), yielding `bfi` and `bvi` for each frame.  These samples are assembled into a `CorrectedBatch` with `is_corrected = True`.
-
-### 8.4 Corrected value for the dark frame itself
-
-The dark frame D_prev is included in the corrected batch.  Its corrected BFI/BVI are not computed by baseline subtraction (its histogram *is* the baseline); instead they are filled in using the same **4-point quadratic stencil** used by the legacy `VisualizeBloodflow` pipeline, which gives a smooth, accurate interpolation through the dark-frame gap:
-
-```
-v(D_prev) = (−1/6)·v(D_prev − 2) + (2/3)·v(D_prev − 1)
-          + (2/3)·v(D_prev + 1)  + (−1/6)·v(D_prev + 2)
-```
-
-applied independently to each metric: `bfi`, `bvi`, `mean`, `std_dev`, `contrast`.
-
-- **v(D_prev − 1)** and **v(D_prev − 2)** are the last two corrected samples of the *previous* batch.
-- **v(D_prev + 1)** and **v(D_prev + 2)** are the first two corrected samples of the *current* batch.
-
-**Fallback rules (applied in order when neighbours are unavailable):**
-
-| Available neighbours | Formula used |
+| Symbol | Value |
 |---|---|
-| All four (normal case) | Full 4-point quadratic stencil above |
-| Left neighbours missing (first interval) but ≥2 right | Linear: `[v(+1) + v(+2)] / 2` — only immediate right used |
-| Only v(−1) and v(+1) available | Simple average: `[v(−1) + v(+1)] / 2` |
-| No left neighbours at all | Repeat `v(D_prev + 1)` |
+| `ADC_GAIN` | `(1024 − 64) / 11_000 ≈ 0.0873` DN/e⁻ |
+| `CAMERA_GAIN_MAP` | `[16, 4, 2, 1, 1, 2, 4, 16]` indexed by `cam_id % 8` |
 
-The current dark frame D_next is **not** included in this batch.  It becomes D_prev for the next batch and will receive its interpolated corrected value at that time.
+Outer cameras (positions 0 and 7) use higher analog gain to compensate for reduced illumination at the array periphery; central cameras (3 and 4) run at unity gain.
 
-**Rationale:** The dark frame's laser-off histogram is a valid measurement of the background floor, not of blood flow.  Interpolating between neighbors removes the dark-frame artefact from the corrected time series.
+#### 5.7.6 DarkFrameQuadraticStencil — the dark frame's own corrected value
 
-### 8.5 Batch ordering and content
-
-The emitted `CorrectedBatch` contains samples in ascending `absolute_frame_id` order:
+The leading dark frame `D_prev` of the interval is included in the emitted interval. Its corrected value is not computed by baseline subtraction (its histogram *is* the baseline). Instead each metric (`mean`, `std`, `contrast`, `bfi`, `bvi`) is filled in with a 4-point quadratic stencil:
 
 ```
-[D_prev, D_prev+1, D_prev+2, ..., D_next-1]
+v(D_prev) = (−1/6)·v(D_prev − 2)
+          + ( 2/3)·v(D_prev − 1)
+          + ( 2/3)·v(D_prev + 1)
+          + (−1/6)·v(D_prev + 2)
 ```
 
-All samples have `is_corrected = True`.  The batch is emitted via `on_corrected_batch_fn`.  Internally, `_pending_moments[key]` is then truncated to discard all stored moments up to and including D_next − 1; any moments at or beyond D_next are retained for the next interval (should not occur in normal operation).
+- `v(D_prev − 1)` and `v(D_prev − 2)` come from `self._prev_interval_tail[(side, cam_id)]` — the last two `EnrichedCorrectedFrame`s of the previous interval.
+- `v(D_prev + 1)` and `v(D_prev + 2)` come from the first two frames of the current enriched interval.
 
-### 8.6 Terminal dark flush (short scans)
+**Fallback chain** (in order, when neighbours are unavailable):
 
-The firmware guarantees that the **last frame of every scan is always a dark frame** (laser off), regardless of when the scan is stopped.  However, for scans that end before the second scheduled dark position (e.g. a scan stopped at frame 300, before the frame-601 dark), `_emit_corrected_for_camera` would never be called and the corrected CSV would remain empty.
+| Available | Formula |
+|---|---|
+| All four (steady state) | Full 4-point quadratic above |
+| Left missing, ≥ 2 right (first interval) | `(v(+1) + v(+2)) / 2` |
+| Only `v(−1)` and `v(+1)` | `(v(−1) + v(+1)) / 2` |
+| Only `v(+1)` | `v(+1)` (repeat right neighbour) |
+| Nothing at all | Stencil raises; `D_prev` not included |
 
-When the science worker's ingress queue fully drains after the stop event is set, `_flush_terminal_dark()` is called once.  For each camera that has buffered moments but has not yet emitted a corrected batch for this interval, it:
+After producing the stencil value, the stage updates `_prev_interval_tail` with the last two frames of *this* interval (excluding the prepended dark row), ready for the next pass.
 
-1. Takes the **last entry in `_pending_moments[key]`** — this is the hardware-guaranteed terminal dark frame.
-2. Computes its variance (`max(0, u2 − u1²)`) and appends it to `_dark_history[key]` as a synthetic dark entry.
-3. Removes it from `_pending_moments[key]` so it is not double-counted as a bright frame.
-4. Calls `_emit_corrected_for_camera(key)` to perform the normal baseline interpolation and emit the corrected batch for all buffered frames.
+#### 5.7.7 Interval emission
 
-This ensures the corrected CSV always contains output for any scan that reached at least:
-- Frame 10 (first scheduled dark — provides the opening dark baseline), and
-- At least one bright frame after it.
+The stage emits `IntervalClosed(corrected_batch=EnrichedCorrectedInterval(...))` with frames in chronological order: `[D_prev_stencilled, L_1, L_2, …, L_k]`. The closing dark `D_next` is **not** in this interval — it becomes `D_prev` of the next interval and gets its stencil value then.
 
-If a camera has no dark history at all (scan stopped before frame 10), the flush logs a `WARNING` and skips that camera — there is no baseline to subtract.
+#### 5.7.8 Terminal-dark flush — `on_scan_stop(batch)`
+
+The firmware guarantees the **last frame of every scan is a dark frame**, regardless of when the scan was stopped. For scans shorter than one full dark interval, that terminal dark won't fall on a scheduled dark position, so the pipeline receives it as the last buffered light frame in `pi._light`.
+
+`on_scan_stop()` (called by `ScanRunner` after the source's iterator drains) walks every `(side, cam_id)` with buffered lights and:
+
+1. Pops the **last entry in `pi._light`** — the hardware-guaranteed terminal dark.
+2. Synthesises a `DarkObservation` using the **last scheduled dark's** `u1` and `std` (no independent moment measurement available for the terminal frame), stamped at the terminal frame's actual timestamp.
+3. Removes the terminal frame from `_light` so it is not double-counted as a light.
+4. Closes the synthetic interval `[D_prev, terminal_dark]` and calls `_emit_interval()` — normal stencil and enrichment apply.
+
+This guarantees the corrected CSV / DB always has output for any scan that reached at least frame 10 (first scheduled dark) and at least one light frame.
+
+If a camera has no dark history at all (scan stopped before frame 10), the flush is silently skipped — there is no baseline to subtract.
+
+### 5.8 ShotNoiseCorrectionStage
+
+**File:** `omotion/pipeline/stages/shot_noise.py`. **Writes:** `std_sn_rt`, `contrast_sn_rt`.
+
+Vectorised Poisson-variance subtraction on the realtime path. Operates on `mean_dc_rt` and `std_dc_rt` from DarkCorrectionStage:
+
+```
+var          = std_dc_rt²
+shot_var     = ADC_GAIN · max(0, mean_dc_rt) · gain_map           # broadcast (1, 1, 8)
+corr_var     = max(0, var − shot_var)
+std_sn_rt    = √corr_var
+contrast_sn_rt = where(mean_dc_rt > 0, std_sn_rt / mean_dc_rt, 0)
+```
+
+`ADC_GAIN` and `CAMERA_GAIN_MAP` are the same constants used in the batched enrichment (§5.7.5). After dark subtraction the remaining variance still contains photon shot noise; subtracting the expected shot-noise contribution isolates the speckle variance, yielding a contrast `K̃` that is independent of mean photon flux. Without this correction, higher-intensity frames would appear to have artificially lower contrast.
+
+### 5.9 BfiBviStage
+
+**File:** `omotion/pipeline/stages/bfi_bvi.py`. **Writes:** `bfi_live`, `bvi_live`.
+
+Affine calibration map from `(contrast_sn_rt, mean_dc_rt)` to `(BFI, BVI)`:
+
+```
+K          = contrast_sn_rt                       # (N, 2, 8)
+m          = mean_dc_rt                           # (N, 2, 8)
+c_span     = c_max − c_min                        # (1, 2, 8)
+i_span     = i_max − i_min                        # (1, 2, 8)
+
+bfi_live   = (1 − (K − c_min) / c_span) · 10      # where c_span > 0
+bvi_live   = (1 − (m − i_min) / i_span) · 10      # where i_span > 0
+```
+
+Fallback (degenerate calibration where the span is zero): identity scaling `bfi = K · 10`, `bvi = m · 10`.
+
+The calibration object passed to `default_pipeline()` must expose `c_min`, `c_max`, `i_min`, `i_max` as `(2, 8)` ndarrays. `omotion.Calibration.Calibration` provides this; in practice it is loaded from the console EEPROM at scan start, or computed by `CalibrationWorkflow` (§11.1).
+
+### 5.10 SideAveragingStage
+
+**File:** `omotion/pipeline/stages/side_avg.py`. **Writes:** `bfi_live_side`, `bvi_live_side` (shape `(N, 2)`) or leaves them `None`.
+
+Active only when `metadata.reduced_mode` is True. Averages per-camera BFI/BVI across all enabled cameras on each side:
+
+```
+bfi_side[:, 0] = bfi_live[:, 0, enabled_left_cams].mean(axis=1)
+bfi_side[:, 1] = bfi_live[:, 1, enabled_right_cams].mean(axis=1)
+```
+
+Enabled cameras are derived from `metadata.left_camera_mask` / `right_camera_mask`. When the stage is disabled (normal mode) it is a pass-through. Downstream sinks check `bfi_live_side is not None` to decide whether to plot per-side traces.
+
+### 5.11 Tee("live")
+
+Emits the FrameBatch on the `"live"` channel after filtering out warmup and stale frames. This is the per-frame live stream consumed by `QtUiSink` (live plot), `ContactQualityWorkflow` (display-mean thresholding), and `CalibrationWorkflow` (dark-frame collection).
+
+### 5.12 RollingAverageStage
+
+**File:** `omotion/pipeline/stages/rolling_avg.py`. **Writes:** `bfi_rolling`, `bvi_rolling`.
+
+Sliding-window mean over the most recent `window` BFI/BVI frames (default 10). Per-frame:
+
+```
+self._bfi_window.append(bfi_live[i])    # deque(maxlen=window)
+bfi_rolling[i] = mean(stack(self._bfi_window), axis=0)
+```
+
+State persists across batches; `reset()` clears it. Used by test/calibration consumers and any UI that wants a smoothed trace alongside the per-frame live one.
+
+### 5.13 Tee("rolling")
+
+Mirror of Tee("live"), but emits the post-rolling-average batch on the `"rolling"` channel.
 
 ---
 
-## 9. BFI/BVI calibration mapping
+## 6. Channels
 
-Both the uncorrected and corrected paths share the same linear calibration mapping from (contrast, mean) to (BFI, BVI).  The calibration constants are stored in four NumPy arrays of shape **(2, 8)** — axis 0 is the module index (0 = left sensor, 1 = right sensor), axis 1 is the camera position (0–7).
+Sinks subscribe to channels by declaring a `channels: set[str]` attribute. The runner inspects every event in `batch.events` and dispatches to all sinks whose set contains the event's channel.
+
+| Channel | Payload | Cadence | Source | Typical consumers |
+|---|---|---|---|---|
+| `"raw"` | `FrameBatch` (full, including warmup) | Per batch (~10–100 frames) | `Tee("raw")` | `CsvSink` (raw per-cam CSV), `ScanDBSink` (`session_raw` blobs) |
+| `"live"` | `FrameBatch` (excluding warmup/stale) | Per batch | `Tee("live")` | `QtUiSink`, `ContactQualityWorkflow._ContactQualitySink`, `CalibrationWorkflow._CalibrationCollectorSink` (dark frames) |
+| `"rolling"` | `FrameBatch` with `bfi_rolling`/`bvi_rolling` populated | Per batch | `Tee("rolling")` | Smoothed-trace UI, test harnesses |
+| `"final"` | `EnrichedCorrectedInterval` | Per closed dark interval (~1 per `dark_interval/40` seconds; default ~15 s) | `IntervalClosed` from `DarkCorrectionStage` | `CsvSink` (corrected CSV), `ScanDBSink` (`session_data`), `CalibrationWorkflow` (corrected light samples) |
+| `"telemetry"` | `TelemetryEvent` | ~10 Hz (independent of frame cadence) | `ConsoleTelemetrySource` (separate runner thread) | `TelemetrySink` (CSV) plus the pipeline's `TelemetryAggregator` |
+| `"diagnostics"` | `DarkIntegrityWarning`, `StencilFallback`, future events | As they occur | Stages append to `batch.events` | Any sink subscribing to `"diagnostics"` |
+
+The runner is fail-soft: if a sink raises during `consume()`, the exception is logged and the next sink is invoked — one broken sink does not break the run.
+
+---
+
+## 7. Sources
+
+`omotion/pipeline/sources.py` defines:
 
 ```python
-module_idx = 0 if side == "left" else 1
-cam_pos    = cam_id % 8
-
-BFI = (1.0 - (K  − C_min[module_idx, cam_pos]) /
-              (C_max[module_idx, cam_pos] − C_min[module_idx, cam_pos])) × 10
-
-BVI = (1.0 - (μ₁ − I_min[module_idx, cam_pos]) /
-              (I_max[module_idx, cam_pos] − I_min[module_idx, cam_pos])) × 10
+@runtime_checkable
+class Source(Protocol):
+    metadata: ScanMetadata
+    def __iter__(self) -> Iterator[FrameBatch]: ...
+    def close(self) -> None: ...
 ```
 
-where:
-- `C_min`, `C_max` — minimum and maximum speckle contrast values over the calibration population (`bfi_c_min`, `bfi_c_max` constructor arguments)
-- `I_min`, `I_max` — minimum and maximum mean bin-index values (`bfi_i_min`, `bfi_i_max`)
+The runner consumes `for batch in source`, so any object that yields `FrameBatch`es is a valid source. The package ships three concrete sources plus the out-of-band telemetry source.
 
-For the uncorrected stream, K and μ₁ are the raw (not dark-subtracted) values.  For the corrected batch, K̃ and μ̃₁ are used.
+### 7.1 LiveUsbSource
 
-**Fallback:** If the module or camera index is out of bounds for the calibration arrays, BFI = K × 10 and BVI = μ₁ × 10 (identity scaling, no clipping).
+**Used by:** every live scan, via `ScanWorkflow.start_scan()`.
 
----
+Per-side packet queues feed per-side reader threads that run `omotion.MotionProcessing.parse_histogram_stream`. Parsed `HistogramSample`s accumulate into `FrameBatch`es (default `batch_size_frames=10`, with a `flush_interval_s=0.25` time-based flush) and are pushed to a shared batch queue that the runner iterates.
 
-## 10. Corrected CSV output
+`close()` follows a strict shutdown sequence to avoid losing the firmware's terminal dark frame:
 
-The `ScanWorkflow` opens the corrected CSV file at the **start** of the scan (not at the end) and writes the header row immediately.  Each time `on_corrected_batch_fn` fires, the workflow accumulates samples from the batch into an in-memory `corrected_by_frame` dict keyed by `absolute_frame_id`.  As soon as all expected cameras have contributed to a given frame, that row is written to disk and removed from the dict.  Rows that are still incomplete at scan end (e.g. the last partial interval) are flushed on teardown.
+1. `stop_streaming()` + `drain_final()` on each side's `StreamInterface`. Drained chunks are pushed into the per-side packet queue while the parser thread is still running, so the parser consumes them on its next iteration.
+2. Set `self._stop` so `parse_histogram_stream`'s drain-then-exit loop wakes and exits.
+3. Join the per-side reader threads (they push any final FrameBatch to the shared queue before returning).
+4. Push a `None` sentinel onto the batch queue so the runner's iteration exits cleanly after delivering the last real batch.
 
-This means the corrected CSV grows incrementally during the scan rather than being written all-at-once post-scan.  Data up to the last completed interval is on disk even if the scan is interrupted.
+### 7.2 CsvReplaySource
 
-**Corrected CSV columns (normal mode):**
+**Used by:** offline analysis, regression testing, the `view_corrected_scan.py` script.
 
-```
-frame_id, timestamp_s,
-bfi_l1..bfi_l8, bfi_r1..bfi_r8,
-bvi_l1..bvi_l8, bvi_r1..bvi_r8,
-mean_l1..mean_l8, mean_r1..mean_r8,
-contrast_l1..contrast_l8, contrast_r1..contrast_r8,
-temp_l1..temp_l8, temp_r1..temp_r8
-```
+Replays a raw-histogram CSV produced by `CsvSink` (one CSV per side, optionally one or both). Schema: `cam_id, frame_id, timestamp_s, type, 0..1023, temperature, sum, tcm, tcl, pdc`. Yields `FrameBatch`es of `batch_size_frames` (default 100) per side, in order.
 
-**Corrected CSV columns (reduced mode — see §16):**
+The metadata to attach is the caller's responsibility — replay sources don't know the original scan's `scan_id` / `subject_id` / camera masks.
 
-```
-frame_id, timestamp_s,
-bfi_left, bfi_right,
-bvi_left, bvi_right
-```
+### 7.3 DbReplaySource
 
-`timestamp_s` is relative to the first corrected frame written (i.e. normalised to zero at the start of the corrected output).
+**Used by:** scan-DB session playback (`SessionPlayback`, future analytics tooling).
 
----
+Reads `session_raw` rows from a `ScanDatabase` SQLite file in order, decodes the 4096-byte histogram blob (1024 × uint32 LE) per row, and yields `FrameBatch`es. Schema match is tied to `omotion/ScanDatabase.py`; see [`ScanDatabase.md`](ScanDatabase.md).
 
-## 11. Input validation and guard rails
+### 7.4 ConsoleTelemetrySource
 
-### Histogram sum check
+**Used by:** every live scan (auto-wired when a sink subscribes to `"telemetry"`).
 
-Before any frame enters the pipeline, the total histogram bin sum is compared to `EXPECTED_HISTOGRAM_SUM = 2,457,606` (= 1920 × 1280 pixels + 6 sentinel counts).  Any frame whose sum does not match is silently dropped with a `WARNING`-level log message.  This rejects corrupt packets before they can contaminate science results.
+Polls `MotionConsole.telemetry.get_snapshot()` at fixed cadence (default 10 Hz). Each snapshot is converted via `omotion.console_telemetry_conversions.tec_thermistor_voltage_to_celsius` and emitted as a `TelemetryEvent` with `timestamp_s` normalised to the first snapshot's clock.
 
-This check occurs in two places:
-1. In `parse_histogram_packet_structured()` during raw binary parsing.
-2. Again in `_science_worker` for samples enqueued directly (e.g. in tests).
+Runs on a dedicated thread inside `ScanRunner._telemetry_loop`. Events flow to two destinations in parallel:
 
-### First-frame staleness check
+- `TelemetryAggregator.update(event)` — for per-frame telemetry ingest (§5.2)
+- All sinks subscribing to `"telemetry"` — for direct telemetry-CSV writing
 
-For each `(side, cam_id)` pair, the very first frame received after pipeline start must have `raw_frame_id == 1`.  Any other value indicates a stale packet from a previous scan that was delivered after the pipeline restarted.  Such frames are dropped and a `WARNING` is logged.
+The aggregator and the telemetry sinks are independent; clearing one does not clear the other.
 
----
+### 7.5 ScanMetadata
 
-## 12. Threading model
+`ScanMetadata` (in `omotion/pipeline/sinks.py`) is the immutable per-scan handle every sink receives at `on_scan_start`:
 
-The pipeline runs a single background daemon thread (`SciencePipeline` thread).  All histogram samples are ingested via a `queue.Queue` (`_ingress_queue`).  The worker thread consumes from this queue and is the sole writer of all internal state (`_unwrappers`, `_dark_history`, `_realtime_dark_history`, `_pending_moments`, `_last_uncorrected`, `_last_corrected`).  No locks are needed for pipeline-internal state.
-
-Callbacks (`on_uncorrected_fn`, `on_realtime_corrected_fn`, `on_corrected_batch_fn`) are invoked on the science thread.  Implementations that touch UI state must marshal to the UI thread (e.g. via a Qt signal).
-
----
-
-## 13. Complete data flow diagram
-
-```
-Sensor firmware
-  │  8-bit rolling frame_id + 1024-bin histogram (4096 bytes)
-  │  at 40 Hz per camera
-  ▼
-parse_histogram_packet_structured()
-  │  → HistogramSample (cam_id, frame_id, histogram, row_sum, timestamp_s, temperature_c)
-  │  Drop if row_sum ≠ 2,457,606  (1920×1280 px + 6 sentinel)
-  ▼
-SciencePipeline._ingress_queue
-  │  (side, cam_id, frame_id, timestamp_s, hist, row_sum, temperature_c)
-  ▼
-_science_worker (single background thread)
-  │
-  ├─ [row_sum check] → drop if mismatch
-  ├─ [first-frame check] → drop if first raw_frame_id ≠ 1
-  ├─ FrameIdUnwrapper.unwrap() → absolute_frame_id
-  ├─ [discard check] → drop if absolute_frame_id ≤ 9
-  ├─ [noise floor] → zero bins < 10; recompute row_sum
-  ├─ Compute raw_μ₁, μ₂ (used for storage AND dark history)
-  │
-  ├─ [dark frame?] ──── YES ──────────────────────────────────────────┐
-  │                                                                    │
-  │  Store (abs_frame, raw_fid, ts, raw_μ₁, σ²) → _dark_history[key] │
-  │                                                                    │
-  │  If ≥2 dark frames in history:                                    │
-  │    _emit_corrected_for_camera(key)  ──► CorrectedBatch            │
-  │       dark-subtracted BFI/BVI for interval (D_prev, D_next)       │
-  │       + interpolated corrected value for D_prev itself            │
-  │       → on_corrected_batch_fn()                                   │
-  │       → corrected CSV (streaming, flushed per complete row)       │
-  │                                                                    │
-  │  Emit uncorrected sample with values from _last_uncorrected[key]  │
-  │    (frame IDs + timestamp updated to D; BFI/BVI held constant)    │
-  │    → on_uncorrected_fn()                                          │
-  │                                                                    │
-  │  continue ◄──────────────────────────────────────────────────────┘
-  │
-  └─ [bright frame] ──────────────────────────────────────────────────┐
-                                                                       │
-     Store _StoredFrameMoments(raw_μ₁, μ₂) → _pending_moments[key]   │
-     (raw values preserved for dark subtraction; pedestal cancels)    │
-                                                                       │
-     compute_realtime_metrics() → Sample (uncorrected)                │
-       mean_val = max(0, raw_μ₁ − 64)  ← pedestal subtracted         │
-       σ² from raw_μ₁ (variance is shift-invariant)                  │
-       K = σ / mean_val  (no shot-noise correction; uncorrected)      │
-       BFI/BVI via calibration mapping                                │
-                                                                       │
-     Emit Sample(is_corrected=False)                                  │
-       → on_uncorrected_fn()                                          │
-       → _last_uncorrected[key]                                       │
-                                                                       │
-     If _realtime_dark_history[key] has ≥1 entry:                    │
-       _emit_realtime_corrected() → Sample (realtime corrected)       │
-         û₁ = avg of last 3 darks (ZOH with 1)                       │
-         σ̂  = linear extrap through last 2 darks (ZOH with 1)        │
-         μ̃₁ = raw_μ₁ − û₁                                            │
-         σ̃² = (μ₂ − raw_μ₁²) − σ̂² − ADC_GAIN·g_cam·μ̃₁  (clamp ≥0)  │
-         BFI/BVI via calibration; is_corrected=True                   │
-       → on_realtime_corrected_fn()                                   │
-                                                              ◄────────┘
-
-[queue drained after stop_event]
-  │
-  └─ _flush_terminal_dark()
-       For each key with buffered moments and ≥1 dark in history:
-         promote last pending moment → synthetic terminal dark entry
-         _emit_corrected_for_camera(key) → CorrectedBatch
-         (ensures corrected CSV populated for scans < dark_interval)
+```python
+@dataclass(frozen=True)
+class ScanMetadata:
+    scan_id:           str
+    subject_id:        str
+    operator:          str
+    started_at_iso:    str
+    duration_sec:      int
+    left_camera_mask:  int
+    right_camera_mask: int
+    reduced_mode:      bool
 ```
 
 ---
 
-## 14. Key constants and defaults
+## 8. Sinks
 
-| Parameter | Default | Meaning |
-|---|---|---|
-| `discard_count` | 9 | Warmup frames dropped at start |
-| `dark_interval` | 600 | Frames between dark acquisitions (15 s at 40 Hz) |
-| `noise_floor` | 10 | Bins below this count are zeroed before moment computation |
-| `realtime_dark_history_size` | 4 | Max dark observations kept in the realtime predictor's ring buffer (§7.4) |
-| `PEDESTAL_HEIGHT` | 64.0 | ADC zero-light bias subtracted from mean in the uncorrected stream |
-| `ADC_GAIN` | (1024−64)/11000 ≈ 0.0873 DN/e⁻ | Sensor ADC gain used for shot-noise correction |
-| `CAMERA_GAIN_MAP` | [16,4,2,1,1,2,4,16] | Per-camera analog gain (index = cam position 0–7) |
-| `EXPECTED_HISTOGRAM_SUM` | 2,457,606 | Required total count per valid frame (1920 × 1280 px + 6 sentinel) |
-| `FRAME_ID_MODULUS` | 256 | Firmware 8-bit counter rollover period |
-| `FRAME_ROLLOVER_THRESHOLD` | 128 | Max forward delta before rollover is detected |
-| Histogram bins | 1024 | Bin indices k ∈ {0, 1, …, 1023} |
-| Cameras per sensor | 8 | OV2312 cameras per sensor module |
-| Max sensors | 2 | Left and right modules |
+`omotion/pipeline/sinks.py` defines:
+
+```python
+@runtime_checkable
+class Sink(Protocol):
+    channels: set[str]
+    def on_scan_start(self, meta: ScanMetadata) -> None: ...
+    def consume(self, channel: str, payload: Any) -> None: ...
+    def on_complete(self) -> None: ...
+```
+
+The runner calls `on_scan_start(metadata)` on every sink before the first batch, `consume(channel, payload)` for every dispatched event, and `on_complete()` once iteration finishes (in a `finally` block, so it runs even on cancellation). Any sink that raises is logged and skipped — the run continues.
+
+### 8.1 CsvSink
+
+**Channels:** `{"raw", "final"}`.
+
+Writes the two legacy CSV families. File creation is lazy on first `consume()`.
+
+- **Raw CSV** — one file per side, named `{scan_id}_{subject_id}_{side}_mask{XX}_raw.csv`. Schema: `cam_id, frame_id, timestamp_s, type, 0..1023, temperature, sum, tcm, tcl, pdc`. Each frame's `type` column is the `frame_type` written by FrameClassificationStage (`"warmup" | "dark" | "light" | "stale"`). Telemetry columns (`tcm`, `tcl`, `pdc`) are blank when no telemetry snapshot was available for that frame's timestamp (NaN → empty cell — `_scalar_or_blank`).
+- **Corrected CSV** — one file per scan, named `{scan_id}_corrected.csv`.
+  - **Normal mode** (82 columns): `frame_id, timestamp_s, {bfi,bvi,mean,contrast,temp}_{l,r}{1..8}`. Per-frame rows are accumulated in `_corrected_acc` until every expected `(side, cam)` slot has contributed a `mean`; only then is the row written.
+  - **Reduced mode** (6 columns): `frame_id, timestamp_s, bfi_left, bfi_right, bvi_left, bvi_right`. Each `EnrichedCorrectedFrame` writes into the row's `bfi_{side}`/`bvi_{side}` slot based on `frame.side`; a row is flushed once both expected sides have contributed (or only one, if the other's camera mask is zero).
+
+On `on_complete`, any partial accumulator rows are flushed verbatim (with blanks for the missing slots) so no completed frames are lost.
+
+### 8.2 ScanDBSink
+
+**Channels:** `{"raw", "final"}`.
+
+SQLite endpoint. On `on_scan_start`, opens a `ScanDatabase` and creates a session row labelled `{scan_id}_{subject_id}` with the scan metadata.
+
+- **Raw** — per-frame rows accumulated in a 200-row buffer (`raw_batch_size`) and flushed via `ScanDatabase.insert_raw_frames`. Each row includes the packed 4096-byte histogram blob (`<1024I` little-endian), `temp`, `sum_counts`, `tcm`, `tcl`, `pdc`.
+- **Final** — per-`EnrichedCorrectedInterval`, one `session_data` row per `CorrectedFrame` carrying `mean`, `contrast`, `bfi`, `bvi`. (PR 3 will carry per-camera identifiers through the interval; today's writer uses sentinel `cam_id = −1, side = 0` so rows are queryable.)
+
+See [`ScanDatabase.md`](ScanDatabase.md) for the full schema and [`PipelineComparison.md`](PipelineComparison.md) for CSV vs. DB semantics.
+
+### 8.3 QtUiSink
+
+**Channels:** `{"live"}`.
+
+Forwards per-frame batches to the application's plot widget via PyQt6 signals (in `motion_connector.py`). The stub in `sinks.py` records calls into a list for test assertions.
+
+### 8.4 TelemetrySink
+
+**Channels:** `{"telemetry"}`.
+
+Writes one CSV row per `TelemetryEvent` with columns `timestamp_s, pdc_samples_ma, tec_setpoint_c, tec_actual_c, tec_setpoint_raw, tec_actual_raw, tcm, tcl, safety_status`.
+
+### 8.5 Writing your own sink
+
+A minimal example: a sink that prints every interval's mean BFI to stdout.
+
+```python
+class StdoutBfiSink:
+    channels = {"final"}
+
+    def on_scan_start(self, meta):
+        print(f"scan {meta.scan_id} started")
+
+    def consume(self, channel, payload):
+        if channel != "final":
+            return
+        means = [f.bfi for f in payload.frames]
+        print(f"interval {payload.left_abs}-{payload.right_abs}: "
+              f"mean BFI = {sum(means)/len(means):.3f}")
+
+    def on_complete(self):
+        print("scan complete")
+```
+
+Drop the instance into the `sinks=[...]` list passed to `ScanRunner` and it works. No pipeline change required.
+
+Sink-authoring rules:
+
+- `consume()` must not raise. Wrap your own work in `try/except`; the runner only catches as a last resort.
+- `consume()` runs on the runner thread (or the telemetry thread, for `"telemetry"` events). UI work must be marshalled to the UI thread (e.g. emit a Qt signal).
+- `on_complete()` must be idempotent — for `LiveUsbSource` close paths it can be called from cleanup paths after partial scans.
 
 ---
 
-## 15. Output data types
+## 9. Telemetry
+
+`omotion/pipeline/telemetry.py` provides the two halves of the telemetry subsystem.
+
+**`TelemetryAggregator`** — thread-safe ring buffer (default 100 events). Exposes `update(event)` (called from the runner's telemetry thread) and `snapshot_at(t)` (called from the pipeline thread by `TelemetryIngestStage`, returns the most recent event with `timestamp_s <= t`).
+
+**`TelemetryIngestStage`** — placed early in the pipeline (after FrameClassificationStage). For each frame in the batch, queries the aggregator and populates `batch.pdc`, `batch.tcm`, `batch.tcl`. Does **not** clear the aggregator on `reset()` — telemetry history is owned by the source and must outlive any transient pipeline exception that triggers a mid-scan reset.
+
+The two-thread design (telemetry on its own thread, frames on the pipeline thread) means telemetry is best-effort per-frame: a frame whose timestamp arrives before any telemetry snapshot has been published gets `pdc = NaN`, `tcm = tcl = 0`. The CSV writers translate NaN to blank cells; the DB writer translates NaN to 0.0 (the schema is NOT NULL today; future relaxation tracked in [`ConsoleTelemetry.md`](ConsoleTelemetry.md)).
+
+---
+
+## 10. Threading model
+
+| Thread | Owner | Lifecycle | Purpose |
+|---|---|---|---|
+| `LiveUsbSource-{left,right}` | `LiveUsbSource` | per scan, daemon | Per-side packet parsing → FrameBatch → shared batch queue |
+| `ScanRunner-telemetry` | `ScanRunner` | per scan, daemon | Pull `TelemetryEvent`s from `ConsoleTelemetrySource`, update aggregator, dispatch to `"telemetry"` sinks |
+| Runner thread (`ScanWorkflow._worker`) | `ScanWorkflow` | per scan, non-daemon | Iterate the source, call `pipeline.process(batch)`, dispatch events to sinks |
+
+The pipeline stages and most sinks run **on the runner thread**. `TelemetryAggregator.update` and `TelemetryAggregator.snapshot_at` are the only cross-thread interaction inside the pipeline; both are guarded by `self._lock`.
+
+`Pipeline.reset()` is called by the runner at scan start and whenever any stage raises during a scan; the run continues with the next batch from the source. This makes a single bad batch survivable without dropping the whole scan.
+
+---
+
+## 11. Example consumers
+
+Two SDK-internal consumers illustrate the pattern.
+
+### 11.1 CalibrationWorkflow — light + dark collection
+
+`omotion/CalibrationWorkflow.py` defines `_CalibrationCollectorSink` with `channels = {"final", "live"}`:
+
+- On `"final"` (each `EnrichedCorrectedInterval` from DarkCorrectionStage), the sink slices each `EnrichedCorrectedFrame` into a legacy `Sample`-shaped object (`mean`, `std_dev`, `contrast`, `bfi`, `bvi`, `is_corrected=True`). These feed `_compute_calibration_from_samples` to produce the per-camera `(2, 8)` calibration arrays.
+- On `"live"` (each FrameBatch), the sink picks out rows where `frame_type == "dark"` and emits a `Sample` whose `mean` is `display_mean` (i.e. `max(0, mean_raw − pedestal)`) — the legacy "u1 − PEDESTAL_HEIGHT" semantics used by the ambient-light gate.
+
+After the scan, the workflow drains the sink's `corrected_samples` and `dark_samples` and applies the existing frame-id windowing on the lights (skip-leading + `frame_window_count` cap), then either uploads the resulting calibration to the console EEPROM or returns it for inspection.
+
+### 11.2 ContactQualityWorkflow — display-mean thresholding
+
+`omotion/ContactQualityWorkflow.py` defines `_ContactQualitySink` with `channels = {"live"}`. For each FrameBatch:
+
+- For `frame_type == "dark"` rows, tracks the per-camera maximum `display_mean` (ambient-light gate).
+- For all other non-warmup/non-stale rows, maintains a per-camera rolling deque of `display_mean` (default 10 samples) and a running sum/count.
+
+After the scan, `result()` evaluates per camera: `no_signal` if no light samples, `ambient_light` if the dark maximum exceeds the per-cam dark threshold, `poor_contact` if the rolling light average falls below the per-cam light threshold, else `ok`. The verdict is rolled up into `ContactQualityResult.passed`.
+
+Both consumers are pure sinks — they add no pipeline stages, do not modify FrameBatch fields, and can be turned off by simply not constructing them.
+
+---
+
+## 12. Key defaults
+
+| Parameter | Default | Defined in | Meaning |
+|---|---|---|---|
+| `discard_count` | 9 | `FrameClassificationStage` | Warmup frames dropped at start |
+| `dark_interval` | 600 | `FrameClassificationStage` | Frames between scheduled darks (15 s at 40 Hz) |
+| `noise_floor_threshold` | 10 | `NoiseFloorStage` | Bins below this count are zeroed before moment computation |
+| `pedestal` | 64.0 (FW ≤ 1.5.2) / 128.0 | `SensorPedestals.from_sensors` | Per-side ADC zero-light bias |
+| `realtime_history_size` | 4 | `DarkHistory` (inside DarkCorrectionStage) | Max dark observations kept in the realtime predictor's ring buffer |
+| `integrity_max_above_pedestal` | 30.0 | `DarkIntegrityGuard` | A dark frame whose u1 exceeds pedestal + 30 raises `DarkIntegrityWarning` |
+| `rolling_avg_window` | 10 | `RollingAverageStage` | Sliding-window size for BFI/BVI smoothing |
+| `ADC_GAIN` | `(1024 − 64) / 11_000` ≈ 0.0873 DN/e⁻ | `factory.py` | Sensor ADC gain used for shot-noise correction |
+| `CAMERA_GAIN_MAP` | `[16, 4, 2, 1, 1, 2, 4, 16]` | `factory.py` | Per-camera analog gain by `cam_id % 8` |
+| `EXPECTED_HISTOGRAM_SUM` | 2_457_606 | `omotion/MotionProcessing.py` | Required total count per valid frame (1920 × 1280 px + 6 sentinel) |
+| `FRAME_ID_MODULUS` | 256 | `FrameClassificationStage` | Firmware 8-bit counter rollover period |
+| `_FRAME_ROLLOVER_THRESHOLD` | 128 | `FrameClassificationStage` | Max forward delta before rollover is detected |
+| `batch_size_frames` | 10 (live) / 100 (replay) | `LiveUsbSource` / `CsvReplaySource` | N frames per FrameBatch |
+| `flush_interval_s` | 0.25 | `LiveUsbSource` | Time-based flush so partial batches don't stall the live UI |
+| `poll_interval_s` | 0.1 | `ConsoleTelemetrySource` | Telemetry polling cadence (~10 Hz) |
+
+---
+
+## 13. Output data types reference
+
+`omotion/pipeline/stages/dark.py` defines the corrected-output types.
 
 ```python
 @dataclass
-class Sample:
-    side: str               # "left" or "right"
-    cam_id: int             # 0–7
-    frame_id: int           # raw 8-bit firmware counter value
-    absolute_frame_id: int  # monotonic unwrapped counter
-    timestamp_s: float      # sensor-reported timestamp
-    row_sum: int            # total histogram counts after noise floor decimation
-    temperature_c: float    # sensor temperature
-    mean: float             # uncorrected: max(0, raw_μ₁ − 64) (pedestal removed)
-                            # corrected:   μ̃₁ = fm.u1 − dark_u1 (pedestal cancels)
-    std_dev: float          # σ  or σ̃  (variance is shift-invariant; pedestal has no effect)
-    contrast: float         # K  or K̃  (σ / mean, using pedestal-adjusted mean)
-    bfi: float              # BFI on [0, 10] scale
-    bvi: float              # BVI on [0, 10] scale
-    is_corrected: bool      # False = uncorrected stream; True = corrected batch
-
-# Backward-compat aliases
-RealtimeSample = Sample
-CorrectedSample = Sample
+class CorrectedFrame:
+    abs_frame_id: int
+    t:             float
+    side:          str          # "left" | "right"
+    cam_id:        int          # 0..7
+    mean:          float        # dark-subtracted u1 (no shot-noise correction)
+    std:           float        # dark-subtracted std (no shot-noise correction)
+    raw_u1:        float
+    raw_var:       float
+    dark_var:      float
 
 @dataclass
-class CorrectedBatch:
-    dark_frame_start: int   # absolute_frame_id of D_prev
-    dark_frame_end: int     # absolute_frame_id of D_next
-    samples: list[Sample]   # chronological, is_corrected=True
-                            # includes D_prev, excludes D_next
+class CorrectedInterval:
+    left_abs:  int              # D_prev absolute frame id
+    right_abs: int              # D_next absolute frame id
+    frames:    list[CorrectedFrame]
+
+@dataclass
+class EnrichedCorrectedFrame:
+    abs_frame_id: int
+    t:        float
+    side:     str
+    cam_id:   int
+    mean:     float
+    std:      float             # after shot-noise correction
+    contrast: float
+    bfi:      float
+    bvi:      float
+
+@dataclass
+class EnrichedCorrectedInterval:
+    left_abs:  int
+    right_abs: int
+    frames:    list[EnrichedCorrectedFrame]   # includes D_prev (stencilled), then lights
 ```
 
----
+The `"final"` channel always carries `EnrichedCorrectedInterval` (the enrichment path runs whenever calibration is available, which is the case in every production build of `default_pipeline()`). `CorrectedInterval` would be emitted only by a pipeline configured without `adc_gain`/`camera_gain_map`/`calibration`, which the factory never produces in normal use.
 
-## 16. Reduced mode (per-side averaging)
-
-**Implementation:** `omotion/ScanWorkflow.py` — activated by setting `ScanRequest.reduced_mode = True`.
-
-**Purpose:** In the clinical "reduced mode", the application displays only two aggregated traces — left and right — rather than individual per-camera plots.  When reduced mode is enabled, the SDK averages all active cameras on each side into single left/right BFI and BVI values at the scan workflow level.  This ensures that both the live display and the corrected CSV contain only the averaged data, so the data files a clinician reviews match what was shown on screen during the scan.
-
-### 16.1 What changes vs. normal mode
-
-| Aspect | Normal mode | Reduced mode |
-|---|---|---|
-| Uncorrected samples emitted | One `Sample` per camera per frame (up to 16 at 40 Hz) | One `Sample` per **side** per frame (up to 2 at 40 Hz) |
-| Corrected batches emitted | One `Sample` per camera per dark-frame interval | One `Sample` per **side** per dark-frame interval |
-| Corrected CSV columns | `bfi_l1..l8, bfi_r1..r8, bvi_l1..l8, bvi_r1..r8, mean_*, contrast_*, temp_*` (80 data columns) | `bfi_left, bfi_right, bvi_left, bvi_right` (4 data columns) |
-| Raw histogram CSV | Unchanged (per-camera histograms written normally) | Unchanged |
-| Science pipeline internals | Unchanged (per-camera BFI/BVI computed normally) | Unchanged — averaging happens **after** the science pipeline, in `ScanWorkflow` |
-
-### 16.2 Architecture — where averaging occurs
-
-The science pipeline (§1–§9) is completely unmodified in reduced mode.  It continues to compute per-camera BFI/BVI from histograms as described in the preceding sections.  The averaging is performed in two interception points inside `ScanWorkflow.start_scan()._worker()`:
-
-```
-SciencePipeline (per-camera BFI/BVI)
-         │
-         ├── on_uncorrected_fn ──► Reduced uncorrected accumulator (§16.3)
-         │                             └── emits 1 averaged Sample per side per frame
-         │
-         └── on_corrected_batch_fn ──► Reduced corrected handler (§16.4)
-                                          ├── averages per side, writes reduced CSV row
-                                          └── emits averaged CorrectedBatch to UI
-```
-
-This design keeps the science pipeline generic and testable.  The averaging logic is isolated in `ScanWorkflow` and only activates when `reduced_mode=True`.
-
-### 16.3 Uncorrected sample averaging (live display path)
-
-Each uncorrected `Sample` emitted by the science pipeline is intercepted by `_on_uncorrected_sample()`.  Instead of forwarding it immediately to the UI, the workflow buffers it in a per-frame, per-side accumulator:
-
-**Accumulator key:** `(side, absolute_frame_id)` — e.g. `("left", 1542)`.
-
-**Accumulator entry:**
-```python
-{
-    "bfi_sum": float,       # running sum of BFI values
-    "bvi_sum": float,       # running sum of BVI values
-    "count": int,           # number of cameras that have contributed
-    "timestamp_s": float,   # timestamp from the first contributing sample
-    "frame_id": int,        # raw firmware frame counter
-    "abs_frame_id": int,    # unwrapped monotonic frame counter
-    "side": str,            # "left" or "right"
-}
-```
-
-**Flush condition:** The entry is flushed (averaged and emitted) when `count` reaches the number of active cameras for that side.  The active camera count is derived from the camera bitmask at scan start — e.g. mask `0x66` (binary `01100110`) has 4 bits set, so `expected_count = 4`.
-
-**Averaged sample:** When flushed, a synthetic `Sample` is constructed:
-
-```python
-Sample(
-    side    = entry["side"],
-    cam_id  = 0,                                    # sentinel — not a real camera
-    bfi     = entry["bfi_sum"] / entry["count"],    # arithmetic mean of all cameras
-    bvi     = entry["bvi_sum"] / entry["count"],    # arithmetic mean of all cameras
-    mean    = 0.0,                                  # not meaningful in reduced mode
-    std_dev = 0.0,
-    contrast = 0.0,
-    temperature_c = 0.0,
-    is_corrected = False,
-    ...
-)
-```
-
-This sample is then forwarded to the UI via `on_uncorrected_fn`.
-
-**Stale entry eviction:** After flushing, any accumulator entries for the same side whose `absolute_frame_id` is more than 5 frames behind the current frame are deleted.  This prevents unbounded memory growth if a camera drops frames and an entry never reaches its expected count.
-
-**Effect on the UI:** The QML `ReducedPlotView` component previously performed its own JavaScript-level averaging of individual camera samples.  With reduced mode enabled at the SDK level, it now receives pre-averaged samples (one per side, `cam_id=0`) and can display them directly.
-
-### 16.4 Corrected batch averaging (CSV + corrected display path)
-
-Each `CorrectedBatch` emitted by the science pipeline is intercepted by `_on_corrected_batch()`.  Two things happen:
-
-#### 16.4.1 Corrected CSV writing
-
-Samples in the batch are accumulated into `corrected_by_frame` (the same dict used in normal mode, but with a different structure).  Each frame entry carries an `_accum` dict keyed by side:
-
-```python
-corrected_by_frame[frame_key] = {
-    "timestamp_s": float,
-    "_accum": {
-        "left":  {"bfi_sum": float, "bvi_sum": float, "count": int},
-        "right": {"bfi_sum": float, "bvi_sum": float, "count": int},
-    },
-}
-```
-
-A frame row is flushed to the CSV when **all expected sides** have their full camera count.  For example, if both left and right sensors are active with 4 cameras each, the row is written when `left.count >= 4` and `right.count >= 4`.
-
-The CSV row contains:
-```
-frame_id, timestamp_s, bfi_left, bfi_right, bvi_left, bvi_right
-```
-
-where each value is the arithmetic mean of all contributing cameras for that side:
-```
-bfi_left = left.bfi_sum / left.count
-```
-
-**No mean, contrast, or temperature columns are written** — these per-camera metrics are not meaningful after side-level averaging.
-
-#### 16.4.2 Averaged CorrectedBatch to UI
-
-After CSV writing, the batch samples are grouped by `(side, absolute_frame_id)` and averaged the same way.  A new `CorrectedBatch` is constructed with one averaged `Sample` per side per frame (`cam_id=0`, `is_corrected=True`) and emitted to the UI via `on_corrected_batch_fn`.
-
-### 16.5 What is NOT changed in reduced mode
-
-- **Raw histogram CSVs** — per-camera histogram data continues to be written to `*_left_mask*.csv` and `*_right_mask*.csv` files at full resolution.  These files are the ground-truth record and can be reprocessed offline if needed.
-- **Science pipeline** — all per-camera computations (frame classification, dark subtraction, shot-noise correction, BFI/BVI calibration) run identically.
-- **Telemetry CSV** — console temperature, PDC, and safety data are unaffected.
-
-### 16.6 Activation
-
-Reduced mode is activated by the application through the `ScanRequest` dataclass:
-
-```python
-req = ScanRequest(
-    subject_id="...",
-    duration_sec=43200,
-    left_camera_mask=0x66,
-    right_camera_mask=0x66,
-    data_dir="...",
-    disable_laser=False,
-    reduced_mode=True,          # ← enables per-side averaging
-)
-```
-
-The bloodflow application sets `reduced_mode=True` when its `appConfig.reducedMode` flag is enabled (clinical mode).  The flag is read from `config/app_config.json` and passed through `motion_connector.py` to the SDK at scan start.
+`TelemetryEvent` (in `omotion/pipeline/batch.py`) carries the per-snapshot console telemetry; `"_c"` fields are degrees Celsius (converted by `omotion.console_telemetry_conversions`), `"_raw"` fields are the original ADC counts.
