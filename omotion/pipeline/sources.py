@@ -248,19 +248,39 @@ class LiveUsbSource(_BaseSource):
             t.start()
             self._reader_threads.append(t)
 
+        # The sentinel `None` pushed by close() is the ONLY signal that no
+        # more batches are coming. Checking `self._stop.is_set()` here is
+        # wrong: close() sets stop at entry (for cancel-race safety), but
+        # then spends ~2s on drain_final + parsing the recovered chunks.
+        # Bailing on stop_set+queue_empty would exit before drained dark
+        # frames are processed, which makes terminal-dark flush see only
+        # light frames and silently drop the whole tail. close() is
+        # bounded (10s teardown timeout, 5s reader join), so blocking on
+        # the queue indefinitely here is safe.
+        stop_deadline: Optional[float] = None
         while True:
             try:
                 batch = self._batch_queue.get(timeout=1.0)
             except queue.Empty:
+                # Safety hatch: if close() crashed before pushing the
+                # sentinel, _stop will be set and the sentinel will never
+                # come. Bound the wait at 15s past stop so __iter__ can't
+                # deadlock the runner.
                 if self._stop.is_set():
-                    # close() set stop, readers have joined and pushed the
-                    # sentinel (or the sentinel slot was full); the queue is
-                    # genuinely empty, no more batches will arrive.
-                    break
+                    now = time.monotonic()
+                    if stop_deadline is None:
+                        stop_deadline = now + 15.0
+                    elif now >= stop_deadline:
+                        logger.warning(
+                            "LiveUsbSource: 15s past stop with no sentinel; "
+                            "exiting __iter__ as safety hatch (drained data "
+                            "may be incomplete)"
+                        )
+                        break
                 continue
             if batch is None:
-                # Sentinel from close(): all readers finished, everything
-                # they were going to produce has already been yielded.
+                # Sentinel from close(): all drained data has flowed
+                # through the parser and been delivered.
                 break
             yield batch
 
@@ -316,23 +336,27 @@ class LiveUsbSource(_BaseSource):
             except Exception:
                 logger.exception("drain_final(%s) raised", side_name)
 
-        teardown_threads: list[threading.Thread] = []
-        for side_name, sensor in self._sensors.items():
-            t = threading.Thread(
-                target=_stop_side, args=(side_name, sensor),
-                name=f"LiveUsbSource-close-{side_name}", daemon=True,
-            )
-            t.start()
-            teardown_threads.append(t)
-        for t in teardown_threads:
-            t.join(timeout=10.0)
-
-        for t in self._reader_threads:
-            t.join(timeout=5.0)
         try:
-            self._batch_queue.put(None, timeout=0.5)
-        except queue.Full:
-            pass
+            teardown_threads: list[threading.Thread] = []
+            for side_name, sensor in self._sensors.items():
+                t = threading.Thread(
+                    target=_stop_side, args=(side_name, sensor),
+                    name=f"LiveUsbSource-close-{side_name}", daemon=True,
+                )
+                t.start()
+                teardown_threads.append(t)
+            for t in teardown_threads:
+                t.join(timeout=10.0)
+
+            for t in self._reader_threads:
+                t.join(timeout=5.0)
+        finally:
+            # The sentinel MUST be pushed even if teardown raised, otherwise
+            # __iter__ blocks the runner indefinitely waiting for it.
+            try:
+                self._batch_queue.put(None, timeout=0.5)
+            except queue.Full:
+                pass
 
     def _reader_loop(self, side_name: str) -> None:
         """Per-side reader. Delegates packet parsing to parse_histogram_stream;
