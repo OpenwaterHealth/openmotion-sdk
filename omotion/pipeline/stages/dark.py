@@ -72,7 +72,7 @@ class DarkHistory:
 class DarkIntegrityGuard:
     """Flag dark frames whose u1 looks suspiciously bright.
 
-    A genuine dark frame should have u1 within ~30 DN of the sensor pedestal.
+    A genuine dark frame should have u1 within ~5 DN of the sensor pedestal.
     Higher u1 suggests the laser wasn't actually off (firmware off-by-one or
     unwrapper alignment quirk). The guard appends a diagnostic event but
     does not drop the frame.
@@ -80,7 +80,7 @@ class DarkIntegrityGuard:
     See docs/SciencePipeline.md §11 (input validation rails).
     """
 
-    def __init__(self, max_above_pedestal: float = 30.0):
+    def __init__(self, max_above_pedestal: float = 5.0):
         self.max_above_pedestal = float(max_above_pedestal)
 
     def check(self, *, side: str, cam_id: int, abs_frame_id: int,
@@ -346,7 +346,7 @@ class DarkCorrectionStage:
                  batch_estimator: LinearInterpolation,
                  pedestals: Optional[SensorPedestals] = None,
                  realtime_history_size: int = 4,
-                 integrity_max_above_pedestal: float = 30.0,
+                 integrity_max_above_pedestal: float = 5.0,
                  # Optional enrichment params (shot-noise + BFI/BVI)
                  adc_gain: Optional[float] = None,
                  camera_gain_map: Optional[np.ndarray] = None,

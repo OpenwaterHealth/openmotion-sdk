@@ -318,7 +318,7 @@ def test_terminal_flush_does_not_emit_terminal_dark_as_light():
     n = 3
     types   = ["dark", "light", "light"]
     abs_ids = [10, 11, 12]
-    mean_raw = np.array([[[80.0]*8]*2, [[500.0]*8]*2, [[90.0]*8]*2], dtype=np.float32)
+    mean_raw = np.array([[[65.0]*8]*2, [[500.0]*8]*2, [[66.0]*8]*2], dtype=np.float32)
     std_raw  = np.array([[[10.0]*8]*2,  [[20.0]*8]*2,  [[21.0]*8]*2],  dtype=np.float32)
     raw_hist = np.zeros((n, 2, 8, 1024), dtype=np.uint32)
     raw_hist[:, 0, 0, 0] = 1
@@ -388,11 +388,11 @@ def test_terminal_flush_discards_trailing_dark_like_tail():
     n = 5
     mean_raw = np.array(
         [
-            [[80.0] * 8] * 2,
+            [[65.0] * 8] * 2,
             [[500.0] * 8] * 2,
             [[510.0] * 8] * 2,
-            [[90.0] * 8] * 2,
-            [[85.0] * 8] * 2,
+            [[66.0] * 8] * 2,
+            [[65.0] * 8] * 2,
         ],
         dtype=np.float32,
     )
@@ -442,7 +442,7 @@ def test_terminal_flush_discards_trailing_dark_like_tail():
 def test_terminal_flush_uses_actual_terminal_dark_moments():
     stage = _make_stage_with_cal()
     n = 3
-    mean_raw = np.array([[[80.0]*8]*2, [[500.0]*8]*2, [[90.0]*8]*2], dtype=np.float32)
+    mean_raw = np.array([[[65.0]*8]*2, [[500.0]*8]*2, [[66.0]*8]*2], dtype=np.float32)
     std_raw = np.array([[[10.0]*8]*2, [[20.0]*8]*2, [[12.0]*8]*2], dtype=np.float32)
     raw_hist = np.zeros((n, 2, 8, 1024), dtype=np.uint32)
     raw_hist[:, 0, 0, 0] = 1
@@ -470,7 +470,9 @@ def test_terminal_flush_uses_actual_terminal_dark_moments():
     closed = [e.corrected_batch for e in stop_batch.events if isinstance(e, IntervalClosed)]
     assert len(closed) == 1
     light = next(f for f in closed[0].frames if f.abs_frame_id == 11)
-    assert light.mean == pytest.approx(415.0)
+    # darks at u1=65 (frame 10) and u1=66 (synthetic terminal at frame 12);
+    # linear interp at frame 11 = 65.5; corrected_mean = 500 - 65.5 = 434.5
+    assert light.mean == pytest.approx(434.5)
 
 
 def test_terminal_flush_logs_and_skips_when_no_terminal_dark_found(caplog):

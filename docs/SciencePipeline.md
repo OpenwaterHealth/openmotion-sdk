@@ -267,7 +267,7 @@ The realtime predictor and the batched corrector share one `DarkHistory` (a per-
 
 #### 5.7.1 DarkIntegrityGuard (dark frames)
 
-A genuine dark frame's μ₁ should be within ~30 DN of the sensor pedestal. Any higher and the laser likely wasn't actually off (firmware off-by-one, unwrapper alignment quirk). The guard appends a `DarkIntegrityWarning(side, cam_id, abs_frame_id, u1, pedestal, threshold)` event — a diagnostic, not a drop signal. The frame is still appended to history and used downstream.
+A genuine dark frame's μ₁ should be within ~5 DN of the sensor pedestal. Any higher and the laser likely wasn't actually off (firmware off-by-one, unwrapper alignment quirk). The guard appends a `DarkIntegrityWarning(side, cam_id, abs_frame_id, u1, pedestal, threshold)` event — a diagnostic, not a drop signal. The frame is still appended to history and used downstream.
 
 #### 5.7.2 HybridRealtimePredictor — realtime baseline
 
@@ -717,7 +717,7 @@ Both consumers are pure sinks — they add no pipeline stages, do not modify Fra
 | `noise_floor_threshold` | 10 | `NoiseFloorStage` | Bins below this count are zeroed before moment computation |
 | `pedestal` | 64.0 (FW ≤ 1.5.2) / 128.0 | `SensorPedestals.from_sensors` | Per-side ADC zero-light bias |
 | `realtime_history_size` | 4 | `DarkHistory` (inside DarkCorrectionStage) | Max dark observations kept in the realtime predictor's ring buffer |
-| `integrity_max_above_pedestal` | 30.0 | `DarkIntegrityGuard` | A dark frame whose u1 exceeds pedestal + 30 raises `DarkIntegrityWarning` |
+| `integrity_max_above_pedestal` | 5.0 | `DarkIntegrityGuard` | A dark frame whose u1 exceeds pedestal + 5 raises `DarkIntegrityWarning` |
 | `rolling_avg_window` | 10 | `RollingAverageStage` | Sliding-window size for BFI/BVI smoothing |
 | `ADC_GAIN` | `(1024 − 64) / 11_000` ≈ 0.0873 DN/e⁻ | `factory.py` | Sensor ADC gain used for shot-noise correction |
 | `CAMERA_GAIN_MAP` | `[16, 4, 2, 1, 1, 2, 4, 16]` | `factory.py` | Per-camera analog gain by `cam_id % 8` |
