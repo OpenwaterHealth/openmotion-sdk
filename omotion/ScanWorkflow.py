@@ -166,6 +166,12 @@ class ScanWorkflow:
         self._scan_active_handles: list = []
         self._scan_abort_reason: str | None = None
 
+        # Per-scan active (side, mask, sensor) tuples, snapshotted by the
+        # worker once it resolves the request. cancel_scan reads this to
+        # tear down cameras BEFORE source.close() — without it, drain_final
+        # fights the still-capturing firmware for several seconds.
+        self._scan_active_sides: list = []
+
         # Set by the worker thread's finally block. Callers (notably
         # CalibrationWorkflow) check this after await_complete to decide
         # whether the scan succeeded.
@@ -365,6 +371,8 @@ class ScanWorkflow:
                 active_sides = self._resolve_active_sides(
                     request.left_camera_mask, request.right_camera_mask
                 )
+                # Expose for cancel_scan's teardown.
+                self._scan_active_sides = active_sides
                 if not active_sides:
                     logger.warning(
                         "start_scan: no active sensors (demo mode or masks 0x00); "
@@ -587,12 +595,51 @@ class ScanWorkflow:
                 pass
 
     def cancel_scan(self, *, join_timeout: float = 5.0) -> None:
-        self.cancel()
+        """User-facing cancel. Mirrors the normal end-of-scan teardown order
+        so a manual Stop returns in ~1s instead of ~3s.
+
+        Order (matches _duration_guard above):
+          stop_trigger -> 0.5s -> disable_camera -> 0.35s -> source.close()
+
+        Without disable_camera before close(), drain_final fights the
+        still-capturing firmware DMA and blocks for 2-3s while the host
+        endpoint buffer drains. With it, drain_final finds almost nothing
+        and close() returns quickly. cancel_scan then sets _stop_evt and
+        joins the worker thread.
+        """
+        # Stop the laser FIRST (laser-safety: fastest response).
         try:
             if self._interface and self._interface.console:
                 self._interface.console.stop_trigger()
+                self._emit_trigger_event("OFF")
         except Exception:
-            pass
+            logger.warning("stop_trigger raised in cancel_scan", exc_info=True)
+
+        # Stop cameras capturing so the firmware DMA stops being filled.
+        # Use the snapshotted active_sides from the running worker. If the
+        # worker hasn't snapshotted yet (very early cancel), this is empty
+        # and we just fall through to the close() — the worker will hit
+        # its own cancel paths.
+        active = list(self._scan_active_sides)
+        if active:
+            time.sleep(0.5)
+            for side, mask, _ in active:
+                try:
+                    self._interface.run_on_sensors(
+                        "disable_camera", mask, target=side
+                    )
+                except Exception:
+                    logger.warning(
+                        "disable_camera(%s) raised in cancel_scan",
+                        side, exc_info=True,
+                    )
+            time.sleep(0.35)
+
+        # Signal worker + tear down source. cancel() sets _stop_evt and
+        # calls source.close(); the duration_guard sees source._stop set
+        # and short-circuits its own teardown.
+        self.cancel()
+
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=join_timeout)
 
