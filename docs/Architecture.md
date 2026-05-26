@@ -14,20 +14,23 @@ The Open-Motion SDK is a Python library for controlling optical speckle imaging 
 └──────────────────────────────┬──────────────────────────────────────┘
                                │ signals / callbacks
 ┌──────────────────────────────▼──────────────────────────────────────┐
-│                         MOTIONInterface                              │
-│          console_module  ·  sensors  ·  scan_workflow               │
+│                         MotionInterface                              │
+│   console · left · right (stable handles) · scan_workflow            │
+│   ConnectionMonitor (single daemon thread; OS hotplug + 200ms poll)  │
 └──────────────┬──────────────────────────────┬───────────────────────┘
                │                              │
-               │  Console path                │  Sensor path
+               │  Console path                │  Sensor path (×2: left, right)
                │  (USB VCP / pyserial)        │  (USB bulk transfer)
                │                              │
 ┌──────────────▼──────────────┐  ┌────────────▼──────────────────────┐
-│       MOTIONConsole         │  │       DualMotionComposite          │
-│  + ConsoleTelemetryPoller   │  │   (left + right MotionComposite)   │
+│        MotionConsole        │  │      MotionSensor  (per side)      │
+│   + ConsoleTelemetryPoller  │  │   state machine:                   │
+│                             │  │   DISCONNECTED → CONNECTING        │
+│                             │  │              → CONNECTED            │
 └──────────────┬──────────────┘  └────────────┬──────────────────────┘
                │                              │
 ┌──────────────▼──────────────┐  ┌────────────▼──────────────────────┐
-│         MOTIONUart          │  │    MotionComposite  (per side)     │
+│         MotionUart          │  │    MotionComposite (uart attr)     │
 │      (pyserial VCP)         │  │                                    │
 │  UartPacket framing + CRC   │  │  CommInterface   StreamInterface   │
 └──────────────┬──────────────┘  │  (cmd/resp)      (histo / imu)    │
@@ -90,27 +93,73 @@ This package is the focus of [`SciencePipeline.md`](SciencePipeline.md), which d
 
 | Module | Purpose |
 |---|---|
-| `MotionSignal.py` | `MOTIONSignal` — lightweight signal with `.connect()` / `.disconnect()` / `.emit()` |
-| `signal_wrapper.py` | `SignalWrapper` base class — uses real `pyqtSignal` if PyQt6 is present, falls back to `MOTIONSignal` |
+| `MotionSignal.py` | `MotionSignal` — lightweight signal with `.connect()` / `.disconnect()` / `.emit()` |
+| `signal_wrapper.py` | `SignalWrapper` base class — uses real `pyqtSignal` if PyQt6 is present, falls back to `MotionSignal` |
 
 Every class that exposes device events inherits `SignalWrapper` and uses the three standard signals: `signal_connect(str, str)`, `signal_disconnect(str, str)`, `signal_data_received(str, str)`.
 
 ### Packet structures
 
-| Module | Wire format | CRC |
-|---|---|---|
-| `UartPacket.py` | `[0xAA][id:2][type][cmd][addr][rsv][len:2][data:N][crc:2][0xDD]` | CRC-16 lookup table |
-| `i2c_packet.py` | `<HBHBH` (little-endian) | CRC-16-CCITT-FALSE (crcmod) |
-| `i2c_data_packet.py` | `<BHBBB` + payload | CRC-16-CCITT-FALSE |
-| `i2c_status_packet.py` | `<HBBBBH` | CRC-16-CCITT-FALSE |
+The SDK speaks two wire formats with the hardware: **UART control packets**
+to the console module, and **USB-bulk histogram packets** from the sensor
+modules. Both validate CRC on receive and raise `ValueError` on mismatch.
+Authoritative spec: [`openmotion-console-fw/CommandHandling.md`](../../openmotion-console-fw/CommandHandling.md);
+packet-type and opcode enums in [`omotion/config.py`](../omotion/config.py).
 
-All packet types validate CRC on receive and raise `ValueError` on mismatch.
+**UART packet** (`MotionUart` / `UartPacket.py`, also used for USB-bulk
+command/response on the sensor):
+
+```
+┌──────┬──────┬──────┬──────┬──────┬──────┬──────┬──────────┬──────┬──────┐
+│ 0xAA │ id:2 │ type │ cmd  │ addr │ rsvd │ len:2│ payload:N│ crc:2│ 0xDD │
+└──────┴──────┴──────┴──────┴──────┴──────┴──────┴──────────┴──────┴──────┘
+  SOF                                                          CRC-16  EOF
+```
+
+- `id` (LE u16) — sequence number, echoed in the response so async callers
+  can match request → reply
+- `type` — one of `OW_ACK`, `OW_NAK`, `OW_CMD`, `OW_RESP`, `OW_DATA`,
+  `OW_JSON`, `OW_FPGA`, `OW_CAMERA`, `OW_IMU`, `OW_I2C_PASSTHRU`,
+  `OW_CONTROLLER`, `OW_ERROR`
+- `cmd` / `addr` — opcode + sub-address (semantics per packet type)
+- `len` (LE u16) — payload byte count
+- `crc` — CRC-16 lookup-table variant (`UartPacket._crc16`)
+- Max payload: **2048 B (console)**, **8192 B (sensor)**
+
+**Histogram packet** (sensor → host over USB bulk IF 1; parsed by
+`omotion/MotionProcessing.py:parse_histogram_packet_structured`):
+
+```
+┌──────┬──────┬───────┬─[ optional ]─┬─[ per-camera block × N ]──────────────────────┬──────┬──────┐
+│ 0xAA │ type │ len:4 │ timestamp:4  │ 0xFF │ cam │ histogram:4096 │ temp:4 │ 0xEE  │ crc:2│ 0xDD │
+└──────┴──────┴───────┴──────────────┴──────┴──────┴────────────────┴────────┴───────┴──────┴──────┘
+  SOF                                  SOH                                       EOH   CRC    EOF
+```
+
+- `type` — `TYPE_HISTO` (uncompressed) or `TYPE_HISTO_CMP` (RLE-compressed)
+- `len` (LE u32) — total packet bytes
+- `timestamp` (LE u32, ms; optional) — firmware TIM5 counter / 100, present
+  when packet length matches `header + N × block + 4 + footer`. Wraps every
+  ~42 949 s (~12 h); `parse_histogram_stream` unwraps it monotonically.
+- Per-camera block (4103 B):
+  - `cam` (1 B) — camera index 0–7
+  - `histogram` (4096 B) — 1024 bins × LE u32; **last word's high byte is
+    the 8-bit frame_id**, masked out before use
+  - `temp` (LE u32) — camera temperature in °C × 100
+- `crc` — CRC-CCITT (poly 0x1021, init 0xFFFF, `binascii.crc_hqx`)
+- Compressed variant inserts a payload-CRC ahead of the transport CRC so the
+  decompressor can verify it produced the right bytes:
+  `[header][compressed:M][uncmp_crc:2][crc:2][0xDD]`
+- Max packet size: **32 837 B** (~8 cameras + headers); typical scan: one
+  camera per packet at 40 Hz.
+- Validation: each parsed sample's `Σ bins` is compared against
+  `EXPECTED_HISTOGRAM_SUM` (`2_457_606`) and dropped on mismatch.
 
 ### Transport layer
 
 The console and sensor modules use entirely separate transport stacks. They share no base classes at this layer.
 
-**Console transport — `MOTIONUart`** — communicates with the console over a USB virtual COM port using pyserial. Frames messages as `UartPacket` (start byte, ID, type, command, data, CRC-16, end byte). Supports sync mode (blocking read) and async mode (background read thread with per-ID response queues). Emits `signal_connect` / `signal_disconnect` on port insertion/removal.
+**Console transport — `MotionUart`** — communicates with the console over a USB virtual COM port using pyserial. Frames messages as `UartPacket` (start byte, ID, type, command, data, CRC-16, end byte). Supports sync mode (blocking read) and async mode (background read thread with per-ID response queues). Connection lifecycle is driven by `ConnectionMonitor`.
 
 **Sensor transport — `USBInterfaceBase`** — base class that claims a USB bulk interface and locates its endpoints. `CommInterface` and `StreamInterface` both subclass it. Used exclusively by the sensor path.
 
@@ -133,13 +182,13 @@ The console and sensor modules use entirely separate transport stacks. They shar
 
 Always creates `CommInterface` in async mode. Claims all three on `connect()`, releases all three on `disconnect()`.
 
-**`DualMotionComposite`** — scans USB for devices matching the sensor PID and assigns them to left/right slots based on USB port topology (`port_numbers[-1] == 2` → left, `== 3` → right). Manages a `monitor_usb_status()` async coroutine that auto-connects arriving devices and auto-disconnects departing ones.
+**`MotionConsole`** — wraps `MotionUart` with the full console command set (ping, version, TEC, PDU monitor, I2C pass-through, LSYNC counter, FPGA programming commands, etc.). Creates a `ConsoleTelemetryPoller` at init time; the poller is started and stopped externally by `MotionInterface` in response to connection signals.
 
-**`MOTIONConsole`** — wraps `MOTIONUart` with the full console command set (ping, version, TEC, PDU monitor, I2C pass-through, LSYNC counter, FPGA programming commands, etc.). Creates a `ConsoleTelemetryPoller` at init time; the poller is started and stopped externally by `MOTIONInterface` in response to connection signals.
+**`MotionSensor`** — one per side (`motion.left`, `motion.right`). Owns the connection state machine for that physical sensor module (`DISCONNECTED → CONNECTING → CONNECTED`). When CONNECTED, holds a `MotionComposite` on `self.uart` and exposes the sensor command set (FPGA control, camera enable / disable / config, histogram capture, IMU, firmware DFU). The handle itself is stable for the lifetime of the SDK — `_state` changes but `motion.left` is the same Python object across reconnects.
 
-**`MOTIONSensor`** — wraps `MotionComposite` with the full sensor command set (FPGA control, camera enable/disable/config, histogram capture, IMU, firmware DFU). Provides `stream_histograms_to_queue()` and `stream_histograms_to_csv()` for data acquisition.
+**`ConnectionMonitor`** — single daemon thread, owned by `MotionInterface`. Watches OS hotplug events (`WM_DEVICECHANGE` on Windows, libusb hotplug on Linux/macOS) for sub-50 ms detection, plus a 200 ms poll sweep as a fallback. Drives all three handles' state machines off a single event queue so they can't fight each other over a shared resource (the USB bus). USB-port topology is what assigns the two sensors to `left` vs `right` (`port_numbers[-1] == 2` → left, `== 3` → right; see `connection_monitor.py`).
 
-**`MOTIONInterface`** — top-level entry point. Composes console, dual-composite, and scan workflow. Intercepts raw USB signals from the transport layer and re-emits them as named events (`"CONSOLE"`, `"SENSOR_LEFT"`, `"SENSOR_RIGHT"`). Starts and stops the console telemetry poller in response to console connect/disconnect events.
+**`MotionInterface`** — top-level entry point. Constructs the three handles (`console`, `left`, `right`) and the `ConnectionMonitor`, and composes the `ScanWorkflow`. The handles are **stable across reconnects** — apps subscribe to each handle's `signal_state_changed` once and cache the reference for the SDK's lifetime. Also starts / stops the console telemetry poller when the console handle enters / leaves `CONNECTED`.
 
 ### Data acquisition
 
@@ -265,7 +314,7 @@ Fallback (zero span): identity scaling, `BFI = K × 10`, `BVI = μ₁ × 10`. Ca
 |---|---|---|---|---|
 | `CommInterface.read_thread` | `CommInterface` | Yes | `claim()` → `release()` | USB bulk read into `_read_buffer` |
 | `CommInterface.response_thread` | `CommInterface` | Yes | async mode only | Parse packets from buffer, route to response queues |
-| `MOTIONUart.read_thread` | `MOTIONUart` | Yes | `connect()` → `disconnect()` | Serial read, parse packets or queue by ID |
+| `MotionUart.read_thread` | `MotionUart` | Yes | `connect()` → `disconnect()` | Serial read, parse packets or queue by ID |
 | `StreamInterface.thread` | `StreamInterface` | Yes | `start_streaming()` → `stop_streaming()` | Fixed-size USB reads into data queue |
 | `ConsoleTelemetryPoller._thread` | `ConsoleTelemetryPoller` | Yes | `start()` → `stop()` | ~1 Hz console health polls |
 | `ScanWorkflow._thread` | `ScanWorkflow` | No | `start_scan()` → completion | Runs `ScanRunner.run()` — iterates the `Source`, drives the `Pipeline`, dispatches to sinks |
@@ -278,10 +327,10 @@ Fallback (zero span): identity scaling, `BFI = K × 10`, `BVI = μ₁ × 10`. Ca
 | Primitive | Location | Protects |
 |---|---|---|
 | `threading.RLock` | `CommInterface._io_lock` | USB write/read operations |
-| `threading.RLock` | `MOTIONUart._io_lock` | Serial write/read + alignment padding |
+| `threading.RLock` | `MotionUart._io_lock` | Serial write/read + alignment padding |
 | `threading.Lock` | `CommInterface._buffer_lock` | `_read_buffer` |
 | `threading.Condition` | `CommInterface._buffer_condition` | Wait for data in async mode |
-| `threading.Lock` | `MOTIONUart.response_lock` | `response_queues` dict |
+| `threading.Lock` | `MotionUart.response_lock` | `response_queues` dict |
 | `threading.Lock` | `ConsoleTelemetryPoller._lock` | `_snapshot`, `_listeners` |
 | `threading.Event` | `ConsoleTelemetryPoller._wake` | Smart sleep interrupt |
 | `threading.Event` | `ScanWorkflow._stop_evt` | Scan cancellation |
@@ -296,18 +345,28 @@ Listener callbacks in `ConsoleTelemetryPoller` are copied under the lock but inv
 ```
 USB insert / serial port appears
          │
-    MOTIONUart / DualMotionComposite
-         │  signal_connect("CONSOLE" | "SENSOR_LEFT" | "SENSOR_RIGHT", ...)
+    OS hotplug (WM_DEVICECHANGE / libusb)  ──or──  200ms ConnectionMonitor poll
+         │
          ▼
-    MOTIONInterface._on_console_connect / _on_sensor_connect
-         │  ├─ start ConsoleTelemetryPoller (console only)
-         │  └─ instantiate MOTIONSensor (sensors only)
-         │  signal_connect(forwarded)
+    ConnectionMonitor event queue
+         │  HotplugWake / PollArrived
          ▼
-    Application (MOTIONConnector / QML)
+    Handle state machine transitions  (MotionConsole / MotionSensor)
+         │  DISCONNECTED → CONNECTING → CONNECTED
+         │  ├─ open transport (MotionUart / MotionComposite)
+         │  ├─ refresh cached IDs (HWID, camera UIDs, version)
+         │  └─ start ConsoleTelemetryPoller (console only)
+         │
+         ▼  signal_state_changed(ConnectionState.CONNECTED)
+    Application (QML connector / headless script)
 ```
 
-The same flow operates in reverse on disconnect. Applications register with `MOTIONInterface.signal_connect` / `signal_disconnect`; they never reference `MOTIONUart` or `DualMotionComposite` directly.
+The same flow operates in reverse on disconnect — `ConnectionMonitor` sees the
+device leave, the handle transitions back to `DISCONNECTED`, and the
+`signal_state_changed` callback fires once more. Apps subscribe to each
+handle's `signal_state_changed` once and rely on the handle reference being
+stable across reconnects; they never touch `MotionUart` or `MotionComposite`
+directly.
 
 ---
 
@@ -317,11 +376,11 @@ The SDK uses a layered catch-log-reraise pattern: each layer catches hardware ex
 
 | Exception | Raised by | Meaning |
 |---|---|---|
-| `CommandError(RuntimeError)` | `MOTIONUart`, `MOTIONConsole`, `MOTIONSensor` | Device returned NAK, BAD_CRC, or OW_ERROR |
+| `CommandError(RuntimeError)` | `MotionUart`, `MotionConsole`, `MotionSensor` | Device returned NAK, BAD_CRC, or OW_ERROR |
 | `ValueError` | All packet parsers, device methods | CRC mismatch, invalid framing, device not connected, bad argument |
-| `TypeError` | `MOTIONConsole.echo()` | Wrong argument type |
-| `TimeoutError` | `CommInterface`, `MOTIONUart` | No response within timeout |
-| `serial.SerialException` | `MOTIONUart` | Serial port failure |
+| `TypeError` | `MotionConsole.echo()` | Wrong argument type |
+| `TimeoutError` | `CommInterface`, `MotionUart` | No response within timeout |
+| `serial.SerialException` | `MotionUart` | Serial port failure |
 | `usb.core.USBError` | `CommInterface`, `StreamInterface` | USB communication error |
 | `JedecError` | `jedecParser` | JEDEC file format violation |
 | `FpgaUpdateError` | `FPGAProgrammer` | FPGA programming sequence failure |
@@ -345,7 +404,13 @@ logger = logging.getLogger(f"{_log_root}.ModuleName" if _log_root else "ModuleNa
 
 ## Demo mode
 
-`MOTIONUart`, `MotionComposite`, and `DualMotionComposite` all accept a `demo_mode` flag. When set, `MOTIONUart` skips serial I/O and emits a synthetic connect signal immediately. `MOTIONConsole` returns hardcoded mock values from `tec_status()`, `get_version()`, etc. This allows the application UI to be developed and tested without physical hardware.
+`MotionInterface(demo_mode=True)` (or `OPENMOTION_DEMO=1` in the environment)
+short-circuits device discovery and connection: `ConnectionMonitor` is not
+started, and the three handles report `CONNECTED` immediately. `MotionUart`
+skips serial I/O; `MotionConsole` returns hardcoded mock values from
+`tec_status()`, `get_version()`, etc.; `MotionSensor` command methods
+short-circuit on `self.demo_mode` and return canned responses. This lets the
+application UI be developed and tested without physical hardware.
 
 ---
 

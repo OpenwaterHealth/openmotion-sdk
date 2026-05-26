@@ -38,11 +38,13 @@ Initialize the MOTIONInterface with console and sensor modules.
 - `demo_mode` (bool): Enable demo mode for testing without hardware (default: False)
 
 **Notes:**
-- Automatically initializes console UART and dual sensor composite
-- Creates MOTIONConsole wrapper for console operations
-- Creates DualMotionComposite for managing left/right sensors
-- Connects USB device signals for connection/disconnection events
-- Initializes any already-connected devices automatically
+- Constructs the three stable device handles: `console` (`MotionConsole`),
+  `left` and `right` (`MotionSensor`).
+- Starts a single `ConnectionMonitor` daemon thread that drives the
+  state machines on all three handles in response to OS hotplug events
+  + a 200 ms poll sweep.
+- Any already-connected devices are picked up by the monitor's first poll
+  after `.start()`; the handles transition to `CONNECTED` automatically.
 
 **Example:**
 ```python
