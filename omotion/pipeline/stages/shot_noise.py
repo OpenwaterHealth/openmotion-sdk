@@ -27,7 +27,19 @@ class ShotNoiseCorrectionStage:
         std_sn = np.sqrt(corrected_var).astype(np.float32)
 
         with np.errstate(divide='ignore', invalid='ignore'):
-            contrast = np.where(mean > 0, std_sn / mean, np.float32(0.0))
+            # Three cases:
+            #   mean > 0           — normal: contrast = std/mean
+            #   mean <= 0  (real)  — no signal: contrast = 0 (legacy behaviour)
+            #   mean is NaN        — slot was never populated (e.g. first dark
+            #                        frame before any light has been seen);
+            #                        propagate NaN so BfiBvi/sinks can skip
+            #                        rather than render a spurious BFI = 10.
+            mean_valid = np.isfinite(mean)
+            contrast = np.where(
+                mean_valid & (mean > 0),
+                std_sn / mean,
+                np.where(mean_valid, np.float32(0.0), np.float32("nan")),
+            )
 
         batch.std_sn_rt      = std_sn
         batch.contrast_sn_rt = contrast.astype(np.float32)
