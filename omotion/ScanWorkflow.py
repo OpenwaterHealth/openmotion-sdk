@@ -65,6 +65,42 @@ def _snap_to_row(snap) -> list:
     return row
 
 
+class _TelemetryCsvWriter:
+    """Listener registered on ConsoleTelemetryPoller that writes each snapshot
+    to ``{scan_id}_{subject_id}_telemetry.csv`` for the duration of one scan.
+
+    Constructed and started by ``start_scan``; ``close()`` is called from the
+    worker's ``finally`` block. The listener runs on the poller thread, so
+    ``__call__`` must stay non-blocking.
+    """
+
+    def __init__(self, path: str, poller) -> None:
+        self._poller = poller
+        self._file = open(path, "w", newline="", encoding="utf-8")
+        self._writer = csv.writer(self._file)
+        self._writer.writerow(_TELEMETRY_HEADERS)
+        self._file.flush()
+        self.path = path
+        poller.add_listener(self)
+
+    def __call__(self, snap) -> None:
+        try:
+            self._writer.writerow(_snap_to_row(snap))
+            self._file.flush()
+        except Exception:
+            logger.exception("telemetry CSV write failed")
+
+    def close(self) -> None:
+        try:
+            self._poller.remove_listener(self)
+        except Exception:
+            pass
+        try:
+            self._file.close()
+        except Exception:
+            pass
+
+
 @dataclass
 class ScanRequest:
     subject_id: str
@@ -84,12 +120,6 @@ class ScanRequest:
     # bfi_left, bfi_right, bvi_left, bvi_right columns.  Uncorrected
     # samples emitted to the UI are also averaged per-side per-frame.
     reduced_mode: bool = False
-    # When True, the pipeline emits a rolling-mean Sample (mean + contrast
-    # only) via on_rolling_avg_fn once per uncorrected light frame per
-    # camera.  Window size is rolling_avg_window.  Dark frames are
-    # excluded from the window.
-    rolling_avg_enabled: bool = False
-    rolling_avg_window: int = 10
     # Database sink (issue #92, see docs/superpowers/specs/2026-04-14-scan-db-sink-design.md).
     # The DB endpoint itself is opt-in at SDK construction via
     # ``MotionInterface(db_path=...)``; these per-scan fields are only
@@ -330,12 +360,12 @@ class ScanWorkflow:
             metadata=meta,
             calibration=calibration,
             pedestals=pedestals,
-            rolling_avg_window=request.rolling_avg_window or 10,
             raw_save_max_duration_s=request.raw_save_max_duration_s,
         )
 
         # ── Auto-inject default storage sinks ─────────────────────────────
         default_sinks: list = []
+        telemetry_writer: Optional[_TelemetryCsvWriter] = None
         if not request.skip_default_storage:
             data_dir = getattr(self._interface, "data_dir", None)
             scan_db_path = getattr(self._interface, "scan_db_path", None)
@@ -343,6 +373,24 @@ class ScanWorkflow:
                 default_sinks.append(PipelineCsvSink(output_dir=data_dir))
             if scan_db_path is not None:
                 default_sinks.append(ScanDBSink(db_path=scan_db_path))
+            # Telemetry CSV: per-scan snapshots from ConsoleTelemetryPoller.
+            # Not a pipeline sink — the poller is its own daemon thread that
+            # predates the sink-based architecture, so we register a listener
+            # for the duration of the scan and unregister in _worker's finally.
+            poller = getattr(getattr(self._interface, "console", None), "telemetry", None)
+            if (
+                request.write_telemetry_csv
+                and data_dir is not None
+                and poller is not None
+            ):
+                telemetry_path = os.path.join(
+                    data_dir, f"{scan_id}_{request.subject_id}_telemetry.csv"
+                )
+                try:
+                    telemetry_writer = _TelemetryCsvWriter(telemetry_path, poller)
+                except Exception:
+                    logger.exception("failed to open telemetry CSV %s", telemetry_path)
+                    telemetry_writer = None
         all_sinks = default_sinks + list(request.sinks)
 
         # ── Build source + runner (set self._runner synchronously) ─────────
@@ -523,6 +571,8 @@ class ScanWorkflow:
                 logger.exception("ScanWorkflow worker raised")
                 self._last_scan_error = str(e) or type(e).__name__
             finally:
+                if telemetry_writer is not None:
+                    telemetry_writer.close()
                 with self._lock:
                     self._running = False
                     self._thread = None

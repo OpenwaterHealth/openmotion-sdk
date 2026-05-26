@@ -285,8 +285,6 @@ class ContactQualityWorkflow:
             right_camera_mask=right_camera_mask,
             disable_laser=False,
             reduced_mode=False,
-            rolling_avg_enabled=False,
-            rolling_avg_window=rolling_window,
             sinks=[sink],
             skip_default_storage=True,
         )

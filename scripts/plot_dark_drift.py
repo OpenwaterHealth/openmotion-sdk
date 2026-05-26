@@ -34,11 +34,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-
-# 1024 bins per histogram row, 10-bit ADC counts.
-_HISTO_BINS = 1024
-_BIN_IDX = np.arange(_HISTO_BINS, dtype=np.float64)
-_BIN_IDX_SQ = _BIN_IDX * _BIN_IDX
+from omotion.config import HISTO_BINS, HISTO_BINS_SQ, HISTO_SIZE_WORDS
 
 
 @dataclass
@@ -84,7 +80,7 @@ def _read_raw_csv_dark_points(
         # Bins start at column 3. ``temperature`` is the first
         # post-bin scalar (column 3 + 1024). Locate it from the header
         # so this doesn't fragile-out if columns get reordered later.
-        bin_lo, bin_hi = 3, 3 + _HISTO_BINS
+        bin_lo, bin_hi = 3, 3 + HISTO_SIZE_WORDS
         try:
             temp_col = header.index("temperature")
         except ValueError:
@@ -110,13 +106,13 @@ def _read_raw_csv_dark_points(
             hist = np.fromiter(
                 (int(x) for x in row[bin_lo:bin_hi]),
                 dtype=np.int64,
-                count=_HISTO_BINS,
+                count=HISTO_SIZE_WORDS,
             )
             row_sum = int(hist.sum())
             if row_sum <= 0:
                 continue
-            u1 = float(_BIN_IDX @ hist) / row_sum
-            mean2 = float(_BIN_IDX_SQ @ hist) / row_sum
+            u1 = float(HISTO_BINS @ hist) / row_sum
+            mean2 = float(HISTO_BINS_SQ @ hist) / row_sum
             var = max(0.0, mean2 - u1 * u1)
             std = float(np.sqrt(var))
 

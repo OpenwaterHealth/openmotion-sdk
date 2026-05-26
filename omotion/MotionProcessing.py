@@ -11,13 +11,18 @@ SciencePipeline class, FrameIdUnwrapper) has moved to the
 
 What lives here
 ---------------
-- Module-level constants: HISTO_SIZE_WORDS, HISTOGRAM_BYTES,
-  EXPECTED_HISTOGRAM_SUM, PEDESTAL_HEIGHT, ADC_GAIN, CAMERA_GAIN_MAP, …
+- Wire-level constants: HISTO_SIZE_WORDS, HISTOGRAM_BYTES, PACKET_*,
+  MIN_*_PACKET_SIZE, MAX_PACKET_SIZE, SOF/SOH/EOH/EOF, FRAME_ID_MODULUS,
+  EXPECTED_HISTOGRAM_SUM, PEDESTAL_HEIGHT
 - Dataclasses: HistogramSample, HistogramPacket, Sample, CorrectedBatch
 - Parsing helpers: parse_histogram_stream, parse_histogram_packet_structured,
   _rle_decompress (re-exported from omotion.utils), _util_crc16
 - Legacy byte-level helper: bytes_to_integers (used by MotionSensor)
 - File conversion helper: process_bin_file
+
+Camera-array constants (CAMERA_GAIN_MAP, HISTO_BINS, HISTO_BINS_SQ) live in
+omotion/config.py. ADC_GAIN is pedestal-derived — see
+omotion.pipeline.pedestal.adc_gain_for_pedestal.
 """
 
 import csv
@@ -68,8 +73,6 @@ MIN_HISTO_CMP_PACKET_SIZE = PACKET_HEADER_SIZE + 1 + CMP_UNCMP_CRC_SIZE + PACKET
 MAX_PACKET_SIZE = 32837
 
 SOF, SOH, EOH, EOF = 0xAA, 0xFF, 0xEE, 0xDD
-HISTO_BINS = np.arange(HISTO_SIZE_WORDS, dtype=np.float64)
-HISTO_BINS_SQ = HISTO_BINS * HISTO_BINS
 
 # Frame ID rollover constants. The firmware packs frame_id into the high byte
 # of the last histogram word, so it is an 8-bit counter (0–255).  We detect
@@ -94,31 +97,6 @@ EXPECTED_HISTOGRAM_SUM: int | None = 2_457_606
 # explicitly before emitting the mean so that downstream consumers see a
 # zero-referenced signal.
 PEDESTAL_HEIGHT: float = 64.0
-
-# Shot-noise correction constants.
-#
-# Photon shot noise follows Poisson statistics: variance (in electrons) equals
-# mean (in electrons).  Converting to digital units:
-#
-#   shot_noise_var_DN = ADC_GAIN · g · mean_electrons
-#                     = ADC_GAIN · mean_DN
-#
-# where g is the per-camera analog gain and mean_DN is the dark-corrected mean
-# in digital units.  This expected shot-noise contribution is subtracted from
-# the dark-corrected variance in the corrected path so that the residual
-# variance (and therefore the speckle contrast) reflects only laser speckle
-# fluctuations, not photon counting noise.
-#
-# ADC_GAIN: (full-scale DN range above pedestal) / (electrons at full scale)
-#   = (1024 − 64) / 11 000 ≈ 0.0873 DN/e⁻
-#
-# CAMERA_GAIN_MAP: analog gain for each of the 8 camera positions within a
-#   sensor module.  The outer cameras use higher gain to compensate for the
-#   reduced illumination at the array periphery.
-ADC_GAIN: float = (1024 - 64) / 11_000          # DN per electron ≈ 0.0873
-CAMERA_GAIN_MAP: np.ndarray = np.array(
-    [16, 4, 2, 1, 1, 2, 4, 16], dtype=np.float64
-)  # index 0 = cam position 0 (outermost), index 7 = cam position 7 (outermost)
 
 logger = logging.getLogger(
     f"{_log_root}.MotionProcessing" if _log_root else "MotionProcessing"

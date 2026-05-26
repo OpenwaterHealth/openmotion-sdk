@@ -58,17 +58,16 @@ A separate **data pipeline** layer sits between the workflow orchestration and t
    │                              │                              │
    │  LiveUsbSource               │ default_pipeline():          │  CsvSink  (raw, final)
    │  CsvReplaySource             │  Classify → TelemetryIngest  │  ScanDBSink (raw, final)
-   │  DbReplaySource              │  → Tee(raw) → NoiseFloor     │  QtUiSink   (live)
-   │                              │  → Moments → PedestalSub     │  TelemetrySink (telemetry)
+   │  DbReplaySource              │  → Tee(raw) → NoiseFloor     │  TelemetrySink (telemetry)
+   │                              │  → Moments → PedestalSub     │  app live/final plot sinks
    │  ConsoleTelemetrySource      │  → DarkCorrection → ShotNoise│  CalibrationWorkflow sinks
    │  (separate thread)           │  → BfiBvi → SideAvg          │  ContactQuality sink
-   │                              │  → Tee(live) → RollingAvg    │  + your own
-   │                              │  → Tee(rolling)              │
+   │                              │  → Tee(live)                 │  + your own
    └──────────────────────────────┴──────────────────────────────┘
                   │                                          ▲
                   │  FrameBatch (mutated in place)            │
                   │  batch.events: LiveEmit / IntervalClosed  │
-                  └─── channels: raw, live, rolling, final, ──┘
+                  └─── channels: raw, live, final,           ──┘
                        telemetry, diagnostics
 ```
 
@@ -208,9 +207,9 @@ Always creates `CommInterface` in async mode. Claims all three on `connect()`, r
 | `pipeline/pipeline.py` | `Stage` protocol; `Pipeline` (ordered stage list + `reset()` + `on_scan_stop()` lifecycle) |
 | `pipeline/runner.py` | `ScanRunner` — iterates a `Source`, runs the `Pipeline`, dispatches events to subscribed sinks, manages the parallel telemetry thread |
 | `pipeline/sources.py` | `Source` protocol; `LiveUsbSource`, `CsvReplaySource`, `DbReplaySource`, `ConsoleTelemetrySource`; `_BaseSource` timestamp normalisation |
-| `pipeline/sinks.py` | `Sink` protocol; `ScanMetadata`; built-in `CsvSink`, `ScanDBSink`, `TelemetrySink`, `QtUiSink` |
+| `pipeline/sinks.py` | `Sink` protocol; `ScanMetadata`; built-in `CsvSink`, `ScanDBSink`, `TelemetrySink`. The live-plot UI sinks live in the bloodflow-app (`_LivePlotSink` + `_FinalBatchSink` in `motion_connector.py`), not here. |
 | `pipeline/tee.py` | `Tee(channel)` — positional marker that emits `LiveEmit` for sinks subscribed to the named channel; supports `filter` and `max_duration_s` |
-| `pipeline/factory.py` | `default_pipeline()` — composes the canonical 10-stage + 3-tee chain |
+| `pipeline/factory.py` | `default_pipeline()` — composes the canonical 8-stage + 2-tee chain |
 | `pipeline/pedestal.py` | `SensorPedestals` per-side, firmware-version-keyed pedestal lookup (replaces the legacy global `PEDESTAL_HEIGHT`) |
 | `pipeline/telemetry.py` | `TelemetryAggregator` (thread-safe ring buffer) + `TelemetryIngestStage` (per-frame pdc/tcm/tcl attachment) |
 | `pipeline/stages/classify.py` | `FrameClassificationStage` — frame-ID unwrap + `warmup`/`dark`/`light`/`stale` labelling |
@@ -221,7 +220,6 @@ Always creates `CommInterface` in async mode. Claims all three on `connect()`, r
 | `pipeline/stages/shot_noise.py` | `ShotNoiseCorrectionStage` — Poisson-variance subtraction on the realtime path |
 | `pipeline/stages/bfi_bvi.py` | `BfiBviStage` — affine calibration map (contrast, mean) → (BFI, BVI) |
 | `pipeline/stages/side_avg.py` | `SideAveragingStage` — per-side averaging for reduced-mode display |
-| `pipeline/stages/rolling_avg.py` | `RollingAverageStage` — sliding-window mean of BFI/BVI |
 
 **`ScanWorkflow`** — orchestrates a complete acquisition:
 1. Build a `ScanMetadata` and `SensorPedestals` from the connected sensors.
@@ -256,8 +254,6 @@ ShotNoiseCorrectionStage    — Poisson variance subtraction on the realtime pat
 BfiBviStage                 — affine calibration (contrast, mean) → (BFI, BVI)
 SideAveragingStage          — per-side averaging (reduced mode only)
 Tee("live")                 — corrected per-frame FrameBatch to "live" sinks
-RollingAverageStage         — sliding-window mean (default 10 frames)
-Tee("rolling")              — smoothed per-frame FrameBatch to "rolling" sinks
 ```
 
 ### Channels
@@ -267,9 +263,8 @@ Sinks declare which channels they consume (`channels: set[str]`):
 | Channel | Payload | Cadence | Typical consumers |
 |---|---|---|---|
 | `raw` | `FrameBatch` (incl. warmup) | per batch | `CsvSink`, `ScanDBSink` |
-| `live` | `FrameBatch` (excl. warmup/stale) | per batch | `QtUiSink`, `ContactQualityWorkflow` sink, `CalibrationWorkflow` sink (dark frames) |
-| `rolling` | `FrameBatch` with smoothed BFI/BVI | per batch | smoothed-trace UI, test harnesses |
-| `final` | `EnrichedCorrectedInterval` | per closed dark interval (~15 s at defaults) | `CsvSink` (corrected CSV), `ScanDBSink` (`session_data`), `CalibrationWorkflow` sink |
+| `live` | `FrameBatch` (excl. warmup/stale) | per batch | app live-plot sink (realtime points, later overwritten via `"final"`), `ContactQualityWorkflow` sink, `CalibrationWorkflow` sink (dark frames) |
+| `final` | `EnrichedCorrectedInterval` | per closed dark interval (~15 s at defaults) | `CsvSink` (corrected CSV), `ScanDBSink` (`session_data`), app final-batch sink (overwrites realtime points with interval-corrected values), `CalibrationWorkflow` sink |
 | `telemetry` | `TelemetryEvent` | ~10 Hz (separate thread) | `TelemetrySink` |
 | `diagnostics` | `DarkIntegrityWarning`, `StencilFallback`, etc. | as they occur | any opt-in sink |
 

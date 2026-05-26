@@ -1,4 +1,4 @@
-"""default_pipeline factory — assembles the canonical 9-stage + 3-Tee chain."""
+"""default_pipeline factory — assembles the canonical 8-stage + 2-Tee chain."""
 
 import numpy as np
 from dataclasses import dataclass
@@ -42,8 +42,6 @@ def test_default_pipeline_has_expected_stages():
         "dark_correction", "shot_noise_correction", "bfi_bvi",
         "side_averaging",
         "tee:live",
-        "rolling_average",
-        "tee:rolling",
     ]
 
 

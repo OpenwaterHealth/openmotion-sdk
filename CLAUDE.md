@@ -101,5 +101,5 @@ Signals are `pyqtSignal` when PyQt is importable, otherwise a fallback `MOTIONSi
 | Change histogram parsing | `omotion/MotionProcessing.py` (parsing) + `omotion/StreamInterface.py` (framing). |
 | Add a science-pipeline step | `omotion/MotionProcessing.py`, then a unit test in `tests/test_pipeline_csv.py`. |
 | Change connection/discovery behavior | `omotion/connection_monitor.py` + `omotion/MotionInterface.py`. |
-| Flash sensor firmware from a script | `omotion/DFUProgrammer.py`; see `scripts/flash_sensors.py` for usage. |
+| Flash sensor firmware from a script | `omotion/DFUProgrammer.py`. (Most `scripts/*.py` are stale post-Interface→MotionInterface rename and need porting — see memory `sdk-scripts-dead`.) |
 | Flash a console FPGA | `omotion/FPGAProgrammer.py`; the JED parser is `scripts/test_jed_parser.py`. |

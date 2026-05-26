@@ -166,8 +166,8 @@ def test_cq_sink_ignores_non_live_channel():
         light_thresholds=[15.0] * 8,
     )
     sink.on_scan_start(None)
-    sink.consume("rolling", _dn_batch(4, 20.0))
-    sink.consume("final",   _dn_batch(4, 20.0))
+    sink.consume("raw",   _dn_batch(4, 20.0))
+    sink.consume("final", _dn_batch(4, 20.0))
     result = sink.result(left_mask=0x01, right_mask=0, duration_sec=1.0)
 
     cam = result.per_camera[("left", 0)]
@@ -289,7 +289,6 @@ def test_cq_workflow_check_uses_skip_default_storage():
     req = captured.get("req")
     assert req is not None
     assert req.skip_default_storage is True
-    assert req.rolling_avg_enabled is False
     cq_sinks = [s for s in req.sinks if isinstance(s, CQSink)]
     assert len(cq_sinks) == 1
 

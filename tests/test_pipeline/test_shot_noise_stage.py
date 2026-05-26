@@ -1,12 +1,16 @@
 """ShotNoiseCorrectionStage — subtract Poisson variance from corrected variance."""
 
 import numpy as np
+from omotion.config import CAMERA_GAIN_MAP
 from omotion.pipeline.batch import FrameBatch
+from omotion.pipeline.pedestal import SensorPedestals, adc_gain_for_pedestal
 from omotion.pipeline.stages.shot_noise import ShotNoiseCorrectionStage
 
 
-ADC_GAIN = (1024 - 64) / 11_000
-CAMERA_GAIN_MAP = np.array([16, 4, 2, 1, 1, 2, 4, 16], dtype=np.float32)
+# Tests pin to the legacy pedestal (64) so the expected values stay the same
+# as before the constants moved out of factory.py.
+PEDESTALS = SensorPedestals(left=64.0, right=64.0)
+ADC_GAIN = adc_gain_for_pedestal(64.0)
 
 
 def _batch_with_dc_rt(mean_dc, std_dc):
@@ -28,7 +32,7 @@ def test_subtracts_shot_noise_variance_per_camera():
     std  = np.full((1, 2, 8), 10.0,  dtype=np.float32)
     batch = _batch_with_dc_rt(mean, std)
 
-    ShotNoiseCorrectionStage(adc_gain=ADC_GAIN, camera_gain_map=CAMERA_GAIN_MAP).process(batch)
+    ShotNoiseCorrectionStage(pedestals=PEDESTALS, camera_gain_map=CAMERA_GAIN_MAP).process(batch)
 
     expected_shot_var = ADC_GAIN * 100.0 * CAMERA_GAIN_MAP
     expected_corr_var = np.maximum(0.0, 100.0 - expected_shot_var)
@@ -42,7 +46,7 @@ def test_negative_corrected_variance_clamps_to_zero_std():
     std  = np.full((1, 2, 8), 1.0,    dtype=np.float32)
     batch = _batch_with_dc_rt(mean, std)
 
-    ShotNoiseCorrectionStage(adc_gain=ADC_GAIN, camera_gain_map=CAMERA_GAIN_MAP).process(batch)
+    ShotNoiseCorrectionStage(pedestals=PEDESTALS, camera_gain_map=CAMERA_GAIN_MAP).process(batch)
 
     assert np.all(batch.std_sn_rt[0, 0, 0] == 0.0)
 
@@ -52,7 +56,7 @@ def test_contrast_computed_with_corrected_std_and_mean():
     std  = np.full((1, 2, 8), 10.0,  dtype=np.float32)
     batch = _batch_with_dc_rt(mean, std)
 
-    ShotNoiseCorrectionStage(adc_gain=ADC_GAIN, camera_gain_map=CAMERA_GAIN_MAP).process(batch)
+    ShotNoiseCorrectionStage(pedestals=PEDESTALS, camera_gain_map=CAMERA_GAIN_MAP).process(batch)
 
     expected = batch.std_sn_rt / 100.0
     np.testing.assert_allclose(batch.contrast_sn_rt, expected, rtol=1e-5)

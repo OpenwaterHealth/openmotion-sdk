@@ -85,8 +85,9 @@ def test_noise_floor_stage_under_5ms(benchmark) -> None:
 
 def test_shot_noise_stage_under_5ms(benchmark) -> None:
     """Budget: 5 ms per batch-of-100 (vectorised variance arithmetic)."""
+    from omotion.pipeline.pedestal import SensorPedestals
     stage = ShotNoiseCorrectionStage(
-        adc_gain=0.0873,
+        pedestals=SensorPedestals(left=64.0, right=64.0),
         camera_gain_map=np.array([16, 4, 2, 1, 1, 2, 4, 16], dtype=np.float32),
     )
     batch = _full_batch(N)

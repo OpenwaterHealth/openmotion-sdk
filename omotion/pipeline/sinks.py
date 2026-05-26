@@ -1,7 +1,9 @@
 """Sink protocol + ScanMetadata.
 
-Concrete sink implementations (CsvSink, ScanDBSink, QtUiSink) live below
-the protocol definitions.
+Concrete sink implementations (CsvSink, ScanDBSink) live below the
+protocol definitions. The live-plot UI sink lives in the bloodflow-app
+(`motion_connector.py` — `_LivePlotSink` for the `"live"` channel and
+`_FinalBatchSink` for the `"final"` channel) rather than in the SDK.
 """
 
 from __future__ import annotations
@@ -12,6 +14,8 @@ import logging
 import os
 from dataclasses import dataclass
 from typing import Any, Optional, Protocol, runtime_checkable
+
+from omotion.config import HISTO_SIZE_WORDS
 
 logger = logging.getLogger("omotion.pipeline.sinks")
 
@@ -38,7 +42,6 @@ class Sink(Protocol):
     Channels in this pipeline:
         "raw"          — per-frame, all non-stale frames including warmup
         "live"         — per-frame, best-effort corrected (light + dark)
-        "rolling"      — per-frame, rolling-averaged for test/calibration
         "final"        — per-dark-interval, accurately corrected CorrectedBatch
         "diagnostics"  — out-of-band events (DarkIntegrityWarning, etc.)
     """
@@ -55,12 +58,10 @@ class Sink(Protocol):
 # Concrete sinks
 # ---------------------------------------------------------------------------
 
-_HISTO_BINS = 1024
-
 # Raw CSV column order: cam_id, frame_id, timestamp_s, type, 0..1023, temperature, sum, tcm, tcl, pdc
 _RAW_PIPELINE_HEADERS: list = [
     "cam_id", "frame_id", "timestamp_s", "type",
-    *list(range(_HISTO_BINS)),
+    *list(range(HISTO_SIZE_WORDS)),
     "temperature", "sum",
     "tcm", "tcl", "pdc",
 ]
@@ -583,7 +584,7 @@ class ScanDBSink:
         import struct
         import numpy as np
 
-        _pack = struct.Struct(f"<{_HISTO_BINS}I")
+        _pack = struct.Struct(f"<{HISTO_SIZE_WORDS}I")
 
         n = len(batch.cam_ids)
         for i in range(n):
@@ -637,23 +638,3 @@ class ScanDBSink:
             logger.exception("ScanDBSink: failed to flush %d raw frames", len(self._raw_buffer))
         finally:
             self._raw_buffer.clear()
-
-class QtUiSink:
-    """Forwards live-channel batches as Qt signals for the app's plot widget.
-
-    PR 1 ships a stub that records calls (for testability). PR 3 wires
-    against PyQt6 signals in motion_connector.py.
-    """
-
-    channels = {"live"}
-
-    def __init__(self):
-        self.live_batches = []
-
-    def on_scan_start(self, meta): pass
-
-    def consume(self, channel: str, payload: Any) -> None:
-        if channel == "live":
-            self.live_batches.append(payload)
-
-    def on_complete(self): pass

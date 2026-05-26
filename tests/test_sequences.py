@@ -118,50 +118,6 @@ def test_fpga_enable_histogram_disable(any_sensor):
 # 5.4 Streaming acquisition
 # ===========================================================================
 
-@pytest.mark.slow
-def test_streaming_acquisition(any_sensor):
-    """
-    Start FSIN streaming, collect 30 science frames, assert monotonic
-    absolute_frame_id increments of exactly 1.
-    """
-    from omotion.MotionProcessing import create_science_pipeline
-
-    N = 30
-    _camera_up(any_sensor)
-    any_sensor.enable_aggregator_fsin()
-
-    frames = []
-    done = threading.Event()
-
-    def on_science_frame(frame):
-        frames.append(frame)
-        if len(frames) >= N:
-            done.set()
-
-    # create_science_pipeline() starts the pipeline internally — do NOT call .start() again
-    pipeline = create_science_pipeline(
-        bfi_c_min=_BFI_ZEROS,
-        bfi_c_max=_BFI_ONES,
-        bfi_i_min=_BFI_ZEROS,
-        bfi_i_max=_BFI_ONES,
-        on_science_frame_fn=on_science_frame,
-    )
-    any_sensor.enable_camera(0x01)
-
-    try:
-        done.wait(timeout=30)
-    finally:
-        any_sensor.disable_camera(0x01)
-        any_sensor.disable_aggregator_fsin()
-        pipeline.stop()
-
-    assert len(frames) >= N, f"Expected {N} frames, got {len(frames)}"
-
-    abs_ids = [f.absolute_frame for f in frames[:N]]
-    for prev, curr in zip(abs_ids, abs_ids[1:]):
-        assert curr == prev + 1, f"Frame ID not monotonic: {prev} → {curr}"
-
-
 # ===========================================================================
 # 5.5 External FSIN sequence
 # ===========================================================================
@@ -207,64 +163,6 @@ def test_trigger_lsync_sequence(console):
     count = console.get_lsync_pulsecount()
     console.stop_trigger()
     assert count >= 1, f"Expected at least 1 LSYNC pulse in 1.1 s, got {count}"
-
-
-# ===========================================================================
-# 5.8 Dual-sensor aligned frame acquisition
-# ===========================================================================
-
-@pytest.mark.slow
-def test_dual_sensor_frame_alignment(sensor_left, sensor_right):
-    """
-    Stream from both sensors and assert ScienceFrames carry both
-    left and right samples with matching absolute_frame.
-    """
-    from omotion.MotionProcessing import create_science_pipeline
-
-    N = 20
-
-    for sensor in (sensor_left, sensor_right):
-        _camera_up(sensor)
-        sensor.enable_aggregator_fsin()
-
-    aligned_frames = []
-    done = threading.Event()
-
-    def on_science_frame(frame):
-        sides = {side for (side, _) in frame.samples.keys()}
-        if "left" in sides and "right" in sides:
-            aligned_frames.append(frame)
-        if len(aligned_frames) >= N:
-            done.set()
-
-    # create_science_pipeline() starts the pipeline internally — do NOT call .start() again
-    pipeline = create_science_pipeline(
-        bfi_c_min=_BFI_ZEROS,
-        bfi_c_max=_BFI_ONES,
-        bfi_i_min=_BFI_ZEROS,
-        bfi_i_max=_BFI_ONES,
-        on_science_frame_fn=on_science_frame,
-    )
-
-    for sensor in (sensor_left, sensor_right):
-        sensor.enable_camera(0x01)
-
-    try:
-        done.wait(timeout=30)
-    finally:
-        for sensor in (sensor_left, sensor_right):
-            sensor.disable_camera(0x01)
-            sensor.disable_aggregator_fsin()
-        pipeline.stop()
-
-    assert len(aligned_frames) >= N, (
-        f"Expected {N} aligned frames, got {len(aligned_frames)}"
-    )
-
-    for frame in aligned_frames:
-        sides_present = {side for (side, _) in frame.samples.keys()}
-        assert "left" in sides_present
-        assert "right" in sides_present
 
 
 # ===========================================================================

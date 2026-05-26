@@ -1,5 +1,7 @@
 from enum import IntEnum
 
+import numpy as np
+
 SERIAL_PORT = "COM24"  # Change this to your serial port
 BAUD_RATE = 921600
 
@@ -14,6 +16,20 @@ ID_COUNTER = 0  # Initializing the ID counter
 # Histo Packet structure constants
 HISTO_SIZE_WORDS = 1024
 HISTO_BLOCK_SIZE = 1 + (HISTO_SIZE_WORDS * 4) + 1  # HID + HISTO + EOH
+
+# Bin-index arrays used by moment computations and CSV column naming.
+# HISTO_BINS[i] = i; HISTO_BINS_SQ[i] = i*i. Float64 so downstream Σ b·n(b)
+# and Σ b²·n(b) keep precision for ~2.4M-count histograms.
+HISTO_BINS: np.ndarray = np.arange(HISTO_SIZE_WORDS, dtype=np.float64)
+HISTO_BINS_SQ: np.ndarray = HISTO_BINS * HISTO_BINS
+
+# Per-camera analog gain for the 8 cameras in a sensor module, indexed by
+# cam_id % 8. Outer positions (0, 7) use higher gain to compensate for the
+# reduced illumination at the array periphery. Used by ShotNoiseCorrectionStage
+# and DarkCorrectionStage's enrichment path; see SciencePipeline.md §8.3.
+CAMERA_GAIN_MAP: np.ndarray = np.array(
+    [16, 4, 2, 1, 1, 2, 4, 16], dtype=np.float32
+)
 
 
 # Packet Types

@@ -12,7 +12,7 @@ def test_public_api_symbols_importable() -> None:
         ScanRunner,
         Source, LiveUsbSource, CsvReplaySource, DbReplaySource,
         Sink, ScanMetadata,
-        CsvSink, ScanDBSink, QtUiSink,
+        CsvSink, ScanDBSink,
         Tee, default_pipeline,
         SensorPedestals,
     )
@@ -20,7 +20,7 @@ def test_public_api_symbols_importable() -> None:
         Pipeline, Stage, FrameBatch, BatchEvent, IntervalClosed, LiveEmit,
         DarkIntegrityWarning, StencilFallback, ScanRunner,
         Source, LiveUsbSource, CsvReplaySource, DbReplaySource,
-        Sink, ScanMetadata, CsvSink, ScanDBSink, QtUiSink,
+        Sink, ScanMetadata, CsvSink, ScanDBSink,
         Tee, default_pipeline, SensorPedestals,
     ):
         assert sym is not None
@@ -38,7 +38,7 @@ def test_public_api_all_list_complete() -> None:
         "default_pipeline",
         "SensorPedestals",
         "Sink", "ScanMetadata",
-        "CsvSink", "ScanDBSink", "QtUiSink",
+        "CsvSink", "ScanDBSink",
         "Source", "LiveUsbSource", "CsvReplaySource", "DbReplaySource",
     }
 

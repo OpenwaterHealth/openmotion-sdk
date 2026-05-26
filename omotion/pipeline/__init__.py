@@ -32,7 +32,7 @@ from .tee import Tee
 from .runner import ScanRunner
 from .factory import default_pipeline
 from .pedestal import SensorPedestals
-from .sinks import Sink, ScanMetadata, CsvSink, ScanDBSink, QtUiSink
+from .sinks import Sink, ScanMetadata, CsvSink, ScanDBSink
 from .sources import Source, LiveUsbSource, CsvReplaySource, DbReplaySource
 
 
@@ -44,6 +44,6 @@ __all__ = [
     "default_pipeline",
     "SensorPedestals",
     "Sink", "ScanMetadata",
-    "CsvSink", "ScanDBSink", "QtUiSink",
+    "CsvSink", "ScanDBSink",
     "Source", "LiveUsbSource", "CsvReplaySource", "DbReplaySource",
 ]
