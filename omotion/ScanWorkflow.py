@@ -16,7 +16,6 @@ from omotion.MotionProcessing import (
     HISTO_SIZE_WORDS,
 )
 from omotion.Calibration import Calibration
-from omotion.CsvSink import CsvSink
 
 if TYPE_CHECKING:
     from omotion.MotionInterface import MotionInterface

@@ -96,21 +96,6 @@ class MotionInterface:
         self._cq_workflow = None
         self._monitor: Optional[ConnectionMonitor] = None
         self._started = False
-        # Set by ``_wrap_kwargs_with_db_sink`` for the duration of a
-        # DB-recorded scan; cleared in the sink's on_complete wrapper.
-        # ``active_db_session_id`` exposes its session id for post-scan
-        # note updates / status checks.
-        self._active_db_sink = None
-
-    @property
-    def active_db_session_id(self) -> Optional[int]:
-        """The DB session id for an in-progress scan, or None when no
-        scan is recording to the DB. Useful for callers who want to
-        update ``session_notes`` mid-/post-scan without re-querying the
-        DB by label.
-        """
-        s = self._active_db_sink
-        return s.session_id if s is not None else None
 
     @property
     def default_trigger_config(self) -> dict:
@@ -347,157 +332,11 @@ class MotionInterface:
         )
 
     def start_scan(self, request, **kwargs) -> bool:
-        # Phase E: ScanWorkflow.start_scan no longer accepts callback kwargs —
-        # storage routing is handled by the pipeline's auto-injected sinks
+        # Storage routing is handled by the pipeline's auto-injected sinks
         # (data_dir → CsvSink, scan_db_path → ScanDBSink). Unknown kwargs are
-        # silently dropped so callers that still pass the legacy callback
-        # arguments don't hard-crash before Phase G migrates them.
+        # silently dropped so legacy callers that still pass the old
+        # callback arguments don't hard-crash.
         return self.scan_workflow.start_scan(request)
-
-    def _wrap_kwargs_with_db_sink(self, request, kwargs: dict) -> dict:
-        """
-        Construct a ScanDBSink for this scan and chain its callbacks in
-        front of any caller-supplied callbacks. The sink is opened when
-        ScanWorkflow fires ``on_scan_start_fn`` and closed inside the
-        wrapped ``on_complete_fn``. Triggered only when the interface
-        was constructed with a ``db_path`` (issue #92).
-        """
-        import os
-        import time
-
-        from omotion import ScanDBSink
-
-        db_path = self._db_path
-        # Auto-create the parent directory so callers can pass a path
-        # inside a fresh data dir without separately mkdir-ing it.
-        parent = os.path.dirname(db_path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-
-        sink = ScanDBSink(
-            db_path,
-            write_raw=bool(getattr(request, "write_raw_to_db", False)),
-            compress_raw_hist=True,
-        )
-        # Track the active sink so callers can read the current
-        # ``session_id`` (e.g. the bloodflow-app pushing post-scan
-        # notes edits back to ``session_notes``). Cleared in
-        # ``_on_complete``.
-        self._active_db_sink = sink
-
-        def _active_cams(mask: int) -> list[int]:
-            return [i + 1 for i in range(8) if (mask >> i) & 0x1]
-
-        def _safe_call(fn):
-            try:
-                return fn()
-            except Exception:
-                return None
-
-        def _hex_or_none(val):
-            return val.hex() if isinstance(val, (bytes, bytearray)) else val
-
-        def _build_meta() -> dict:
-            return {
-                "subject_id": request.subject_id,
-                "duration_sec": request.duration_sec,
-                "expected_size": request.expected_size,
-                "fps": 40,
-                "left_camera_mask": request.left_camera_mask,
-                "right_camera_mask": request.right_camera_mask,
-                "active_left_cams": _active_cams(request.left_camera_mask),
-                "active_right_cams": _active_cams(request.right_camera_mask),
-                "disable_laser": bool(request.disable_laser),
-                "sdk_version": _SDK_VERSION,
-                "console_fw_version": _safe_call(self.console.get_version),
-                "console_hw_id": _hex_or_none(
-                    _safe_call(self.console.get_hardware_id)
-                ),
-                "left_fw_version": _safe_call(self.left.get_version),
-                "right_fw_version": _safe_call(self.right.get_version),
-                "left_hw_id": _hex_or_none(
-                    _safe_call(
-                        getattr(
-                            self.left,
-                            "get_cached_hardware_id",
-                            self.left.get_hardware_id,
-                        )
-                    )
-                ),
-                "right_hw_id": _hex_or_none(
-                    _safe_call(
-                        getattr(
-                            self.right,
-                            "get_cached_hardware_id",
-                            self.right.get_hardware_id,
-                        )
-                    )
-                ),
-                "sdk_flags": {
-                    "write_raw_csv": getattr(request, "write_raw_csv", False),
-                    "write_corrected_csv": getattr(request, "write_corrected_csv", True),
-                    "write_telemetry_csv": getattr(request, "write_telemetry_csv", True),
-                    "write_raw_to_db": getattr(request, "write_raw_to_db", False),
-                },
-            }
-
-        user_on_scan_start = kwargs.pop("on_scan_start_fn", None)
-        user_on_raw_frame = kwargs.pop("on_raw_frame_fn", None)
-        user_on_corrected = kwargs.pop("on_corrected_batch_fn", None)
-        user_on_complete = kwargs.pop("on_complete_fn", None)
-
-        def _on_scan_start(ts: str, start_ts: float) -> None:
-            try:
-                sink.on_scan_start(
-                    ts=ts,
-                    session_start_ts=start_ts,
-                    request=request,
-                    meta=_build_meta(),
-                )
-            except Exception:
-                logger.exception(
-                    "ScanDBSink.on_scan_start failed; DB writes disabled for this scan"
-                )
-            if user_on_scan_start:
-                user_on_scan_start(ts, start_ts)
-
-        def _on_raw_frame(*args, **kw) -> None:
-            try:
-                sink.on_raw_frame(*args, **kw)
-            except Exception:
-                logger.exception("ScanDBSink.on_raw_frame raised")
-            if user_on_raw_frame:
-                user_on_raw_frame(*args, **kw)
-
-        def _on_corrected(batch) -> None:
-            try:
-                sink.on_corrected_batch(batch)
-            except Exception:
-                logger.exception("ScanDBSink.on_corrected_batch raised")
-            if user_on_corrected:
-                user_on_corrected(batch)
-
-        def _on_complete(result) -> None:
-            try:
-                sink.on_complete(result)
-            except Exception:
-                logger.exception("ScanDBSink.on_complete raised")
-            # User callback fires BEFORE we clear the active-sink pointer
-            # — that's the only chance a synchronous on_complete handler
-            # has to read ``active_db_session_id`` (the bloodflow-app
-            # uses it to push post-scan notes back into session_notes).
-            # If we cleared first, the connector would read None and
-            # silently drop the notes write.
-            if user_on_complete:
-                user_on_complete(result)
-            if self._active_db_sink is sink:
-                self._active_db_sink = None
-
-        kwargs["on_scan_start_fn"] = _on_scan_start
-        kwargs["on_raw_frame_fn"] = _on_raw_frame
-        kwargs["on_corrected_batch_fn"] = _on_corrected
-        kwargs["on_complete_fn"] = _on_complete
-        return kwargs
 
     def cancel_scan(self, **kwargs) -> None:
         self.scan_workflow.cancel_scan(**kwargs)

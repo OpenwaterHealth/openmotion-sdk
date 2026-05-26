@@ -49,10 +49,7 @@ from .MotionSignal import MotionSignal
 from .MotionComposite import MotionComposite
 from .USBInterfaceBase import USBInterfaceBase
 from .MotionConfig import MotionConfig
-from .Sink import Sink
-from .CsvSink import CsvSink
 from .ScanDatabase import ScanDatabase
-from .ScanDBSink import ScanDBSink
 from .SessionPlayback import materialize_corrected_csv
 from .Calibration import Calibration
 from .CalibrationWorkflow import (
@@ -80,10 +77,7 @@ __all__ = [
     "MotionComposite",
     "USBInterfaceBase",
     "MotionConfig",
-    "Sink",
-    "CsvSink",
     "ScanDatabase",
-    "ScanDBSink",
     "materialize_corrected_csv",
     "Calibration",
     "CalibrationRequest",
