@@ -28,7 +28,7 @@ A scan is driven by a `ScanRunner` (`omotion/pipeline/runner.py`). It pulls `Fra
 │ CSV, DB)   │  batch        │ Tee(raw) → NoiseFloor → Moments →       │
 └────────────┘               │ PedestalSub → DarkCorrection →          │
                              │ ShotNoise → BfiBvi → SideAvg →          │
-                             │ Tee(live) → RollingAvg → Tee(rolling)   │
+                             │ Tee(live)                               │
                              └──────────────┬──────────────────────────┘
                                             │ batch.events (LiveEmit /
                                             │ IntervalClosed / diagnostics)
@@ -36,13 +36,14 @@ A scan is driven by a `ScanRunner` (`omotion/pipeline/runner.py`). It pulls `Fra
                               ┌──────────────────────────┐
                               │       ScanRunner         │
                               │  channel-based dispatch  │
-                              └─┬─────┬─────┬─────┬─────┬┘
-                                │     │     │     │     │
-                              raw  live rolling final telemetry  diagnostics
-                                │     │     │     │     │
-                                ▼     ▼     ▼     ▼     ▼
+                              └─┬─────┬─────┬─────┬─────┘
+                                │     │     │     │
+                              raw  live  final telemetry  diagnostics
+                                │     │     │     │
+                                ▼     ▼     ▼     ▼
                                   Sinks (CsvSink, ScanDBSink,
-                                  QtUiSink, TelemetrySink, …)
+                                  TelemetrySink, app live/final
+                                  plot sinks, …)
 ```
 
 The pipeline is **pure transformation**: stages mutate a typed `FrameBatch` dataclass in place and append events to `batch.events`. They never perform I/O. All side effects — file writes, UI emission, DB inserts — happen in sinks downstream of the runner.
@@ -50,7 +51,7 @@ The pipeline is **pure transformation**: stages mutate a typed `FrameBatch` data
 Three things characterise this design and make it auditable:
 
 - **One owner per field.** Each field on `FrameBatch` is written by exactly one stage. The ownership table (§2) is part of the contract; tests assert it.
-- **No global mutable state.** Per-scan state (pedestal values, calibration arrays, dark history, rolling-average rings) is constructor-injected into stages and reset by `Pipeline.reset()` at scan start.
+- **No global mutable state.** Per-scan state (pedestal values, calibration arrays, dark history) is constructor-injected into stages and reset by `Pipeline.reset()` at scan start.
 - **Channel-based output.** Sinks declare which channels they care about (`channels: set[str]`). The runner dispatches each `LiveEmit` / `IntervalClosed` event to the matching sinks. Adding a new consumer is a class with a `channels` set and a `consume(channel, payload)` method; no pipeline code changes.
 
 ---
@@ -86,8 +87,6 @@ Three things characterise this design and make it auditable:
 | `bvi_live` | `(N, 2, 8)` float32 | BfiBviStage | BVI from realtime corrected mean via calibration |
 | `bfi_live_side` | `(N, 2)` float32 \| None | SideAveragingStage | Per-side BFI mean (reduced mode only) |
 | `bvi_live_side` | `(N, 2)` float32 \| None | SideAveragingStage | Per-side BVI mean (reduced mode only) |
-| `bfi_rolling` | `(N, 2, 8)` float32 | RollingAverageStage | Sliding-window mean of `bfi_live` |
-| `bvi_rolling` | `(N, 2, 8)` float32 | RollingAverageStage | Sliding-window mean of `bvi_live` |
 | `events` | `list[BatchEvent]` | Stages append | Out-of-band events: `LiveEmit`, `IntervalClosed`, diagnostics |
 
 ### 2.2 BatchEvent types
@@ -134,8 +133,6 @@ ShotNoiseCorrectionStage
 BfiBviStage
 SideAveragingStage      (enabled only in reduced mode)
 Tee("live", filter=ft not in {"warmup","stale"})
-RollingAverageStage
-Tee("rolling", filter=ft not in {"warmup","stale"})
 ```
 
 ---
@@ -359,10 +356,12 @@ bvi           = (1 − (f.mean   − i_min) / (i_max − i_min)) · 10
 
 When `c_min == c_max` (degenerate calibration), the fallback is identity scaling: `bfi = contrast · 10`, `bvi = mean · 10`. Constants:
 
-| Symbol | Value |
-|---|---|
-| `ADC_GAIN` | `(1024 − 64) / 11_000 ≈ 0.0873` DN/e⁻ |
-| `CAMERA_GAIN_MAP` | `[16, 4, 2, 1, 1, 2, 4, 16]` indexed by `cam_id % 8` |
+| Symbol | Value | Defined in |
+|---|---|---|
+| `ADC_GAIN` | `(1024 − pedestal_height) / 11_000`. ≈ 0.0873 DN/e⁻ at pedestal 64 (FW ≤ 1.5.2); ≈ 0.0815 at pedestal 128 (current). | `omotion/pipeline/pedestal.py` (`adc_gain_for_pedestal`) |
+| `CAMERA_GAIN_MAP` | `[16, 4, 2, 1, 1, 2, 4, 16]` indexed by `cam_id % 8` | `omotion/config.py` |
+
+`ADC_GAIN` is **per-side**, derived from each sensor's pedestal at stage construction. Both `DarkCorrectionStage` (enrichment) and `ShotNoiseCorrectionStage` take a `SensorPedestals` and compute `[adc_gain_for_pedestal(left), adc_gain_for_pedestal(right)]` once, indexing by `side_idx ∈ {0, 1}` per frame. Mixed-firmware sensor modules (left and right with different pedestals) get the right gain on each side.
 
 Outer cameras (positions 0 and 7) use higher analog gain to compensate for reduced illumination at the array periphery; central cameras (3 and 4) run at unity gain.
 
@@ -462,24 +461,7 @@ Enabled cameras are derived from `metadata.left_camera_mask` / `right_camera_mas
 
 ### 5.11 Tee("live")
 
-Emits the FrameBatch on the `"live"` channel after filtering out warmup and stale frames. This is the per-frame live stream consumed by `QtUiSink` (live plot), `ContactQualityWorkflow` (DN-scale ambient-light + poor-contact thresholding — see §11.2), and `CalibrationWorkflow` (dark-frame collection).
-
-### 5.12 RollingAverageStage
-
-**File:** `omotion/pipeline/stages/rolling_avg.py`. **Writes:** `bfi_rolling`, `bvi_rolling`.
-
-Sliding-window mean over the most recent `window` BFI/BVI frames (default 10). Per-frame:
-
-```
-self._bfi_window.append(bfi_live[i])    # deque(maxlen=window)
-bfi_rolling[i] = mean(stack(self._bfi_window), axis=0)
-```
-
-State persists across batches; `reset()` clears it. Used by test/calibration consumers and any UI that wants a smoothed trace alongside the per-frame live one.
-
-### 5.13 Tee("rolling")
-
-Mirror of Tee("live"), but emits the post-rolling-average batch on the `"rolling"` channel.
+Emits the FrameBatch on the `"live"` channel after filtering out warmup and stale frames. This is the per-frame live stream consumed by the bloodflow-app's `_LivePlotSink` (realtime BFI/BVI/mean/contrast traces — later overwritten in place by the `"final"`-channel refinement, see §8.3), `ContactQualityWorkflow` (DN-scale ambient-light + poor-contact thresholding — see §11.2), and `CalibrationWorkflow` (dark-frame collection).
 
 ---
 
@@ -490,9 +472,8 @@ Sinks subscribe to channels by declaring a `channels: set[str]` attribute. The r
 | Channel | Payload | Cadence | Source | Typical consumers |
 |---|---|---|---|---|
 | `"raw"` | `FrameBatch` (full, including warmup) | Per batch (~10–100 frames) | `Tee("raw")` | `CsvSink` (raw per-cam CSV), `ScanDBSink` (`session_raw` blobs) |
-| `"live"` | `FrameBatch` (excluding warmup/stale) | Per batch | `Tee("live")` | `QtUiSink` (live plot — overwritten by `"final"` corrections), `ContactQualityWorkflow._ContactQualitySink` (DN thresholding), `CalibrationWorkflow._CalibrationCollectorSink` (dark frames) |
-| `"rolling"` | `FrameBatch` with `bfi_rolling`/`bvi_rolling` populated | Per batch | `Tee("rolling")` | Smoothed-trace UI, test harnesses |
-| `"final"` | `EnrichedCorrectedInterval` | Per closed dark interval (~1 per `dark_interval/40` seconds; default ~15 s) | `IntervalClosed` from `DarkCorrectionStage` | `CsvSink` (corrected CSV), `ScanDBSink` (`session_data`), `CalibrationWorkflow` (corrected light samples) |
+| `"live"` | `FrameBatch` (excluding warmup/stale) | Per batch | `Tee("live")` | bloodflow-app `_LivePlotSink` (realtime per-frame plot — later overwritten by `"final"` corrections, see §8.3), `ContactQualityWorkflow._ContactQualitySink` (DN thresholding), `CalibrationWorkflow._CalibrationCollectorSink` (dark frames) |
+| `"final"` | `EnrichedCorrectedInterval` | Per closed dark interval (~1 per `dark_interval/40` seconds; default ~15 s) | `IntervalClosed` from `DarkCorrectionStage` | `CsvSink` (corrected CSV), `ScanDBSink` (`session_data`), bloodflow-app `_FinalBatchSink` (overwrites the realtime points plotted from `"live"` with interval-corrected BFI/BVI/mean/contrast), `CalibrationWorkflow` (corrected light samples) |
 | `"telemetry"` | `TelemetryEvent` | ~10 Hz (independent of frame cadence) | `ConsoleTelemetrySource` (separate runner thread) | `TelemetrySink` (CSV) plus the pipeline's `TelemetryAggregator` |
 | `"diagnostics"` | `DarkIntegrityWarning`, `StencilFallback`, future events | As they occur | Stages append to `batch.events` | Any sink subscribing to `"diagnostics"` |
 
@@ -612,13 +593,16 @@ SQLite endpoint. On `on_scan_start`, opens a `ScanDatabase` and creates a sessio
 
 See [`ScanDatabase.md`](ScanDatabase.md) for the full schema and [`PipelineComparison.md`](PipelineComparison.md) for CSV vs. DB semantics.
 
-### 8.3 QtUiSink
+### 8.3 Live-plot UI sinks (bloodflow-app)
 
-**Channels:** `{"live", "final"}` (in the bloodflow-app split into `_LivePlotSink` + `_FinalBatchSink`).
+**Channels:** `{"live", "final"}`, split across two sinks in the bloodflow-app's `motion_connector.py`:
 
-Forwards per-frame batches to the application's plot widget via PyQt6 signals (in `motion_connector.py`). The stub in `sinks.py` records calls into a list for test assertions.
+- `_LivePlotSink` (`channels = {"live"}`) — forwards per-frame BFI/BVI/mean/contrast to the plot widget via PyQt6 signals.
+- `_FinalBatchSink` (`channels = {"final"}`) — forwards per-`EnrichedCorrectedInterval` refined values to the same widget.
 
 The plot widget uses a **two-pass refinement pattern** for BFI, BVI, mean, and contrast: the `"live"` channel emits realtime values per frame (using `bfi_live` / `bvi_live` / `mean_dc_rt` / `contrast_sn_rt`, which use the realtime predictor's dark baseline), and the `"final"` channel emits the more-accurate values per closed dark interval (from `EnrichedCorrectedFrame.bfi` / `.bvi` / `.mean` / `.contrast`, which use the linearly-interpolated baseline between bounding darks). The QML side matches by `frame_id` and overwrites the previously-plotted realtime point in place, so each plotted sample silently "settles" to the more accurate value as the trailing interval closes (~every 15 s at the default `dark_interval`).
+
+The SDK itself ships no UI sink — only the bloodflow-app wires PyQt6 signals to QML.
 
 ### 8.4 TelemetrySink
 
@@ -720,9 +704,9 @@ Both consumers are pure sinks — they add no pipeline stages, do not modify Fra
 | `pedestal` | 64.0 (FW ≤ 1.5.2) / 128.0 | `SensorPedestals.from_sensors` | Per-side ADC zero-light bias |
 | `realtime_history_size` | 4 | `DarkHistory` (inside DarkCorrectionStage) | Max dark observations kept in the realtime predictor's ring buffer |
 | `integrity_max_above_pedestal` | 5.0 | `DarkIntegrityGuard` | A dark frame whose u1 exceeds pedestal + 5 raises `DarkIntegrityWarning` |
-| `rolling_avg_window` | 10 | `RollingAverageStage` | Sliding-window size for BFI/BVI smoothing |
-| `ADC_GAIN` | `(1024 − 64) / 11_000` ≈ 0.0873 DN/e⁻ | `factory.py` | Sensor ADC gain used for shot-noise correction |
-| `CAMERA_GAIN_MAP` | `[16, 4, 2, 1, 1, 2, 4, 16]` | `factory.py` | Per-camera analog gain by `cam_id % 8` |
+| `ADC_GAIN` | `(1024 − pedestal_height) / 11_000` (≈ 0.0873 at pedestal 64, ≈ 0.0815 at pedestal 128) | `omotion/pipeline/pedestal.py` (`adc_gain_for_pedestal`) | Sensor ADC gain used for shot-noise correction; derived per-scan from the pedestal |
+| `CAMERA_GAIN_MAP` | `[16, 4, 2, 1, 1, 2, 4, 16]` | `omotion/config.py` | Per-camera analog gain by `cam_id % 8` |
+| `HISTO_BINS` / `HISTO_BINS_SQ` | `[0..1023]` / element-wise square | `omotion/config.py` | Bin-index arrays for moment computations and CSV column names |
 | `EXPECTED_HISTOGRAM_SUM` | 2_457_606 | `omotion/MotionProcessing.py` | Required total count per valid frame (1920 × 1280 px + 6 sentinel) |
 | `FRAME_ID_MODULUS` | 256 | `FrameClassificationStage` | Firmware 8-bit counter rollover period |
 | `_FRAME_ROLLOVER_THRESHOLD` | 128 | `FrameClassificationStage` | Max forward delta before rollover is detected |

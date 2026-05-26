@@ -8,13 +8,21 @@ from __future__ import annotations
 import numpy as np
 
 from ..batch import FrameBatch
+from ..pedestal import SensorPedestals, adc_gain_for_pedestal
 
 
 class ShotNoiseCorrectionStage:
     name = "shot_noise_correction"
 
-    def __init__(self, adc_gain: float, camera_gain_map: np.ndarray):
-        self.adc_gain = float(adc_gain)
+    def __init__(self, pedestals: SensorPedestals, camera_gain_map: np.ndarray):
+        # ADC gain is (1024 - pedestal) / 11_000 — different per side when the
+        # two sensor modules ship with different firmware. Pre-broadcast as
+        # (1, 2, 1) so the multiplication aligns with the (N, 2, 8) mean.
+        self._adc_gain = np.array(
+            [adc_gain_for_pedestal(pedestals.left),
+             adc_gain_for_pedestal(pedestals.right)],
+            dtype=np.float64,
+        ).reshape(1, 2, 1)
         self._gain_map = np.asarray(camera_gain_map, dtype=np.float32).reshape(1, 1, 8)
 
     def process(self, batch: FrameBatch) -> FrameBatch:
@@ -22,7 +30,7 @@ class ShotNoiseCorrectionStage:
         std  = batch.std_dc_rt
         var  = std.astype(np.float64) ** 2
 
-        shot_var = self.adc_gain * np.maximum(0.0, mean.astype(np.float64)) * self._gain_map
+        shot_var = self._adc_gain * np.maximum(0.0, mean.astype(np.float64)) * self._gain_map
         corrected_var = np.maximum(0.0, var - shot_var)
         std_sn = np.sqrt(corrected_var).astype(np.float32)
 

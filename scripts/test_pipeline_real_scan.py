@@ -83,7 +83,6 @@ def run_new_pipeline(scan_dir: pathlib.Path, scan_id: str, calibration: _Cal,
 
     pipeline = default_pipeline(
         metadata=meta, calibration=calibration, pedestals=pedestals,
-        rolling_avg_window=10,
     )
 
     source = CsvReplaySource(

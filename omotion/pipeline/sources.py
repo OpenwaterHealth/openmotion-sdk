@@ -51,6 +51,10 @@ class _BaseSource:
         The offset is set on the first batch and held fixed for all subsequent
         batches in the same scan. Thread-safety is not a concern here because
         sources are consumed by a single thread.
+
+        Replay sources (CSV, DB) use this array-based form. LiveUsbSource
+        receives samples one at a time and uses ``_t0_normalize`` below
+        instead; both share ``self._t0`` so whichever fires first sets it.
         """
         if not self._normalize_timestamps:
             return timestamp_s
@@ -60,6 +64,18 @@ class _BaseSource:
             else:
                 return timestamp_s
         return timestamp_s - self._t0
+
+    def _t0_normalize(self, ts: float) -> float:
+        """Scalar version of ``_apply_timestamp_normalization`` for callbacks
+        that fire per-sample (e.g. ``parse_histogram_stream`` in
+        LiveUsbSource). Shares ``self._t0`` with the array form so the first
+        sample seen by either path sets the per-scan zero.
+        """
+        if not self._normalize_timestamps:
+            return ts
+        if self._t0 is None:
+            self._t0 = float(ts)
+        return float(ts) - self._t0
 
     def close(self) -> None:
         pass
@@ -386,7 +402,7 @@ class LiveUsbSource(_BaseSource):
             self._packet_queues[side_name], self._stop, buf,
             on_row_fn=on_row,
             expected_row_sum=EXPECTED_HISTOGRAM_SUM,
-            t0_normalizer=getattr(self, "_t0_normalize", None),
+            t0_normalizer=self._t0_normalize,
         )
         # Flush any remaining samples after parse_histogram_stream returns
         if accumulated:

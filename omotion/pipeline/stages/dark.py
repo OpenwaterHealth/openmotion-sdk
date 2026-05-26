@@ -18,7 +18,7 @@ from typing import Any, Deque, Optional
 import numpy as np
 
 from ..batch import DarkIntegrityWarning, FrameBatch, IntervalClosed
-from ..pedestal import SensorPedestals
+from ..pedestal import SensorPedestals, adc_gain_for_pedestal
 
 
 logger = logging.getLogger(__name__)
@@ -348,12 +348,17 @@ class DarkCorrectionStage:
                  realtime_history_size: int = 4,
                  integrity_max_above_pedestal: float = 5.0,
                  # Optional enrichment params (shot-noise + BFI/BVI)
-                 adc_gain: Optional[float] = None,
                  camera_gain_map: Optional[np.ndarray] = None,
                  calibration: "Optional[Any]" = None):
         self._realtime = realtime_estimator
         self._batch = batch_estimator
         self._pedestals = pedestals or SensorPedestals(left=64.0, right=64.0)
+        # Per-side ADC gain derived from the pedestal: (1024 - p) / 11_000.
+        # Indexed by side_idx (0=left, 1=right) in _enrich_corrected_frame.
+        self._adc_gain_per_side: tuple[float, float] = (
+            adc_gain_for_pedestal(self._pedestals.left),
+            adc_gain_for_pedestal(self._pedestals.right),
+        )
         self._history = DarkHistory(max_darks=realtime_history_size)
         self._pending: dict[tuple[str, int], PendingInterval] = {}
         self._guard = DarkIntegrityGuard(
@@ -365,8 +370,8 @@ class DarkCorrectionStage:
         # neighbours v(D-1) and v(D-2) for the quadratic stencil (§8.4).
         self._prev_interval_tail: dict[tuple[str, int], list[EnrichedCorrectedFrame]] = {}
         self._last_realtime: dict[tuple[str, int], tuple[float, float, float]] = {}
-        # Enrichment (shot-noise + calibration) — None means emit raw CorrectedInterval
-        self._adc_gain: Optional[float] = float(adc_gain) if adc_gain is not None else None
+        # Enrichment (shot-noise + calibration). When camera_gain_map is None
+        # the stage emits raw CorrectedInterval (no enrichment).
         self._gain_map: Optional[np.ndarray] = (
             np.asarray(camera_gain_map, dtype=np.float32) if camera_gain_map is not None else None
         )
@@ -383,8 +388,7 @@ class DarkCorrectionStage:
     # ------------------------------------------------------------------
 
     def _can_enrich(self) -> bool:
-        return (self._adc_gain is not None
-                and self._gain_map is not None
+        return (self._gain_map is not None
                 and self._c_min is not None)
 
     def _enrich_corrected_frame(self, f: "CorrectedFrame") -> "EnrichedCorrectedFrame":
@@ -392,9 +396,10 @@ class DarkCorrectionStage:
         side_idx = 0 if f.side == "left" else 1
         cam_pos = int(f.cam_id) % 8
         g_cam = float(self._gain_map[cam_pos])
+        adc_gain = self._adc_gain_per_side[side_idx]
 
         # Shot-noise variance: §8.3 — use dark-corrected mean (f.mean)
-        shot_var = self._adc_gain * max(0.0, f.mean) * g_cam
+        shot_var = adc_gain * max(0.0, f.mean) * g_cam
         corrected_var = max(0.0, f.std ** 2 - shot_var)
         shot_corrected_std = corrected_var ** 0.5
 

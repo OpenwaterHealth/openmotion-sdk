@@ -16,6 +16,20 @@ def pedestal_for_fw(version: tuple[int, int, int]) -> float:
     return 128.0
 
 
+def adc_gain_for_pedestal(pedestal_height: float) -> float:
+    """Sensor ADC gain in DN per electron, derived from the pedestal height.
+
+    ADC_GAIN = (full-scale DN range above pedestal) / (electrons at full scale)
+             = (1024 − pedestal_height) / 11_000
+
+    The pedestal occupies the bottom of the 10-bit ADC range, so the usable
+    range above it determines how many DN one electron at full scale produces.
+    Legacy sensors (FW ≤ 1.5.2, pedestal = 64) give ≈ 0.0873 DN/e⁻; current
+    sensors (pedestal = 128) give ≈ 0.0815 DN/e⁻.
+    """
+    return (1024.0 - float(pedestal_height)) / 11_000.0
+
+
 @dataclass(frozen=True)
 class SensorPedestals:
     """Per-side pedestal values to feed into PedestalSubtractionStage."""

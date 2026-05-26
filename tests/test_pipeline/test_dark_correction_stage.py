@@ -107,7 +107,6 @@ def test_emits_enriched_interval_when_calibration_provided():
         i_min=np.zeros((2, 8), dtype=np.float32),
         i_max=np.full((2, 8), 500.0, dtype=np.float32),
     )
-    adc_gain = (1024 - 64) / 11_000
     gain_map = np.array([16, 4, 2, 1, 1, 2, 4, 16], dtype=np.float32)
 
     n = 4
@@ -119,7 +118,6 @@ def test_emits_enriched_interval_when_calibration_provided():
     stage = DarkCorrectionStage(
         realtime_estimator=HybridRealtimePredictor(),
         batch_estimator=LinearInterpolation(),
-        adc_gain=adc_gain,
         camera_gain_map=gain_map,
         calibration=cal,
     )
@@ -215,12 +213,10 @@ def _make_stage_with_cal():
         i_min=np.zeros((2, 8), dtype=np.float32),
         i_max=np.full((2, 8), 500.0, dtype=np.float32),
     )
-    adc_gain = (1024 - 64) / 11_000
     gain_map = np.array([16, 4, 2, 1, 1, 2, 4, 16], dtype=np.float32)
     return DarkCorrectionStage(
         realtime_estimator=HybridRealtimePredictor(),
         batch_estimator=LinearInterpolation(),
-        adc_gain=adc_gain,
         camera_gain_map=gain_map,
         calibration=cal,
     )

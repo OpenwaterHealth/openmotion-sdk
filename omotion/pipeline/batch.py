@@ -93,7 +93,6 @@ class FrameBatch:
       ShotNoise:       std_sn_rt, contrast_sn_rt
       BfiBvi:          bfi_live, bvi_live
       SideAveraging:   bfi_live_side, bvi_live_side (None unless reduced mode)
-      RollingAverage:  bfi_rolling, bvi_rolling
       Tee:             appends LiveEmit to events
     """
 
@@ -135,8 +134,5 @@ class FrameBatch:
 
     bfi_live_side:  Optional[np.ndarray] = None
     bvi_live_side:  Optional[np.ndarray] = None
-
-    bfi_rolling:    Optional[np.ndarray] = None
-    bvi_rolling:    Optional[np.ndarray] = None
 
     events:         list[BatchEvent] = field(default_factory=list)

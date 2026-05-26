@@ -37,14 +37,14 @@ from omotion.pipeline.factory import default_pipeline
 from omotion.pipeline.runner import ScanRunner
 from omotion.pipeline.sources import CsvReplaySource
 from omotion.pipeline.sinks import CsvSink, ScanMetadata
+from omotion.config import HISTO_SIZE_WORDS
 from omotion.pipeline.pedestal import SensorPedestals
 
 HERE = pathlib.Path(__file__).parent
 RAW_OUT  = HERE / "normal_short_scan.raw.csv"
 GOLD_OUT = HERE / "normal_short_scan.corrected.golden.csv"
 
-# Histogram constants
-_HISTO_BINS = 1024
+# Fixture-shape constants
 _N_FRAMES   = 50
 _CAM_ID     = 0
 _PEDESTAL   = 64.0
@@ -53,7 +53,7 @@ _DARK_INTERVAL = 20   # pipeline param; keeps second dark at frame 30
 
 def _make_histogram(u1_target: float, std_target: float, rng: np.random.Generator) -> np.ndarray:
     """Synthesize a 1024-bin histogram with given mean ± std (Gaussian-shaped)."""
-    bins = np.arange(_HISTO_BINS, dtype=np.float64)
+    bins = np.arange(HISTO_SIZE_WORDS, dtype=np.float64)
     weights = np.exp(-0.5 * ((bins - u1_target) / max(std_target, 1.0)) ** 2)
     weights = np.maximum(weights, 0.0)
     total = weights.sum()
@@ -73,7 +73,7 @@ def _write_raw_csv(path: pathlib.Path) -> None:
     # cam_id, frame_id, timestamp_s, type, 0..1023, temperature, sum, tcm, tcl, pdc
     headers = [
         "cam_id", "frame_id", "timestamp_s", "type",
-        *[str(b) for b in range(_HISTO_BINS)],
+        *[str(b) for b in range(HISTO_SIZE_WORDS)],
         "temperature", "sum", "tcm", "tcl", "pdc",
     ]
 

@@ -1,10 +1,10 @@
-"""default_pipeline() — assembles the canonical 9-stage + 3-Tee chain."""
+"""default_pipeline() — assembles the canonical 8-stage + 2-Tee chain."""
 
 from __future__ import annotations
 
 from typing import Any, Optional
 
-import numpy as np
+from omotion.config import CAMERA_GAIN_MAP
 
 from .pipeline import Pipeline
 from .pedestal import SensorPedestals
@@ -20,12 +20,7 @@ from .stages.dark import (
 from .stages.shot_noise import ShotNoiseCorrectionStage
 from .stages.bfi_bvi import BfiBviStage
 from .stages.side_avg import SideAveragingStage
-from .stages.rolling_avg import RollingAverageStage
 from .tee import Tee
-
-
-ADC_GAIN = (1024 - 64) / 11_000
-CAMERA_GAIN_MAP = np.array([16, 4, 2, 1, 1, 2, 4, 16], dtype=np.float32)
 
 
 def default_pipeline(*,
@@ -33,7 +28,6 @@ def default_pipeline(*,
                      calibration: Any,
                      pedestals: SensorPedestals,
                      noise_floor_threshold: int = 10,
-                     rolling_avg_window: int = 10,
                      discard_count: int = 9,
                      dark_interval: int = 600,
                      realtime_dark_history_size: int = 4,
@@ -68,12 +62,11 @@ def default_pipeline(*,
             batch_estimator=LinearInterpolation(),
             pedestals=pedestals,
             realtime_history_size=realtime_dark_history_size,
-            adc_gain=ADC_GAIN,
             camera_gain_map=CAMERA_GAIN_MAP,
             calibration=calibration,
         ),
 
-        ShotNoiseCorrectionStage(adc_gain=ADC_GAIN, camera_gain_map=CAMERA_GAIN_MAP),
+        ShotNoiseCorrectionStage(pedestals=pedestals, camera_gain_map=CAMERA_GAIN_MAP),
         BfiBviStage(calibration=calibration),
 
         SideAveragingStage(
@@ -82,9 +75,6 @@ def default_pipeline(*,
             right_camera_mask=metadata.right_camera_mask,
         ),
         Tee("live", filter=not_warmup_or_stale),
-
-        RollingAverageStage(window=rolling_avg_window),
-        Tee("rolling", filter=not_warmup_or_stale),
     ])
 
     return Pipeline(stages)
