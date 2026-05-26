@@ -12,12 +12,16 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
+import logging
 from typing import Any, Deque, Optional
 
 import numpy as np
 
 from ..batch import DarkIntegrityWarning, FrameBatch, IntervalClosed
 from ..pedestal import SensorPedestals
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -250,11 +254,12 @@ class LinearInterpolation:
                          side: str, cam_id: int) -> CorrectedInterval:
         d_prev = interval.left.obs
         d_next = interval.right.obs
-        dt = d_next.t - d_prev.t
+        d_abs = interval.right_abs - interval.left_abs
 
         corrected_frames: list[CorrectedFrame] = []
         for lf in interval.light_frames:
-            t_frac = (lf.t - d_prev.t) / dt if dt > 0 else 0.0
+            t_frac = ((lf.abs_frame_id - interval.left_abs) / d_abs
+                      if d_abs > 0 else 0.0)
             baseline_u1  = d_prev.u1  + t_frac * (d_next.u1  - d_prev.u1)
             baseline_var = d_prev.std ** 2 + t_frac * (d_next.std ** 2 - d_prev.std ** 2)
 
@@ -359,6 +364,7 @@ class DarkCorrectionStage:
         # the previous interval, keyed by (side, cam_id).  Used as the left
         # neighbours v(D-1) and v(D-2) for the quadratic stencil (§8.4).
         self._prev_interval_tail: dict[tuple[str, int], list[EnrichedCorrectedFrame]] = {}
+        self._last_realtime: dict[tuple[str, int], tuple[float, float, float]] = {}
         # Enrichment (shot-noise + calibration) — None means emit raw CorrectedInterval
         self._adc_gain: Optional[float] = float(adc_gain) if adc_gain is not None else None
         self._gain_map: Optional[np.ndarray] = (
@@ -543,13 +549,23 @@ class DarkCorrectionStage:
             cam_id  = int(batch.cam_ids[i])
             abs_id  = int(batch.abs_frame_ids[i])
             t       = float(batch.timestamp_s[i])
-            side_idx = int(np.argmax(batch.raw_histograms[i].sum(axis=(-2, -1))))
+            # Read side from the per-row side_ids set by the source.
+            # See FrameBatch.side_ids docstring for why inference from
+            # raw_histograms is unsafe (zero-filled rows misroute to side 0).
+            side_idx = int(batch.side_ids[i])
             side = self.SIDE_NAMES[side_idx]
 
             u1 = float(batch.mean_raw[i, side_idx, cam_id])
             std = float(batch.std_raw[i, side_idx, cam_id])
 
             if ftype == "dark":
+                last_rt = self._last_realtime.get((side, cam_id))
+                if last_rt is not None:
+                    u1_hat, mean_rt, std_rt = last_rt
+                    baseline_rt[i, side_idx, cam_id] = np.float32(u1_hat)
+                    mean_dc_rt[i, side_idx, cam_id] = np.float32(mean_rt)
+                    std_dc_rt[i, side_idx, cam_id] = np.float32(std_rt)
+
                 pedestal = (self._pedestals.left if side == "left"
                             else self._pedestals.right)
                 self._guard.check(
@@ -585,6 +601,11 @@ class DarkCorrectionStage:
                     raw_var = max(0.0, std ** 2)
                     corr_var = max(0.0, raw_var - std_hat ** 2)
                     std_dc_rt[i, side_idx, cam_id] = np.float32(corr_var ** 0.5)
+                    self._last_realtime[(side, cam_id)] = (
+                        float(u1_hat),
+                        float(mean_dc_rt[i, side_idx, cam_id]),
+                        float(std_dc_rt[i, side_idx, cam_id]),
+                    )
 
                     pi = self._pending.get((side, cam_id))
                     if pi is not None:
@@ -600,19 +621,22 @@ class DarkCorrectionStage:
         self._history.clear()
         self._pending.clear()
         self._prev_interval_tail.clear()
+        self._last_realtime.clear()
 
     def on_scan_stop(self, batch: FrameBatch) -> None:
         """Terminal dark flush — see SciencePipeline.md §8.6.
 
-        The firmware guarantees the last frame of every scan is a dark (laser-
+        The firmware guarantees the end of every scan contains a dark (laser-
         off) frame.  That frame may not fall on a scheduled dark position, so
-        the pipeline receives it as a buffered light in pi._light.
+        the pipeline receives it as a buffered light in pi._light.  Host-side
+        trigger-stop drain can deliver a short dark-like tail; all contiguous
+        dark-like frames at the end are removed from the light list.
 
         Following the legacy SciencePipeline._flush_terminal_dark logic:
-          1. Pop the last entry from pi._light — that is the terminal dark.
-          2. Use the terminal dark's actual data (not the last scheduled dark's)
+          1. Find the trailing dark-like tail in pi._light.
+          2. Use the last tail frame's actual data (not the last scheduled dark's)
              as the right boundary of the synthetic interval.
-          3. Remove it from the light list so it is not double-counted.
+          3. Remove the whole tail from the light list so it is not double-counted.
           4. Call _emit_interval with the remaining lights (which may be empty).
              The stencil for D_prev is applied as normal; if there are no lights,
              D_prev cannot be stencilled (no right neighbours) and is skipped.
@@ -623,22 +647,47 @@ class DarkCorrectionStage:
             if self._history.size(side, cam_id) < 1:
                 continue
 
-            # The last buffered frame is the hardware-guaranteed terminal dark.
-            terminal_light = pi._light[-1]
+            pedestal = self._pedestals.left if side == "left" else self._pedestals.right
+            threshold = pedestal + self._guard.max_above_pedestal
 
-            # Build the terminal dark observation from the LAST SCHEDULED dark's
-            # u1/std (reuse moments since we have no independent measurement),
-            # but stamp it at the terminal frame's actual timestamp.
-            last_dark = self._history.recent(side, cam_id, n=1)[0]
+            def _is_dark_like(light_frame) -> bool:
+                return light_frame.u1 <= threshold
+
+            # The final buffered frame should be the hardware-guaranteed
+            # terminal dark.  If it is not dark-like, leave the interval open
+            # and log; this preserves the non-failing behavior expected by the
+            # app while avoiding a bogus terminal boundary.
+            terminal_light = pi._light[-1]
+            if not _is_dark_like(terminal_light):
+                logger.warning(
+                    "no terminal dark frame found for side=%s cam_id=%d; "
+                    "last frame abs_id=%d u1=%.3f exceeds dark threshold %.3f",
+                    side, cam_id, terminal_light.abs_frame_id,
+                    terminal_light.u1, threshold,
+                )
+                continue
+
+            tail_start = len(pi._light) - 1
+            while tail_start > 0 and _is_dark_like(pi._light[tail_start - 1]):
+                tail_start -= 1
+
+            terminal_var = max(0.0, terminal_light.u2 - terminal_light.u1 ** 2)
             terminal_obs = DarkObservation(
                 t=terminal_light.t,
-                u1=last_dark.u1,
-                std=last_dark.std,
+                u1=terminal_light.u1,
+                std=terminal_var ** 0.5,
             )
 
-            # Remove the terminal frame from pi._light so it is not emitted as
-            # a corrected light frame (mirrors legacy _pending_moments[key][:-1]).
-            pi._light = pi._light[:-1]
+            # Remove the terminal dark-like tail from pi._light so those frames
+            # are not emitted as corrected light frames.
+            tail_len = len(pi._light) - tail_start
+            if tail_len > 1:
+                logger.info(
+                    "terminal dark flush removed %d trailing dark-like frames "
+                    "for side=%s cam_id=%d",
+                    tail_len, side, cam_id,
+                )
+            pi._light = pi._light[:tail_start]
 
             # Close the synthetic interval [D_prev, terminal_dark].
             pi.set_right_dark(terminal_obs, abs_frame_id=terminal_light.abs_frame_id)

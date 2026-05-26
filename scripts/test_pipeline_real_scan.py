@@ -97,7 +97,7 @@ def run_new_pipeline(scan_dir: pathlib.Path, scan_id: str, calibration: _Cal,
           f" right mask 0x{right_mask:02x})...")
     runner.run()
 
-    out = list(out_dir.glob("*corrected*.csv"))
+    out = [p for p in out_dir.glob("*.csv") if not p.name.endswith("_raw.csv")]
     if not out:
         raise RuntimeError("CsvSink produced no corrected CSV")
     return out[0]

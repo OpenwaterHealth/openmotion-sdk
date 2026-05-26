@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 
@@ -36,15 +36,29 @@ def default_pipeline(*,
                      rolling_avg_window: int = 10,
                      discard_count: int = 9,
                      dark_interval: int = 600,
-                     realtime_dark_history_size: int = 4) -> Pipeline:
-    """Build the canonical pipeline. See SciencePipeline.md for the algorithm."""
+                     realtime_dark_history_size: int = 4,
+                     raw_save_max_duration_s: Optional[float] = None) -> Pipeline:
+    """Build the canonical pipeline. See SciencePipeline.md for the algorithm.
+
+    Args:
+        raw_save_max_duration_s: If provided and > 0, includes Tee("raw") with
+            max_duration_s set. If 0 or negative, omits the raw tee. If None
+            (default), includes unbounded raw tee.
+    """
 
     not_warmup_or_stale = lambda ft: ft != "warmup" and ft != "stale"
 
-    return Pipeline([
+    stages: list = [
         FrameClassificationStage(discard_count=discard_count, dark_interval=dark_interval),
-        Tee("raw", filter=lambda ft: ft != "stale"),
+    ]
 
+    # Conditionally add raw tee based on raw_save_max_duration_s
+    if raw_save_max_duration_s is None or raw_save_max_duration_s > 0:
+        stages.append(
+            Tee("raw", filter=lambda ft: ft != "stale", max_duration_s=raw_save_max_duration_s)
+        )
+
+    stages.extend([
         NoiseFloorStage(threshold=noise_floor_threshold),
         MomentsStage(),
         PedestalSubtractionStage(pedestals=pedestals),
@@ -72,3 +86,5 @@ def default_pipeline(*,
         RollingAverageStage(window=rolling_avg_window),
         Tee("rolling", filter=not_warmup_or_stale),
     ])
+
+    return Pipeline(stages)

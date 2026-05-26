@@ -48,3 +48,30 @@ def test_tee_with_filter_emits_when_any_frame_passes():
 def test_tee_reset_is_a_noop():
     tee = Tee("raw", filter=None)
     tee.reset()
+
+
+def test_tee_with_max_duration_s_emits_within_budget():
+    tee = Tee("raw", filter=None, max_duration_s=60.0)
+    batch = _batch_with_frame_types(["light"])
+    batch.timestamp_s = np.array([0.0], dtype=np.float64)
+    tee.process(batch)
+    emits = [e for e in batch.events if isinstance(e, LiveEmit)]
+    assert len(emits) == 1
+
+
+def test_tee_with_max_duration_s_skips_after_budget():
+    tee = Tee("raw", filter=None, max_duration_s=60.0)
+    batch = _batch_with_frame_types(["light"])
+    batch.timestamp_s = np.array([65.0], dtype=np.float64)
+    tee.process(batch)
+    emits = [e for e in batch.events if isinstance(e, LiveEmit)]
+    assert emits == []
+
+
+def test_tee_with_max_duration_s_none_means_unbounded():
+    tee = Tee("raw", filter=None, max_duration_s=None)
+    batch = _batch_with_frame_types(["light"])
+    batch.timestamp_s = np.array([9999.0], dtype=np.float64)
+    tee.process(batch)
+    emits = [e for e in batch.events if isinstance(e, LiveEmit)]
+    assert len(emits) == 1

@@ -50,3 +50,8 @@ def test_pipeline_process_returns_the_batch():
     batch = _empty_batch()
     result = pipeline.process(batch)
     assert result is batch
+
+
+def test_pipeline_has_no_telemetry_aggregator_attribute():
+    pipeline = Pipeline(stages=[])
+    assert not hasattr(pipeline, "telemetry_aggregator")

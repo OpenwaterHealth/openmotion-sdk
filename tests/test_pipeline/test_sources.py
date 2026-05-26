@@ -17,7 +17,6 @@ def _meta():
         scan_id="x", subject_id="y", operator="z",
         started_at_iso="2026-05-22T00:00:00Z", duration_sec=60,
         left_camera_mask=0xFF, right_camera_mask=0, reduced_mode=False,
-        write_raw_csv=False, raw_csv_duration_sec=None,
     )
 
 
@@ -195,14 +194,105 @@ def test_live_usb_source_close_stops_event():
     assert src._stop.is_set()
 
 
-def test_live_usb_source_reader_loop_raises_not_implemented():
-    """_reader_loop raises NotImplementedError (body deferred to PR 2)."""
-    src = LiveUsbSource(
-        console=None, left=None, right=None,
-        metadata=_meta(),
+def test_live_usb_source_reader_loop_builds_batches_from_packet_queue(monkeypatch):
+    """Mock parse_histogram_stream to feed fake samples; verify _reader_loop
+    accumulates them into FrameBatches and pushes to the batch queue."""
+    import queue as _queue
+    import numpy as np
+    from omotion.pipeline.batch import FrameBatch
+
+    # Fake parse_histogram_stream: ignores the real queue and fires on_row_fn
+    # with 15 synthetic samples positionally (matching the real call site), then returns.
+    def _fake_parse_histogram_stream(q, stop_evt, buf, *, on_row_fn=None,
+                                     expected_row_sum=None, t0_normalizer=None):
+        for i in range(15):
+            if on_row_fn is not None:
+                on_row_fn(
+                    0,                              # cam_id
+                    i + 1,                          # frame_id
+                    0.025 * (i + 1),                # ts
+                    np.ones(1024, dtype=np.uint32), # histogram
+                    1024,                           # row_sum
+                    27.0,                           # temperature_c (temp)
+                )
+            if stop_evt.is_set():
+                return 15
+        return 15
+
+    monkeypatch.setattr(
+        "omotion.MotionProcessing.parse_histogram_stream",
+        _fake_parse_histogram_stream,
     )
-    with pytest.raises(NotImplementedError):
-        src._reader_loop("left", object())
+
+    class _FakeSensor:
+        class _FakeStream:
+            def start_streaming(self, q, expected_size):
+                pass
+            def stop_streaming(self):
+                pass
+            def drain_final(self, expected_size):
+                return []
+        class _FakeUart:
+            def __init__(self, stream):
+                self.histo = stream
+        def __init__(self):
+            self.uart = self._FakeUart(self._FakeStream())
+
+    meta = ScanMetadata(
+        scan_id="x", subject_id="y", operator="z",
+        started_at_iso="2026-05-22T00:00:00Z", duration_sec=2,
+        left_camera_mask=0xFF, right_camera_mask=0, reduced_mode=False,
+    )
+
+    src = LiveUsbSource(
+        console=None, left=_FakeSensor(), right=None,
+        batch_size_frames=10, metadata=meta,
+    )
+    batches = []
+    for batch in src:
+        batches.append(batch)
+        if len(batches) >= 2:
+            src.close()
+            break
+
+    # 15 samples with batch_size=10 → at least one full batch (10) and a partial (5)
+    assert len(batches) >= 1
+    total_frames = sum(b.raw_histograms.shape[0] for b in batches)
+    assert total_frames >= 10
+    # Each batch has the correct histogram shape
+    for b in batches:
+        assert b.raw_histograms.shape[-1] == 1024
+
+
+@pytest.mark.sensor
+def test_live_usb_source_smoke_yields_framebatches():
+    """Hardware-marked smoke test — requires a connected sensor."""
+    from omotion import MotionInterface
+    from omotion.pipeline.sources import LiveUsbSource
+    from omotion.pipeline.sinks import ScanMetadata
+
+    motion = MotionInterface(data_dir=None, scan_db_path=None, operator_id="test")
+    motion.start()
+    try:
+        meta = ScanMetadata(
+            scan_id="smoke", subject_id="x", operator="test",
+            started_at_iso="2026-05-22T00:00:00Z", duration_sec=2,
+            left_camera_mask=0xFF, right_camera_mask=0, reduced_mode=False,
+        )
+        src = LiveUsbSource(
+            console=motion.console, left=motion.left, right=motion.right,
+            batch_size_frames=10, metadata=meta,
+        )
+        batches_seen = 0
+        for batch in src:
+            batches_seen += 1
+            assert batch.raw_histograms.shape[-1] == 1024
+            if batches_seen >= 3:
+                src.close()
+                break
+        assert batches_seen >= 1
+    finally:
+        motion.stop()
 
 
 # ---------------------------------------------------------------------------

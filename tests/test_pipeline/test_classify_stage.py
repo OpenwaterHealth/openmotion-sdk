@@ -15,12 +15,14 @@ def _batch_with_raw_ids(raw_ids_per_side_cam):
     n = len(rows)
     cam_ids = np.array([r[1] for r in rows], dtype=np.int8)
     frame_ids = np.array([r[2] for r in rows], dtype=np.uint8)
+    side_ids = np.array([r[0] for r in rows], dtype=np.int8)
     raw_hists = np.zeros((n, 2, 8, 1024), dtype=np.uint32)
     for i, (s, c, _) in enumerate(rows):
         raw_hists[i, s, c, 0] = 1
     return FrameBatch(
         cam_ids=cam_ids,
         frame_ids=frame_ids,
+        side_ids=side_ids,
         raw_histograms=raw_hists,
         temperature_c=np.zeros((n, 2, 8), dtype=np.float32),
         timestamp_s=np.arange(n, dtype=np.float64),
@@ -67,6 +69,37 @@ def test_unwrap_handles_8bit_rollover():
     FrameClassificationStage(discard_count=9, dark_interval=600).process(batch)
     expected_abs = [250, 251, 252, 253, 254, 255, 256, 257, 258, 259, 260]
     np.testing.assert_array_equal(batch.abs_frame_ids, expected_abs)
+
+
+def test_zero_filled_row_keeps_source_assigned_side():
+    """A row whose raw_histogram is all zeros (e.g. firmware-dropped frame)
+    must still be routed to its source-assigned side.
+
+    Before the side_ids fix, classify.py inferred side via
+    ``np.argmax(raw_histograms[i].sum(axis=(-2, -1)))`` which silently
+    defaults to 0 whenever the histogram is all zeros, so right-side dropped
+    frames were misclassified as left.
+    """
+    # Two right-side rows, both with all-zero histograms — would have
+    # defaulted to side=0 under the old logic.
+    raw_ids = [1, 2]
+    n = len(raw_ids)
+    batch = FrameBatch(
+        cam_ids=np.array([0, 0], dtype=np.int8),
+        frame_ids=np.array(raw_ids, dtype=np.uint8),
+        side_ids=np.array([1, 1], dtype=np.int8),  # right
+        raw_histograms=np.zeros((n, 2, 8, 1024), dtype=np.uint32),
+        temperature_c=np.zeros((n, 2, 8), dtype=np.float32),
+        timestamp_s=np.arange(n, dtype=np.float64),
+        pdc=None, tcm=None, tcl=None,
+    )
+
+    stage = FrameClassificationStage(discard_count=9, dark_interval=600)
+    stage.process(batch)
+
+    # The unwrapper key is (side_idx, cam_id) — verify state went to side=1.
+    assert (1, 0) in stage._unwrappers
+    assert (0, 0) not in stage._unwrappers
 
 
 def test_reset_clears_unwrapper_state():

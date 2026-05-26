@@ -44,7 +44,7 @@ def _replay_once(raw_csv: pathlib.Path, out_dir: pathlib.Path, run_id: str) -> p
     sink = CsvSink(output_dir=str(out_dir))
     ScanRunner(source=source, pipeline=pipeline, sinks=[sink]).run()
 
-    corrected = list(out_dir.glob("*corrected*.csv"))
+    corrected = [p for p in out_dir.glob("*.csv") if not p.name.endswith("_raw.csv")]
     if not corrected:
         pytest.skip("CsvSink.consume('final') not writing corrected output")
     return corrected[0]

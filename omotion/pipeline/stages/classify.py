@@ -59,7 +59,10 @@ class FrameClassificationStage:
         for i in range(n):
             cam_id = int(batch.cam_ids[i])
             raw_id = int(batch.frame_ids[i])
-            side_idx = int(np.argmax(batch.raw_histograms[i].sum(axis=(-2, -1))))
+            # Side is authoritatively set by the source (see FrameBatch.side_ids
+            # docstring). Inferring from raw_histograms would misclassify any
+            # zero-filled row — e.g. a firmware-dropped frame — as side 0.
+            side_idx = int(batch.side_ids[i])
 
             key = (side_idx, cam_id)
             unwrapper = self._unwrappers.get(key)

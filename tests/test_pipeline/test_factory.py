@@ -29,7 +29,6 @@ def test_default_pipeline_has_expected_stages():
         scan_id="x", subject_id="y", operator="z",
         started_at_iso="2026-05-22T00:00:00Z", duration_sec=60,
         left_camera_mask=0xFF, right_camera_mask=0xFF, reduced_mode=False,
-        write_raw_csv=True, raw_csv_duration_sec=None,
     )
     pipeline = default_pipeline(
         metadata=meta, calibration=_trivial_calibration(),
@@ -46,3 +45,65 @@ def test_default_pipeline_has_expected_stages():
         "rolling_average",
         "tee:rolling",
     ]
+
+
+def test_default_pipeline_omits_raw_tee_when_duration_zero():
+    cal = _trivial_calibration()
+    meta = ScanMetadata(
+        scan_id="x", subject_id="y", operator="z",
+        started_at_iso="2026-05-22T00:00:00Z", duration_sec=60,
+        left_camera_mask=0xFF, right_camera_mask=0xFF, reduced_mode=False,
+    )
+    pipeline = default_pipeline(
+        metadata=meta, calibration=cal,
+        pedestals=SensorPedestals(left=64.0, right=64.0),
+        raw_save_max_duration_s=0,
+    )
+    names = [stage.name for stage in pipeline.stages]
+    assert "tee:raw" not in names
+
+
+def test_default_pipeline_includes_raw_tee_with_finite_duration():
+    cal = _trivial_calibration()
+    meta = ScanMetadata(
+        scan_id="x", subject_id="y", operator="z",
+        started_at_iso="2026-05-22T00:00:00Z", duration_sec=60,
+        left_camera_mask=0xFF, right_camera_mask=0xFF, reduced_mode=False,
+    )
+    pipeline = default_pipeline(
+        metadata=meta, calibration=cal,
+        pedestals=SensorPedestals(left=64.0, right=64.0),
+        raw_save_max_duration_s=60.0,
+    )
+    raw_tee = next(s for s in pipeline.stages if s.name == "tee:raw")
+    assert raw_tee.max_duration_s == 60.0
+
+
+def test_default_pipeline_has_no_telemetry_scaffolding():
+    cal = _trivial_calibration()
+    meta = ScanMetadata(
+        scan_id="x", subject_id="y", operator="z",
+        started_at_iso="2026-05-22T00:00:00Z", duration_sec=60,
+        left_camera_mask=0xFF, right_camera_mask=0xFF, reduced_mode=False,
+    )
+    pipeline = default_pipeline(metadata=meta, calibration=cal,
+                                pedestals=SensorPedestals(left=64.0, right=64.0))
+    names = [s.name for s in pipeline.stages]
+    assert "telemetry_ingest" not in names
+    assert not hasattr(pipeline, "telemetry_aggregator")
+
+
+def test_default_pipeline_includes_raw_tee_with_none_unbounded():
+    cal = _trivial_calibration()
+    meta = ScanMetadata(
+        scan_id="x", subject_id="y", operator="z",
+        started_at_iso="2026-05-22T00:00:00Z", duration_sec=60,
+        left_camera_mask=0xFF, right_camera_mask=0xFF, reduced_mode=False,
+    )
+    pipeline = default_pipeline(
+        metadata=meta, calibration=cal,
+        pedestals=SensorPedestals(left=64.0, right=64.0),
+        raw_save_max_duration_s=None,
+    )
+    raw_tee = next(s for s in pipeline.stages if s.name == "tee:raw")
+    assert raw_tee.max_duration_s is None

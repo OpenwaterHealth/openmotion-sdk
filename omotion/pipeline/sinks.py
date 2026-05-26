@@ -18,17 +18,17 @@ logger = logging.getLogger("omotion.pipeline.sinks")
 
 @dataclass(frozen=True)
 class ScanMetadata:
-    """Per-scan metadata handed to every sink at on_scan_start."""
-    scan_id:               str
-    subject_id:            str
-    operator:              str
-    started_at_iso:        str
-    duration_sec:          int
-    left_camera_mask:      int
-    right_camera_mask:     int
-    reduced_mode:          bool
-    write_raw_csv:         bool
-    raw_csv_duration_sec:  Optional[float]
+    """Per-scan metadata handed to every sink at on_scan_start.
+    Output gating lives elsewhere (raw-save gate is on the pipeline's
+    Tee("raw"); default storage sinks are SDK-injected at start_scan)."""
+    scan_id:           str
+    subject_id:        str
+    operator:          str
+    started_at_iso:    str
+    duration_sec:      int
+    left_camera_mask:  int
+    right_camera_mask: int
+    reduced_mode:      bool
 
 
 @runtime_checkable
@@ -85,6 +85,74 @@ def _corrected_headers_reduced() -> list[str]:
 _NORMAL_HEADERS = _corrected_headers_normal()
 _REDUCED_HEADERS = _corrected_headers_reduced()
 
+
+def _scalar_or_blank(arr, i):
+    """Pull arr[i] as a float, returning "" for missing/None/NaN values.
+
+    Used for raw-CSV optional cells where ``""`` is the schema's missing-value
+    marker.
+    """
+    if arr is None:
+        return ""
+    try:
+        v = float(arr[i])
+    except (TypeError, ValueError):
+        return ""
+    if v != v:  # NaN
+        return ""
+    return v
+
+
+def _scalar_or_default(arr, i, default=0.0):
+    """Pull arr[i] as a float, returning ``default`` for missing/NaN.
+
+    Used for DB columns where NULL would be acceptable but the schema
+    is currently NOT NULL — keep the default to preserve writability.
+    """
+    if arr is None:
+        return default
+    try:
+        v = float(arr[i])
+    except (TypeError, ValueError):
+        return default
+    if v != v:  # NaN
+        return default
+    return v
+
+
+def _batch_frame_type(batch, i: int) -> str:
+    if getattr(batch, "frame_type", None) is None:
+        return ""
+    return str(batch.frame_type[i])
+
+
+def _source_side_indices(batch, i: int, cam_id: int, meta: ScanMetadata):
+    """Yield the active source side(s) for one raw row.
+
+    New live sources set ``side_ids`` per row; when absent, keep the older
+    mask-based fallback for replay/test batches that have not been migrated.
+    """
+    masks = (meta.left_camera_mask, meta.right_camera_mask)
+    names = ("left", "right")
+    side_ids = getattr(batch, "side_ids", None)
+    if side_ids is not None:
+        side_idx = int(side_ids[i])
+        if side_idx not in (0, 1):
+            logger.warning(
+                "raw frame skipped with invalid side_id=%s cam_id=%d frame_id=%s",
+                side_idx, cam_id, int(batch.frame_ids[i]),
+            )
+            return
+        mask = masks[side_idx]
+        if mask and (mask & (1 << cam_id)):
+            yield side_idx, names[side_idx], mask
+        return
+
+    for side_idx, side_name in enumerate(names):
+        mask = masks[side_idx]
+        if mask and (mask & (1 << cam_id)):
+            yield side_idx, side_name, mask
+
 # Maps (metric, side_char, cam_1indexed) -> column index in _NORMAL_HEADERS
 _NORMAL_COL_IDX: dict[tuple[str, str, int], int] = {
     (metric, side, cam): _NORMAL_HEADERS.index(f"{metric}_{side}{cam}")
@@ -101,8 +169,14 @@ class CsvSink:
         "raw"   — per-frame raw histograms (gated by meta.write_raw_csv)
         "final" — per-interval corrected output
 
-    Raw file naming: ``{scan_id}_{subject_id}_{side}_mask{XX}_raw.csv``
-    Corrected file naming: ``{scan_id}_corrected.csv``
+    Raw file naming:       ``{scan_id}_{subject_id}_{side}_mask{XX}_raw.csv``
+    Corrected file naming: ``{scan_id}_{subject_id}.csv``
+
+    The corrected stream is the default output — naming it ``_corrected``
+    doesn't add information, and the ``_raw`` suffix on histogram CSVs
+    already disambiguates them. See issue #44 / commit 71bee4c for the
+    rationale; the pipeline cutover's first pass regressed this back to
+    ``_corrected.csv`` until it was restored.
 
     Normal mode corrected CSV: 82-column wide format matching legacy SciencePipeline
     output (frame_id, timestamp_s, bfi_l1..bfi_r8, bvi_l1..bvi_r8,
@@ -189,7 +263,7 @@ class CsvSink:
     def _consume_raw(self, batch) -> None:
         """Write raw histogram rows for each frame in the batch."""
         meta = self._meta
-        if meta is None or not meta.write_raw_csv:
+        if meta is None:
             return
 
         import numpy as np
@@ -201,33 +275,27 @@ class CsvSink:
             frame_id = int(batch.frame_ids[i])
             ts = float(batch.timestamp_s[i])
 
-            # Duration cap: skip this frame if it's past the limit
-            if meta.raw_csv_duration_sec is not None and ts > meta.raw_csv_duration_sec:
+            frame_type = _batch_frame_type(batch, i)
+            if frame_type == "stale":
+                logger.warning(
+                    "stale raw frame skipped cam_id=%d frame_id=%d abs_frame_id=%s",
+                    cam_id, frame_id,
+                    "" if batch.abs_frame_ids is None else int(batch.abs_frame_ids[i]),
+                )
                 continue
 
-            frame_type = ""
-            if batch.frame_type is not None:
-                frame_type = str(batch.frame_type[i])
+            pdc_val = _scalar_or_blank(batch.pdc, i)
+            tcm_val = _scalar_or_blank(batch.tcm, i)
+            tcl_val = _scalar_or_blank(batch.tcl, i)
 
-            temp = float(batch.temperature_c[i, 0, cam_id]) if batch.temperature_c is not None else ""
-            pdc_val = float(batch.pdc[i]) if batch.pdc is not None else ""
-            tcm_val = float(batch.tcm[i]) if batch.tcm is not None else ""
-            tcl_val = float(batch.tcl[i]) if batch.tcl is not None else ""
-
-            # Determine side from cam_id: left=side 0, right=side 1
-            # The batch has shape (N, 2, 8, 1024) for raw_histograms.
-            # We write one row per frame/cam using side=0 if left_camera_mask
-            # has this cam bit set, side=1 for right_camera_mask.
-            for side_idx, (side_name, mask) in enumerate(
-                [("left", meta.left_camera_mask), ("right", meta.right_camera_mask)]
-            ):
-                if mask == 0:
-                    continue
-                if not (mask & (1 << cam_id)):
-                    continue
+            for side_idx, side_name, mask in _source_side_indices(batch, i, cam_id, meta):
                 w = self._get_or_open_raw_writer(side_name, mask)
                 if w is None:
                     continue
+                temp = (
+                    float(batch.temperature_c[i, side_idx, cam_id])
+                    if batch.temperature_c is not None else ""
+                )
                 histo = batch.raw_histograms[i, side_idx, cam_id, :]
                 histo_list = histo.tolist()
                 histo_sum = int(np.sum(histo))
@@ -359,7 +427,18 @@ class CsvSink:
             return None
         try:
             os.makedirs(self._output_dir, exist_ok=True)
-            filename = f"{meta.scan_id}_corrected.csv"
+            # Post-#44 naming: the canonical corrected CSV is just
+            # {scan_id}_{subject_id}.csv — no _corrected suffix. The
+            # _raw suffix on histogram CSVs disambiguates them. When
+            # subject_id is empty (e.g. some calibration paths), we
+            # fall back to {scan_id}.csv so the file still has a stable
+            # name.
+            stem = (
+                f"{meta.scan_id}_{meta.subject_id}"
+                if meta.subject_id
+                else meta.scan_id
+            )
+            filename = f"{stem}.csv"
             path = os.path.join(self._output_dir, filename)
             fh = open(path, "w", newline="", encoding="utf-8")
             w = csv.writer(fh)
@@ -496,7 +575,7 @@ class ScanDBSink:
 
     def _consume_raw(self, batch) -> None:
         meta = self._meta
-        if meta is None or not meta.write_raw_csv:
+        if meta is None:
             return
         if self._db is None or self._session_id is None:
             return
@@ -511,15 +590,23 @@ class ScanDBSink:
             cam_id = int(batch.cam_ids[i])
             frame_id = int(batch.frame_ids[i])
             ts = float(batch.timestamp_s[i])
-            temp = float(batch.temperature_c[i, 0, cam_id]) if batch.temperature_c is not None else None
-            pdc_val = float(batch.pdc[i]) if batch.pdc is not None else 0.0
-            tcm_val = float(batch.tcm[i]) if batch.tcm is not None else 0.0
-            tcl_val = float(batch.tcl[i]) if batch.tcl is not None else 0.0
+            frame_type = _batch_frame_type(batch, i)
+            if frame_type == "stale":
+                logger.warning(
+                    "stale raw frame skipped cam_id=%d frame_id=%d abs_frame_id=%s",
+                    cam_id, frame_id,
+                    "" if batch.abs_frame_ids is None else int(batch.abs_frame_ids[i]),
+                )
+                continue
+            pdc_val = _scalar_or_default(batch.pdc, i, 0.0)
+            tcm_val = _scalar_or_default(batch.tcm, i, 0.0)
+            tcl_val = _scalar_or_default(batch.tcl, i, 0.0)
 
-            for side_idx, side_name in enumerate(("left", "right")):
-                mask = meta.left_camera_mask if side_idx == 0 else meta.right_camera_mask
-                if mask == 0 or not (mask & (1 << cam_id)):
-                    continue
+            for side_idx, side_name, _mask in _source_side_indices(batch, i, cam_id, meta):
+                temp = (
+                    float(batch.temperature_c[i, side_idx, cam_id])
+                    if batch.temperature_c is not None else None
+                )
                 histo = batch.raw_histograms[i, side_idx, cam_id, :]
                 hist_bytes = _pack.pack(*histo.tolist())
                 histo_sum = int(np.sum(histo))
@@ -550,7 +637,6 @@ class ScanDBSink:
             logger.exception("ScanDBSink: failed to flush %d raw frames", len(self._raw_buffer))
         finally:
             self._raw_buffer.clear()
-
 
 class QtUiSink:
     """Forwards live-channel batches as Qt signals for the app's plot widget.

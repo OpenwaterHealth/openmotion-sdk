@@ -67,8 +67,6 @@ def _make_meta(scan_id: str = "golden_normal") -> ScanMetadata:
         left_camera_mask=0x01,
         right_camera_mask=0,
         reduced_mode=False,
-        write_raw_csv=False,
-        raw_csv_duration_sec=None,
     )
 
 
@@ -89,7 +87,7 @@ def _run_replay(raw_csv_path: pathlib.Path, output_dir: pathlib.Path,
     sink = CsvSink(output_dir=str(output_dir))
     ScanRunner(source=source, pipeline=pipeline, sinks=[sink]).run()
 
-    corrected_files = list(output_dir.glob("*corrected*.csv"))
+    corrected_files = [p for p in output_dir.glob("*.csv") if not p.name.endswith("_raw.csv")]
     if not corrected_files:
         pytest.fail(
             "No corrected CSV produced — CsvSink.consume('final') is still a no-op "

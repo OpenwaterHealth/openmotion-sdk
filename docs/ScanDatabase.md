@@ -66,9 +66,9 @@ CREATE TABLE sessions (
 
 #### Session metadata
 
-`session_meta` is a JSON blob populated at scan start by
-`MotionInterface._wrap_kwargs_with_db_sink._build_meta()`. Stored as text and
-re-parsed on read.
+`session_meta` is a JSON blob populated at scan start by the pipeline's
+`ScanDBSink.on_scan_start()` (see `omotion/pipeline/sinks.py`). Stored as
+text and re-parsed on read.
 
 ```json
 {
@@ -195,15 +195,20 @@ CREATE TABLE database_settings (
 
 ## Lifecycle
 
+> **NOTE:** The lifecycle diagram below describes the legacy callback-based
+> sink architecture. The pipeline cutover replaced it with channel-subscribed
+> sinks; see `docs/SciencePipeline.md` §8 (Sinks) for the current
+> architecture. The DB schema + semantics described elsewhere in this doc
+> are unchanged.
+
 ```
 MotionInterface.start_scan(request)
         │
-        │  if self._db_path is not None:
-        │     kwargs = self._wrap_kwargs_with_db_sink(request, kwargs)
+        │  ScanWorkflow auto-injects ScanDBSink based on
+        │  MotionInterface(scan_db_path=...) ctor kwarg
         │
         ▼
-ScanWorkflow.start_scan(request, on_scan_start_fn=..., on_raw_frame_fn=...,
-                                  on_corrected_batch_fn=..., on_complete_fn=...)
+ScanWorkflow.start_scan(request)
         │
         ▼  _worker thread spawned
 ScanWorkflow._worker
