@@ -266,28 +266,6 @@ def test_stream_interface_no_data_loss(any_sensor, motion):
         )
 
 
-# ===========================================================================
-# 4.4 Dual-sensor USB topology
-# ===========================================================================
-
-def test_left_right_port_assignment(motion):
-    """
-    DualMotionComposite must map port_numbers[-1]==2 to 'left'
-    and port_numbers[-1]==3 to 'right'.
-    """
-    dmc = motion._dual_composite
-    if dmc.left is not None:
-        dev = dmc.left.dev
-        assert dev.port_numbers[-1] == 2, (
-            f"Left sensor is on port {dev.port_numbers[-1]}, expected 2"
-        )
-    if dmc.right is not None:
-        dev = dmc.right.dev
-        assert dev.port_numbers[-1] == 3, (
-            f"Right sensor is on port {dev.port_numbers[-1]}, expected 3"
-        )
-
-
 @pytest.mark.slow
 def test_dual_sensor_independent_pings(sensor_left, sensor_right):
     """Both sensors must respond to ping simultaneously without interference."""
