@@ -252,7 +252,7 @@ Per-side pedestal subtraction with a clamp at zero:
 display_mean = max(0, mean_raw − pedestal)        # per-side broadcast (1, 2, 1)
 ```
 
-`display_mean` is what the live UI plots as "intensity" and what `ContactQualityWorkflow` thresholds against (§11). The dark-correction path uses `mean_raw` (un-pedestal-subtracted) directly, because the pedestal cancels exactly when you subtract one dark mean from one light mean — both terms carry the same pedestal.
+`display_mean` is the right quantity for measuring **ambient light on a dark frame** — its baseline is the zero-light pedestal, so any non-zero value is stray light leaking onto the sensor. `ContactQualityWorkflow` reads it that way for its AMBIENT_LIGHT threshold on dark frames (§11.2). For light frames, the right "intensity" quantity is `mean_dc_rt` (mean above the just-measured dark baseline, not above pedestal) — the live UI emits it, and `_ContactQualitySink` reads it for the POOR_CONTACT threshold. The dark-correction path uses `mean_raw` (un-pedestal-subtracted) directly, because the pedestal cancels exactly when you subtract one dark mean from one light mean — both terms carry the same pedestal.
 
 ### 5.7 DarkCorrectionStage
 
@@ -462,7 +462,7 @@ Enabled cameras are derived from `metadata.left_camera_mask` / `right_camera_mas
 
 ### 5.11 Tee("live")
 
-Emits the FrameBatch on the `"live"` channel after filtering out warmup and stale frames. This is the per-frame live stream consumed by `QtUiSink` (live plot), `ContactQualityWorkflow` (display-mean thresholding), and `CalibrationWorkflow` (dark-frame collection).
+Emits the FrameBatch on the `"live"` channel after filtering out warmup and stale frames. This is the per-frame live stream consumed by `QtUiSink` (live plot), `ContactQualityWorkflow` (DN-scale ambient-light + poor-contact thresholding — see §11.2), and `CalibrationWorkflow` (dark-frame collection).
 
 ### 5.12 RollingAverageStage
 
@@ -490,7 +490,7 @@ Sinks subscribe to channels by declaring a `channels: set[str]` attribute. The r
 | Channel | Payload | Cadence | Source | Typical consumers |
 |---|---|---|---|---|
 | `"raw"` | `FrameBatch` (full, including warmup) | Per batch (~10–100 frames) | `Tee("raw")` | `CsvSink` (raw per-cam CSV), `ScanDBSink` (`session_raw` blobs) |
-| `"live"` | `FrameBatch` (excluding warmup/stale) | Per batch | `Tee("live")` | `QtUiSink`, `ContactQualityWorkflow._ContactQualitySink`, `CalibrationWorkflow._CalibrationCollectorSink` (dark frames) |
+| `"live"` | `FrameBatch` (excluding warmup/stale) | Per batch | `Tee("live")` | `QtUiSink` (live plot — overwritten by `"final"` corrections), `ContactQualityWorkflow._ContactQualitySink` (DN thresholding), `CalibrationWorkflow._CalibrationCollectorSink` (dark frames) |
 | `"rolling"` | `FrameBatch` with `bfi_rolling`/`bvi_rolling` populated | Per batch | `Tee("rolling")` | Smoothed-trace UI, test harnesses |
 | `"final"` | `EnrichedCorrectedInterval` | Per closed dark interval (~1 per `dark_interval/40` seconds; default ~15 s) | `IntervalClosed` from `DarkCorrectionStage` | `CsvSink` (corrected CSV), `ScanDBSink` (`session_data`), `CalibrationWorkflow` (corrected light samples) |
 | `"telemetry"` | `TelemetryEvent` | ~10 Hz (independent of frame cadence) | `ConsoleTelemetrySource` (separate runner thread) | `TelemetrySink` (CSV) plus the pipeline's `TelemetryAggregator` |
@@ -614,9 +614,11 @@ See [`ScanDatabase.md`](ScanDatabase.md) for the full schema and [`PipelineCompa
 
 ### 8.3 QtUiSink
 
-**Channels:** `{"live"}`.
+**Channels:** `{"live", "final"}` (in the bloodflow-app split into `_LivePlotSink` + `_FinalBatchSink`).
 
 Forwards per-frame batches to the application's plot widget via PyQt6 signals (in `motion_connector.py`). The stub in `sinks.py` records calls into a list for test assertions.
+
+The plot widget uses a **two-pass refinement pattern** for BFI, BVI, mean, and contrast: the `"live"` channel emits realtime values per frame (using `bfi_live` / `bvi_live` / `mean_dc_rt` / `contrast_sn_rt`, which use the realtime predictor's dark baseline), and the `"final"` channel emits the more-accurate values per closed dark interval (from `EnrichedCorrectedFrame.bfi` / `.bvi` / `.mean` / `.contrast`, which use the linearly-interpolated baseline between bounding darks). The QML side matches by `frame_id` and overwrites the previously-plotted realtime point in place, so each plotted sample silently "settles" to the more accurate value as the trailing interval closes (~every 15 s at the default `dark_interval`).
 
 ### 8.4 TelemetrySink
 
@@ -695,14 +697,14 @@ Two SDK-internal consumers illustrate the pattern.
 
 After the scan, the workflow drains the sink's `corrected_samples` and `dark_samples` and applies the existing frame-id windowing on the lights (skip-leading + `frame_window_count` cap), then either uploads the resulting calibration to the console EEPROM or returns it for inspection.
 
-### 11.2 ContactQualityWorkflow — display-mean thresholding
+### 11.2 ContactQualityWorkflow — DN-scale thresholding
 
-`omotion/ContactQualityWorkflow.py` defines `_ContactQualitySink` with `channels = {"live"}`. For each FrameBatch:
+`omotion/ContactQualityWorkflow.py` defines `_ContactQualitySink` with `channels = {"live"}`. For each FrameBatch, it reads **two different DN-scale signals depending on frame type**:
 
-- For `frame_type == "dark"` rows, tracks the per-camera maximum `display_mean` (ambient-light gate).
-- For all other non-warmup/non-stale rows, maintains a per-camera rolling deque of `display_mean` (default 10 samples) and a running sum/count.
+- For `frame_type == "dark"` rows, tracks the per-camera maximum `display_mean` (= `max(0, mean_raw − pedestal)`). Baseline is the zero-light pedestal; this measures ambient light leaking onto the sensor — the right quantity for the **AMBIENT_LIGHT** gate.
+- For all other non-warmup/non-stale rows (light frames), maintains a per-camera rolling deque (default 10 samples) of `mean_dc_rt` (= `mean_raw − predicted_dark_baseline`). Baseline is the just-measured dark, not the pedestal; this measures actual laser-driven signal strength — the right quantity for the **POOR_CONTACT** gate. Early light frames before the first dark observation have `mean_dc_rt = NaN` (predictor returned `None`) and are skipped; the window fills up once the first dark lands.
 
-After the scan, `result()` evaluates per camera: `no_signal` if no light samples, `ambient_light` if the dark maximum exceeds the per-cam dark threshold, `poor_contact` if the rolling light average falls below the per-cam light threshold, else `ok`. The verdict is rolled up into `ContactQualityResult.passed`.
+After the scan, `result()` evaluates per camera: `no_signal` if no light samples were collected, `ambient_light` if the dark-frame max exceeds the per-cam dark threshold, `poor_contact` if the rolling light average falls below the per-cam light threshold, else `ok`. The verdict is rolled up into `ContactQualityResult.passed`.
 
 Both consumers are pure sinks — they add no pipeline stages, do not modify FrameBatch fields, and can be turned off by simply not constructing them.
 

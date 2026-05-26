@@ -56,9 +56,17 @@ class _ContactQualitySink:
     """Internal: collects per-camera light/dark DN values during a short scan
     and evaluates them against background-subtracted DN thresholds.
 
-    Subscribes to the "live" pipeline channel so it sees every frame's
-    ``display_mean`` (= ``max(0, mean_raw - pedestal)`` from the
-    PedestalSubtraction stage), bucketed by frame_type.
+    Subscribes to the "live" pipeline channel and reads two different
+    signals depending on frame type:
+
+      * Dark frames → ``display_mean`` (= ``max(0, mean_raw - pedestal)``
+        from PedestalSubtractionStage). Measures ambient light leaking onto
+        the sensor; AMBIENT_LIGHT threshold gates on this.
+
+      * Light frames → ``mean_dc_rt`` (= ``mean_raw - predicted_dark_baseline``
+        from DarkCorrectionStage). Measures the actual laser-driven signal
+        above the just-measured dark, not signal + dark; POOR_CONTACT
+        threshold gates on this.
     """
 
     channels: set = frozenset({"live"})
@@ -96,10 +104,21 @@ class _ContactQualitySink:
     def consume(self, channel: str, batch) -> None:
         if channel != "live":
             return
-        # Use display_mean (DN, pedestal-subtracted) from PedestalSubtractionStage.
-        # This matches legacy ContactQuality semantics: threshold compared
-        # against (raw_mean - pedestal) in DN.
-        if batch.display_mean is None:
+        # Two different DN-scale signals — both pedestal-aware, but different
+        # baselines:
+        #   * Dark frames: use display_mean = max(0, mean_raw - pedestal).
+        #     For a laser-off frame this measures ambient light leaking onto
+        #     the sensor relative to the zero-light pedestal — exactly what
+        #     the AMBIENT_LIGHT threshold gates on.
+        #   * Light frames: use mean_dc_rt = mean_raw - predicted_dark_baseline
+        #     from DarkCorrectionStage. This is the actual laser-driven signal
+        #     above the just-measured dark frame, not signal + dark. The
+        #     POOR_CONTACT threshold should compare against signal strength,
+        #     not signal + dark.
+        # display_mean is set by PedestalSubtractionStage; mean_dc_rt is set
+        # by DarkCorrectionStage. Both arrays have shape (N, 2, 8) when
+        # present.
+        if batch.display_mean is None or getattr(batch, "mean_dc_rt", None) is None:
             return
         n = batch.display_mean.shape[0]
         for i in range(n):
@@ -110,20 +129,28 @@ class _ContactQualitySink:
                     continue
             for side_idx, side in enumerate(("left", "right")):
                 for cam_id in range(8):
-                    v = float(batch.display_mean[i, side_idx, cam_id])
-                    if not math.isfinite(v):
-                        continue
                     std_v = float("nan")
                     if getattr(batch, "std_raw", None) is not None:
                         std_v = float(batch.std_raw[i, side_idx, cam_id])
                     key = (side, cam_id)
                     if ft == "dark":
+                        v = float(batch.display_mean[i, side_idx, cam_id])
+                        if not math.isfinite(v):
+                            continue
                         prev = self._dark_max.get(key, float("-inf"))
                         if v > prev:
                             self._dark_max[key] = v
                             self._dark_std[key] = std_v
                     else:
                         # Light or unclassified — treat as light for CQ purposes.
+                        # mean_dc_rt is NaN for early light frames before any
+                        # dark has been observed (predictor returns None →
+                        # baseline_rt/mean_dc_rt stay at their NaN init).
+                        # Skip those frames; the rolling window will fill up
+                        # once the first dark lands.
+                        v = float(batch.mean_dc_rt[i, side_idx, cam_id])
+                        if not math.isfinite(v):
+                            continue
                         w = self._light_window.get(key)
                         if w is None:
                             w = collections.deque(maxlen=self._window_size)

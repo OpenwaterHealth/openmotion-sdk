@@ -25,8 +25,15 @@ from omotion.ContactQualityWorkflow import (
 
 @dataclass
 class _FakeFrameBatch:
-    """Minimal FrameBatch stub for sink unit tests (display_mean only)."""
-    display_mean: np.ndarray            # shape (n_frames, 2, 8) — DN, pedestal-subtracted
+    """Minimal FrameBatch stub for sink unit tests.
+
+    The CQ sink reads ``display_mean`` for dark frames and ``mean_dc_rt``
+    for light frames; the fixture seeds both with the same DN value so a
+    single ``dn_value`` argument exercises whichever branch the test cares
+    about.
+    """
+    display_mean: np.ndarray            # shape (n_frames, 2, 8) — used for dark frames
+    mean_dc_rt:   np.ndarray            # shape (n_frames, 2, 8) — used for light frames
     std_raw:      Optional[np.ndarray] = None
     frame_type:   Optional[np.ndarray] = None
 
@@ -36,11 +43,17 @@ def _dn_batch(
     dn_value: float,
     frame_types=None,
 ) -> _FakeFrameBatch:
-    """Return a FrameBatch-like stub with uniform DN across all cams."""
+    """Return a FrameBatch-like stub with uniform DN across all cams.
+
+    Both display_mean and mean_dc_rt get the same value so the test stays
+    valid regardless of which the sink reads for a given frame_type.
+    """
     if frame_types is None:
         frame_types = ["light"] * n_frames
+    arr = np.full((n_frames, 2, 8), dn_value, dtype=np.float32)
     return _FakeFrameBatch(
-        display_mean=np.full((n_frames, 2, 8), dn_value, dtype=np.float32),
+        display_mean=arr,
+        mean_dc_rt=arr.copy(),
         std_raw=np.full((n_frames, 2, 8), 2.5, dtype=np.float32),
         frame_type=np.array(frame_types, dtype="<U8"),
     )
@@ -89,6 +102,7 @@ def test_cq_sink_records_light_std_without_thresholding_it():
     sink.on_scan_start(None)
     batch = _FakeFrameBatch(
         display_mean=np.full((2, 2, 8), 20.0, dtype=np.float32),
+        mean_dc_rt=np.full((2, 2, 8), 20.0, dtype=np.float32),
         std_raw=np.full((2, 2, 8), 500.0, dtype=np.float32),
         frame_type=np.array(["light", "light"], dtype="<U8"),
     )
@@ -187,6 +201,7 @@ def test_cq_sink_overall_passed_requires_all_cams():
     arr[0, 0, 1] = 5.0   # left cam 1 below light threshold
     batch = _FakeFrameBatch(
         display_mean=arr,
+        mean_dc_rt=arr.copy(),
         frame_type=np.array(["light"], dtype="<U8"),
     )
     sink.consume("live", batch)
