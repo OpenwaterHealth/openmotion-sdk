@@ -30,12 +30,21 @@ class SideAveragingStage:
         bfi_side = np.zeros((n, 2), dtype=np.float32)
         bvi_side = np.zeros((n, 2), dtype=np.float32)
 
-        if len(self._left_cams) > 0:
-            bfi_side[:, 0] = batch.bfi_live[:, 0, self._left_cams].mean(axis=1)
-            bvi_side[:, 0] = batch.bvi_live[:, 0, self._left_cams].mean(axis=1)
-        if len(self._right_cams) > 0:
-            bfi_side[:, 1] = batch.bfi_live[:, 1, self._right_cams].mean(axis=1)
-            bvi_side[:, 1] = batch.bvi_live[:, 1, self._right_cams].mean(axis=1)
+        # nanmean (not mean) so one bad camera frame doesn't poison the
+        # whole side average. The realtime BFI/BVI stage emits NaN for
+        # early frames before the first dark observation closes; with
+        # plain mean, the side average is NaN until every active cam
+        # has a finite value at the same frame index, which can take
+        # several seconds and leaves the reduced-mode display empty.
+        # Suppress the "Mean of empty slice" RuntimeWarning that fires
+        # when an entire row is NaN — those rows correctly emit NaN.
+        with np.errstate(invalid="ignore"):
+            if len(self._left_cams) > 0:
+                bfi_side[:, 0] = np.nanmean(batch.bfi_live[:, 0, self._left_cams], axis=1)
+                bvi_side[:, 0] = np.nanmean(batch.bvi_live[:, 0, self._left_cams], axis=1)
+            if len(self._right_cams) > 0:
+                bfi_side[:, 1] = np.nanmean(batch.bfi_live[:, 1, self._right_cams], axis=1)
+                bvi_side[:, 1] = np.nanmean(batch.bvi_live[:, 1, self._right_cams], axis=1)
 
         batch.bfi_live_side = bfi_side
         batch.bvi_live_side = bvi_side
