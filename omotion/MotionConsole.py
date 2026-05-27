@@ -361,11 +361,18 @@ class MotionConsole(SignalWrapper):
             logger.error("Unexpected error during %s: %s", method_name, e)
 
     def _drive_disconnecting(self, reason: str) -> None:
-        self._set_state(ConnectionState.DISCONNECTING, reason=reason)
+        # Stop the telemetry poller FIRST while the console still looks
+        # connected, so its poll thread joins cleanly. If we flipped
+        # state to DISCONNECTING first, any in-flight poll tick would
+        # hit `is_connected() == False`, raise ValueError("Console
+        # controller not connected"), and the 40 ValueError-log+reraise
+        # blocks in MotionConsole would surface that as ERROR before
+        # _read_all could demote it to INFO.
         try:
             self.telemetry.stop()
         except Exception:
             logger.exception("telemetry stop failed")
+        self._set_state(ConnectionState.DISCONNECTING, reason=reason)
         try:
             self.uart.close()
         except Exception:
