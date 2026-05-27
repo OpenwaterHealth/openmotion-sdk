@@ -379,8 +379,8 @@ class MotionConsole(SignalWrapper):
 
     def ping(self) -> bool:
         """
-        Send a ping command to the MOTIONConsole and receive a response.
-        Returns the response from the MOTIONConsole.
+        Send a ping command to the MotionConsole and receive a response.
+        Returns the response from the MotionConsole.
         """
         try:
             if self.uart.demo_mode:

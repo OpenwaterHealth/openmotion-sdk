@@ -29,7 +29,7 @@ Three-tier API: facade → device wrapper → transport.
 
 | Layer | Module | Lines | What lives here |
 |---|---|---:|---|
-| Facade | `omotion/MotionInterface.py` | 616 | `MOTIONInterface` — discover, connect, run scans. **Start here.** |
+| Facade | `omotion/MotionInterface.py` | 616 | `MotionInterface` — discover, connect, run scans. **Start here.** |
 | Device | `omotion/MotionConsole.py` | **2815** | UART-side device. Trigger, TEC, fan, FPGA programming, telemetry. Biggest file in the repo. |
 | Device | `omotion/MotionSensor.py` | 1316 | USB-side device. Cameras, histograms, IMU, DFU. |
 | Transport | `omotion/MotionUart.py` | 252 | UART framing, CRC-16. |
@@ -48,17 +48,17 @@ Three-tier API: facade → device wrapper → transport.
 **Call graph for the common case:**
 
 ```
-MOTIONInterface.start()
+MotionInterface.start()
  ├── ConnectionMonitor (daemon thread — hotplug)
  ├── motion.console      = MotionConsole(MotionUart(pyserial))
  └── motion.left/right   = MotionComposite(CommInterface(pyusb), StreamInterface(pyusb))
 ```
 
-Signals are `pyqtSignal` when PyQt is importable, otherwise a fallback `MOTIONSignal` — same API both ways, so headless scripts work identically to the apps.
+Signals are `pyqtSignal` when PyQt is importable, otherwise a fallback `MotionSignal` — same API both ways, so headless scripts work identically to the apps.
 
 ## Working without hardware
 
-- `MOTIONInterface(demo_mode=True)` **or** `OPENMOTION_DEMO=1` — skips device discovery, generates fake data. The first thing to reach for if a script is hanging on enumeration.
+- `MotionInterface(demo_mode=True)` **or** `OPENMOTION_DEMO=1` — skips device discovery, generates fake data. The first thing to reach for if a script is hanging on enumeration.
 - Pure-software tests that run anywhere: `test_pipeline_csv.py`, `test_rolling_average.py`, `test_frame_id_unwrapper.py`, `test_calibration_workflow_compute.py`, `test_realtime_dark_estimator.py`.
 - Pure-software scripts: `scripts/test_jed_parser.py`, `scripts/test_github_release.py`, `scripts/run_pipeline_csv_tests.py`, `scripts/plot_telemetry.py`, `scripts/view_corrected_scan.py`.
 

@@ -147,8 +147,8 @@ class ConsoleTelemetryPoller:
 
     Lifecycle
     ---------
-    start()  – called by MOTIONInterface when the console USB connects
-    stop()   – called by MOTIONInterface when the console USB disconnects
+    start()  – called by MotionInterface when the console USB connects
+    stop()   – called by MotionInterface when the console USB disconnects
                (also called automatically on object deletion)
 
     Thread safety
