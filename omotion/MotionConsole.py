@@ -48,8 +48,11 @@ from omotion.config import (
     OW_CTRL_GET_FSYNC,
     OW_CTRL_GET_IND,
     OW_CTRL_GET_LSYNC,
+    OW_CTRL_GET_LASER_ODO,
     OW_CTRL_GET_PDC_BUFFER,
+    OW_CTRL_GET_SYSTEM_ODO,
     OW_CTRL_GET_TEMPS,
+    OW_CTRL_RESET_ODO,
     OW_CTRL_GET_TRIG,
     OW_CTRL_I2C_RD,
     OW_CTRL_I2C_SCAN,
@@ -1301,6 +1304,91 @@ class MotionConsole(SignalWrapper):
 
         except Exception as e:
             self._log_command_error("get_lsync_pulsecount", e)
+
+    def get_system_odometer_minutes(self) -> Optional[int]:
+        """Cumulative console uptime in minutes, persisted in flash.
+
+        Returns the firmware-tracked total, advancing smoothly between the
+        ~6 h flash-persist intervals (in-memory increment + last persisted
+        value).
+
+        Returns None when the firmware NAKs (build predates the odometer
+        feature) or when the response is malformed — callers should treat
+        the metric as best-effort and not abort on absence.
+
+        Raises:
+            ValueError: If the UART is not connected.
+        """
+        return self._read_odo_uint32("get_system_odometer_minutes", OW_CTRL_GET_SYSTEM_ODO)
+
+    def get_laser_odometer_pulses(self) -> Optional[int]:
+        """Cumulative LSYNC pulse count across every scan this console has
+        run, persisted in flash on scan-finish.
+
+        Returns None when the firmware NAKs the opcode (pre-odometer build)
+        or returns malformed data. See :meth:`get_system_odometer_minutes`.
+        """
+        return self._read_odo_uint32("get_laser_odometer_pulses", OW_CTRL_GET_LASER_ODO)
+
+    def _read_odo_uint32(self, name: str, opcode: int) -> Optional[int]:
+        """Shared body for the two odometer getters: send opcode, expect 4-byte
+        little-endian uint32 back. NAK / unexpected length → None so callers
+        running against older firmware don't blow up."""
+        try:
+            if self.uart.demo_mode:
+                return 0
+            if not self.is_connected():
+                raise ValueError("Console controller not connected")
+            r = self.uart.send_packet(
+                id=None, packetType=OW_CONTROLLER, command=opcode, data=None
+            )
+            self.uart.clear_buffer()
+            if r.packet_type == OW_ERROR:
+                logger.info(
+                    "%s: console NAK'd opcode 0x%02X — firmware likely predates "
+                    "the odometer feature", name, opcode,
+                )
+                return None
+            if r.data_len != 4:
+                logger.warning(
+                    "%s: expected 4 bytes, got %d — odometer reading skipped",
+                    name, r.data_len,
+                )
+                return None
+            return int(struct.unpack("<I", r.data)[0])
+        except ValueError:
+            raise
+        except Exception as e:
+            self._log_command_error(name, e)
+            return None
+
+    def reset_odometer(self, target: int = 2) -> bool:
+        """Reset one or both odometers and persist the cleared state.
+
+        ``target``: 0 = system uptime, 1 = laser pulses, 2 = both (default).
+        Returns True on success, False on NAK / error. No-op in demo mode.
+        """
+        try:
+            if self.uart.demo_mode:
+                return True
+            if not self.is_connected():
+                raise ValueError("Console controller not connected")
+            if target not in (0, 1, 2):
+                raise ValueError(f"odometer reset target must be 0/1/2, got {target}")
+            r = self.uart.send_packet(
+                id=None, packetType=OW_CONTROLLER, command=OW_CTRL_RESET_ODO,
+                data=bytes([target]),
+            )
+            self.uart.clear_buffer()
+            if r.packet_type == OW_ERROR:
+                logger.error("reset_odometer(target=%d): console returned error", target)
+                return False
+            return True
+        except ValueError:
+            raise
+        except Exception as e:
+            self._log_command_error("reset_odometer", e)
+            return False
 
     def read_gpio_value(self) -> int:
         """
@@ -2801,13 +2889,44 @@ class MotionConsole(SignalWrapper):
             raise
 
     def log_device_info(self) -> None:
-        """Log console firmware version and hardware ID to the SDK logger."""
+        """Log console firmware version, hardware ID, and odometer readings.
+
+        Called once per console-connect via
+        :meth:`omotion.MotionInterface.log_console_info`. The odometer reads
+        return ``None`` on firmware builds that predate the feature; in that
+        case the log line just omits the values (no warning — the absence is
+        expected on older units until they're re-flashed).
+        """
         try:
             fw_version = self.get_version()
             hw_id      = self.get_hardware_id()
             logger.info("Console: firmware=%s  hw_id=%s", fw_version, hw_id)
         except Exception as e:
             logger.warning("Console: failed to read device info: %s", e)
+            return
+
+        try:
+            system_min = self.get_system_odometer_minutes()
+            laser_pulses = self.get_laser_odometer_pulses()
+        except Exception as e:
+            logger.warning("Console: failed to read odometer: %s", e)
+            return
+
+        if system_min is None and laser_pulses is None:
+            # Both NAK'd → this firmware doesn't have the odometer feature.
+            # log_console_info logs the firmware version above, so the user
+            # can already see what's running; no need to spam a warning.
+            return
+        # Format: hours.minutes (h:mm) since most useful unit is hours, but
+        # keep the raw minutes in the log for downstream tooling.
+        hours = (system_min or 0) // 60
+        mins = (system_min or 0) % 60
+        logger.info(
+            "Console odometer: system=%s min (%dh %02dm)  laser=%s pulses",
+            "?" if system_min is None else system_min,
+            hours, mins,
+            "?" if laser_pulses is None else f"{laser_pulses:,}",
+        )
 
 # Note: graceful disconnect is now driven by ConnectionMonitor via
 # `request_disconnect()` (which submits an EVT_USER_STOP). The old

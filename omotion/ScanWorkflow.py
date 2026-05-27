@@ -206,6 +206,12 @@ class ScanWorkflow:
         # whether the scan succeeded.
         self._last_scan_error: str | None = None
         self._last_scan_canceled: bool = False
+        # Cancel signal flag. Distinct from _stop_evt (which is also pulsed
+        # by the worker's inner finally to wake the duration guard on a
+        # clean exit). Set ONLY by the user-cancel paths — cancel() and
+        # cancel_scan() — so _last_scan_canceled isn't tripped by normal
+        # scan completion.
+        self._cancel_requested: bool = False
 
     @property
     def running(self) -> bool:
@@ -576,12 +582,17 @@ class ScanWorkflow:
                 with self._lock:
                     self._running = False
                     self._thread = None
-                self._last_scan_canceled = self._stop_evt.is_set()
+                # _stop_evt is also set by the inner finally to wake the
+                # duration guard on a clean exit, so checking it here would
+                # mark every scan as canceled. Use the dedicated flag set
+                # only by the user-cancel paths.
+                self._last_scan_canceled = self._cancel_requested
 
         # Reset per-scan outcome before spawning the worker so callers
         # don't see stale state from a prior run.
         self._last_scan_error = None
         self._last_scan_canceled = False
+        self._cancel_requested = False
 
         self._thread = threading.Thread(
             target=_worker, daemon=True, name="ScanWorkflow-scan"
@@ -636,6 +647,7 @@ class ScanWorkflow:
         Closes the source (stopping the USB reader loops). The worker thread's
         duration guard exits on the next poll and the runner's finally block fires.
         """
+        self._cancel_requested = True
         self._stop_evt.set()
         if self._runner is not None:
             try:
@@ -972,4 +984,7 @@ class ScanWorkflow:
             self._scan_abort_reason = (
                 f"{handle.name} disconnected mid-scan ({reason})"
             )
+            # Treat mid-scan disconnect the same as user-cancel for
+            # downstream "is partial data trustworthy" decisions.
+            self._cancel_requested = True
             self._stop_evt.set()

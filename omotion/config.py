@@ -163,6 +163,14 @@ OW_CTRL_TEC_STATUS = 0x22
 OW_CTRL_BOARDID = 0x23
 OW_CTRL_PDUMON = 0x24
 OW_CTRL_GET_PDC_BUFFER = 0x25
+# Lifetime usage counters persisted to console flash. System counter is minutes
+# of uptime (uint32, ~8000 yr range); laser counter is cumulative LSYNC pulses
+# across all scans (uint32, ~3.4 yr at 40 Hz continuous).
+OW_CTRL_GET_SYSTEM_ODO = 0x26
+OW_CTRL_GET_LASER_ODO = 0x27
+# Payload: 1 byte target (0=system, 1=laser, 2=both). Missing payload defaults
+# to both.
+OW_CTRL_RESET_ODO = 0x28
 OW_CTRL_FAN_CTL = 0x0A
 
 # Page-by-page direct FPGA programming commands (0x30–0x3C)
