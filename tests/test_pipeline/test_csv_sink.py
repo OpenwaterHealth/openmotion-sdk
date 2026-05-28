@@ -162,6 +162,27 @@ def _meta_reduced():
     )
 
 
+def test_corrected_csv_not_written_when_write_corrected_false(tmp_path):
+    """write_corrected=False skips the corrected CSV entirely — the
+    scan DB is the system of record. Raw CSV handling is unaffected."""
+    sink = CsvSink(output_dir=tmp_path, write_corrected=False)
+    sink.on_scan_start(_meta_normal())
+    sink.consume("final", _make_enriched_interval())
+    sink.on_complete()
+    corrected = [p for p in tmp_path.glob("*.csv") if not p.name.endswith("_raw.csv")]
+    assert corrected == []
+
+
+def test_corrected_csv_still_written_when_write_corrected_true(tmp_path):
+    """Default (write_corrected=True) still produces the corrected CSV."""
+    sink = CsvSink(output_dir=tmp_path, write_corrected=True)
+    sink.on_scan_start(_meta_normal())
+    sink.consume("final", _make_enriched_interval())
+    sink.on_complete()
+    corrected = [p for p in tmp_path.glob("*.csv") if not p.name.endswith("_raw.csv")]
+    assert len(corrected) == 1
+
+
 def test_corrected_csv_normal_mode_header_has_82_columns(tmp_path):
     """Normal mode corrected CSV must have exactly 82 columns matching legacy format."""
     sink = CsvSink(output_dir=tmp_path)

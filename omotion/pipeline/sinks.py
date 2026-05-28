@@ -191,8 +191,15 @@ class CsvSink:
 
     channels = {"raw", "final"}
 
-    def __init__(self, output_dir) -> None:
+    def __init__(self, output_dir, write_corrected: bool = True) -> None:
         self._output_dir = str(output_dir)
+        # When False, the corrected CSV ({scan_id}_{subject}.csv) is not
+        # written — the scan DB's session_data is the system of record
+        # for per-cam BFI/BVI instead. Raw histogram CSV handling (the
+        # "raw" channel, separately gated by meta.write_raw_csv) is
+        # unaffected. The SDK runner forces this True when no scan DB is
+        # configured so there's always at least one persisted record.
+        self._write_corrected = bool(write_corrected)
         self._meta: Optional[ScanMetadata] = None
         self._raw_fhs: dict[str, Any] = {}    # side -> file handle
         self._raw_csvs: dict[str, Any] = {}   # side -> csv.writer
@@ -225,20 +232,22 @@ class CsvSink:
     def consume(self, channel: str, payload: Any) -> None:
         if channel == "raw":
             self._consume_raw(payload)
-        elif channel == "final":
+        elif channel == "final" and self._write_corrected:
             self._consume_final(payload)
 
     def on_complete(self) -> None:
         if self._closed:
             return
         self._closed = True
-        # Flush any partial rows (cameras that didn't all contribute)
-        for abs_id in sorted(self._corrected_acc.keys()):
-            entry = self._corrected_acc[abs_id]
-            row = entry["row"]
-            row[0] = abs_id
-            row[1] = round(entry["t"], 9)
-            self._write_corrected_row(row)
+        # Flush any partial rows (cameras that didn't all contribute).
+        # No-op when corrected CSV is disabled — the accumulator is empty.
+        if self._write_corrected:
+            for abs_id in sorted(self._corrected_acc.keys()):
+                entry = self._corrected_acc[abs_id]
+                row = entry["row"]
+                row[0] = abs_id
+                row[1] = round(entry["t"], 9)
+                self._write_corrected_row(row)
         self._corrected_acc.clear()
         for side, fh in list(self._raw_fhs.items()):
             try:

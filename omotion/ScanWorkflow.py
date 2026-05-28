@@ -376,7 +376,19 @@ class ScanWorkflow:
             data_dir = getattr(self._interface, "data_dir", None)
             scan_db_path = getattr(self._interface, "scan_db_path", None)
             if data_dir is not None:
-                default_sinks.append(PipelineCsvSink(output_dir=data_dir))
+                # Corrected CSV: honor request.write_corrected_csv when a
+                # scan DB is configured (DB is the system of record, so
+                # the CSV is opt-in). When NO DB is configured the CSV is
+                # the only persisted record of corrected data — force it
+                # on regardless of the request flag so a scan is never
+                # silently unrecorded.
+                write_corrected = (
+                    True if scan_db_path is None
+                    else bool(request.write_corrected_csv)
+                )
+                default_sinks.append(
+                    PipelineCsvSink(output_dir=data_dir, write_corrected=write_corrected)
+                )
             if scan_db_path is not None:
                 default_sinks.append(ScanDBSink(db_path=scan_db_path))
             # Telemetry CSV: per-scan snapshots from ConsoleTelemetryPoller.
