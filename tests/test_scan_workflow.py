@@ -40,6 +40,7 @@ def test_scan_request_sinks_default_empty_list():
     assert req.sinks == []
     assert req.skip_default_storage is False
     assert req.raw_save_max_duration_s is None
+    assert req.trigger_config is None
 
 
 # ---------------------------------------------------------------------------
@@ -251,3 +252,76 @@ def test_start_scan_passes_raw_save_max_duration_s_to_pipeline():
     raw_tee = next(s for s in motion.scan_workflow._runner.pipeline.stages
                    if s.name == "tee:raw")
     assert raw_tee.max_duration_s == 60.0
+
+
+def _run_scan_capturing_trigger(motion, request):
+    """Drive start_scan through the active-sensor block (which demo mode would
+    otherwise skip) and return the ordered list of ("set", payload) /
+    ("start", None) console calls. Forces one active side and stubs the
+    per-side hardware bring-up so the worker reaches the trigger send."""
+    calls = []
+
+    def _factory(*, console, left, right, batch_size_frames, metadata):
+        return _MockSource(metadata=metadata)
+
+    fake_side = ("left", request.left_camera_mask or 0xFF, mock.MagicMock())
+
+    with mock.patch("omotion.pipeline.sources.LiveUsbSource", _factory), \
+         mock.patch.object(motion.scan_workflow, "_resolve_active_sides",
+                           return_value=[fake_side]), \
+         mock.patch.object(motion.scan_workflow, "_scan_subscribe_state",
+                           lambda handles: None), \
+         mock.patch.object(motion, "run_on_sensors", return_value=True), \
+         mock.patch.object(motion.console, "set_trigger_json",
+                           side_effect=lambda **kw: calls.append(("set", kw.get("data")))), \
+         mock.patch.object(motion.console, "start_trigger",
+                           side_effect=lambda *a, **k: calls.append(("start", None))):
+        assert motion.scan_workflow.start_scan(request)
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and not any(c[0] == "start" for c in calls):
+            time.sleep(0.01)
+        motion.scan_workflow.cancel_scan(join_timeout=5.0)
+    return calls
+
+
+def test_start_scan_sends_trigger_config_before_start_trigger():
+    """start_scan must (re)send the resolved trigger config to reset the
+    firmware fsync/dark schedule BEFORE starting the trigger, so the firmware's
+    laser-skip (dark) frames align with the pipeline's dark-frame classification.
+    Asserts both the ordering and that the sent payload is the resolved default."""
+    motion = _build_motion_with_data_dir(None)
+    expected_cfg = motion.resolve_trigger_config(None)
+    request = ScanRequest(
+        subject_id="x", duration_sec=30,
+        left_camera_mask=0xFF, right_camera_mask=0, reduced_mode=False,
+        skip_default_storage=True,
+    )
+    calls = _run_scan_capturing_trigger(motion, request)
+
+    kinds = [c[0] for c in calls]
+    assert "set" in kinds, "start_scan never sent the trigger config"
+    assert "start" in kinds, "start_scan never started the trigger"
+    assert kinds.index("set") < kinds.index("start"), \
+        "set_trigger_json must be sent before start_trigger"
+    sent = next(payload for kind, payload in calls if kind == "set")
+    assert sent == expected_cfg
+
+
+def test_start_scan_trigger_config_override_is_merged():
+    """A ScanRequest.trigger_config override is shallow-merged on top of the
+    interface default before being sent to the console."""
+    motion = _build_motion_with_data_dir(None)
+    request = ScanRequest(
+        subject_id="x", duration_sec=30,
+        left_camera_mask=0xFF, right_camera_mask=0, reduced_mode=False,
+        skip_default_storage=True,
+        trigger_config={"TriggerFrequencyHz": 20},
+    )
+    calls = _run_scan_capturing_trigger(motion, request)
+
+    sent = next((payload for kind, payload in calls if kind == "set"), None)
+    assert sent is not None, "trigger config was never sent"
+    assert sent["TriggerFrequencyHz"] == 20
+    # untouched keys fall through to the resolved default
+    assert sent["LaserPulseSkipInterval"] == \
+        motion.resolve_trigger_config(None)["LaserPulseSkipInterval"]

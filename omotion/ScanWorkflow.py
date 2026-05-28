@@ -131,6 +131,14 @@ class ScanRequest:
     raw_save_max_duration_s: float | None = None
     # Number of histogram frames to batch before pushing to the pipeline.
     batch_size_frames: int = 10
+    # Trigger-config override sent to the console before the scan starts.
+    # start_scan always (re)sends a resolved trigger config so the firmware
+    # fsync/dark schedule is reset and aligned to the pipeline's dark-frame
+    # classification — without this the boundary dark frame can land on a
+    # laser-on frame and corrupt dark correction. None -> the interface's
+    # resolved default (DEFAULT_TRIGGER_CONFIG ⊕ constructor override). A dict
+    # here is shallow-merged on top (e.g. {"TriggerFrequencyHz": 20}).
+    trigger_config: dict | None = None
 
 
 @dataclass
@@ -579,6 +587,18 @@ class ScanWorkflow:
                                 "Failed to enable camera on %s (mask 0x%02X).", side, mask
                             )
 
+                    # (Re)send the trigger config before starting the trigger.
+                    # This resets the firmware fsync counter so its laser-skip
+                    # (dark-frame) schedule starts fresh and aligns with the
+                    # pipeline's dark-frame classification (boundary dark at
+                    # abs_id == discard_count+1, then every dark_interval). The
+                    # bloodflow app does this via QML; doing it here makes any
+                    # direct SDK caller (contact-quality, examples) correct too.
+                    # Idempotent for the app: its trigger ≈ this resolved config.
+                    trigger_cfg = self._interface.resolve_trigger_config(
+                        request.trigger_config
+                    )
+                    self._interface.console.set_trigger_json(data=trigger_cfg)
                     self._interface.console.start_trigger()
                     self._emit_trigger_event("ON")
 
