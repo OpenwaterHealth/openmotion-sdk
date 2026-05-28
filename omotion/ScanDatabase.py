@@ -546,8 +546,16 @@ class ScanDatabase:
         session_id: int,
         side: Optional[int] = None,
         cam_id: Optional[int] = None,
+        t_lo: Optional[float] = None,
+        t_hi: Optional[float] = None,
     ) -> Iterator[Dict[str, Any]]:
-        sql, bindings = _build_session_data_query(session_id, side, cam_id)
+        """Iterate session_data rows for one session, optionally filtered
+        by side, cam_id, and/or timestamp range [t_lo, t_hi] (inclusive).
+        Time range is the lazy-load entry point — viewer queries a
+        narrow window on pan-into-past instead of paging the full scan.
+        Both indexes (session_id, timestamp_s) and (session_id, side,
+        cam_id, timestamp_s) cover the access patterns we care about."""
+        sql, bindings = _build_session_data_query(session_id, side, cam_id, t_lo, t_hi)
         cursor = self._connection().execute(sql, bindings)
         for row in cursor:
             yield dict(row)
@@ -660,6 +668,8 @@ def _build_session_data_query(
     session_id: int,
     side: Optional[int],
     cam_id: Optional[int],
+    t_lo: Optional[float] = None,
+    t_hi: Optional[float] = None,
 ) -> tuple[str, list[Any]]:
     clauses = ["session_id = ?"]
     bindings: list[Any] = [session_id]
@@ -672,6 +682,14 @@ def _build_session_data_query(
     if cam_id is not None:
         clauses.append("cam_id = ?")
         bindings.append(cam_id)
+
+    if t_lo is not None:
+        clauses.append("timestamp_s >= ?")
+        bindings.append(float(t_lo))
+
+    if t_hi is not None:
+        clauses.append("timestamp_s <= ?")
+        bindings.append(float(t_hi))
 
     where = " AND ".join(clauses)
     sql = (

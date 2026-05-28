@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 from omotion.pipeline.batch import FrameBatch, LiveEmit, IntervalClosed
 from omotion.pipeline.pipeline import Pipeline
-from omotion.pipeline.runner import ScanRunner
+from omotion.pipeline.runner import ScanRunner, CriticalSinkError
 from omotion.pipeline.sinks import ScanMetadata
 
 
@@ -230,3 +230,82 @@ def test_runner_calls_on_scan_stop_and_dispatches_flush_events():
     )
     runner.run()
     assert ("final", "terminal_payload") in final_sink.consumed
+
+
+def test_critical_sink_failure_aborts_scan():
+    """A sink marked critical that raises in on_scan_start must abort the
+    whole scan (raise CriticalSinkError) — not silently disable itself and
+    run on, which would leave no durable record of the data."""
+
+    class _CriticalBadSink:
+        channels = {"live"}
+        critical = True
+        def on_scan_start(self, meta):
+            raise RuntimeError("db connection refused")
+        def consume(self, channel, payload):
+            raise AssertionError("consume must not run on an aborted scan")
+        def on_complete(self):
+            raise AssertionError("on_complete must not run on a failed critical sink")
+
+    runner = ScanRunner(
+        source=_FakeSource([_empty_batch()], _meta()),
+        pipeline=Pipeline([_EmitTagsStage(["live"])]),
+        sinks=[_CriticalBadSink()],
+    )
+    with pytest.raises(CriticalSinkError, match="db connection refused"):
+        runner.run()
+
+
+def test_critical_sink_failure_rolls_back_already_started_sinks():
+    """When a critical sink fails, sinks that already started successfully
+    get on_complete() so their handles/connections are released before the
+    abort propagates."""
+
+    good_sink = _RecordingSink(channels={"live"})  # starts first, succeeds
+
+    class _CriticalBadSink:
+        channels = {"live"}
+        critical = True
+        def on_scan_start(self, meta):
+            raise RuntimeError("boom")
+        def consume(self, channel, payload):
+            pass
+        def on_complete(self):
+            pass
+
+    runner = ScanRunner(
+        source=_FakeSource([_empty_batch()], _meta()),
+        pipeline=Pipeline([_EmitTagsStage(["live"])]),
+        sinks=[good_sink, _CriticalBadSink()],
+    )
+    with pytest.raises(CriticalSinkError):
+        runner.run()
+
+    assert good_sink.on_start_calls == 1
+    assert good_sink.on_complete_calls == 1, \
+        "an already-started sink must be rolled back (on_complete) on abort"
+    assert good_sink.consumed == [], "no frames should be consumed on an aborted scan"
+
+
+def test_noncritical_sink_failure_still_disables_and_continues():
+    """The default (critical=False) behavior is unchanged: a failing sink is
+    disabled and the scan runs on."""
+
+    class _BadSink:
+        channels = {"live"}
+        # critical defaults to False (attribute absent)
+        def on_scan_start(self, meta):
+            raise RuntimeError("boom")
+        def consume(self, channel, payload):
+            pass
+        def on_complete(self):
+            pass
+
+    good_sink = _RecordingSink(channels={"live"})
+    runner = ScanRunner(
+        source=_FakeSource([_empty_batch()], _meta()),
+        pipeline=Pipeline([_EmitTagsStage(["live"])]),
+        sinks=[_BadSink(), good_sink],
+    )
+    runner.run()  # must NOT raise
+    assert len(good_sink.consumed) == 1

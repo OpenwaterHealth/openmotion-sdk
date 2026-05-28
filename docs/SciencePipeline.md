@@ -85,9 +85,7 @@ Three things characterise this design and make it auditable:
 | `contrast_sn_rt` | `(N, 2, 8)` float32 | ShotNoiseCorrectionStage | `std_sn_rt / mean_dc_rt`, 0 where mean ≤ 0 |
 | `bfi_live` | `(N, 2, 8)` float32 | BfiBviStage | BFI from realtime corrected (K, μ₁) via calibration |
 | `bvi_live` | `(N, 2, 8)` float32 | BfiBviStage | BVI from realtime corrected mean via calibration |
-| `bfi_live_side` | `(N, 2)` float32 \| None | SideAveragingStage | Per-side BFI mean (reduced mode only) |
-| `bvi_live_side` | `(N, 2)` float32 \| None | SideAveragingStage | Per-side BVI mean (reduced mode only) |
-| `events` | `list[BatchEvent]` | Stages append | Out-of-band events: `LiveEmit`, `IntervalClosed`, diagnostics |
+| `events` | `list[BatchEvent]` | Stages append | Out-of-band events: `LiveEmit`, `IntervalClosed`, diagnostics. Reduced-mode per-side averages ride here as `LiveEmit(channel="live_side"/"final_side", SideAverageSample)` (see §5.10) rather than as batch arrays |
 
 ### 2.2 BatchEvent types
 
@@ -131,7 +129,9 @@ PedestalSubtractionStage
 DarkCorrectionStage
 ShotNoiseCorrectionStage
 BfiBviStage
-SideAveragingStage      (enabled only in reduced mode)
+DarkFrameHoldStage
+LiveSideAverageStage         (reduced mode; emits LiveEmit "live_side")
+CorrectedSideAverageStage    (reduced mode; emits LiveEmit "final_side")
 Tee("live", filter=ft not in {"warmup","stale"})
 ```
 
@@ -446,18 +446,16 @@ Fallback (degenerate calibration where the span is zero): identity scaling `bfi 
 
 The calibration object passed to `default_pipeline()` must expose `c_min`, `c_max`, `i_min`, `i_max` as `(2, 8)` ndarrays. `omotion.Calibration.Calibration` provides this; in practice it is loaded from the console EEPROM at scan start, or computed by `CalibrationWorkflow` (§11.1).
 
-### 5.10 SideAveragingStage
+### 5.10 Reduced-mode side averages (`LiveSideAverageStage`, `CorrectedSideAverageStage`)
 
-**File:** `omotion/pipeline/stages/side_avg.py`. **Writes:** `bfi_live_side`, `bvi_live_side` (shape `(N, 2)`) or leaves them `None`.
+**Files:** `omotion/pipeline/stages/side_avg.py`, `omotion/pipeline/stages/corrected_side_avg.py`. Both active only when `metadata.reduced_mode` is True; pass-throughs otherwise.
 
-Active only when `metadata.reduced_mode` is True. Averages per-camera BFI/BVI across all enabled cameras on each side:
+The reduced-mode per-side average is a **purely spatial** mean across the enabled cameras at one capture instant (the shared `spatial_side_average` helper) — never a temporal/rolling average. The live USB path delivers one camera per frame row, so each stage gathers a capture's cameras (sharing a `frame_id`) and emits **one value per capture per side** as a `LiveEmit` carrying a `SideAverageSample(t, frame_id, side, bfi, bvi, mean?, contrast?)`:
 
-```
-bfi_side[:, 0] = bfi_live[:, 0, enabled_left_cams].mean(axis=1)
-bfi_side[:, 1] = bfi_live[:, 1, enabled_right_cams].mean(axis=1)
-```
+- **`LiveSideAverageStage`** — averages the realtime `bfi_live`/`bvi_live` → `LiveEmit(channel="live_side")`. Drives the live reduced-mode display (immediate, best-effort). After `DarkFrameHoldStage`, so dark intervals hold steady.
+- **`CorrectedSideAverageStage`** — gathers the per-`(side,cam)` `EnrichedCorrectedInterval` events (`IntervalClosed`), averages the dark-corrected BFI/BVI → `LiveEmit(channel="final_side")`. This is the accurate record `ScanDBSink` persists at `cam_id=-1` and replay reads.
 
-Enabled cameras are derived from `metadata.left_camera_mask` / `right_camera_mask`. When the stage is disabled (normal mode) it is a pass-through. Downstream sinks check `bfi_live_side is not None` to decide whether to plot per-side traces.
+Both finalize a capture/window when the next begins and flush the last at `on_scan_stop`. The live (`live_side`) and corrected (`final_side`) averages differ by design — realtime display vs corrected record. Enabled cameras come from `metadata.left_camera_mask` / `right_camera_mask`.
 
 ### 5.11 Tee("live")
 

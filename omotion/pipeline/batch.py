@@ -77,6 +77,25 @@ class TriggerStateEvent(BatchEvent):
     state:        str    # "ON" or "OFF"
     timestamp_s:  float
 
+
+@dataclass
+class SideAverageSample:
+    """One reduced-mode per-side average for a single capture instant.
+
+    Carried as the payload of a ``LiveEmit`` — channel ``"live_side"`` for the
+    realtime average (LiveSideAverageStage) and ``"final_side"`` for the
+    dark-corrected average (CorrectedSideAverageStage). One sample per capture
+    (``frame_id``) per side. ``mean`` / ``contrast`` are populated only on the
+    corrected path; the live path leaves them ``None``."""
+    t:         float
+    frame_id:  int
+    side:      int            # 0 = left, 1 = right
+    bfi:       float
+    bvi:       float
+    mean:      Optional[float] = None
+    contrast:  Optional[float] = None
+
+
 @dataclass
 class FrameBatch:
     """N frames worth of data, two sides, 8 cameras each.
@@ -92,7 +111,8 @@ class FrameBatch:
                        (also appends IntervalClosed to events when interval closes)
       ShotNoise:       std_sn_rt, contrast_sn_rt
       BfiBvi:          bfi_live, bvi_live
-      SideAveraging:   bfi_live_side, bvi_live_side (None unless reduced mode)
+      LiveSideAverage: appends LiveEmit(channel="live_side", SideAverageSample)
+                       per capture (reduced mode only)
       Tee:             appends LiveEmit to events
     """
 
@@ -131,8 +151,5 @@ class FrameBatch:
 
     bfi_live:       Optional[np.ndarray] = None
     bvi_live:       Optional[np.ndarray] = None
-
-    bfi_live_side:  Optional[np.ndarray] = None
-    bvi_live_side:  Optional[np.ndarray] = None
 
     events:         list[BatchEvent] = field(default_factory=list)

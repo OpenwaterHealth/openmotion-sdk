@@ -19,7 +19,9 @@ from .stages.dark import (
 )
 from .stages.shot_noise import ShotNoiseCorrectionStage
 from .stages.bfi_bvi import BfiBviStage
-from .stages.side_avg import SideAveragingStage
+from .stages.dark_frame_hold import DarkFrameHoldStage
+from .stages.side_avg import LiveSideAverageStage
+from .stages.corrected_side_avg import CorrectedSideAverageStage
 from .tee import Tee
 
 
@@ -69,7 +71,23 @@ def default_pipeline(*,
         ShotNoiseCorrectionStage(pedestals=pedestals, camera_gain_map=CAMERA_GAIN_MAP),
         BfiBviStage(calibration=calibration),
 
-        SideAveragingStage(
+        # Hold the last light frame's BFI/BVI across dark frames so the
+        # laser-off intervals (periodic baselines + the firmware's stop
+        # frame) don't spike the trace. Before SideAveraging so per-side
+        # averages reflect the held values.
+        DarkFrameHoldStage(),
+
+        LiveSideAverageStage(
+            enabled=metadata.reduced_mode,
+            left_camera_mask=metadata.left_camera_mask,
+            right_camera_mask=metadata.right_camera_mask,
+        ),
+
+        # Corrected per-side average for the DB record (reduced mode). Reads
+        # the IntervalClosed events DarkCorrectionStage emits, so it must come
+        # after it; emits LiveEmit(channel="final_side") which the runner
+        # routes by channel (no Tee needed).
+        CorrectedSideAverageStage(
             enabled=metadata.reduced_mode,
             left_camera_mask=metadata.left_camera_mask,
             right_camera_mask=metadata.right_camera_mask,

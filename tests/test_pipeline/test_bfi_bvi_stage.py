@@ -38,6 +38,8 @@ def _batch_with_live_values(mean_dc, contrast_sn):
 
 
 def test_calibration_maps_full_range_to_zero_to_ten():
+    """K == C_max → BFI = 0 (the calibrated minimum). No sanity filter:
+    the affine map's full output range is preserved verbatim."""
     mean = np.full((1, 2, 8), 50.0, dtype=np.float32)
     contrast = np.full((1, 2, 8), 1.0, dtype=np.float32)
     batch = _batch_with_live_values(mean, contrast)
@@ -55,7 +57,24 @@ def test_midpoint_contrast_maps_to_bfi_5():
 
 def test_bvi_uses_mean_with_i_min_i_max():
     mean = np.full((1, 2, 8), 50.0, dtype=np.float32)
-    contrast = np.full((1, 2, 8), 0.0, dtype=np.float32)
+    contrast = np.full((1, 2, 8), 0.5, dtype=np.float32)
     batch = _batch_with_live_values(mean, contrast)
     BfiBviStage(calibration=_trivial_calibration()).process(batch)
     np.testing.assert_allclose(batch.bvi_live, 5.0, atol=1e-5)
+
+
+def test_calibration_extremes_pass_through_unfiltered():
+    """No sanity clamp: K == C_min → BFI = 10.0 (calibrated max) passes
+    through verbatim, as do out-of-calibration values. The terminal
+    dark-frame spike is handled on the live datapath (repeat the last
+    light frame in place of a dark frame), NOT by dropping data here."""
+    cal = _trivial_calibration()
+    mean = np.full((1, 2, 8), 50.0, dtype=np.float32)
+    # K == C_min (0) → BFI = 10.0 exactly
+    batch = _batch_with_live_values(mean, np.zeros((1, 2, 8), dtype=np.float32))
+    BfiBviStage(calibration=cal).process(batch)
+    np.testing.assert_allclose(batch.bfi_live, 10.0, atol=1e-5)
+    # K above C_max → BFI goes negative, still preserved (no clamp)
+    batch2 = _batch_with_live_values(mean, np.full((1, 2, 8), 2.0, dtype=np.float32))
+    BfiBviStage(calibration=cal).process(batch2)
+    np.testing.assert_allclose(batch2.bfi_live, -10.0, atol=1e-5)

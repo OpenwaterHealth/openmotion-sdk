@@ -206,6 +206,11 @@ class ScanWorkflow:
         # whether the scan succeeded.
         self._last_scan_error: str | None = None
         self._last_scan_canceled: bool = False
+        # Label of the scan-DB session for the most recent start_scan, set
+        # synchronously when the scan's metadata is built. Lets callers bind
+        # to THIS scan's session row (e.g. the app's live plot DB tail) by
+        # exact label instead of guessing the newest session.
+        self._current_scan_label: str | None = None
         # Cancel signal flag. Distinct from _stop_evt (which is also pulsed
         # by the worker's inner finally to wake the duration guard on a
         # clean exit). Set ONLY by the user-cancel paths — cancel() and
@@ -317,6 +322,10 @@ class ScanWorkflow:
         from omotion.pipeline.sinks import CsvSink as PipelineCsvSink, ScanDBSink, ScanMetadata
         from omotion.pipeline.pedestal import SensorPedestals, pedestal_for_fw
 
+        # Clear the prior scan's outcome up front so a refusal below (busy, or
+        # a pre-flight failure) never reports a stale error from an earlier run.
+        self._last_scan_error = None
+
         with self._lock:
             if self._running or (self._thread and self._thread.is_alive()):
                 logger.warning(
@@ -345,6 +354,9 @@ class ScanWorkflow:
             right_camera_mask=request.right_camera_mask,
             reduced_mode=request.reduced_mode,
         )
+        # Mirror ScanDBSink.on_scan_start's label so callers can bind to this
+        # exact session row (must match f"{scan_id}_{subject_id}" there).
+        self._current_scan_label = f"{scan_id}_{request.subject_id}"
 
         # ── Build pedestals (safe: fall back to 64.0 if version unreadable) ─
         def _safe_pedestal(sensor) -> float:
@@ -376,8 +388,40 @@ class ScanWorkflow:
             data_dir = getattr(self._interface, "data_dir", None)
             scan_db_path = getattr(self._interface, "scan_db_path", None)
             if data_dir is not None:
-                default_sinks.append(PipelineCsvSink(output_dir=data_dir))
+                # Corrected CSV: honor request.write_corrected_csv when a
+                # scan DB is configured (DB is the system of record, so
+                # the CSV is opt-in). When NO DB is configured the CSV is
+                # the only persisted record of corrected data — force it
+                # on regardless of the request flag so a scan is never
+                # silently unrecorded.
+                write_corrected = (
+                    True if scan_db_path is None
+                    else bool(request.write_corrected_csv)
+                )
+                default_sinks.append(
+                    PipelineCsvSink(output_dir=data_dir, write_corrected=write_corrected)
+                )
             if scan_db_path is not None:
+                # Pre-flight the scan DB before the laser fires. The DB is the
+                # system of record for live per-camera BFI/BVI (and, when the
+                # corrected CSV is opt-in and off, the ONLY record). If it
+                # can't be opened there is nowhere to persist the scan, so
+                # refuse now — failing fast, with the laser still off — rather
+                # than run a scan whose data is silently lost. (ScanDBSink is
+                # also marked ``critical`` so the runner aborts as a backstop
+                # if the DB dies between this check and the worker start.)
+                try:
+                    from omotion.ScanDatabase import ScanDatabase
+                    ScanDatabase(db_path=scan_db_path).close()
+                except Exception as exc:
+                    logger.exception(
+                        "start_scan: scan database pre-flight failed (%s) — "
+                        "aborting before laser start", scan_db_path,
+                    )
+                    self._last_scan_error = f"Scan database unavailable: {exc}"
+                    with self._lock:
+                        self._running = False
+                    return False
                 default_sinks.append(ScanDBSink(db_path=scan_db_path))
             # Telemetry CSV: per-scan snapshots from ConsoleTelemetryPoller.
             # Not a pipeline sink — the poller is its own daemon thread that
@@ -589,8 +633,8 @@ class ScanWorkflow:
                 self._last_scan_canceled = self._cancel_requested
 
         # Reset per-scan outcome before spawning the worker so callers
-        # don't see stale state from a prior run.
-        self._last_scan_error = None
+        # don't see stale state from a prior run. (_last_scan_error is cleared
+        # at the top of start_scan so refusals report no stale error.)
         self._last_scan_canceled = False
         self._cancel_requested = False
 
@@ -628,6 +672,14 @@ class ScanWorkflow:
         """True if the most recent scan was canceled (stop_evt was set
         before the worker finished). Cleared at the start of each new scan."""
         return self._last_scan_canceled
+
+    @property
+    def current_scan_label(self) -> str | None:
+        """Scan-DB session label (``f"{scan_id}_{subject_id}"``) for the most
+        recent start_scan, or None if no scan has started. Set synchronously
+        while building scan metadata, so it's valid as soon as start_scan
+        returns. Callers use it to bind to this scan's exact session row."""
+        return self._current_scan_label
 
     def await_complete(self, *, timeout_sec: float | None = None) -> None:
         """Block until the current scan worker thread finishes (or the
