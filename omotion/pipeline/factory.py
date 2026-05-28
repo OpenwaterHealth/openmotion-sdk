@@ -20,7 +20,7 @@ from .stages.dark import (
 from .stages.shot_noise import ShotNoiseCorrectionStage
 from .stages.bfi_bvi import BfiBviStage
 from .stages.dark_frame_hold import DarkFrameHoldStage
-from .stages.side_avg import SideAveragingStage
+from .stages.side_avg import LiveSideAverageStage
 from .tee import Tee
 
 
@@ -76,7 +76,7 @@ def default_pipeline(*,
         # averages reflect the held values.
         DarkFrameHoldStage(),
 
-        SideAveragingStage(
+        LiveSideAverageStage(
             enabled=metadata.reduced_mode,
             left_camera_mask=metadata.left_camera_mask,
             right_camera_mask=metadata.right_camera_mask,
