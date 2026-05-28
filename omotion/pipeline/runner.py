@@ -16,6 +16,17 @@ from .sources import Source
 logger = logging.getLogger("omotion.pipeline.runner")
 
 
+class CriticalSinkError(RuntimeError):
+    """A sink marked ``critical`` failed to initialize, so the scan was
+    aborted rather than run with no durable record of the data.
+
+    Sinks opt in by setting ``critical = True`` (default is False). The
+    canonical critical sink is ScanDBSink: if the scan database can't be
+    opened there is nowhere to persist the live per-camera signal, and
+    (when the corrected CSV is opt-in and off) the scan would otherwise
+    complete with no data at all."""
+
+
 def _empty_batch_for_flush() -> FrameBatch:
     """Build an empty FrameBatch for the terminal on_scan_stop flush."""
     return FrameBatch(
@@ -53,10 +64,30 @@ class ScanRunner:
                              type(sink).__name__, channel)
 
     def run(self) -> None:
+        started: list[Sink] = []
         for sink in self.sinks:
             try:
                 sink.on_scan_start(self.source.metadata)
-            except Exception:
+                started.append(sink)
+            except Exception as exc:
+                if getattr(sink, "critical", False):
+                    logger.exception(
+                        "critical sink %r raised in on_scan_start — aborting scan",
+                        type(sink).__name__,
+                    )
+                    # Roll back sinks that already started so their file
+                    # handles / DB connections don't leak on the aborted scan.
+                    for s in reversed(started):
+                        try:
+                            s.on_complete()
+                        except Exception:
+                            logger.exception(
+                                "sink %r raised during abort rollback",
+                                type(s).__name__,
+                            )
+                    raise CriticalSinkError(
+                        f"{type(sink).__name__} failed to initialize: {exc}"
+                    ) from exc
                 logger.exception(
                     "sink %r raised in on_scan_start — disabling for this scan",
                     type(sink).__name__,

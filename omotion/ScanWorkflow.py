@@ -317,6 +317,10 @@ class ScanWorkflow:
         from omotion.pipeline.sinks import CsvSink as PipelineCsvSink, ScanDBSink, ScanMetadata
         from omotion.pipeline.pedestal import SensorPedestals, pedestal_for_fw
 
+        # Clear the prior scan's outcome up front so a refusal below (busy, or
+        # a pre-flight failure) never reports a stale error from an earlier run.
+        self._last_scan_error = None
+
         with self._lock:
             if self._running or (self._thread and self._thread.is_alive()):
                 logger.warning(
@@ -390,6 +394,26 @@ class ScanWorkflow:
                     PipelineCsvSink(output_dir=data_dir, write_corrected=write_corrected)
                 )
             if scan_db_path is not None:
+                # Pre-flight the scan DB before the laser fires. The DB is the
+                # system of record for live per-camera BFI/BVI (and, when the
+                # corrected CSV is opt-in and off, the ONLY record). If it
+                # can't be opened there is nowhere to persist the scan, so
+                # refuse now — failing fast, with the laser still off — rather
+                # than run a scan whose data is silently lost. (ScanDBSink is
+                # also marked ``critical`` so the runner aborts as a backstop
+                # if the DB dies between this check and the worker start.)
+                try:
+                    from omotion.ScanDatabase import ScanDatabase
+                    ScanDatabase(db_path=scan_db_path).close()
+                except Exception as exc:
+                    logger.exception(
+                        "start_scan: scan database pre-flight failed (%s) — "
+                        "aborting before laser start", scan_db_path,
+                    )
+                    self._last_scan_error = f"Scan database unavailable: {exc}"
+                    with self._lock:
+                        self._running = False
+                    return False
                 default_sinks.append(ScanDBSink(db_path=scan_db_path))
             # Telemetry CSV: per-scan snapshots from ConsoleTelemetryPoller.
             # Not a pipeline sink — the poller is its own daemon thread that
@@ -601,8 +625,8 @@ class ScanWorkflow:
                 self._last_scan_canceled = self._cancel_requested
 
         # Reset per-scan outcome before spawning the worker so callers
-        # don't see stale state from a prior run.
-        self._last_scan_error = None
+        # don't see stale state from a prior run. (_last_scan_error is cleared
+        # at the top of start_scan so refusals report no stale error.)
         self._last_scan_canceled = False
         self._cancel_requested = False
 

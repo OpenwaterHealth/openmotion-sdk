@@ -44,6 +44,13 @@ class Sink(Protocol):
         "live"         — per-frame, best-effort corrected (light + dark)
         "final"        — per-dark-interval, accurately corrected CorrectedBatch
         "diagnostics"  — out-of-band events (DarkIntegrityWarning, etc.)
+
+    A sink may set ``critical = True`` to mean "if my on_scan_start fails,
+    abort the whole scan" (ScanRunner raises CriticalSinkError). The default
+    is False: a failing sink is disabled for the scan and the rest continue.
+    ``critical`` is optional (the runner reads it via getattr with a False
+    default), so it is deliberately NOT declared as a protocol member — adding
+    a data attribute here would make runtime isinstance() checks require it.
     """
     channels: set[str]
 
@@ -499,6 +506,10 @@ class ScanDBSink:
     """
 
     channels = {"raw", "live", "final"}
+
+    # If the scan database can't be opened, abort the scan rather than run
+    # it with no durable record (see ScanRunner.CriticalSinkError).
+    critical = True
 
     def __init__(self, db_path: str, *, raw_batch_size: int = 200) -> None:
         self._db_path = db_path

@@ -29,7 +29,7 @@ from .batch import (
 )
 from .pipeline import Pipeline, Stage
 from .tee import Tee
-from .runner import ScanRunner
+from .runner import ScanRunner, CriticalSinkError
 from .factory import default_pipeline
 from .pedestal import SensorPedestals
 from .sinks import Sink, ScanMetadata, CsvSink, ScanDBSink
@@ -40,7 +40,7 @@ __all__ = [
     "FrameBatch", "BatchEvent", "IntervalClosed", "LiveEmit",
     "DarkIntegrityWarning", "StencilFallback",
     "Pipeline", "Stage", "Tee",
-    "ScanRunner",
+    "ScanRunner", "CriticalSinkError",
     "default_pipeline",
     "SensorPedestals",
     "Sink", "ScanMetadata",

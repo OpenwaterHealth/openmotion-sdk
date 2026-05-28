@@ -9,7 +9,7 @@ def test_public_api_symbols_importable() -> None:
         Pipeline, Stage,
         FrameBatch, BatchEvent, IntervalClosed, LiveEmit,
         DarkIntegrityWarning, StencilFallback,
-        ScanRunner,
+        ScanRunner, CriticalSinkError,
         Source, LiveUsbSource, CsvReplaySource, DbReplaySource,
         Sink, ScanMetadata,
         CsvSink, ScanDBSink,
@@ -18,7 +18,7 @@ def test_public_api_symbols_importable() -> None:
     )
     for sym in (
         Pipeline, Stage, FrameBatch, BatchEvent, IntervalClosed, LiveEmit,
-        DarkIntegrityWarning, StencilFallback, ScanRunner,
+        DarkIntegrityWarning, StencilFallback, ScanRunner, CriticalSinkError,
         Source, LiveUsbSource, CsvReplaySource, DbReplaySource,
         Sink, ScanMetadata, CsvSink, ScanDBSink,
         Tee, default_pipeline, SensorPedestals,
@@ -34,7 +34,7 @@ def test_public_api_all_list_complete() -> None:
         "FrameBatch", "BatchEvent", "IntervalClosed", "LiveEmit",
         "DarkIntegrityWarning", "StencilFallback",
         "Pipeline", "Stage", "Tee",
-        "ScanRunner",
+        "ScanRunner", "CriticalSinkError",
         "default_pipeline",
         "SensorPedestals",
         "Sink", "ScanMetadata",
