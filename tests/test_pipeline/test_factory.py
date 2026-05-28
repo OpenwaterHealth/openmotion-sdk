@@ -40,6 +40,7 @@ def test_default_pipeline_has_expected_stages():
         "tee:raw",
         "noise_floor", "moments", "pedestal_subtraction",
         "dark_correction", "shot_noise_correction", "bfi_bvi",
+        "dark_frame_hold",
         "side_averaging",
         "tee:live",
     ]

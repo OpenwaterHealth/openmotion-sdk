@@ -19,6 +19,7 @@ from .stages.dark import (
 )
 from .stages.shot_noise import ShotNoiseCorrectionStage
 from .stages.bfi_bvi import BfiBviStage
+from .stages.dark_frame_hold import DarkFrameHoldStage
 from .stages.side_avg import SideAveragingStage
 from .tee import Tee
 
@@ -68,6 +69,12 @@ def default_pipeline(*,
 
         ShotNoiseCorrectionStage(pedestals=pedestals, camera_gain_map=CAMERA_GAIN_MAP),
         BfiBviStage(calibration=calibration),
+
+        # Hold the last light frame's BFI/BVI across dark frames so the
+        # laser-off intervals (periodic baselines + the firmware's stop
+        # frame) don't spike the trace. Before SideAveraging so per-side
+        # averages reflect the held values.
+        DarkFrameHoldStage(),
 
         SideAveragingStage(
             enabled=metadata.reduced_mode,
