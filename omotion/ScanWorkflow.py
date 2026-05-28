@@ -120,12 +120,6 @@ class ScanRequest:
     # bfi_left, bfi_right, bvi_left, bvi_right columns.  Uncorrected
     # samples emitted to the UI are also averaged per-side per-frame.
     reduced_mode: bool = False
-    # Database sink (issue #92, see docs/superpowers/specs/2026-04-14-scan-db-sink-design.md).
-    # The DB endpoint itself is opt-in at SDK construction via
-    # ``MotionInterface(scan_db_path=...)``; these per-scan fields are only
-    # effective when that path is set.
-    write_raw_to_db: bool = False
-    notes: str = ""
     # Pipeline sinks list — will be injected by the runner at start_scan time.
     # Normally managed by the SDK at MotionInterface construction (data_dir, scan_db_path).
     sinks: list = field(default_factory=list)
