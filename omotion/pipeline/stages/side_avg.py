@@ -23,40 +23,59 @@ class SideAveragingStage:
         self.enabled = bool(enabled)
         self._left_cams  = _mask_to_cam_indices(left_camera_mask)
         self._right_cams = _mask_to_cam_indices(right_camera_mask)
+        # Running latest finite BFI/BVI per (side, cam), carried across rows
+        # AND batches. The live USB path delivers ONE camera per frame row
+        # (raw_hist[i, side, cam] for a single cam), so at any single row only
+        # that camera's bfi_live is finite — the rest are NaN (MomentsStage
+        # NaNs zero histograms). A per-row nanmean over the active cameras is
+        # therefore NOT a cross-camera average; it's whichever camera owns the
+        # row, which makes the reduced-mode trace hop between cameras frame to
+        # frame. Holding each camera's most recent value and averaging those
+        # yields a true, smooth side average. NaN = "not seen yet".
+        self._last_bfi = np.full((2, 8), np.nan, dtype=np.float64)
+        self._last_bvi = np.full((2, 8), np.nan, dtype=np.float64)
 
     def process(self, batch: FrameBatch) -> FrameBatch:
         if not self.enabled:
             return batch
 
-        n = batch.bfi_live.shape[0]
-        bfi_side = np.zeros((n, 2), dtype=np.float32)
-        bvi_side = np.zeros((n, 2), dtype=np.float32)
+        bfi = batch.bfi_live
+        bvi = batch.bvi_live
+        n = bfi.shape[0]
+        bfi_side = np.full((n, 2), np.nan, dtype=np.float32)
+        bvi_side = np.full((n, 2), np.nan, dtype=np.float32)
 
-        # nanmean (not mean) so one bad camera frame doesn't poison the
-        # whole side average. The realtime BFI/BVI stage emits NaN for
-        # early frames before the first dark observation closes; with
-        # plain mean, the side average is NaN until every active cam
-        # has a finite value at the same frame index, which can take
-        # several seconds and leaves the reduced-mode display empty.
-        # Suppress the "Mean of empty slice" warning that fires when an
-        # entire row is NaN (all active cams non-finite for that frame —
-        # common in early warmup frames). nanmean raises it via
-        # warnings.warn, NOT numpy's FP errstate, so catch_warnings is
-        # required. Those rows correctly emit NaN.
+        sides = ((0, self._left_cams), (1, self._right_cams))
+        # nanmean over the per-camera latest values. Suppress the "Mean of
+        # empty slice" warning that fires before any active camera has
+        # reported (all-NaN cache → NaN average, which the consumer skips).
+        # nanmean raises it via warnings.warn, not numpy errstate.
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", r"Mean of empty slice",
                                     category=RuntimeWarning)
             with np.errstate(invalid="ignore"):
-                if len(self._left_cams) > 0:
-                    bfi_side[:, 0] = np.nanmean(batch.bfi_live[:, 0, self._left_cams], axis=1)
-                    bvi_side[:, 0] = np.nanmean(batch.bvi_live[:, 0, self._left_cams], axis=1)
-                if len(self._right_cams) > 0:
-                    bfi_side[:, 1] = np.nanmean(batch.bfi_live[:, 1, self._right_cams], axis=1)
-                    bvi_side[:, 1] = np.nanmean(batch.bvi_live[:, 1, self._right_cams], axis=1)
+                for i in range(n):
+                    for side, cams in sides:
+                        if len(cams) == 0:
+                            continue
+                        # Update this side's latest with whatever cameras are
+                        # finite in this row (typically just the row's camera).
+                        row_bfi = bfi[i, side, cams]
+                        row_bvi = bvi[i, side, cams]
+                        fb = np.isfinite(row_bfi)
+                        if fb.any():
+                            self._last_bfi[side, cams[fb]] = row_bfi[fb]
+                        fv = np.isfinite(row_bvi)
+                        if fv.any():
+                            self._last_bvi[side, cams[fv]] = row_bvi[fv]
+                        # Emit the running average across active cameras.
+                        bfi_side[i, side] = np.nanmean(self._last_bfi[side, cams])
+                        bvi_side[i, side] = np.nanmean(self._last_bvi[side, cams])
 
         batch.bfi_live_side = bfi_side
         batch.bvi_live_side = bvi_side
         return batch
 
     def reset(self) -> None:
-        pass
+        self._last_bfi[:] = np.nan
+        self._last_bvi[:] = np.nan
