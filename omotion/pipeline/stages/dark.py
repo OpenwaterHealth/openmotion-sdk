@@ -73,9 +73,10 @@ class DarkIntegrityGuard:
     """Flag dark frames whose u1 looks suspiciously bright.
 
     A genuine dark frame should have u1 within ~5 DN of the sensor pedestal.
-    Higher u1 suggests the laser wasn't actually off (firmware off-by-one or
-    unwrapper alignment quirk). The guard appends a diagnostic event but
-    does not drop the frame.
+    Higher u1 means the dark reference is contaminated — either the laser
+    wasn't actually off (firmware off-by-one / fsync misalignment) or ambient
+    light is leaking onto the sensor. The guard appends a diagnostic event and
+    logs a WARNING, but does not drop the frame.
 
     See docs/SciencePipeline.md §11 (input validation rails).
     """
@@ -93,6 +94,14 @@ class DarkIntegrityGuard:
                 u1=float(u1), pedestal=float(pedestal),
                 threshold=float(threshold),
             ))
+            logger.warning(
+                "dark frame brighter than expected: side=%s cam=%d abs_id=%d "
+                "u1=%.1f exceeds pedestal+%.1f=%.1f — dark reference contaminated "
+                "(laser on for this frame from trigger/fsync misalignment, or "
+                "ambient light leaking onto the sensor); dark correction will be skewed.",
+                side, int(cam_id), int(abs_frame_id),
+                float(u1), self.max_above_pedestal, float(threshold),
+            )
             return False
         return True
 
