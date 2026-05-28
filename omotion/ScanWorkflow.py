@@ -108,7 +108,6 @@ class ScanRequest:
     left_camera_mask: int
     right_camera_mask: int
     disable_laser: bool = False
-    data_dir: str = ""
     expected_size: int = 32837
     # CSV output flags — all enabled by default.  Flip to False once the
     # corresponding downstream consumer no longer needs the file, so the

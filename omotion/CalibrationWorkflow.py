@@ -903,7 +903,6 @@ def _run_subscan_capture(
         duration_sec=duration_sec,
         left_camera_mask=request.left_camera_mask,
         right_camera_mask=request.right_camera_mask,
-        data_dir=request.output_dir,
         disable_laser=False,
         reduced_mode=False,
         sinks=[collector],
