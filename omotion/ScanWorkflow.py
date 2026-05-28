@@ -871,40 +871,47 @@ class ScanWorkflow:
                 if not active:
                     raise RuntimeError("No active sensors to configure.")
 
-                if request.power_off_unused_cameras:
-                    _emit_log("Powering on cameras before programming FPGAs...")
-                    for side, mask, sensor in active:
-                        try:
+                # Always power on the cameras we're about to program. FPGA SRAM
+                # programming requires the camera module powered — a READY status
+                # bit alone is not sufficient (program_fpga is rejected otherwise).
+                # The bloodflow app powers cameras on at connect; doing it here makes
+                # the SDK configure self-sufficient for any caller. The
+                # power_off_unused_cameras flag must NOT gate this power-on — it only
+                # controls whether the OTHER (unused) cameras get powered down.
+                _emit_log("Powering on cameras before programming FPGAs...")
+                for side, mask, sensor in active:
+                    try:
+                        on_mask = mask & 0xFF
+                        off_mask = 0
+                        if request.power_off_unused_cameras:
                             power_status = sensor.get_camera_power_status()
-                            if not power_status or len(power_status) != 8:
+                            if power_status and len(power_status) == 8:
+                                off_mask = sum(
+                                    1 << i
+                                    for i in range(8)
+                                    if power_status[i] and not (mask & (1 << i))
+                                )
+                            else:
                                 _emit_log(f"{side}: could not get camera power status")
-                                continue
-                            off_mask = sum(
-                                1 << i
-                                for i in range(8)
-                                if power_status[i] and not (mask & (1 << i))
+                        if off_mask:
+                            if sensor.disable_camera_power(off_mask):
+                                _emit_log(
+                                    f"{side}: powered off cameras not in mask (0x{off_mask:02X})"
+                                )
+                            time.sleep(0.05)
+                        if on_mask:
+                            if not sensor.enable_camera_power(on_mask):
+                                raise RuntimeError(
+                                    f"Failed to power on cameras on {side} (mask 0x{on_mask:02X})."
+                                )
+                            _emit_log(
+                                f"{side}: powered on cameras (mask 0x{on_mask:02X})"
                             )
-                            on_mask = mask & 0xFF
-                            if off_mask:
-                                if sensor.disable_camera_power(off_mask):
-                                    _emit_log(
-                                        f"{side}: powered off cameras not in mask (0x{off_mask:02X})"
-                                    )
-                                time.sleep(0.05)
-                            if on_mask:
-                                if sensor.enable_camera_power(on_mask):
-                                    _emit_log(
-                                        f"{side}: powered on cameras (mask 0x{on_mask:02X})"
-                                    )
-                                else:
-                                    raise RuntimeError(
-                                        f"Failed to power on cameras on {side} (mask 0x{on_mask:02X})."
-                                    )
-                                time.sleep(0.5)
-                        except Exception as e:
-                            raise RuntimeError(
-                                f"Error setting camera power for {side}: {e}"
-                            ) from e
+                            time.sleep(0.5)
+                    except Exception as e:
+                        raise RuntimeError(
+                            f"Error setting camera power for {side}: {e}"
+                        ) from e
 
                 side_positions: dict[str, list[int]] = {}
                 side_sensors: dict = {}
