@@ -4,7 +4,7 @@ import logging
 
 import numpy as np
 import pytest
-from omotion.pipeline.batch import FrameBatch
+from omotion.pipeline.batch import FrameBatch, SideAverageSample
 from omotion.pipeline.sinks import ScanDBSink, ScanMetadata
 
 
@@ -14,6 +14,14 @@ def _meta_simple():
         scan_id="abc", subject_id="subj", operator="op",
         started_at_iso="2026-05-22T00:00:00Z", duration_sec=300,
         left_camera_mask=0x01, right_camera_mask=0, reduced_mode=False,
+    )
+
+
+def _meta_reduced():
+    return ScanMetadata(
+        scan_id="r", subject_id="subj", operator="op",
+        started_at_iso="2026-05-22T00:00:00Z", duration_sec=300,
+        left_camera_mask=0x03, right_camera_mask=0x03, reduced_mode=True,
     )
 
 
@@ -45,7 +53,50 @@ def test_scan_db_sink_channels_attribute():
     sink = ScanDBSink(db_path=":memory:")
     assert "raw" in sink.channels
     assert "live" in sink.channels
-    assert "final" in sink.channels
+    assert "final_side" in sink.channels
+    # The per-cam corrected interval ("final") is no longer persisted by the
+    # DB sink — the corrected side average comes via "final_side".
+    assert "final" not in sink.channels
+
+
+def test_scan_db_sink_reduced_mode_live_writes_no_per_cam_rows(tmp_path):
+    """Reduced mode persists only the corrected side average (cam_id=-1) — the
+    per-camera realtime 'live' rows are not written."""
+    import sqlite3
+    db_path = str(tmp_path / "scan.db")
+    sink = ScanDBSink(db_path=db_path)
+    sink.on_scan_start(_meta_reduced())
+    batch = _dummy_live_batch(
+        frame_types=["light", "light"], side_ids=[0, 0], cam_ids=[0, 1],
+        bfi=[0.4, 0.5], bvi=[5.0, 5.1],
+    )
+    sink.consume("live", batch)
+    sink.on_complete()
+
+    conn = sqlite3.connect(db_path)
+    n = conn.execute("SELECT COUNT(*) FROM session_data").fetchone()[0]
+    conn.close()
+    assert n == 0
+
+
+def test_scan_db_sink_final_side_writes_cam_id_minus_1(tmp_path):
+    """The corrected side average lands as a cam_id=-1 row carrying real
+    bfi/bvi/mean/contrast (superseding the old NULL-bfi placeholder)."""
+    import sqlite3
+    db_path = str(tmp_path / "scan.db")
+    sink = ScanDBSink(db_path=db_path)
+    sink.on_scan_start(_meta_reduced())
+    sink.consume("final_side", SideAverageSample(
+        t=1.5, frame_id=42, side=1, bfi=3.5, bvi=7.5, mean=120.0, contrast=0.25))
+    sink.on_complete()
+
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute(
+        "SELECT cam_id, side, frame_id, bfi, bvi, mean, contrast FROM session_data"
+    ).fetchall()
+    conn.close()
+    assert rows == [(-1, 1, 42, pytest.approx(3.5), pytest.approx(7.5),
+                     pytest.approx(120.0), pytest.approx(0.25))]
 
 
 def _dummy_live_batch(*, frame_types=None, side_ids=None, cam_ids=None,

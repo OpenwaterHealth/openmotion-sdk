@@ -496,28 +496,33 @@ class ScanDBSink:
     """Channel-based SQLite sink for the pipeline.
 
     Channels:
-        "raw"   — per-frame raw histograms (gated by meta.write_raw_csv)
-        "live"  — per-frame per-cam BFI/BVI/mean/contrast (uncorrected
-                  realtime values), for past-scan replay in the new
-                  PlotViewer. Cheap: ~40 rows/sec.
-        "final" — per-interval corrected output. Writes a sentinel
-                  cam_id=-1 placeholder row carrying the side-aggregated
-                  corrected mean/contrast.
+        "raw"        — per-frame raw histograms (gated by meta.write_raw_csv)
+        "live"       — per-frame per-cam BFI/BVI/mean/contrast (uncorrected
+                       realtime values), for past-scan replay. ~40 rows/sec.
+                       NOT written in reduced mode (which persists only the
+                       corrected side average).
+        "final_side" — reduced-mode per-side dark-corrected average
+                       (CorrectedSideAverageStage), one SideAverageSample per
+                       capture. Persisted as cam_id=-1 rows — the accurate
+                       side-average record replay reads.
     """
 
-    channels = {"raw", "live", "final"}
+    channels = {"raw", "live", "final_side"}
 
     # If the scan database can't be opened, abort the scan rather than run
     # it with no durable record (see ScanRunner.CriticalSinkError).
     critical = True
 
-    def __init__(self, db_path: str, *, raw_batch_size: int = 200) -> None:
+    def __init__(self, db_path: str, *, raw_batch_size: int = 200,
+                 side_batch_size: int = 200) -> None:
         self._db_path = db_path
         self._raw_batch_size = max(1, int(raw_batch_size))
+        self._side_batch_size = max(1, int(side_batch_size))
         self._db = None
         self._session_id: Optional[int] = None
         self._meta: Optional[ScanMetadata] = None
         self._raw_buffer: list = []
+        self._side_buffer: list = []
         self._closed = False
 
     def on_scan_start(self, meta: ScanMetadata) -> None:
@@ -539,8 +544,8 @@ class ScanDBSink:
             self._consume_raw(payload)
         elif channel == "live":
             self._consume_live(payload)
-        elif channel == "final":
-            self._consume_final(payload)
+        elif channel == "final_side":
+            self._consume_side(payload)
 
     def on_complete(self) -> None:
         if self._closed:
@@ -549,6 +554,7 @@ class ScanDBSink:
         import time
         try:
             self._flush_raw()
+            self._flush_side()
             if self._db is not None and self._session_id is not None:
                 self._db.close_session(self._session_id, time.time())
         except Exception:
@@ -575,8 +581,13 @@ class ScanDBSink:
         past-replay sees the same values the user saw live. Skips dark
         frames (no useful display signal) and non-finite samples (early
         warmup before first dark observation).
+
+        Reduced mode persists only the corrected side average (cam_id=-1, via
+        the "final_side" channel), so per-camera realtime rows are not written.
         """
         if self._db is None or self._session_id is None:
+            return
+        if self._meta is not None and self._meta.reduced_mode:
             return
         if batch.bfi_live is None:
             return
@@ -629,41 +640,50 @@ class ScanDBSink:
                     "ScanDBSink: failed to insert %d live rows", len(rows)
                 )
 
-    def _consume_final(self, interval) -> None:
-        """Write CorrectedFrames from a CorrectedInterval to session_data.
-
-        The session_data table holds: cam_id, side, frame_id, timestamp_s,
-        mean, bfi, bvi, contrast. For CorrectedFrames we don't have cam_id
-        or side metadata (they're aggregated by DarkCorrectionStage at the
-        per-camera level). We write cam_id=-1, side=0 (left sentinel) so the
-        rows are query-able; PR 3 will carry per-cam data through the interval.
-        """
+    def _consume_side(self, sample) -> None:
+        """Buffer one corrected per-side average (SideAverageSample from
+        CorrectedSideAverageStage) for persistence as a cam_id=-1 row. This is
+        the accurate side-average record reduced-mode replay reads."""
         if self._db is None or self._session_id is None:
             return
-        rows = []
-        for frame in interval.frames:
-            mean_val = float(frame.mean)
-            std_val = float(frame.std)
-            contrast_val = (std_val / mean_val) if mean_val > 0 else None
-            rows.append({
-                "session_id": self._session_id,
-                "session_raw_id": None,
-                "cam_id": -1,
-                "side": 0,
-                "frame_id": int(frame.abs_frame_id),
-                "timestamp_s": round(frame.t, 6),
-                "mean": round(mean_val, 9),
-                "contrast": round(contrast_val, 9) if contrast_val is not None else None,
-                "bfi": None,
-                "bvi": None,
-            })
-        if rows:
-            try:
-                self._db.insert_session_data_rows(rows)
-            except Exception:
-                logger.exception(
-                    "ScanDBSink: failed to insert %d corrected frames", len(rows)
-                )
+        import math
+
+        def _round(v):
+            if v is None:
+                return None
+            v = float(v)
+            return round(v, 9) if math.isfinite(v) else None
+
+        bfi = _round(getattr(sample, "bfi", None))
+        bvi = _round(getattr(sample, "bvi", None))
+        if bfi is None and bvi is None:
+            return  # nothing finite to record for this capture
+        self._side_buffer.append({
+            "session_id": self._session_id,
+            "session_raw_id": None,
+            "cam_id": -1,
+            "side": int(sample.side),
+            "frame_id": int(sample.frame_id),
+            "timestamp_s": round(float(sample.t), 6),
+            "bfi": bfi,
+            "bvi": bvi,
+            "mean": _round(getattr(sample, "mean", None)),
+            "contrast": _round(getattr(sample, "contrast", None)),
+        })
+        if len(self._side_buffer) >= self._side_batch_size:
+            self._flush_side()
+
+    def _flush_side(self) -> None:
+        if not self._side_buffer or self._db is None:
+            return
+        try:
+            self._db.insert_session_data_rows(self._side_buffer)
+        except Exception:
+            logger.exception(
+                "ScanDBSink: failed to insert %d side-average rows",
+                len(self._side_buffer),
+            )
+        self._side_buffer = []
 
     def _consume_raw(self, batch) -> None:
         meta = self._meta
