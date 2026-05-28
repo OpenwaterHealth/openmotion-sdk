@@ -5,6 +5,8 @@ See docs/SciencePipeline.md §16.
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 
 from ..batch import FrameBatch
@@ -36,15 +38,21 @@ class SideAveragingStage:
         # plain mean, the side average is NaN until every active cam
         # has a finite value at the same frame index, which can take
         # several seconds and leaves the reduced-mode display empty.
-        # Suppress the "Mean of empty slice" RuntimeWarning that fires
-        # when an entire row is NaN — those rows correctly emit NaN.
-        with np.errstate(invalid="ignore"):
-            if len(self._left_cams) > 0:
-                bfi_side[:, 0] = np.nanmean(batch.bfi_live[:, 0, self._left_cams], axis=1)
-                bvi_side[:, 0] = np.nanmean(batch.bvi_live[:, 0, self._left_cams], axis=1)
-            if len(self._right_cams) > 0:
-                bfi_side[:, 1] = np.nanmean(batch.bfi_live[:, 1, self._right_cams], axis=1)
-                bvi_side[:, 1] = np.nanmean(batch.bvi_live[:, 1, self._right_cams], axis=1)
+        # Suppress the "Mean of empty slice" warning that fires when an
+        # entire row is NaN (all active cams non-finite for that frame —
+        # common in early warmup frames). nanmean raises it via
+        # warnings.warn, NOT numpy's FP errstate, so catch_warnings is
+        # required. Those rows correctly emit NaN.
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", r"Mean of empty slice",
+                                    category=RuntimeWarning)
+            with np.errstate(invalid="ignore"):
+                if len(self._left_cams) > 0:
+                    bfi_side[:, 0] = np.nanmean(batch.bfi_live[:, 0, self._left_cams], axis=1)
+                    bvi_side[:, 0] = np.nanmean(batch.bvi_live[:, 0, self._left_cams], axis=1)
+                if len(self._right_cams) > 0:
+                    bfi_side[:, 1] = np.nanmean(batch.bfi_live[:, 1, self._right_cams], axis=1)
+                    bvi_side[:, 1] = np.nanmean(batch.bvi_live[:, 1, self._right_cams], axis=1)
 
         batch.bfi_live_side = bfi_side
         batch.bvi_live_side = bvi_side
