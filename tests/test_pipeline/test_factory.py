@@ -42,6 +42,7 @@ def test_default_pipeline_has_expected_stages():
         "dark_correction", "shot_noise_correction", "bfi_bvi",
         "dark_frame_hold",
         "live_side_average",
+        "corrected_side_average",
         "tee:live",
     ]
 
