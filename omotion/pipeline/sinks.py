@@ -481,10 +481,15 @@ class ScanDBSink:
 
     Channels:
         "raw"   — per-frame raw histograms (gated by meta.write_raw_csv)
-        "final" — per-interval corrected output (placeholder; wired in PR 3)
+        "live"  — per-frame per-cam BFI/BVI/mean/contrast (uncorrected
+                  realtime values), for past-scan replay in the new
+                  PlotViewer. Cheap: ~40 rows/sec.
+        "final" — per-interval corrected output. Writes a sentinel
+                  cam_id=-1 placeholder row carrying the side-aggregated
+                  corrected mean/contrast.
     """
 
-    channels = {"raw", "final"}
+    channels = {"raw", "live", "final"}
 
     def __init__(self, db_path: str, *, raw_batch_size: int = 200) -> None:
         self._db_path = db_path
@@ -512,6 +517,8 @@ class ScanDBSink:
     def consume(self, channel: str, payload: Any) -> None:
         if channel == "raw":
             self._consume_raw(payload)
+        elif channel == "live":
+            self._consume_live(payload)
         elif channel == "final":
             self._consume_final(payload)
 
@@ -537,6 +544,70 @@ class ScanDBSink:
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
+
+    def _consume_live(self, batch) -> None:
+        """Write per-frame per-cam BFI/BVI/mean/contrast rows from a
+        post-BfiBvi batch. One row per frame; the source camera for that
+        frame is identified by batch.side_ids[i] / batch.cam_ids[i] (the
+        live pipeline interleaves frames across cameras).
+
+        Mirrors the read pattern in bloodflow-app's _LivePlotSink so
+        past-replay sees the same values the user saw live. Skips dark
+        frames (no useful display signal) and non-finite samples (early
+        warmup before first dark observation).
+        """
+        if self._db is None or self._session_id is None:
+            return
+        if batch.bfi_live is None:
+            return
+        side_ids = getattr(batch, "side_ids", None)
+        cam_ids = getattr(batch, "cam_ids", None)
+        if side_ids is None or cam_ids is None:
+            return
+        import math
+        n = batch.bfi_live.shape[0]
+        rows = []
+        for i in range(n):
+            ft = str(batch.frame_type[i]) if batch.frame_type is not None else "light"
+            if ft in ("warmup", "stale", "dark"):
+                continue
+            side_idx = int(side_ids[i])
+            cam_id = int(cam_ids[i])
+            if side_idx < 0 or side_idx > 1 or cam_id < 0 or cam_id >= 8:
+                continue
+            bfi = float(batch.bfi_live[i, side_idx, cam_id])
+            bvi = float(batch.bvi_live[i, side_idx, cam_id])
+            if not (math.isfinite(bfi) and math.isfinite(bvi)):
+                continue
+            mean_v = None
+            contrast_v = None
+            if batch.mean_dc_rt is not None:
+                m = float(batch.mean_dc_rt[i, side_idx, cam_id])
+                if math.isfinite(m):
+                    mean_v = round(m, 9)
+            if batch.contrast_sn_rt is not None:
+                c = float(batch.contrast_sn_rt[i, side_idx, cam_id])
+                if math.isfinite(c):
+                    contrast_v = round(c, 9)
+            rows.append({
+                "session_id": self._session_id,
+                "session_raw_id": None,
+                "cam_id": cam_id,
+                "side": side_idx,
+                "frame_id": int(batch.abs_frame_ids[i]) if batch.abs_frame_ids is not None else i,
+                "timestamp_s": round(float(batch.timestamp_s[i]), 6),
+                "bfi": round(bfi, 9),
+                "bvi": round(bvi, 9),
+                "mean": mean_v,
+                "contrast": contrast_v,
+            })
+        if rows:
+            try:
+                self._db.insert_session_data_rows(rows)
+            except Exception:
+                logger.exception(
+                    "ScanDBSink: failed to insert %d live rows", len(rows)
+                )
 
     def _consume_final(self, interval) -> None:
         """Write CorrectedFrames from a CorrectedInterval to session_data.

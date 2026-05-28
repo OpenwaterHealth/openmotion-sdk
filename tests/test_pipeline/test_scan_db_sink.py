@@ -44,7 +44,117 @@ def test_scan_db_sink_creates_session_at_scan_start(tmp_path):
 def test_scan_db_sink_channels_attribute():
     sink = ScanDBSink(db_path=":memory:")
     assert "raw" in sink.channels
+    assert "live" in sink.channels
     assert "final" in sink.channels
+
+
+def _dummy_live_batch(*, frame_types=None, side_ids=None, cam_ids=None,
+                     bfi=None, bvi=None):
+    """A post-BfiBvi batch: bfi_live/bvi_live/mean_dc_rt/contrast_sn_rt
+    set per-cam, side_ids+cam_ids pointing to the source camera for
+    each frame. n_frames inferred from the longest input."""
+    n = max(len(x) for x in (frame_types or ["light"],
+                              side_ids if side_ids is not None else [0],
+                              cam_ids if cam_ids is not None else [0]))
+    bfi_arr = np.zeros((n, 2, 8), dtype=np.float32)
+    bvi_arr = np.zeros((n, 2, 8), dtype=np.float32)
+    mean_arr = np.full((n, 2, 8), 100.0, dtype=np.float32)
+    contrast_arr = np.full((n, 2, 8), 0.3, dtype=np.float32)
+    if bfi is not None:
+        for i, val in enumerate(bfi):
+            bfi_arr[i, int(side_ids[i]), int(cam_ids[i])] = val
+    if bvi is not None:
+        for i, val in enumerate(bvi):
+            bvi_arr[i, int(side_ids[i]), int(cam_ids[i])] = val
+    return FrameBatch(
+        cam_ids=np.array(cam_ids if cam_ids is not None else [0] * n, dtype=np.int8),
+        frame_ids=np.array([10 + i for i in range(n)], dtype=np.uint8),
+        raw_histograms=None,
+        temperature_c=np.full((n, 2, 8), 35.0, dtype=np.float32),
+        timestamp_s=np.array([0.025 * (10 + i) for i in range(n)], dtype=np.float64),
+        pdc=None, tcm=None, tcl=None,
+        abs_frame_ids=np.array([100 + i for i in range(n)], dtype=np.int64),
+        frame_type=np.array(frame_types or ["light"] * n, dtype="<U8"),
+        side_ids=np.array(side_ids if side_ids is not None else [0] * n, dtype=np.int8),
+        bfi_live=bfi_arr, bvi_live=bvi_arr,
+        mean_dc_rt=mean_arr, contrast_sn_rt=contrast_arr,
+    )
+
+
+def test_scan_db_sink_live_writes_per_cam_rows(tmp_path):
+    """Phase 1: the 'live' channel writes per-frame per-cam rows with
+    BFI/BVI/mean/contrast — the foundation for past-scan replay from
+    the DB. One row per frame, side+cam from side_ids/cam_ids."""
+    import sqlite3
+    db_path = str(tmp_path / "scan.db")
+    sink = ScanDBSink(db_path=db_path)
+    sink.on_scan_start(_meta_simple())
+    batch = _dummy_live_batch(
+        frame_types=["light", "light", "light"],
+        side_ids=[0, 1, 0],
+        cam_ids=[0, 2, 7],
+        bfi=[0.42, 0.31, 0.50],
+        bvi=[5.1, 4.9, 5.3],
+    )
+    sink.consume("live", batch)
+    sink.on_complete()
+
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute(
+        "SELECT side, cam_id, bfi, bvi FROM session_data ORDER BY frame_id"
+    ).fetchall()
+    conn.close()
+    assert len(rows) == 3
+    assert rows[0] == (0, 0, pytest.approx(0.42), pytest.approx(5.1))
+    assert rows[1] == (1, 2, pytest.approx(0.31), pytest.approx(4.9))
+    assert rows[2] == (0, 7, pytest.approx(0.50), pytest.approx(5.3))
+
+
+def test_scan_db_sink_live_skips_dark_and_warmup_frames(tmp_path):
+    """Dark frames have no useful display BFI/BVI; warmup/stale frames
+    are already filtered by the pipeline's Tee but the sink double-
+    checks. Only light frames should land in session_data."""
+    import sqlite3
+    db_path = str(tmp_path / "scan.db")
+    sink = ScanDBSink(db_path=db_path)
+    sink.on_scan_start(_meta_simple())
+    batch = _dummy_live_batch(
+        frame_types=["warmup", "dark", "light", "stale"],
+        side_ids=[0, 0, 0, 0],
+        cam_ids=[0, 0, 0, 0],
+        bfi=[0.10, 0.20, 0.30, 0.40],
+        bvi=[1.0, 2.0, 3.0, 4.0],
+    )
+    sink.consume("live", batch)
+    sink.on_complete()
+
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute("SELECT bfi FROM session_data").fetchall()
+    conn.close()
+    assert rows == [(pytest.approx(0.30),)]
+
+
+def test_scan_db_sink_live_skips_nan_bfi_or_bvi(tmp_path):
+    """Early frames before the first dark observation can emit NaN for
+    BFI or BVI — skip them so the DB doesn't carry display noise."""
+    import sqlite3
+    db_path = str(tmp_path / "scan.db")
+    sink = ScanDBSink(db_path=db_path)
+    sink.on_scan_start(_meta_simple())
+    batch = _dummy_live_batch(
+        frame_types=["light", "light"],
+        side_ids=[0, 0],
+        cam_ids=[0, 0],
+        bfi=[float("nan"), 0.45],
+        bvi=[5.0, 5.5],
+    )
+    sink.consume("live", batch)
+    sink.on_complete()
+
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute("SELECT bfi FROM session_data").fetchall()
+    conn.close()
+    assert rows == [(pytest.approx(0.45),)]
 
 
 def test_scan_db_sink_raw_always_writes_when_consume_called(tmp_path):
