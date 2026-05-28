@@ -66,6 +66,7 @@ Signals are `pyqtSignal` when PyQt is importable, otherwise a fallback `MOTIONSi
 
 | Doc | Purpose |
 |---|---|
+| `docs/API.md` | **Public API / interface guide** — how a host app or script drives the SDK (`MotionInterface`, scans, reading the DB, custom sinks). Start here for consumer-facing usage. |
 | `docs/Architecture.md` | Comprehensive — layer diagram, module reference, transport details. |
 | `docs/scan-sequencing.md` | Frame ID unwrapping + histogram packet ordering. |
 | `docs/SciencePipeline.md` | BFI/BVI computation. |
@@ -79,7 +80,7 @@ Signals are `pyqtSignal` when PyQt is importable, otherwise a fallback `MOTIONSi
 
 ## Gotchas
 
-- **`MotionConsole.py` is 2815 lines** — read its module-level docstring + method docstrings before scrolling. The class is the source-of-truth for the console command set; there's no separate API reference doc.
+- **`MotionConsole.py` is 2815 lines** — read its module-level docstring + method docstrings before scrolling. The class is the source-of-truth for the low-level console command set. For the consumer-facing public interface (facade, scans, DB read, pipeline sinks) see `docs/API.md`.
 - **Three transport threads can run concurrently:** ConnectionMonitor + per-endpoint stream readers + telemetry poller. Anything touching shared state needs to assume cross-thread emission.
 - **Histogram packets have two CRCs when `DEBUG_FLAG_HISTO_CMP` is on** — transport CRC + decompressed-payload CRC. See `StreamInterface.py` ~lines 51–100.
 - **Debug flags live in firmware**, set via `MotionSensor.set_debug_flags()`. Bits defined at `config.py:116-125` (`USB_PRINTF`, `HISTO_THROTTLE`, `FAKE_DATA`, `HISTO_CMP`, etc.).

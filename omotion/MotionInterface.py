@@ -48,7 +48,6 @@ class MotionInterface:
         timeout: int = 30,
         demo_mode: bool = False,
         default_trigger_config: Optional[dict] = None,
-        db_path: Optional[str] = None,
         data_dir: Optional[str] = None,
         scan_db_path: Optional[str] = None,
         operator_id: Optional[str] = None,
@@ -61,12 +60,6 @@ class MotionInterface:
         self.data_dir = data_dir
         self.scan_db_path = scan_db_path
         self.operator_id = operator_id
-
-        # Optional DB sink (issue #92). When set, ``start_scan`` builds a
-        # ScanDBSink that writes corrected (and optionally raw) data to
-        # this SQLite file for every scan. When None (the default), no
-        # DB code runs in the scan hot path.
-        self._db_path: Optional[str] = db_path
 
         # Resolved default trigger config used by every workflow whose
         # request doesn't carry a ``trigger_config`` override. Stored

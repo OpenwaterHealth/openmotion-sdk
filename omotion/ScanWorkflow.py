@@ -122,7 +122,7 @@ class ScanRequest:
     reduced_mode: bool = False
     # Database sink (issue #92, see docs/superpowers/specs/2026-04-14-scan-db-sink-design.md).
     # The DB endpoint itself is opt-in at SDK construction via
-    # ``MotionInterface(db_path=...)``; these per-scan fields are only
+    # ``MotionInterface(scan_db_path=...)``; these per-scan fields are only
     # effective when that path is set.
     write_raw_to_db: bool = False
     notes: str = ""
