@@ -16,6 +16,24 @@ def _mask_to_cam_indices(mask: int) -> np.ndarray:
     return np.array([i for i in range(8) if mask & (1 << i)], dtype=np.int8)
 
 
+def spatial_side_average(values_by_cam: np.ndarray, cam_indices: np.ndarray) -> float:
+    """Nan-aware mean of the SELECTED cameras' values at one capture instant.
+
+    This is the single definition of the reduced-mode side average — a purely
+    SPATIAL operation (across cameras at one instant), with no temporal element.
+    `values_by_cam` is a per-camera 1-D array (length 8); `cam_indices` selects
+    the active cameras. Returns NaN when the selection is empty or every selected
+    camera is non-finite."""
+    if len(cam_indices) == 0:
+        return float("nan")
+    selected = np.asarray(values_by_cam)[cam_indices]
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", r"Mean of empty slice",
+                                category=RuntimeWarning)
+        with np.errstate(invalid="ignore"):
+            return float(np.nanmean(selected))
+
+
 class SideAveragingStage:
     name = "side_averaging"
 

@@ -1,9 +1,45 @@
 """SideAveragingStage — average BFI/BVI across cameras into per-side values."""
 
 import numpy as np
+import pytest
 from omotion.pipeline.batch import FrameBatch
-from omotion.pipeline.stages.side_avg import SideAveragingStage
+from omotion.pipeline.stages.side_avg import SideAveragingStage, spatial_side_average
 
+
+# ── spatial_side_average (pure helper) ───────────────────────────────────────
+
+def test_spatial_side_average_means_selected_cameras():
+    vals = np.array([2.0, 4.0, np.nan, np.nan, np.nan, np.nan, 6.0, 8.0])
+    cams = np.array([0, 1, 6, 7], dtype=np.int8)
+    assert spatial_side_average(vals, cams) == pytest.approx(5.0)  # mean(2,4,6,8)
+
+
+def test_spatial_side_average_ignores_unselected_cameras():
+    # cam 2 carries a large value but is not in the active selection.
+    vals = np.array([2.0, 4.0, 999.0, np.nan, np.nan, np.nan, 6.0, 8.0])
+    cams = np.array([0, 1, 6, 7], dtype=np.int8)
+    assert spatial_side_average(vals, cams) == pytest.approx(5.0)
+
+
+def test_spatial_side_average_is_nan_aware():
+    vals = np.array([2.0, np.nan, np.nan, np.nan, np.nan, np.nan, 6.0, np.nan])
+    cams = np.array([0, 1, 6, 7], dtype=np.int8)
+    assert spatial_side_average(vals, cams) == pytest.approx(4.0)  # mean(2,6)
+
+
+def test_spatial_side_average_all_nan_returns_nan():
+    vals = np.full(8, np.nan)
+    cams = np.array([0, 1], dtype=np.int8)
+    assert np.isnan(spatial_side_average(vals, cams))
+
+
+def test_spatial_side_average_empty_selection_returns_nan():
+    vals = np.ones(8)
+    cams = np.array([], dtype=np.int8)
+    assert np.isnan(spatial_side_average(vals, cams))
+
+
+# ── SideAveragingStage ───────────────────────────────────────────────────────
 
 def _batch_with_bfi_bvi(bfi, bvi):
     n = bfi.shape[0]
