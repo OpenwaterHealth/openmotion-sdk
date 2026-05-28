@@ -16,17 +16,18 @@ import numpy as np
 from ..batch import FrameBatch
 
 
-# Sanity bounds for finite BFI/BVI output. Values outside indicate
-# degenerate input (e.g. near-zero mean at scan stop when the laser
-# is turning off, making K = std/mean blow up; or K << C_min driving
-# the formula past its calibrated extreme). The viewer would otherwise
-# display these as cell-label garbage (BFI=10.0 clamp-exact or
-# BFI=-1183 from divide-by-near-zero). NaN propagates naturally through
-# every downstream consumer (LivePlotSink, ScanDBSink, SideAveragingStage's
-# nanmean) so out-of-range values become gaps in the display rather
-# than spikes.
-_BFI_BVI_SANITY_LO = -2.0
-_BFI_BVI_SANITY_HI = 12.0
+# Sanity bounds for finite BFI/BVI output. Values outside (or AT) the
+# formula's calibrated extremes [0, 10] indicate degenerate input —
+# either near-zero mean at scan stop when the laser is turning off
+# (making K = std/mean blow up) or K << C_min driving the formula past
+# its calibrated extreme. Exact-10.0 only happens when K == C_min as
+# float-bitwise-identical, which never arises from real continuous
+# measurements (it's a degenerate-sentinel pattern). NaN propagates
+# naturally through every downstream consumer (LivePlotSink,
+# ScanDBSink, SideAveragingStage's nanmean) so out-of-range values
+# become display gaps rather than spikes.
+_BFI_BVI_SANITY_LO = -2.0   # exclusive: legit "high blood flow" tops at ~3-5
+_BFI_BVI_SANITY_HI = 10.0   # exclusive: exact 10.0 == formula extreme == junk
 
 
 class BfiBviStage:
@@ -55,13 +56,17 @@ class BfiBviStage:
         bvi = np.where(i_span_broadcast > 0, bvi, m * 10.0)
 
         # Sanity filter — see module-level constants for rationale.
+        # Lower bound is inclusive (0.0 is a legitimate occlusion-test
+        # reading); upper bound is exclusive (exact 10.0 is the formula's
+        # degenerate-input marker from laser turn-off, never produced
+        # by real continuous measurements).
         with np.errstate(invalid='ignore'):
             bfi = np.where(
-                (bfi >= _BFI_BVI_SANITY_LO) & (bfi <= _BFI_BVI_SANITY_HI),
+                (bfi >= _BFI_BVI_SANITY_LO) & (bfi < _BFI_BVI_SANITY_HI),
                 bfi, np.nan,
             )
             bvi = np.where(
-                (bvi >= _BFI_BVI_SANITY_LO) & (bvi <= _BFI_BVI_SANITY_HI),
+                (bvi >= _BFI_BVI_SANITY_LO) & (bvi < _BFI_BVI_SANITY_HI),
                 bvi, np.nan,
             )
 
