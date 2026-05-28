@@ -206,6 +206,11 @@ class ScanWorkflow:
         # whether the scan succeeded.
         self._last_scan_error: str | None = None
         self._last_scan_canceled: bool = False
+        # Label of the scan-DB session for the most recent start_scan, set
+        # synchronously when the scan's metadata is built. Lets callers bind
+        # to THIS scan's session row (e.g. the app's live plot DB tail) by
+        # exact label instead of guessing the newest session.
+        self._current_scan_label: str | None = None
         # Cancel signal flag. Distinct from _stop_evt (which is also pulsed
         # by the worker's inner finally to wake the duration guard on a
         # clean exit). Set ONLY by the user-cancel paths — cancel() and
@@ -349,6 +354,9 @@ class ScanWorkflow:
             right_camera_mask=request.right_camera_mask,
             reduced_mode=request.reduced_mode,
         )
+        # Mirror ScanDBSink.on_scan_start's label so callers can bind to this
+        # exact session row (must match f"{scan_id}_{subject_id}" there).
+        self._current_scan_label = f"{scan_id}_{request.subject_id}"
 
         # ── Build pedestals (safe: fall back to 64.0 if version unreadable) ─
         def _safe_pedestal(sensor) -> float:
@@ -664,6 +672,14 @@ class ScanWorkflow:
         """True if the most recent scan was canceled (stop_evt was set
         before the worker finished). Cleared at the start of each new scan."""
         return self._last_scan_canceled
+
+    @property
+    def current_scan_label(self) -> str | None:
+        """Scan-DB session label (``f"{scan_id}_{subject_id}"``) for the most
+        recent start_scan, or None if no scan has started. Set synchronously
+        while building scan metadata, so it's valid as soon as start_scan
+        returns. Callers use it to bind to this scan's exact session row."""
+        return self._current_scan_label
 
     def await_complete(self, *, timeout_sec: float | None = None) -> None:
         """Block until the current scan worker thread finishes (or the
