@@ -219,7 +219,9 @@ Always creates `CommInterface` in async mode. Claims all three on `connect()`, r
 | `pipeline/stages/dark.py` | `DarkCorrectionStage` + `HybridRealtimePredictor` + `LinearInterpolation` + `DarkFrameQuadraticStencil`; dual-output (realtime per-frame and batched per-interval) |
 | `pipeline/stages/shot_noise.py` | `ShotNoiseCorrectionStage` — Poisson-variance subtraction on the realtime path |
 | `pipeline/stages/bfi_bvi.py` | `BfiBviStage` — affine calibration map (contrast, mean) → (BFI, BVI) |
-| `pipeline/stages/side_avg.py` | `SideAveragingStage` — per-side averaging for reduced-mode display |
+| `pipeline/stages/dark_frame_hold.py` | `DarkFrameHoldStage` — hold last light BFI/BVI across dark frames |
+| `pipeline/stages/side_avg.py` | `LiveSideAverageStage` — realtime per-side spatial average (reduced mode) → `live_side` |
+| `pipeline/stages/corrected_side_avg.py` | `CorrectedSideAverageStage` — dark-corrected per-side average (reduced mode) → `final_side` |
 
 **`ScanWorkflow`** — orchestrates a complete acquisition:
 1. Build a `ScanMetadata` and `SensorPedestals` from the connected sensors.
@@ -252,7 +254,9 @@ DarkCorrectionStage         — dual-output: realtime (predicted) + batched (int
                               interval closes
 ShotNoiseCorrectionStage    — Poisson variance subtraction on the realtime path
 BfiBviStage                 — affine calibration (contrast, mean) → (BFI, BVI)
-SideAveragingStage          — per-side averaging (reduced mode only)
+DarkFrameHoldStage          — hold last light BFI/BVI across dark frames
+LiveSideAverageStage        — realtime per-side spatial average (reduced) → "live_side"
+CorrectedSideAverageStage   — dark-corrected per-side average (reduced) → "final_side"
 Tee("live")                 — corrected per-frame FrameBatch to "live" sinks
 ```
 

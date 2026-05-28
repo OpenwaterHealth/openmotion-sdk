@@ -8,7 +8,7 @@ the most recent LIGHT frame's values for that camera, so the live trace
 holds steady through the dark interval instead of spiking.
 
 Placed AFTER BfiBviStage (so bfi_live/bvi_live exist) and BEFORE
-SideAveragingStage (so the per-side averages reflect the held values).
+LiveSideAverageStage (so the per-side averages reflect the held values).
 Frames stay labeled "dark" — only their display values are held; the
 upstream dark-correction baseline machinery is untouched. Only the
 display metrics (bfi_live, bvi_live) are held; mean/contrast feed the
