@@ -59,3 +59,38 @@ def test_bvi_uses_mean_with_i_min_i_max():
     batch = _batch_with_live_values(mean, contrast)
     BfiBviStage(calibration=_trivial_calibration()).process(batch)
     np.testing.assert_allclose(batch.bvi_live, 5.0, atol=1e-5)
+
+
+def test_bfi_out_of_sanity_range_replaced_with_nan():
+    """Last-frame-at-scan-stop artifact: when contrast K is huge (e.g.
+    from near-zero mean after laser turn-off), BFI = (1 - K/span) * 10
+    blows up massively negative. Values outside the [-2, 12] sanity
+    range get NaN'd so consumers (LivePlotSink, ScanDBSink, viewer
+    decimation) skip them naturally instead of plotting garbage."""
+    # contrast = 200 → BFI = (1 - 200/1) * 10 = -1990 → NaN
+    mean = np.full((1, 2, 8), 50.0, dtype=np.float32)
+    contrast = np.full((1, 2, 8), 200.0, dtype=np.float32)
+    batch = _batch_with_live_values(mean, contrast)
+    BfiBviStage(calibration=_trivial_calibration()).process(batch)
+    assert np.all(np.isnan(batch.bfi_live))
+
+
+def test_bvi_out_of_sanity_range_replaced_with_nan():
+    """Same as above for BVI when mean is far above i_max."""
+    # mean = 5000 with i_min=0, i_max=100 → BVI = (1 - 50) * 10 = -490 → NaN
+    mean = np.full((1, 2, 8), 5000.0, dtype=np.float32)
+    contrast = np.full((1, 2, 8), 0.5, dtype=np.float32)
+    batch = _batch_with_live_values(mean, contrast)
+    BfiBviStage(calibration=_trivial_calibration()).process(batch)
+    assert np.all(np.isnan(batch.bvi_live))
+
+
+def test_bfi_at_clamp_extreme_passes_when_legitimate():
+    """BFI = 10.0 when K == C_min exactly is the calibrated maximum;
+    it's *legitimate*. The sanity range is [-2, 12] so 10.0 passes
+    through unfiltered."""
+    mean = np.full((1, 2, 8), 50.0, dtype=np.float32)
+    contrast = np.full((1, 2, 8), 0.0, dtype=np.float32)  # K = C_min
+    batch = _batch_with_live_values(mean, contrast)
+    BfiBviStage(calibration=_trivial_calibration()).process(batch)
+    np.testing.assert_allclose(batch.bfi_live, 10.0, atol=1e-5)
