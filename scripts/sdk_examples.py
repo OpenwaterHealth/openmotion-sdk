@@ -94,14 +94,20 @@ def example_contact_quality(iface: MotionInterface) -> None:
 
 def example_configure(iface: MotionInterface) -> None:
     _banner("configure cameras — start_configure_camera_sensors()")
+    # FPGA SRAM programming takes ~14s per camera, so a full both-sensor
+    # configure runs ~2 minutes. Wait well past that, and surface progress so
+    # the wait isn't silent — finishing early (e.g. the old 60s) tears down the
+    # USB comm mid-program and shows up as "No response in async mode".
+    print("programming all camera FPGAs — this takes ~2 minutes (~14s/camera)...")
     done = threading.Event()
     holder: dict = {}
     started = iface.start_configure_camera_sensors(
         ConfigureRequest(left_camera_mask=LEFT_MASK, right_camera_mask=RIGHT_MASK),
+        on_progress_fn=lambda pct: print(f"  progress: {int(pct)}%"),
         on_complete_fn=lambda res: (holder.__setitem__("res", res), done.set()),
     )
     print("started:", started)
-    done.wait(timeout=60)
+    done.wait(timeout=240)
     res = holder.get("res")
     print("result:", f"ok={res.ok}  error={res.error!r}" if res else "(no result within timeout)")
 
