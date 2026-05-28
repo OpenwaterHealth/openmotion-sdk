@@ -862,7 +862,7 @@ class _CalibrationCollectorSink:
 # Orchestration class
 # ---------------------------------------------------------------------------
 
-from omotion.ScanWorkflow import ScanRequest
+from omotion.ScanWorkflow import run_collection_scan
 
 
 def _run_subscan_capture(
@@ -898,40 +898,21 @@ def _run_subscan_capture(
     """
     collector = _CalibrationCollectorSink()
 
-    scan_req = ScanRequest(
+    # Shared short-scan engine (ScanWorkflow.run_collection_scan), the same one
+    # the contact-quality check uses. Cancellable via stop_evt; raises on a
+    # scan-level failure so the caller aborts calibration cleanly rather than
+    # running the math on empty data.
+    completed = run_collection_scan(
+        interface.scan_workflow,
+        collector,
         subject_id=subject_id,
         duration_sec=duration_sec,
         left_camera_mask=request.left_camera_mask,
         right_camera_mask=request.right_camera_mask,
-        disable_laser=False,
-        reduced_mode=False,
-        sinks=[collector],
-        skip_default_storage=True,
+        stop_evt=stop_evt,
+        raise_on_error=True,
     )
-
-    started = interface.scan_workflow.start_scan(scan_req)
-    if not started:
-        raise RuntimeError("ScanWorkflow refused start_scan.")
-
-    # Poll the worker thread with short awaits so a stop_evt set by the
-    # caller can interrupt and cancel the scan.
-    while interface.scan_workflow.running:
-        interface.scan_workflow.await_complete(timeout_sec=0.1)
-        if stop_evt.is_set() and interface.scan_workflow.running:
-            try:
-                interface.scan_workflow.cancel_scan()
-            except Exception:
-                pass
-            interface.scan_workflow.await_complete(timeout_sec=5.0)
-            return "", "", [], []
-
-    # Surface scan-level failures so the caller can abort calibration
-    # cleanly instead of running the calibration math on empty data and
-    # producing a misleading "no corrected samples" error.
-    err = interface.scan_workflow.last_scan_error
-    if err:
-        raise RuntimeError(f"sub-scan failed: {err}")
-    if interface.scan_workflow.last_scan_canceled:
+    if not completed:  # canceled (mid-scan stop_evt or last_scan_canceled)
         return "", "", [], []
 
     # Apply the legacy windowing on light samples here so the sink's

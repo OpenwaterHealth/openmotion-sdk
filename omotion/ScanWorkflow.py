@@ -2,6 +2,7 @@ import concurrent.futures
 import datetime
 import csv
 import logging
+import math
 import os
 import queue
 import threading
@@ -161,6 +162,71 @@ class ConfigureRequest:
 class ConfigureResult:
     ok: bool
     error: str
+
+
+def run_collection_scan(
+    scan_workflow,
+    collector,
+    *,
+    subject_id: str,
+    duration_sec,
+    left_camera_mask: int,
+    right_camera_mask: int,
+    disable_laser: bool = False,
+    reduced_mode: bool = False,
+    stop_evt: "threading.Event | None" = None,
+    poll_interval_s: float = 0.1,
+    timeout_pad_s: float = 2.0,
+    raise_on_error: bool = False,
+) -> bool:
+    """Run one short scan whose only sink is ``collector``, blocking until it
+    finishes. This is the shared "threshold scan" engine behind both the
+    contact-quality check and the calibration/test sub-scans: build a
+    ``ScanRequest`` with default storage skipped and just the collector
+    attached, start it, and wait. The collector's own per-camera accumulation
+    and verdict logic stays specialized to each caller.
+
+    ``stop_evt`` (calibration): poll in ``poll_interval_s`` slices and
+    ``cancel_scan()`` if the event is set, returning ``False`` (canceled).
+    Without it (CQ): a single ``await_complete(duration_sec + timeout_pad_s)``.
+    ``raise_on_error``: a refused start or a scan-level error raises
+    ``RuntimeError``. Returns ``False`` when the scan was canceled, else ``True``.
+
+    Operates only on ``scan_workflow``'s public surface (``start_scan`` /
+    ``await_complete`` / ``running`` / ``cancel_scan`` / ``last_scan_error`` /
+    ``last_scan_canceled``) so callers can pass a real ``ScanWorkflow`` or a
+    compatible mock.
+    """
+    request = ScanRequest(
+        subject_id=subject_id,
+        duration_sec=int(math.ceil(duration_sec)),
+        left_camera_mask=left_camera_mask,
+        right_camera_mask=right_camera_mask,
+        disable_laser=disable_laser,
+        reduced_mode=reduced_mode,
+        sinks=[collector],
+        skip_default_storage=True,
+    )
+    started = scan_workflow.start_scan(request)
+    if raise_on_error and not started:
+        raise RuntimeError("ScanWorkflow refused start_scan.")
+
+    if stop_evt is None:
+        scan_workflow.await_complete(timeout_sec=duration_sec + timeout_pad_s)
+    else:
+        while scan_workflow.running:
+            scan_workflow.await_complete(timeout_sec=poll_interval_s)
+            if stop_evt.is_set() and scan_workflow.running:
+                try:
+                    scan_workflow.cancel_scan()
+                except Exception:
+                    pass
+                scan_workflow.await_complete(timeout_sec=5.0)
+                return False
+
+    if raise_on_error and scan_workflow.last_scan_error:
+        raise RuntimeError(f"sub-scan failed: {scan_workflow.last_scan_error}")
+    return not scan_workflow.last_scan_canceled
 
 
 class ScanWorkflow:

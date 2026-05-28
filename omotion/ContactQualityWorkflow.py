@@ -26,7 +26,7 @@ from typing import Optional
 
 import numpy as np
 
-from omotion.ScanWorkflow import ScanRequest
+from omotion.ScanWorkflow import run_collection_scan
 
 
 @dataclass
@@ -278,19 +278,16 @@ class ContactQualityWorkflow:
             light_thresholds=light_threshold_per_camera,
             rolling_window=rolling_window,
         )
-        request = ScanRequest(
+        # Shared short-scan engine (see ScanWorkflow.run_collection_scan), the
+        # same one the calibration/test sub-scans use. CQ runs it synchronously
+        # (no stop_evt) and reads the verdict off its own sink.
+        run_collection_scan(
+            self._scan_workflow,
+            sink,
             subject_id="_cq_check",
-            duration_sec=int(math.ceil(duration_sec)),
+            duration_sec=duration_sec,
             left_camera_mask=left_camera_mask,
             right_camera_mask=right_camera_mask,
-            disable_laser=False,
-            reduced_mode=False,
-            sinks=[sink],
-            skip_default_storage=True,
-        )
-        self._scan_workflow.start_scan(request)
-        self._scan_workflow.await_complete(
-            timeout_sec=duration_sec + 2.0
         )
         return sink.result(
             left_mask=left_camera_mask,
