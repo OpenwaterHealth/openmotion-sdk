@@ -45,15 +45,20 @@ def _banner(title: str) -> None:
     print("=" * 70)
 
 
-def connect(*, wait_timeout: float = 5.0) -> MotionInterface:
-    """Construct + start a MotionInterface and report connection state."""
+def connect(*, timeout: float = 10.0) -> MotionInterface:
+    """Construct + start a MotionInterface and block until the hardware is up.
+
+    Devices enumerate asynchronously after ``start()`` (the console and both
+    sensors land over a few seconds via the hotplug monitor), so we wait on
+    ``wait_for_ready`` rather than reading connection state immediately."""
     Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
     iface = MotionInterface(
         data_dir=DATA_DIR,
         scan_db_path=DB_PATH,
         operator_id="sdk-examples",
     )
-    iface.start(wait=True, wait_timeout=wait_timeout)
+    iface.start(wait=True, wait_timeout=2.0)
+    iface.wait_for_ready(console=True, sensors=2, timeout=timeout)
     console, left, right = iface.is_device_connected()
     print(f"connected — console={console}  left={left}  right={right}")
     print(f"output dir: {DATA_DIR}")
