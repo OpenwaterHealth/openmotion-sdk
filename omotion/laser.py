@@ -26,7 +26,7 @@ import logging
 from pathlib import Path
 from typing import Any, Optional
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("openmotion.sdk.laser")
 
 _DATA_DIR = Path(__file__).resolve().parent / "data"
 _FPGA_MODEL_PATH = _DATA_DIR / "fpga_model.json"
