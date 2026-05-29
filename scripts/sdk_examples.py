@@ -232,6 +232,9 @@ def main(argv=None) -> None:
         "example", nargs="?", default="all",
         choices=list(_EXAMPLES) + ["all"],
         help="which example to run (default: all)")
+    parser.add_argument(
+        "--duration", type=int, default=5,
+        help="scan / test-scan duration in seconds (default: 5)")
     args = parser.parse_args(argv)
 
     if args.example == "read-scan":
@@ -242,6 +245,10 @@ def main(argv=None) -> None:
     try:
         if args.example == "all":
             _run_all(iface)
+        elif args.example == "scan":
+            example_scan(iface, duration_sec=args.duration)
+        elif args.example == "test-scan":
+            example_test_scan(iface, duration_sec=args.duration)
         else:
             _EXAMPLES[args.example](iface)
     finally:
