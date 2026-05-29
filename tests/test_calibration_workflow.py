@@ -1,9 +1,9 @@
 """Integration tests for CalibrationWorkflow with mocked ScanWorkflow.
 
-Patches MotionInterface.scan_workflow.start_scan to immediately invoke
-on_complete_fn with a fake ScanResult pointing at fixture CSVs.
-Patches MotionInterface.write_calibration to record arguments without
-hitting hardware.
+Patches MotionInterface.scan_workflow.start_scan so sub-scans don't hit
+hardware, and MotionInterface.write_calibration to record arguments.
+Sub-scans run via run_collection_scan, which calls start_scan(request) and
+polls scan_workflow.running — there is no on_complete_fn / ScanResult callback.
 """
 import os
 import threading
@@ -20,7 +20,6 @@ from omotion.CalibrationWorkflow import (
     CalibrationResult,
     CalibrationThresholds,
 )
-from omotion.ScanWorkflow import ScanResult
 
 
 _FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
@@ -272,17 +271,11 @@ def test_subscan_uses_collector_sink_and_skip_default_storage(interface, request
 
     captured_requests: list = []
 
-    def _capture_and_complete(req, *, on_complete_fn=None, on_corrected_batch_fn=None,
-                               on_dark_frame_fn=None, **kw):
+    def _capture_and_complete(req, **kw):
+        # run_collection_scan calls start_scan(request) then polls
+        # scan_workflow.running (False here — no worker is started), so just
+        # capture the request and report a successful launch.
         captured_requests.append(req)
-        # Satisfy the existing callback contract so the workflow doesn't hang.
-        threading.Thread(
-            target=lambda: on_complete_fn(ScanResult(
-                ok=True, error="", left_path="", right_path="",
-                canceled=False, scan_timestamp="20260101_000000",
-            )) if on_complete_fn else None,
-            daemon=True,
-        ).start()
         return True
 
     interface.scan_workflow.start_scan = _capture_and_complete
@@ -333,15 +326,8 @@ def test_start_test_scan_uses_collector_sink_and_skip_default_storage(
 
     captured_requests: list = []
 
-    def _capture_and_complete(req, *, on_complete_fn=None, **kw):
+    def _capture_and_complete(req, **kw):
         captured_requests.append(req)
-        threading.Thread(
-            target=lambda: on_complete_fn(ScanResult(
-                ok=True, error="", left_path="", right_path="",
-                canceled=False, scan_timestamp="20260101_000000",
-            )) if on_complete_fn else None,
-            daemon=True,
-        ).start()
         return True
 
     interface.scan_workflow.start_scan = _capture_and_complete

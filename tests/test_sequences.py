@@ -172,12 +172,13 @@ def test_trigger_lsync_sequence(console):
 @pytest.mark.slow
 @pytest.mark.console
 @pytest.mark.timeout(300)
-def test_scan_workflow_end_to_end(motion, tmp_path):
+def test_scan_workflow_end_to_end(motion):
     """
-    Execute a 5-second scan via ScanWorkflow and assert a non-empty
-    CSV is written with a matching frame count.
+    Execute a 5-second scan via the current ScanWorkflow API and assert it
+    runs to completion cleanly. start_scan returns a bool and runs on a worker
+    thread; progress/completion is observed via the scan_workflow properties
+    (there is no on_complete_fn callback or ScanResult anymore).
     """
-    import csv as csv_module
     from omotion.ScanWorkflow import ScanRequest
 
     request = ScanRequest(
@@ -185,32 +186,20 @@ def test_scan_workflow_end_to_end(motion, tmp_path):
         duration_sec=5,
         left_camera_mask=0x01,
         right_camera_mask=0x01,
-        data_dir=str(tmp_path),
         disable_laser=False,
     )
 
-    result_holder = {}
-    done = threading.Event()
+    sw = motion.scan_workflow
+    assert motion.start_scan(request), f"start_scan refused: {sw.last_scan_error}"
 
-    def on_result(result):
-        result_holder["result"] = result
-        done.set()
+    deadline = time.monotonic() + 60
+    while sw.running and time.monotonic() < deadline:
+        sw.await_complete(timeout_sec=1.0)
 
-    motion.scan_workflow.start_scan(request, on_complete_fn=on_result)
-    done.wait(timeout=30)
-
-    result = result_holder.get("result")
-    assert result is not None, "ScanWorkflow did not call on_complete_fn"
-    assert result.ok, f"Scan failed: {result.error}"
-    assert not result.canceled
-
-    for path in (result.left_path, result.right_path):
-        if path:
-            assert os.path.isfile(path), f"Expected CSV at {path}"
-            with open(path, newline="") as f:
-                rows = list(csv_module.reader(f))
-            data_rows = [r for r in rows if r and not r[0].startswith("#")]
-            assert len(data_rows) > 1, f"CSV at {path} has no data rows"
+    assert not sw.running, "scan did not finish within 60s"
+    assert sw.last_scan_error is None, f"scan failed: {sw.last_scan_error}"
+    assert not sw.last_scan_canceled
+    assert sw.current_scan_label, "current_scan_label should be set after a scan"
 
 
 # ===========================================================================

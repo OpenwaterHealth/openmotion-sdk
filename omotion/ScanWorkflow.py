@@ -142,24 +142,6 @@ class ScanRequest:
 
 
 @dataclass
-class ScanResult:
-    ok: bool
-    error: str
-    left_path: str
-    right_path: str
-    canceled: bool
-    scan_timestamp: str
-    corrected_path: str = ""
-    telemetry_path: str = ""
-    # Populated when the science pipeline detected schedule/measurement
-    # disagreement on dark frames (firmware off-by-one, unwrapper
-    # alignment quirk, or significant ambient light in a dark slot).
-    # Empty on a clean scan. Diagnostic only — calibration no longer
-    # aborts on this; the per-camera FT dark mean-max check gates that.
-    dark_integrity_warnings: list[str] = field(default_factory=list)
-
-
-@dataclass
 class ConfigureRequest:
     left_camera_mask: int
     right_camera_mask: int
