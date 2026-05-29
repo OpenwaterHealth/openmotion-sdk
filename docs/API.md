@@ -72,13 +72,23 @@ python scripts/sdk_examples.py connect          # §2  connect + version
 python scripts/sdk_examples.py configure        # §4  configure cameras
 python scripts/sdk_examples.py contact-quality  # §4  per-camera CQ verdicts
 python scripts/sdk_examples.py scan             # §3  run a short scan
+python scripts/sdk_examples.py scan --duration 60   # §3  run a 60s scan
 python scripts/sdk_examples.py read-scan        # §5  summarize the scan DB
 python scripts/sdk_examples.py test-scan        # §4  per-camera test rows
 python scripts/sdk_examples.py                  # all of the above, one connection
 ```
 
 (`scan` and `test-scan` turn the laser on; `read-scan` is read-only and needs no
-hardware. Output lands under a temp directory printed at connect time.)
+hardware. `--duration` (seconds) applies to `scan` / `test-scan`. Output lands
+under a temp directory printed at connect time.)
+
+To plot a finished scan, [`scripts/visualize_scan.py`](../scripts/visualize_scan.py)
+renders BFI / BVI / mean / contrast over time (16 cameras, per-side average bold)
+from the corrected CSV the `scan` example writes:
+
+```
+python scripts/visualize_scan.py --csv <scan_id>_<subject>.csv   # -> <stem>_viz.png
+```
 
 ---
 
