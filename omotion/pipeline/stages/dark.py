@@ -21,7 +21,7 @@ from ..batch import DarkIntegrityWarning, FrameBatch, IntervalClosed
 from ..pedestal import SensorPedestals, adc_gain_for_pedestal
 
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("openmotion.sdk.pipeline.stages.dark")
 
 
 @dataclass(frozen=True)

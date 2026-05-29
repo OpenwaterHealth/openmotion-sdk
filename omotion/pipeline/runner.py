@@ -13,7 +13,7 @@ from .sinks import Sink
 from .sources import Source
 
 
-logger = logging.getLogger("omotion.pipeline.runner")
+logger = logging.getLogger("openmotion.sdk.pipeline.runner")
 
 
 class CriticalSinkError(RuntimeError):
