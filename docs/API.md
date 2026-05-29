@@ -152,6 +152,7 @@ below.
 | `cancel_scan(**kw)` | Stop the running scan. |
 | `start_configure_camera_sensors(request) -> bool` | Program/enable cameras (see §4). |
 | `start_calibration(request) -> bool` / `start_test_scan(request)` | Calibration / validation (see §4). |
+| `apply_laser_power(*, force_fault=False) -> bool` | Write laser-driver config over I2C — a **cold-start prerequisite** for any laser scan (see §3). |
 | `get_single_histogram(side, camera_id, test_pattern_id=4, auto_upload=True)` | One-shot histogram grab. |
 | `scan_workflow` | The `ScanWorkflow` instance (lazy). |
 | `calibration_workflow` / `contact_quality_workflow` | The other workflows (lazy; CQ shares the scan workflow). |
@@ -168,6 +169,14 @@ A scan runs **asynchronously on a worker thread**. `start_scan` returns `True`
 once the worker is spawned (or `False` if it refused — see below); use the
 `scan_workflow` properties to observe progress and completion.
 
+> **Laser-power cold start.** After a power-cycle the laser-driver registers are
+> cleared, so the trigger fires but **no light is emitted** — scans complete but
+> produce no signal. Call `iface.apply_laser_power()` once after connecting and
+> before the first laser scan (scan / contact-quality / calibration / test). It
+> writes the SDK's bundled laser config over I2C and persists in the firmware
+> until the next power-cycle. (The bloodflow app does this automatically; raw
+> SDK consumers must call it themselves.)
+
 ### `ScanRequest`
 
 `from omotion.ScanWorkflow import ScanRequest`
@@ -180,18 +189,20 @@ class ScanRequest:
     left_camera_mask: int            # bit i set = camera i enabled
     right_camera_mask: int
     disable_laser: bool = False
-    data_dir: str = ""               # usually left blank — the interface's data_dir is used
     expected_size: int = 32837
     write_corrected_csv: bool = True # opt out when the DB is the system of record
     write_telemetry_csv: bool = True
     reduced_mode: bool = False       # per-side averaged BFI/BVI instead of per-camera
-    write_raw_to_db: bool = False    # store raw histograms in the DB (large)
-    notes: str = ""
     sinks: list = field(default_factory=list)        # custom pipeline sinks (§6)
     skip_default_storage: bool = False               # don't auto-inject CSV/DB sinks
     raw_save_max_duration_s: float | None = None     # cap raw output; 0 = no raw
     batch_size_frames: int = 10
+    trigger_config: dict | None = None               # override; None = interface default
 ```
+
+`start_scan` (re)sends the resolved trigger config before starting the trigger,
+which resets the firmware fsync/dark-frame schedule so dark correction stays
+aligned — so you normally never need to set `trigger_config`.
 
 **reduced mode** is the clinical path: the pipeline averages the active cameras
 into one left + one right BFI/BVI value per capture. In reduced mode the scan DB

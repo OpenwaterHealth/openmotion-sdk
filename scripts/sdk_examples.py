@@ -64,6 +64,11 @@ def connect(*, timeout: float = 10.0) -> MotionInterface:
     print(f"output dir: {DATA_DIR}")
     if not (console and left and right):
         print("WARNING: not all devices connected — examples may produce no data.")
+    # Cold-start laser-power setup: after a power-cycle the driver registers are
+    # cleared, so the laser emits no light until applied. Without this the scan /
+    # contact-quality / test-scan examples run but produce no signal.
+    if console:
+        print(f"laser power applied: {iface.apply_laser_power()}")
     return iface
 
 
