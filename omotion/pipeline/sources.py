@@ -24,7 +24,7 @@ from .batch import FrameBatch
 from .sinks import ScanMetadata
 
 
-logger = logging.getLogger("omotion.pipeline.sources")
+logger = logging.getLogger("openmotion.sdk.pipeline.sources")
 
 
 @runtime_checkable

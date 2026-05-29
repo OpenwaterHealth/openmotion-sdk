@@ -17,7 +17,7 @@ from typing import Any, Optional, Protocol, runtime_checkable
 
 from omotion.config import HISTO_SIZE_WORDS
 
-logger = logging.getLogger("omotion.pipeline.sinks")
+logger = logging.getLogger("openmotion.sdk.pipeline.sinks")
 
 
 @dataclass(frozen=True)
