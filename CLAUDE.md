@@ -16,7 +16,7 @@ python -m build         # → dist/openmotion_sdk-X.Y.Z-py3-none-any.whl
 # Test suite — defaults exclude fpga and imu markers (see pyproject.toml)
 pytest tests/                                       # all (needs hardware)
 pytest tests/ -m "not destructive and not slow"     # CI smoke subset
-pytest tests/test_pipeline_csv.py                   # pure-software test, no hw
+pytest tests/test_pipeline/                          # pure-software pipeline tests, no hw
 ```
 
 - Python **3.12+**. Version is computed from git tags via `setuptools_scm` — never edit a version string by hand. To cut a release, tag and push. Tags use **semantic versioning** (`MAJOR.MINOR.PATCH`, e.g. `1.6.0`, `1.6.0-rc.1`).
@@ -29,37 +29,38 @@ Three-tier API: facade → device wrapper → transport.
 
 | Layer | Module | Lines | What lives here |
 |---|---|---:|---|
-| Facade | `omotion/MotionInterface.py` | 616 | `MOTIONInterface` — discover, connect, run scans. **Start here.** |
-| Device | `omotion/MotionConsole.py` | **2815** | UART-side device. Trigger, TEC, fan, FPGA programming, telemetry. Biggest file in the repo. |
+| Facade | `omotion/MotionInterface.py` | 492 | `MotionInterface` — discover, connect, run scans. **Start here. The one and only front door.** |
+| Device | `omotion/MotionConsole.py` | **2934** | UART-side device. Trigger, TEC, fan, FPGA programming, telemetry. Biggest file in the repo. |
 | Device | `omotion/MotionSensor.py` | 1316 | USB-side device. Cameras, histograms, IMU, DFU. |
 | Transport | `omotion/MotionUart.py` | 252 | UART framing, CRC-16. |
 | Transport | `omotion/CommInterface.py` | 380 | USB bulk command/response (sensor IF 0). |
 | Transport | `omotion/StreamInterface.py` | 382 | USB bulk streaming (sensor IF 1 = histo, IF 2 = IMU). Daemon reader thread per endpoint. |
-| Workflow | `omotion/ScanWorkflow.py` | 1222 | Full acquisition orchestration. |
-| Workflow | `omotion/CalibrationWorkflow.py` | 1222 | Per-camera gain / I_max calibration. Newer; not in old docs. |
-| Science | `omotion/MotionProcessing.py` | **1941** | Histogram parsing + BFI/BVI pipeline. |
+| Workflow | `omotion/ScanWorkflow.py` | 1110 | Full acquisition orchestration. Owns hardware bring-up + lifecycle; feeds frames into the pipeline. |
+| Workflow | `omotion/CalibrationWorkflow.py` | 1643 | Per-camera gain / I_max calibration. |
+| **Science** | `omotion/pipeline/` | — | **Stage-based BFI/BVI pipeline** (`sources`, stages in `pipeline.py`, `sinks`, `runner`, `factory`, `pedestal`, `batch`, `tee`). **The science lives here.** Full reference: `docs/SciencePipeline.md`. |
+| Science | `omotion/MotionProcessing.py` | 730 | Wire-level histogram packet **parsing only** — a thin shim feeding the pipeline. (BFI/BVI moved to `omotion/pipeline/`; this module is slated to dissolve eventually.) |
 | Config | `omotion/config.py` | 291 | VID/PID, baud, packet types, command opcodes, `DEBUG_FLAG_*` bits. Single source of truth. |
 | Programming | `omotion/FPGAProgrammer.py` | 567 | Page-by-page Lattice XO2 flash. |
 | Programming | `omotion/DFUProgrammer.py` | 346 | STM32 DFU over USB (uses vendored `dfu-util`). |
-| Telemetry | `omotion/ConsoleTelemetry.py` | 460 | PDC + TEC poller. Daemon thread, 10 Hz slow / 1 Hz fast. |
+| Telemetry | `omotion/ConsoleTelemetry.py` | 478 | PDC + TEC poller. Daemon thread. Raw-ADC→units conversion lives in `console_telemetry_conversions.py`. |
 | Hotplug | `omotion/connection_monitor.py`, `connection_state.py`, `hotplug/` | — | Daemon thread that watches Win32/libusb hotplug events and emits to the app thread. |
-| Storage | `omotion/ScanDatabase.py`, `ScanDBSink.py`, `SessionPlayback.py` | — | SQLite scan sink + playback (issue #92). |
+| Storage | `omotion/pipeline/sinks.py` (`CsvSink`, `ScanDBSink`), `omotion/ScanDatabase.py`, `SessionPlayback.py` | — | CSV + SQLite scan sinks + playback (issue #92). |
 
 **Call graph for the common case:**
 
 ```
-MOTIONInterface.start()
+MotionInterface.start()
  ├── ConnectionMonitor (daemon thread — hotplug)
  ├── motion.console      = MotionConsole(MotionUart(pyserial))
  └── motion.left/right   = MotionComposite(CommInterface(pyusb), StreamInterface(pyusb))
 ```
 
-Signals are `pyqtSignal` when PyQt is importable, otherwise a fallback `MOTIONSignal` — same API both ways, so headless scripts work identically to the apps.
+Signals are `pyqtSignal` when PyQt is importable, otherwise a fallback `MotionSignal` — same API both ways, so headless scripts work identically to the apps.
 
 ## Working without hardware
 
-- `MOTIONInterface(demo_mode=True)` **or** `OPENMOTION_DEMO=1` — skips device discovery, generates fake data. The first thing to reach for if a script is hanging on enumeration.
-- Pure-software tests that run anywhere: `test_pipeline_csv.py`, `test_rolling_average.py`, `test_frame_id_unwrapper.py`, `test_calibration_workflow_compute.py`, `test_realtime_dark_estimator.py`.
+- `MotionInterface(demo_mode=True)` **or** `OPENMOTION_DEMO=1` — skips device discovery, generates fake data. The first thing to reach for if a script is hanging on enumeration. (Note: the *new pipeline* scan path does not yet support demo mode end-to-end — demo sensors have no real `uart`, so a full `start_scan` in demo mode will not stream. Demo mode is for discovery/connection-level work.)
+- Pure-software tests that run anywhere: the entire `tests/test_pipeline/` suite, plus `test_calibration_workflow_compute.py`, `test_contact_quality_workflow.py`, `test_scan_database.py`, `test_console_telemetry_unit.py`, `test_pedestal_height.py`. Run them with `pytest -m "not console and not sensor and not destructive"`.
 - Pure-software scripts: `scripts/test_jed_parser.py`, `scripts/test_github_release.py`, `scripts/run_pipeline_csv_tests.py`, `scripts/plot_telemetry.py`, `scripts/view_corrected_scan.py`.
 
 ## Existing in-repo docs (read before re-explaining)
@@ -70,7 +71,6 @@ Signals are `pyqtSignal` when PyQt is importable, otherwise a fallback `MOTIONSi
 | `docs/Architecture.md` | Comprehensive — layer diagram, module reference, transport details. |
 | `docs/scan-sequencing.md` | Frame ID unwrapping + histogram packet ordering. |
 | `docs/SciencePipeline.md` | BFI/BVI computation. |
-| `docs/PipelineComparison.md` | CSV vs DB output. |
 | `docs/ScanDatabase.md` | SQLite schema. |
 | `docs/ScanDatabase-HardwareVerification.md` | DB sink test plan. |
 | `docs/ConsoleTelemetry.md` | PDC (dark correction) + TEC telemetry. |
@@ -100,7 +100,7 @@ Signals are `pyqtSignal` when PyQt is importable, otherwise a fallback `MOTIONSi
 | Add a host-side command for the console | `omotion/MotionConsole.py` — find a sibling method, copy its pattern; opcode lives in `omotion/config.py`. |
 | Add a host-side command for a sensor | `omotion/MotionSensor.py` + `omotion/CommInterface.py`; opcode in `omotion/config.py`. |
 | Change histogram parsing | `omotion/MotionProcessing.py` (parsing) + `omotion/StreamInterface.py` (framing). |
-| Add a science-pipeline step | `omotion/MotionProcessing.py`, then a unit test in `tests/test_pipeline_csv.py`. |
+| Add a science-pipeline step | `omotion/pipeline/` (add a stage in `pipeline.py`, wire it in `factory.py`), then a unit test under `tests/test_pipeline/`. |
 | Change connection/discovery behavior | `omotion/connection_monitor.py` + `omotion/MotionInterface.py`. |
 | Flash sensor firmware from a script | `omotion/DFUProgrammer.py`. (Most `scripts/*.py` are stale post-Interface→MotionInterface rename and need porting — see memory `sdk-scripts-dead`.) |
 | Flash a console FPGA | `omotion/FPGAProgrammer.py`; the JED parser is `scripts/test_jed_parser.py`. |

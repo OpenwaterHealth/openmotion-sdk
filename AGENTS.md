@@ -17,8 +17,11 @@ library used by the bloodflow app and other tools.
 - `omotion/StreamInterface.py`: USB streaming transport for histogram and IMU
   interfaces.
 - `omotion/ScanWorkflow.py`: acquisition orchestration and scan lifecycle.
-- `omotion/MotionProcessing.py`: histogram parsing and BFI/BVI processing.
-- `omotion/CsvSink.py`, `omotion/ScanDBSink.py`, `omotion/ScanDatabase.py`:
+- `omotion/pipeline/`: the stage-based science pipeline (BFI/BVI, dark
+  correction, sources, sinks, runner). This is where the science lives.
+- `omotion/MotionProcessing.py`: wire-level histogram packet parsing only — a
+  thin shim feeding the pipeline (the BFI/BVI science moved to `omotion/pipeline/`).
+- `omotion/pipeline/sinks.py` (`CsvSink`, `ScanDBSink`) + `omotion/ScanDatabase.py`:
   scan persistence outputs.
 - `omotion/CalibrationWorkflow.py`, `omotion/Calibration.py`: calibration flow
   and calibration math.
@@ -34,7 +37,7 @@ and `imu`:
 
 ```powershell
 python -m pytest
-python -m pytest tests/test_pipeline_csv.py
+python -m pytest tests/test_pipeline/          # pure-software pipeline tests, no hardware
 python -m pytest -m "not fpga and not imu"
 ```
 

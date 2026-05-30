@@ -2,9 +2,11 @@
 
 ## Overview
 
-This document defines the hardware-in-the-loop test suite for the Open-Motion SDK. Tests are grouped by system (console / sensor), then by subsystem, and finally by individual function. The plan also covers common command sequences, communication-path verification, and the recommended pytest infrastructure for a GitHub Actions CI workflow backed by physical hardware runners.
+This document defines the **hardware-in-the-loop (HIL) test suite** for the Open-Motion SDK. Tests are grouped by system (console / sensor), then by subsystem, and finally by individual function. The plan also covers common command sequences, communication-path verification, and the recommended pytest infrastructure for a GitHub Actions CI workflow backed by physical hardware runners.
 
-All tests are written against the public SDK API (`MOTIONConsole`, `MOTIONSensor`, `MOTIONInterface`). Lower-level transport classes (`MOTIONUart`, `CommInterface`, `StreamInterface`) are exercised indirectly; dedicated transport tests are called out where the transport behaviour itself is the thing under test.
+**Scope.** This plan covers HIL tests only — the ones gated behind the `console` / `sensor` / `sensor_left` / `sensor_right` / `sequence` / `destructive` markers and run on the self-hosted hardware runners. The pure-software tier (the stage-based pipeline tests under `tests/test_pipeline/`, the calibration-compute tests, contact-quality, scan-DB, and unit tests) runs anywhere without hardware and is intentionally **out of scope here** — those tests are their own authoritative spec. There is, by design, no software-only PR CI job; everything runs on the rig.
+
+All tests are written against the public SDK API (`MotionConsole`, `MotionSensor`, `MotionInterface`). Lower-level transport classes (`MotionUart`, `CommInterface`, `StreamInterface`) are exercised indirectly; dedicated transport tests are called out where the transport behaviour itself is the thing under test.
 
 ---
 
@@ -23,11 +25,11 @@ All tests are written against the public SDK API (`MOTIONConsole`, `MOTIONSensor
 ```python
 # tests/conftest.py
 import pytest
-from omotion.Interface import MOTIONInterface
+from omotion.MotionInterface import MotionInterface
 
 @pytest.fixture(scope="session")
 def motion():
-    iface = MOTIONInterface()
+    iface = MotionInterface()
     iface.connect()
     yield iface
     iface.disconnect()
@@ -380,10 +382,10 @@ These tests verify that bytes take the correct path through the transport stack 
 Constructs a `UartPacket`, flips one byte in the CRC field, sends raw bytes over the serial port. Asserts the response is a `CommandError` with `BAD_CRC` (not a silent discard).
 
 **`test_uart_response_arrives_on_correct_queue`**
-Sends two commands with different packet IDs concurrently (two threads). Asserts each thread receives the response matching its own ID. (Tests the per-ID `queue.Queue` routing in `MOTIONUart` async mode.)
+Sends two commands with different packet IDs concurrently (two threads). Asserts each thread receives the response matching its own ID. (Tests the per-ID `queue.Queue` routing in `MotionUart` async mode.)
 
 **`test_uart_sync_mode_blocking`**
-Forces `MOTIONUart` into sync mode (if exposed). Sends a `ping`. Asserts the response arrives within the timeout and is correct.
+Forces `MotionUart` into sync mode (if exposed). Sends a `ping`. Asserts the response arrives within the timeout and is correct.
 
 **`test_uart_timeout_raises`**
 Sends a command to a known-nonexistent address with a very short timeout. Asserts `TimeoutError` is raised.
@@ -571,7 +573,7 @@ Sends a command byte that the firmware returns NAK for (use `echo` against the s
 Manually corrupts an incoming packet buffer and attempts to parse it with `UartPacket(buffer=...)`. Asserts `ValueError` is raised.
 
 **`test_timeout_error_no_device`**
-Attempts a `ping` on a `MOTIONUart` instance backed by a serial port that has been closed. Asserts `TimeoutError` or `serial.SerialException`.
+Attempts a `ping` on a `MotionUart` instance backed by a serial port that has been closed. Asserts `TimeoutError` or `serial.SerialException`.
 
 **`test_usb_error_propagates`**
 With the sensor connected, calls `release()` on the `CommInterface` to simulate a disconnect, then attempts `ping()`. Asserts `usb.core.USBError` or `ValueError("not connected")`.

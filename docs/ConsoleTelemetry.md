@@ -4,9 +4,9 @@
 
 ## Overview
 
-`ConsoleTelemetryPoller` runs as a daemon thread owned by `MOTIONConsole`. It polls the console at ~1 Hz and stores the result as an immutable `ConsoleTelemetry` snapshot. Clients can either pull the latest snapshot directly or register a push callback.
+`ConsoleTelemetryPoller` runs as a daemon thread owned by `MotionConsole`. It polls the console at ~1 Hz and stores the result as an immutable `ConsoleTelemetry` snapshot. Clients can either pull the latest snapshot directly or register a push callback.
 
-**Lifecycle** — wired automatically by `MOTIONInterface`:
+**Lifecycle** — wired automatically by `MotionInterface`:
 
 | Event | Action |
 |---|---|
@@ -46,7 +46,7 @@ Each poll produces one `ConsoleTelemetry` dataclass instance. All fields have de
 
 ### TEC status
 
-Raw ADC voltages returned by `MOTIONConsole.tec_status()` → `(vout, temp_set, tec_curr, tec_volt, tec_good)`. Conversion to engineering units (°C, A, V) happens in `MOTIONConnector.tec_status()` using the thermistor R-T lookup table.
+Raw ADC voltages returned by `MotionConsole.tec_status()` → `(vout, temp_set, tec_curr, tec_volt, tec_good)`. Conversion to engineering units (°C, A, V) lives in the SDK at `omotion/console_telemetry_conversions.py` (`tec_thermistor_voltage_to_celsius`, `tec_current_to_amps`, `tec_voltage_to_volts`), using the `10K3CG_R-T` thermistor lookup table shipped alongside it. (Bloodflow-app historically owned this math; it now lives in the SDK so every consumer applies the same formula.)
 
 | Field | Type | ADC channel | Description |
 |---|---|---|---|

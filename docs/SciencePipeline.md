@@ -589,7 +589,9 @@ SQLite endpoint. On `on_scan_start`, opens a `ScanDatabase` and creates a sessio
 - **Raw** — per-frame rows accumulated in a 200-row buffer (`raw_batch_size`) and flushed via `ScanDatabase.insert_raw_frames`. Each row includes the packed 4096-byte histogram blob (`<1024I` little-endian), `temp`, `sum_counts`, `tcm`, `tcl`, `pdc`.
 - **Final** — per-`EnrichedCorrectedInterval`, one `session_data` row per `CorrectedFrame` carrying `mean`, `contrast`, `bfi`, `bvi`. (PR 3 will carry per-camera identifiers through the interval; today's writer uses sentinel `cam_id = −1, side = 0` so rows are queryable.)
 
-See [`ScanDatabase.md`](ScanDatabase.md) for the full schema and [`PipelineComparison.md`](PipelineComparison.md) for CSV vs. DB semantics.
+See [`ScanDatabase.md`](ScanDatabase.md) for the full schema. The CSV-vs-DB
+output model (DB-if-present-else-CSV; CSV forced on when no DB) is described in
+[`API.md`](API.md) §"Where the data goes".
 
 ### 8.3 Live-plot UI sinks (bloodflow-app)
 
