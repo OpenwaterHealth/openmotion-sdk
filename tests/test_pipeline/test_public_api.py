@@ -8,7 +8,7 @@ def test_public_api_symbols_importable() -> None:
     from omotion.pipeline import (
         Pipeline, Stage,
         FrameBatch, BatchEvent, IntervalClosed, LiveEmit,
-        DarkIntegrityWarning, StencilFallback,
+        DarkIntegrityWarning, StencilFallback, TerminalDarkResult,
         ScanRunner, CriticalSinkError,
         Source, LiveUsbSource, CsvReplaySource, DbReplaySource,
         Sink, ScanMetadata,
@@ -18,7 +18,7 @@ def test_public_api_symbols_importable() -> None:
     )
     for sym in (
         Pipeline, Stage, FrameBatch, BatchEvent, IntervalClosed, LiveEmit,
-        DarkIntegrityWarning, StencilFallback, ScanRunner, CriticalSinkError,
+        DarkIntegrityWarning, StencilFallback, TerminalDarkResult, ScanRunner, CriticalSinkError,
         Source, LiveUsbSource, CsvReplaySource, DbReplaySource,
         Sink, ScanMetadata, CsvSink, ScanDBSink,
         Tee, default_pipeline, SensorPedestals,
@@ -32,7 +32,7 @@ def test_public_api_all_list_complete() -> None:
 
     expected = {
         "FrameBatch", "BatchEvent", "IntervalClosed", "LiveEmit",
-        "DarkIntegrityWarning", "StencilFallback",
+        "DarkIntegrityWarning", "StencilFallback", "TerminalDarkResult",
         "Pipeline", "Stage", "Tee",
         "ScanRunner", "CriticalSinkError",
         "default_pipeline",

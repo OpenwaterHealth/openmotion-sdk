@@ -4,6 +4,11 @@ Per (side, cam_id) pair, the stage maintains a FrameUnwrapper (8-bit →
 monotonic absolute index) and a "first frame seen" guard. Each row is
 labeled with one of: "warmup", "dark", "light", "stale".
 
+Dark frames are determined strictly by position — matching the firmware's
+LaserPulseSkipInterval schedule. Content-based detection is not used;
+the terminal dark frame (firmware laser-off at scan stop) is handled
+separately by DarkCorrectionStage.on_scan_stop.
+
 See docs/SciencePipeline.md §3 (unwrapping) and §4 (classification).
 """
 

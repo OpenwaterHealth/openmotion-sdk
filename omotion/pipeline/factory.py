@@ -20,8 +20,7 @@ from .stages.dark import (
 from .stages.shot_noise import ShotNoiseCorrectionStage
 from .stages.bfi_bvi import BfiBviStage
 from .stages.dark_frame_hold import DarkFrameHoldStage
-from .stages.side_avg import LiveSideAverageStage
-from .stages.corrected_side_avg import CorrectedSideAverageStage
+from .stages.side_avg import SideAverageStage
 from .tee import Tee
 
 
@@ -64,8 +63,6 @@ def default_pipeline(*,
             batch_estimator=LinearInterpolation(),
             pedestals=pedestals,
             realtime_history_size=realtime_dark_history_size,
-            camera_gain_map=CAMERA_GAIN_MAP,
-            calibration=calibration,
         ),
 
         ShotNoiseCorrectionStage(pedestals=pedestals, camera_gain_map=CAMERA_GAIN_MAP),
@@ -77,17 +74,11 @@ def default_pipeline(*,
         # averages reflect the held values.
         DarkFrameHoldStage(),
 
-        LiveSideAverageStage(
-            enabled=metadata.reduced_mode,
-            left_camera_mask=metadata.left_camera_mask,
-            right_camera_mask=metadata.right_camera_mask,
-        ),
-
-        # Corrected per-side average for the DB record (reduced mode). Reads
-        # the IntervalClosed events DarkCorrectionStage emits, so it must come
-        # after it; emits LiveEmit(channel="final_side") which the runner
-        # routes by channel (no Tee needed).
-        CorrectedSideAverageStage(
+        # Combined realtime + corrected per-side average (reduced mode).
+        # Realtime: emits LiveEmit("live_side") for the UI trace.
+        # Corrected: reads IntervalClosed events from DarkCorrectionStage,
+        # emits LiveEmit("final_side") for DB persistence.
+        SideAverageStage(
             enabled=metadata.reduced_mode,
             left_camera_mask=metadata.left_camera_mask,
             right_camera_mask=metadata.right_camera_mask,

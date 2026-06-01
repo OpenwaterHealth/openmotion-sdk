@@ -12,7 +12,7 @@ from omotion.pipeline.batch import (
     FrameBatch, IntervalClosed, LiveEmit, SideAverageSample,
 )
 from omotion.pipeline.stages.dark import EnrichedCorrectedFrame, EnrichedCorrectedInterval
-from omotion.pipeline.stages.corrected_side_avg import CorrectedSideAverageStage
+from omotion.pipeline.stages.side_avg import CorrectedSideAverageStage
 
 
 def _ef(fid, t, side, cam, bfi, bvi, mean=100.0, contrast=0.3):

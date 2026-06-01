@@ -502,7 +502,7 @@ class ScanDBSink:
                        NOT written in reduced mode (which persists only the
                        corrected side average).
         "final_side" — reduced-mode per-side dark-corrected average
-                       (CorrectedSideAverageStage), one SideAverageSample per
+                       (SideAverageStage), one SideAverageSample per
                        capture. Persisted as cam_id=-1 rows — the accurate
                        side-average record replay reads.
     """
@@ -642,7 +642,7 @@ class ScanDBSink:
 
     def _consume_side(self, sample) -> None:
         """Buffer one corrected per-side average (SideAverageSample from
-        CorrectedSideAverageStage) for persistence as a cam_id=-1 row. This is
+        SideAverageStage) for persistence as a cam_id=-1 row. This is
         the accurate side-average record reduced-mode replay reads."""
         if self._db is None or self._session_id is None:
             return

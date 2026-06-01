@@ -4,11 +4,10 @@ import logging
 
 import numpy as np
 import pytest
-from dataclasses import dataclass
 from omotion.pipeline.batch import FrameBatch, IntervalClosed
 from omotion.pipeline.stages.dark import (
     DarkCorrectionStage, HybridRealtimePredictor, LinearInterpolation,
-    EnrichedCorrectedFrame, EnrichedCorrectedInterval,
+    CorrectedFrame, CorrectedInterval,
 )
 
 
@@ -90,25 +89,9 @@ def test_realtime_dark_frame_reuses_previous_live_corrected_values():
     assert batch.dark_baseline_rt[2, 0, 0] == pytest.approx(batch.dark_baseline_rt[1, 0, 0])
 
 
-def test_emits_enriched_interval_when_calibration_provided():
-    """When DarkCorrectionStage is given adc_gain + gain_map + calibration,
-    IntervalClosed.corrected_batch should be an EnrichedCorrectedInterval
-    whose frames carry bfi, bvi, and contrast fields."""
-    @dataclass
-    class _TrivialCal:
-        c_min: np.ndarray
-        c_max: np.ndarray
-        i_min: np.ndarray
-        i_max: np.ndarray
-
-    cal = _TrivialCal(
-        c_min=np.zeros((2, 8), dtype=np.float32),
-        c_max=np.ones((2, 8), dtype=np.float32),
-        i_min=np.zeros((2, 8), dtype=np.float32),
-        i_max=np.full((2, 8), 500.0, dtype=np.float32),
-    )
-    gain_map = np.array([16, 4, 2, 1, 1, 2, 4, 16], dtype=np.float32)
-
+def test_emits_corrected_interval():
+    """DarkCorrectionStage emits raw CorrectedInterval (enrichment is done
+    by downstream stages ShotNoiseCorrectionStage and BfiBviStage)."""
     n = 4
     mean = np.array([[100.0], [500.0], [510.0], [105.0]], dtype=np.float32).reshape(4, 1, 1) * np.ones((1, 2, 8))
     std  = np.array([[10.0],  [20.0],  [22.0],  [11.0]], dtype=np.float32).reshape(4, 1, 1) * np.ones((1, 2, 8))
@@ -118,8 +101,6 @@ def test_emits_enriched_interval_when_calibration_provided():
     stage = DarkCorrectionStage(
         realtime_estimator=HybridRealtimePredictor(),
         batch_estimator=LinearInterpolation(),
-        camera_gain_map=gain_map,
-        calibration=cal,
     )
     stage.process(batch)
 
@@ -127,19 +108,16 @@ def test_emits_enriched_interval_when_calibration_provided():
     assert len(events) > 0
 
     interval = events[0].corrected_batch
-    assert isinstance(interval, EnrichedCorrectedInterval), (
-        f"Expected EnrichedCorrectedInterval, got {type(interval)}"
+    assert isinstance(interval, CorrectedInterval), (
+        f"Expected CorrectedInterval, got {type(interval)}"
     )
     assert len(interval.frames) > 0
     f = interval.frames[0]
-    assert isinstance(f, EnrichedCorrectedFrame)
-    assert hasattr(f, "bfi")
-    assert hasattr(f, "bvi")
-    assert hasattr(f, "contrast")
+    assert isinstance(f, CorrectedFrame)
     assert f.side == "left"
     assert f.cam_id == 0
-    assert isinstance(f.bfi, float)
-    assert isinstance(f.bvi, float)
+    assert isinstance(f.mean, float)
+    assert isinstance(f.std, float)
 
 
 def test_zero_filled_row_routes_to_source_assigned_right_side():
@@ -199,38 +177,24 @@ def test_reset_clears_dark_history_and_pending():
 
 
 def _make_stage_with_cal():
-    """Return a DarkCorrectionStage wired with trivial calibration."""
-    @dataclass
-    class _TrivialCal:
-        c_min: np.ndarray
-        c_max: np.ndarray
-        i_min: np.ndarray
-        i_max: np.ndarray
-
-    cal = _TrivialCal(
-        c_min=np.zeros((2, 8), dtype=np.float32),
-        c_max=np.ones((2, 8), dtype=np.float32),
-        i_min=np.zeros((2, 8), dtype=np.float32),
-        i_max=np.full((2, 8), 500.0, dtype=np.float32),
-    )
-    gain_map = np.array([16, 4, 2, 1, 1, 2, 4, 16], dtype=np.float32)
+    """Return a DarkCorrectionStage (no longer carries calibration — that's
+    now handled by downstream stages)."""
     return DarkCorrectionStage(
         realtime_estimator=HybridRealtimePredictor(),
         batch_estimator=LinearInterpolation(),
-        camera_gain_map=gain_map,
-        calibration=cal,
     )
 
 
-def test_dark_frame_included_in_interval_via_stencil():
-    """After a second interval closes, D_prev gets a stencil-interpolated row.
+def test_emits_raw_corrected_interval_without_stencil():
+    """DarkCorrectionStage emits raw CorrectedInterval — no stencil, no
+    enrichment. The quadratic stencil is now handled by DarkFrameHoldStage.
 
     Scenario: dark@10, lights@11-12, dark@30, lights@31-32, dark@50.
-    When interval [30, 50] closes, dark@30 should appear in the emitted
-    EnrichedCorrectedInterval as an EnrichedCorrectedFrame with abs_frame_id=30.
+    Two intervals should close: [10,30] and [30,50], each containing only
+    light CorrectedFrames (no dark-frame rows).
     """
     stage = _make_stage_with_cal()
-    n = 7  # dark, light, light, dark, light, light, dark
+    n = 7
     types   = ["dark",  "light", "light", "dark",  "light", "light", "dark"]
     abs_ids = [10,      11,      12,      30,      31,      32,      50]
     ts      = [i * 0.025 for i in range(n)]
@@ -240,7 +204,7 @@ def test_dark_frame_included_in_interval_via_stencil():
     mean_raw = np.zeros((n, 2, 8), dtype=np.float32)
     std_raw  = np.zeros((n, 2, 8), dtype=np.float32)
     raw_hist = np.zeros((n, 2, 8, 1024), dtype=np.uint32)
-    raw_hist[:, 0, 0, 0] = 1  # side=0, cam=0 active
+    raw_hist[:, 0, 0, 0] = 1
 
     for i in range(n):
         mean_raw[i, 0, 0] = mean_v[i]
@@ -263,43 +227,21 @@ def test_dark_frame_included_in_interval_via_stencil():
 
     intervals = [e.corrected_batch for e in batch.events
                  if isinstance(e, IntervalClosed)]
-    assert len(intervals) >= 2, (
-        "Expected at least 2 intervals (one for [10,30] and one for [30,50])"
-    )
+    assert len(intervals) == 2
 
-    # First interval [10, 30]: D_prev=10, no left neighbours → stencil fallback
-    iv0 = intervals[0]
-    assert isinstance(iv0, EnrichedCorrectedInterval)
-    dark_frame_ids_iv0 = [f.abs_frame_id for f in iv0.frames
-                          if f.abs_frame_id == 10]
-    assert dark_frame_ids_iv0, (
-        "Dark frame at abs_id=10 missing from first interval"
-    )
-    df0 = next(f for f in iv0.frames if f.abs_frame_id == 10)
-    assert isinstance(df0, EnrichedCorrectedFrame)
-    # Stencil fallback (no left neighbours): avg of right1 and right2 or repeat
-    assert np.isfinite(df0.bfi), "Dark frame bfi should be finite"
-    assert np.isfinite(df0.mean), "Dark frame mean should be finite"
+    # Both should be raw CorrectedInterval (not enriched)
+    for iv in intervals:
+        assert isinstance(iv, CorrectedInterval)
 
-    # Second interval [30, 50]: D_prev=30, has left neighbours from [10,30]
-    iv1 = intervals[1]
-    assert isinstance(iv1, EnrichedCorrectedInterval)
-    dark_frame_ids_iv1 = [f.abs_frame_id for f in iv1.frames
-                          if f.abs_frame_id == 30]
-    assert dark_frame_ids_iv1, (
-        "Dark frame at abs_id=30 missing from second interval"
-    )
-    df1 = next(f for f in iv1.frames if f.abs_frame_id == 30)
-    assert isinstance(df1, EnrichedCorrectedFrame)
-    assert np.isfinite(df1.bfi), "Dark frame bfi in second interval should be finite"
+    # Interval [10,30]: lights at 11, 12 only (no dark-frame row)
+    iv0_ids = [f.abs_frame_id for f in intervals[0].frames]
+    assert iv0_ids == [11, 12]
+    assert intervals[0].left_abs == 10
 
-    # Dark frame row should be chronologically FIRST in each interval
-    assert iv0.frames[0].abs_frame_id == 10, (
-        "Dark frame should be prepended (first in interval)"
-    )
-    assert iv1.frames[0].abs_frame_id == 30, (
-        "Dark frame should be prepended (first in second interval)"
-    )
+    # Interval [30,50]: lights at 31, 32 only
+    iv1_ids = [f.abs_frame_id for f in intervals[1].frames]
+    assert iv1_ids == [31, 32]
+    assert intervals[1].left_abs == 30
 
 
 def test_terminal_flush_does_not_emit_terminal_dark_as_light():
@@ -497,8 +439,14 @@ def test_terminal_flush_logs_and_skips_when_no_terminal_dark_found(caplog):
         0, [], [], mean_raw=np.zeros((0, 2, 8), dtype=np.float32),
         std_raw=np.zeros((0, 2, 8), dtype=np.float32)
     )
-    with caplog.at_level(logging.WARNING, logger="omotion.pipeline.stages.dark"):
+    with caplog.at_level(logging.ERROR, logger="openmotion.sdk.pipeline.stages.dark"):
         stage.on_scan_stop(stop_batch)
 
     assert [e for e in stop_batch.events if isinstance(e, IntervalClosed)] == []
-    assert "no terminal dark frame found" in caplog.text
+    assert "TERMINAL DARK MISSING" in caplog.text
+
+    # Should also emit a TerminalDarkResult diagnostic event with found=False
+    from omotion.pipeline.batch import TerminalDarkResult
+    tdr = [e for e in stop_batch.events if isinstance(e, TerminalDarkResult)]
+    assert len(tdr) > 0
+    assert tdr[0].found is False

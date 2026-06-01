@@ -31,7 +31,7 @@ def test_sensor_pedestals_per_side_independent():
     assert peds.right == 128.0
 
 
-def test_pedestal_stage_subtracts_per_side_pedestal_and_clamps_at_zero():
+def test_pedestal_stage_subtracts_per_side_pedestal():
     n = 2
     mean_raw = np.array([
         [[100] * 8, [200] * 8],
@@ -51,9 +51,10 @@ def test_pedestal_stage_subtracts_per_side_pedestal_and_clamps_at_zero():
     peds = SensorPedestals(left=64.0, right=128.0)
     PedestalSubtractionStage(pedestals=peds).process(batch)
 
+    # Negative values are valid — frame mean below pedestal is normal noise.
     expected = np.array([
-        [[36] * 8, [72] * 8],
-        [[0]  * 8, [0]  * 8],
+        [[36]   * 8, [72]   * 8],    # 100-64=36,  200-128=72
+        [[-14]  * 8, [-118] * 8],    # 50-64=-14,  10-128=-118
     ], dtype=np.float32)
-    np.testing.assert_array_equal(batch.display_mean, expected)
+    np.testing.assert_array_equal(batch.subtracted_mean, expected)
     np.testing.assert_array_equal(batch.mean_raw, mean_raw)

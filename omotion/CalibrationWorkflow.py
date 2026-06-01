@@ -769,7 +769,7 @@ class _CalibrationCollectorSink:
 
     * ``"live"``   — each payload is a per-frame ``FrameBatch``. The sink
       picks out rows where ``frame_type == "dark"`` and emits a Sample
-      whose ``mean`` is the pedestal-subtracted ``display_mean`` (matching
+      whose ``mean`` is the pedestal-subtracted ``subtracted_mean`` (matching
       the legacy "u1 - PEDESTAL_HEIGHT" semantics used by the FT
       ambient-light gate).
 
@@ -814,10 +814,10 @@ class _CalibrationCollectorSink:
                 ))
         elif channel == "live":
             # payload is a FrameBatch — pick out dark frames and emit Samples
-            # with pedestal-subtracted mean (display_mean).
-            if payload.frame_type is None or payload.display_mean is None:
+            # with pedestal-subtracted mean (subtracted_mean).
+            if payload.frame_type is None or payload.subtracted_mean is None:
                 return
-            n = payload.display_mean.shape[0]
+            n = payload.subtracted_mean.shape[0]
             for i in range(n):
                 if str(payload.frame_type[i]) != "dark":
                     continue
@@ -829,7 +829,7 @@ class _CalibrationCollectorSink:
                 ts = float(payload.timestamp_s[i])
                 for side_idx, side in enumerate(("left", "right")):
                     for cam_id in range(8):
-                        m = float(payload.display_mean[i, side_idx, cam_id])
+                        m = float(payload.subtracted_mean[i, side_idx, cam_id])
                         if not np.isfinite(m):
                             continue
                         temp = (

@@ -23,6 +23,11 @@ HISTO_BLOCK_SIZE = 1 + (HISTO_SIZE_WORDS * 4) + 1  # HID + HISTO + EOH
 HISTO_BINS: np.ndarray = np.arange(HISTO_SIZE_WORDS, dtype=np.float64)
 HISTO_BINS_SQ: np.ndarray = HISTO_BINS * HISTO_BINS
 
+# Full-well capacity of the OV2312 sensor in electrons. Used to compute
+# ADC gain (DN per electron) for shot-noise correction:
+#   ADC_GAIN = (HISTO_SIZE_WORDS - pedestal) / ELECTRON_WELL_CAPACITY
+ELECTRON_WELL_CAPACITY: int = 11_000
+
 # Per-camera analog gain for the 8 cameras in a sensor module, indexed by
 # cam_id % 8. Outer positions (0, 7) use higher gain to compensate for the
 # reduced illumination at the array periphery. Used by ShotNoiseCorrectionStage

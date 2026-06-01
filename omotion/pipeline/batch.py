@@ -64,6 +64,26 @@ class StencilFallback(BatchEvent):
 
 
 @dataclass
+class TerminalDarkResult(BatchEvent):
+    """Emitted during on_scan_stop for each (side, cam) pending interval.
+
+    ``found=True``: the terminal frame was dark-like (u1 ≤ threshold), as
+    expected from firmware. The interval was closed normally.
+
+    ``found=False``: the terminal frame was NOT dark-like — the laser
+    appears to have been on for the final frame. This is a firmware issue:
+    the trigger-stop did not produce the expected laser-off frame. The
+    interval is left open (data for this interval is lost).
+    """
+    side:           str
+    cam_id:         int
+    abs_frame_id:   int
+    u1:             float
+    threshold:      float
+    found:          bool
+
+
+@dataclass
 class TriggerStateEvent(BatchEvent):
     """Emitted whenever the laser trigger transitions ON or OFF.
 
@@ -83,8 +103,8 @@ class SideAverageSample:
     """One reduced-mode per-side average for a single capture instant.
 
     Carried as the payload of a ``LiveEmit`` — channel ``"live_side"`` for the
-    realtime average (LiveSideAverageStage) and ``"final_side"`` for the
-    dark-corrected average (CorrectedSideAverageStage). One sample per capture
+    realtime average (SideAverageStage, ``"live_side"``) and ``"final_side"`` for the
+    dark-corrected average (SideAverageStage, ``"final_side"``). One sample per capture
     (``frame_id``) per side. ``mean`` / ``contrast`` are populated only on the
     corrected path; the live path leaves them ``None``."""
     t:         float
@@ -106,12 +126,13 @@ class FrameBatch:
       Classify:        abs_frame_ids, frame_type
       NoiseFloor:      (mutates raw_histograms in place — no new field)
       Moments:         mean_raw, std_raw, contrast_raw
-      PedestalSubtraction: display_mean
+      PedestalSubtraction: subtracted_mean
       DarkCorrection:  dark_baseline_rt, mean_dc_rt, std_dc_rt
                        (also appends IntervalClosed to events when interval closes)
       ShotNoise:       std_sn_rt, contrast_sn_rt
       BfiBvi:          bfi_live, bvi_live
-      LiveSideAverage: appends LiveEmit(channel="live_side", SideAverageSample)
+      SideAverage:     appends LiveEmit(channel="live_side", SideAverageSample)
+                       and LiveEmit(channel="final_side", SideAverageSample)
                        per capture (reduced mode only)
       Tee:             appends LiveEmit to events
     """
@@ -140,7 +161,7 @@ class FrameBatch:
     std_raw:        Optional[np.ndarray] = None
     contrast_raw:   Optional[np.ndarray] = None
 
-    display_mean:   Optional[np.ndarray] = None
+    subtracted_mean:   Optional[np.ndarray] = None
 
     dark_baseline_rt: Optional[np.ndarray] = None
     mean_dc_rt:       Optional[np.ndarray] = None

@@ -36,9 +36,9 @@ class CamCQResult:
     side:        str    # "left" or "right"
     cam_id:      int    # 0-based camera index within module
     passed:      bool
-    light_avg_dn: float # mean of rolling-window light-frame display_mean (NaN when no data)
+    light_avg_dn: float # mean of rolling-window light-frame subtracted_mean (NaN when no data)
     light_std_dn: float # mean of rolling-window light-frame std_raw (NaN when no data)
-    dark_max_dn:  float # max of dark-frame display_mean (NaN when no data)
+    dark_max_dn:  float # max of dark-frame subtracted_mean (NaN when no data)
     dark_std_dn:  float # std_raw recorded with dark_max_dn (NaN when no data)
     reason:      str    # "ok" | "poor_contact" | "ambient_light" | "no_signal"
 
@@ -59,7 +59,7 @@ class _ContactQualitySink:
     Subscribes to the "live" pipeline channel and reads two different
     signals depending on frame type:
 
-      * Dark frames → ``display_mean`` (= ``max(0, mean_raw - pedestal)``
+      * Dark frames → ``subtracted_mean`` (= ``max(0, mean_raw - pedestal)``
         from PedestalSubtractionStage). Measures ambient light leaking onto
         the sensor; AMBIENT_LIGHT threshold gates on this.
 
@@ -80,17 +80,17 @@ class _ContactQualitySink:
         self._dark = list(dark_thresholds)
         self._light = list(light_thresholds)
         self._window_size = max(1, int(rolling_window))
-        # (side, cam_id) -> deque[float]   (light-frame display_mean values)
+        # (side, cam_id) -> deque[float]   (light-frame subtracted_mean values)
         self._light_window: dict = {}
         # (side, cam_id) -> deque[float]   (light-frame std_raw values)
         self._light_std_window: dict = {}
-        # (side, cam_id) -> float          (max dark-frame display_mean seen)
+        # (side, cam_id) -> float          (max dark-frame subtracted_mean seen)
         self._dark_max: dict = {}
         # (side, cam_id) -> float          (std_raw paired with max dark frame)
         self._dark_std: dict = {}
         # (side, cam_id) -> int            (count of light-frame samples seen)
         self._light_count: dict = {}
-        # (side, cam_id) -> float          (running sum of light display_mean)
+        # (side, cam_id) -> float          (running sum of light subtracted_mean)
         self._light_sum: dict = {}
 
     def on_scan_start(self, meta) -> None:
@@ -106,7 +106,7 @@ class _ContactQualitySink:
             return
         # Two different DN-scale signals — both pedestal-aware, but different
         # baselines:
-        #   * Dark frames: use display_mean = max(0, mean_raw - pedestal).
+        #   * Dark frames: use subtracted_mean = max(0, mean_raw - pedestal).
         #     For a laser-off frame this measures ambient light leaking onto
         #     the sensor relative to the zero-light pedestal — exactly what
         #     the AMBIENT_LIGHT threshold gates on.
@@ -115,12 +115,12 @@ class _ContactQualitySink:
         #     above the just-measured dark frame, not signal + dark. The
         #     POOR_CONTACT threshold should compare against signal strength,
         #     not signal + dark.
-        # display_mean is set by PedestalSubtractionStage; mean_dc_rt is set
+        # subtracted_mean is set by PedestalSubtractionStage; mean_dc_rt is set
         # by DarkCorrectionStage. Both arrays have shape (N, 2, 8) when
         # present.
-        if batch.display_mean is None or getattr(batch, "mean_dc_rt", None) is None:
+        if batch.subtracted_mean is None or getattr(batch, "mean_dc_rt", None) is None:
             return
-        n = batch.display_mean.shape[0]
+        n = batch.subtracted_mean.shape[0]
         for i in range(n):
             ft = None
             if batch.frame_type is not None:
@@ -134,7 +134,7 @@ class _ContactQualitySink:
                         std_v = float(batch.std_raw[i, side_idx, cam_id])
                     key = (side, cam_id)
                     if ft == "dark":
-                        v = float(batch.display_mean[i, side_idx, cam_id])
+                        v = float(batch.subtracted_mean[i, side_idx, cam_id])
                         if not math.isfinite(v):
                             continue
                         prev = self._dark_max.get(key, float("-inf"))

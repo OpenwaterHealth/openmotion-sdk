@@ -17,8 +17,8 @@ from typing import Any, Deque, Optional
 
 import numpy as np
 
-from ..batch import DarkIntegrityWarning, FrameBatch, IntervalClosed
-from ..pedestal import SensorPedestals, adc_gain_for_pedestal
+from ..batch import DarkIntegrityWarning, FrameBatch, IntervalClosed, TerminalDarkResult
+from ..pedestal import SensorPedestals
 
 
 logger = logging.getLogger("openmotion.sdk.pipeline.stages.dark")
@@ -173,7 +173,12 @@ class Interval:
 
 @dataclass
 class CorrectedFrame:
-    """One corrected sample, output of batch correction."""
+    """One corrected sample, output of batch correction.
+
+    After DarkCorrectionStage emits this, downstream stages mutate it:
+      ShotNoiseCorrectionStage: overwrites std, sets contrast
+      BfiBviStage: reads contrast/mean to produce EnrichedCorrectedFrame
+    """
     abs_frame_id: int
     t:             float
     side:          str       # "left" or "right"
@@ -183,6 +188,7 @@ class CorrectedFrame:
     raw_u1:        float     # original raw mean (for shot-noise use by downstream)
     raw_var:       float     # u2 - u1^2 (raw variance before dark sub)
     dark_var:      float     # interpolated dark baseline variance
+    contrast:      Optional[float] = None  # set by ShotNoiseCorrectionStage
 
 
 @dataclass
@@ -191,6 +197,7 @@ class CorrectedInterval:
     left_abs:  int
     right_abs: int
     frames:    list[CorrectedFrame]
+    left_t:    float = 0.0   # timestamp of the left dark boundary (for stencil)
 
 
 @dataclass
@@ -213,6 +220,7 @@ class EnrichedCorrectedInterval:
     left_abs:  int
     right_abs: int
     frames:    list[EnrichedCorrectedFrame]
+    left_t:    float = 0.0   # timestamp of the left dark boundary (for stencil)
 
 
 class PendingInterval:
@@ -273,8 +281,24 @@ class LinearInterpolation:
             baseline_var = d_prev.std ** 2 + t_frac * (d_next.std ** 2 - d_prev.std ** 2)
 
             mean = lf.u1 - baseline_u1
-            raw_var = max(0.0, lf.u2 - lf.u1 ** 2)
-            corrected_var = max(0.0, raw_var - baseline_var)
+            raw_var = lf.u2 - lf.u1 ** 2
+            if raw_var < 0:
+                logger.debug(
+                    "batch raw variance clamped negative (float rounding): "
+                    "side=%s cam=%d abs_id=%d raw_var=%.6f",
+                    side, cam_id, lf.abs_frame_id, raw_var,
+                )
+                raw_var = 0.0
+            corrected_var = raw_var - baseline_var
+            if corrected_var < 0:
+                logger.debug(
+                    "batch dark sub clamped negative variance: "
+                    "side=%s cam=%d abs_id=%d raw_var=%.3f "
+                    "baseline_var=%.3f deficit=%.3f",
+                    side, cam_id, lf.abs_frame_id, raw_var,
+                    baseline_var, -corrected_var,
+                )
+                corrected_var = 0.0
             std = float(corrected_var ** 0.5)
 
             corrected_frames.append(CorrectedFrame(
@@ -335,14 +359,14 @@ class DarkCorrectionStage:
     appropriate PendingInterval, and emits an IntervalClosed event when an
     interval bookends.
 
-    When an interval closes, the leading dark frame D_prev is given a
-    corrected value via DarkFrameQuadraticStencil (§8.4) and prepended to
-    the interval's frame list before emission.
+    The emitted IntervalClosed carries a raw CorrectedInterval — downstream
+    stages (ShotNoiseCorrectionStage, BfiBviStage, DarkFrameHoldStage)
+    handle enrichment and the dark-frame quadratic stencil.
 
     on_scan_stop(batch) performs the terminal-dark flush — per §8.6, the
     last buffered light frame is the firmware-guaranteed terminal dark frame;
     it is promoted to a dark boundary, removed from the light list, and the
-    remaining lights (if any) plus the D_prev stencil value are emitted.
+    remaining lights (if any) are emitted.
 
     See docs/SciencePipeline.md §7.4 (realtime) and §8 (batched).
     """
@@ -355,155 +379,16 @@ class DarkCorrectionStage:
                  batch_estimator: LinearInterpolation,
                  pedestals: Optional[SensorPedestals] = None,
                  realtime_history_size: int = 4,
-                 integrity_max_above_pedestal: float = 5.0,
-                 # Optional enrichment params (shot-noise + BFI/BVI)
-                 camera_gain_map: Optional[np.ndarray] = None,
-                 calibration: "Optional[Any]" = None):
+                 integrity_max_above_pedestal: float = 5.0):
         self._realtime = realtime_estimator
         self._batch = batch_estimator
         self._pedestals = pedestals or SensorPedestals(left=64.0, right=64.0)
-        # Per-side ADC gain derived from the pedestal: (1024 - p) / 11_000.
-        # Indexed by side_idx (0=left, 1=right) in _enrich_corrected_frame.
-        self._adc_gain_per_side: tuple[float, float] = (
-            adc_gain_for_pedestal(self._pedestals.left),
-            adc_gain_for_pedestal(self._pedestals.right),
-        )
         self._history = DarkHistory(max_darks=realtime_history_size)
         self._pending: dict[tuple[str, int], PendingInterval] = {}
         self._guard = DarkIntegrityGuard(
             max_above_pedestal=integrity_max_above_pedestal
         )
-        self._stencil = DarkFrameQuadraticStencil()
-        # Ring buffer (≤2 entries) of the last two EnrichedCorrectedFrames from
-        # the previous interval, keyed by (side, cam_id).  Used as the left
-        # neighbours v(D-1) and v(D-2) for the quadratic stencil (§8.4).
-        self._prev_interval_tail: dict[tuple[str, int], list[EnrichedCorrectedFrame]] = {}
         self._last_realtime: dict[tuple[str, int], tuple[float, float, float]] = {}
-        # Enrichment (shot-noise + calibration). When camera_gain_map is None
-        # the stage emits raw CorrectedInterval (no enrichment).
-        self._gain_map: Optional[np.ndarray] = (
-            np.asarray(camera_gain_map, dtype=np.float32) if camera_gain_map is not None else None
-        )
-        if calibration is not None:
-            self._c_min = np.asarray(calibration.c_min, dtype=np.float32)
-            self._c_max = np.asarray(calibration.c_max, dtype=np.float32)
-            self._i_min = np.asarray(calibration.i_min, dtype=np.float32)
-            self._i_max = np.asarray(calibration.i_max, dtype=np.float32)
-        else:
-            self._c_min = self._c_max = self._i_min = self._i_max = None
-
-    # ------------------------------------------------------------------
-    # Enrichment helpers (shot-noise + BFI/BVI calibration)
-    # ------------------------------------------------------------------
-
-    def _can_enrich(self) -> bool:
-        return (self._gain_map is not None
-                and self._c_min is not None)
-
-    def _enrich_corrected_frame(self, f: "CorrectedFrame") -> "EnrichedCorrectedFrame":
-        """Apply shot-noise correction + BFI/BVI calibration to a CorrectedFrame."""
-        side_idx = 0 if f.side == "left" else 1
-        cam_pos = int(f.cam_id) % 8
-        g_cam = float(self._gain_map[cam_pos])
-        adc_gain = self._adc_gain_per_side[side_idx]
-
-        # Shot-noise variance: §8.3 — use dark-corrected mean (f.mean)
-        shot_var = adc_gain * max(0.0, f.mean) * g_cam
-        corrected_var = max(0.0, f.std ** 2 - shot_var)
-        shot_corrected_std = corrected_var ** 0.5
-
-        if f.mean > 0:
-            contrast = shot_corrected_std / f.mean
-        else:
-            contrast = 0.0
-
-        # BFI/BVI calibration §9
-        c_min = float(self._c_min.reshape(2, 8)[side_idx, cam_pos])
-        c_max = float(self._c_max.reshape(2, 8)[side_idx, cam_pos])
-        i_min = float(self._i_min.reshape(2, 8)[side_idx, cam_pos])
-        i_max = float(self._i_max.reshape(2, 8)[side_idx, cam_pos])
-        c_span = c_max - c_min
-        i_span = i_max - i_min
-
-        if c_span > 0:
-            bfi = (1.0 - (contrast - c_min) / c_span) * 10.0
-        else:
-            bfi = contrast * 10.0
-        if i_span > 0:
-            bvi = (1.0 - (f.mean - i_min) / i_span) * 10.0
-        else:
-            bvi = f.mean * 10.0
-
-        return EnrichedCorrectedFrame(
-            abs_frame_id=f.abs_frame_id, t=f.t,
-            side=f.side, cam_id=f.cam_id,
-            mean=float(f.mean),
-            std=float(shot_corrected_std),
-            contrast=float(contrast),
-            bfi=float(bfi),
-            bvi=float(bvi),
-        )
-
-    def _enrich_interval(self, ci: "CorrectedInterval") -> "EnrichedCorrectedInterval":
-        return EnrichedCorrectedInterval(
-            left_abs=ci.left_abs,
-            right_abs=ci.right_abs,
-            frames=[self._enrich_corrected_frame(f) for f in ci.frames],
-        )
-
-    def _apply_dark_stencil(
-        self,
-        key: "tuple[str, int]",
-        d_prev_abs: int,
-        d_prev_t: float,
-        enriched_frames: "list[EnrichedCorrectedFrame]",
-    ) -> "Optional[EnrichedCorrectedFrame]":
-        """Compute the stencil-interpolated corrected value for the dark frame D_prev.
-
-        Uses the quadratic 4-point stencil (§8.4):
-            v(D) = (-1/6)*v(D-2) + (2/3)*v(D-1) + (2/3)*v(D+1) + (-1/6)*v(D+2)
-
-        Left neighbours  v(D-1), v(D-2) come from self._prev_interval_tail[key].
-        Right neighbours v(D+1), v(D+2) come from the first two frames of enriched_frames.
-
-        Falls back gracefully when fewer neighbours are available (see
-        DarkFrameQuadraticStencil.interpolate_dark_value for the fallback chain).
-
-        Returns None if there is no v(D+1) (interval has no corrected light frames).
-        Updates self._prev_interval_tail[key] after producing the stencil value.
-        """
-        if not enriched_frames:
-            return None
-
-        side, cam_id = key
-        right1 = enriched_frames[0]
-        right2 = enriched_frames[1] if len(enriched_frames) >= 2 else None
-        prev_tail = self._prev_interval_tail.get(key, [])
-        left1 = prev_tail[-1] if len(prev_tail) >= 1 else None
-        left2 = prev_tail[-2] if len(prev_tail) >= 2 else None
-
-        def _interp(attr: str) -> float:
-            r1 = getattr(right1, attr)
-            r2 = getattr(right2, attr) if right2 is not None else None
-            l1 = getattr(left1,  attr) if left1  is not None else None
-            l2 = getattr(left2,  attr) if left2  is not None else None
-            return self._stencil.interpolate_dark_value(
-                v_minus_2=l2, v_minus_1=l1,
-                v_plus_1=r1, v_plus_2=r2,
-            )
-
-        dark_frame = EnrichedCorrectedFrame(
-            abs_frame_id=d_prev_abs,
-            t=d_prev_t,
-            side=side,
-            cam_id=cam_id,
-            mean=_interp("mean"),
-            std=_interp("std"),
-            contrast=_interp("contrast"),
-            bfi=_interp("bfi"),
-            bvi=_interp("bvi"),
-        )
-        return dark_frame
 
     def _emit_interval(
         self,
@@ -511,44 +396,15 @@ class DarkCorrectionStage:
         interval: "Interval",
         events: list,
     ) -> None:
-        """Correct interval, apply stencil for D_prev, emit IntervalClosed.
+        """Correct interval and emit IntervalClosed with raw CorrectedInterval.
 
-        Mutates self._prev_interval_tail[key] to store the tail of the emitted
-        interval for the next stencil application.
+        Downstream stages handle shot-noise, BFI/BVI, and the dark-frame
+        quadratic stencil.
         """
         side, cam_id = key
         corrected = self._batch.correct_interval(interval, side=side, cam_id=cam_id)
-
-        if self._can_enrich():
-            enriched = self._enrich_interval(corrected)
-        else:
-            # No enrichment — we cannot produce an EnrichedCorrectedFrame for
-            # the stencil.  Emit the raw interval without a dark-frame row.
-            events.append(IntervalClosed(corrected_batch=corrected))
-            return
-
-        # Apply the quadratic stencil for the dark frame D_prev (§8.4).
-        d_prev_abs = interval.left_abs
-        d_prev_t   = interval.left.obs.t
-        dark_ef = self._apply_dark_stencil(key, d_prev_abs, d_prev_t, enriched.frames)
-
-        # Prepend the dark-frame corrected row (chronological order).
-        all_frames: list[EnrichedCorrectedFrame] = []
-        if dark_ef is not None:
-            all_frames.append(dark_ef)
-        all_frames.extend(enriched.frames)
-
-        # Update the tail for the NEXT interval's stencil (last two frames of
-        # this interval, excluding the prepended dark row itself).
-        tail = enriched.frames[-2:] if len(enriched.frames) >= 2 else enriched.frames[-1:]
-        self._prev_interval_tail[key] = list(tail)
-
-        emit = EnrichedCorrectedInterval(
-            left_abs=enriched.left_abs,
-            right_abs=enriched.right_abs,
-            frames=all_frames,
-        )
-        events.append(IntervalClosed(corrected_batch=emit))
+        corrected.left_t = interval.left.obs.t
+        events.append(IntervalClosed(corrected_batch=corrected))
 
     def process(self, batch: FrameBatch) -> FrameBatch:
         n = batch.frame_ids.shape[0]
@@ -612,8 +468,17 @@ class DarkCorrectionStage:
                     u1_hat, std_hat = pred
                     baseline_rt[i, side_idx, cam_id] = np.float32(u1_hat)
                     mean_dc_rt[i, side_idx, cam_id]  = np.float32(u1 - u1_hat)
-                    raw_var = max(0.0, std ** 2)
-                    corr_var = max(0.0, raw_var - std_hat ** 2)
+                    raw_var = std ** 2
+                    corr_var = raw_var - std_hat ** 2
+                    if corr_var < 0:
+                        logger.debug(
+                            "realtime dark sub clamped negative variance: "
+                            "side=%s cam=%d abs_id=%d raw_var=%.3f "
+                            "dark_var=%.3f deficit=%.3f",
+                            side, cam_id, abs_id, raw_var,
+                            std_hat ** 2, -corr_var,
+                        )
+                        corr_var = 0.0
                     std_dc_rt[i, side_idx, cam_id] = np.float32(corr_var ** 0.5)
                     self._last_realtime[(side, cam_id)] = (
                         float(u1_hat),
@@ -634,7 +499,6 @@ class DarkCorrectionStage:
     def reset(self) -> None:
         self._history.clear()
         self._pending.clear()
-        self._prev_interval_tail.clear()
         self._last_realtime.clear()
 
     def on_scan_stop(self, batch: FrameBatch) -> None:
@@ -669,17 +533,38 @@ class DarkCorrectionStage:
 
             # The final buffered frame should be the hardware-guaranteed
             # terminal dark.  If it is not dark-like, leave the interval open
-            # and log; this preserves the non-failing behavior expected by the
-            # app while avoiding a bogus terminal boundary.
+            # and log loudly — the firmware did not produce the expected
+            # laser-off frame, which indicates a trigger/firmware issue.
             terminal_light = pi._light[-1]
             if not _is_dark_like(terminal_light):
-                logger.warning(
-                    "no terminal dark frame found for side=%s cam_id=%d; "
-                    "last frame abs_id=%d u1=%.3f exceeds dark threshold %.3f",
+                logger.error(
+                    "TERMINAL DARK MISSING: side=%s cam_id=%d — "
+                    "last frame abs_id=%d u1=%.3f exceeds dark threshold %.3f. "
+                    "Firmware did not produce a laser-off frame at scan stop. "
+                    "Interval left open; corrected data for this interval is lost.",
                     side, cam_id, terminal_light.abs_frame_id,
                     terminal_light.u1, threshold,
                 )
+                batch.events.append(TerminalDarkResult(
+                    side=side, cam_id=cam_id,
+                    abs_frame_id=terminal_light.abs_frame_id,
+                    u1=terminal_light.u1, threshold=threshold,
+                    found=False,
+                ))
                 continue
+
+            logger.info(
+                "terminal dark confirmed: side=%s cam_id=%d "
+                "abs_id=%d u1=%.3f (threshold=%.3f)",
+                side, cam_id, terminal_light.abs_frame_id,
+                terminal_light.u1, threshold,
+            )
+            batch.events.append(TerminalDarkResult(
+                side=side, cam_id=cam_id,
+                abs_frame_id=terminal_light.abs_frame_id,
+                u1=terminal_light.u1, threshold=threshold,
+                found=True,
+            ))
 
             tail_start = len(pi._light) - 1
             while tail_start > 0 and _is_dark_like(pi._light[tail_start - 1]):
