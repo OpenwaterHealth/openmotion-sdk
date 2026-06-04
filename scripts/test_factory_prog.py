@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-lattice_deploy.py - Deploy a Lattice FPGA bitstream via the H7-LatticeProgrammer board.
+test_factory_prog.py - Deploy a Lattice FPGA bitstream via the OpenMotion Sensor board.
 
 Parses the .iea/.ied algorithm/data files produced by Lattice Diamond and replays
 every I2C transaction against the real FPGA over the STM32H7-based programmer board.
@@ -33,7 +33,8 @@ from omotion.i2c_parser import I2CDriver, isp_entry_point, ERR_MESSAGES  # noqa:
 # ---------------------------------------------------------------------------
 if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
-from omotion.Interface import MOTIONInterface  # noqa: E402
+from omotion import MotionInterface  # noqa: E402
+from omotion.MotionSensor import MotionSensor  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +53,7 @@ class _TxState(Enum):
 
 
 class HardwareDriver(I2CDriver):
-    """I2CDriver that groups raw I2C signals into MOTIONInterface transactions.
+    """I2CDriver that groups raw I2C signals into MotionSensor transactions.
 
     The .iea file encodes the I2C address as the first WRITE byte after each
     START/RESTART:
@@ -60,7 +61,7 @@ class HardwareDriver(I2CDriver):
         0x81  =  (0x40 << 1) | 1  =  address 0x40, read
 
     The driver strips that address byte, accumulates subsequent write bytes,
-    then on STOP (or READ) dispatches the appropriate OWInterface call:
+    then on STOP (or READ) dispatches the appropriate MotionSensor call:
         Pure write:        i2c_write(dev_addr, write_data)
         Write then read:   i2c_write_read(dev_addr, write_data, read_len)
         Pure read:         i2c_read(dev_addr, read_len)
@@ -69,7 +70,7 @@ class HardwareDriver(I2CDriver):
     ignored because write_data will be empty when stop() is called.
     """
 
-    def __init__(self, ifc: MOTIONInterface, default_addr: int = 0x40):
+    def __init__(self, ifc: MotionSensor, default_addr: int = 0x40):
         self._ifc          = ifc
         self._default_addr = default_addr
         self._state        = _TxState.IDLE
@@ -174,6 +175,14 @@ class HardwareDriver(I2CDriver):
 
     # ------------------------------------------------------------------
 
+    def select_camera(self, camera: int) -> None:
+        """Select the active camera. User-facing cameras are 1-8; firmware uses 0-7."""
+        if not (1 <= camera <= 8):
+            raise ValueError(f"camera must be 1–8, got {camera}")
+        camera_id = camera - 1
+        logger.info("select_camera %d -> firmware camera_id %d", camera, camera_id)
+        self._ifc.switch_camera(camera_id)
+
     def creset(self, value: int) -> None:
         state = value != 0
         logger.info("creset %s", "HIGH (release)" if state else "LOW (assert)")
@@ -196,14 +205,10 @@ def main() -> None:
                         help="Lattice algorithm file (.iea)")
     parser.add_argument("data", metavar="DATA.IED",
                         help="Lattice data file (.ied)")
-    parser.add_argument("--port", default=None,
-                        help="Serial port (e.g. COM3). Auto-detected if omitted.")
     parser.add_argument("--sensor", default="left",
                         help="Sensor Module [left, right] (default left).")
-    parser.add_argument("--cam", default="left",
+    parser.add_argument("--cam", default=1, type=int,
                         help="Sensor Module [1-8] (default 1).")
-    parser.add_argument("--baudrate", type=int, default=921600,
-                        help="Serial baud rate (default 921600).")
     parser.add_argument("--timeout", type=float, default=5.0,
                         help="Per-command timeout in seconds (default 5.0).")
     parser.add_argument("-v", "--verbose", action="store_true",
@@ -218,6 +223,10 @@ def main() -> None:
         print(f"Error: --sensor must be 'left' or 'right', got '{args.sensor}'", file=sys.stderr)
         sys.exit(1)
 
+    if not (1 <= args.cam <= 8):
+        print(f"Error: --cam must be 1–8, got {args.cam}", file=sys.stderr)
+        sys.exit(1)
+
     # Validate input files
     for path in (args.algo, args.data):
         if not os.path.isfile(path):
@@ -226,27 +235,53 @@ def main() -> None:
 
     # Connect to programmer board
     print("Connecting to Motion Sensor...")
-    
 
-    # Acquire interface + connection state
-    interface, console_connected, left_sensor, right_sensor = MOTIONInterface.acquire_motion_interface()
+    _CONNECT_TIMEOUT = 12.0
+    iface = MotionInterface()
+    iface.start(wait=True, wait_timeout=_CONNECT_TIMEOUT)
 
-    if console_connected and left_sensor and right_sensor:
+    # Poll for connection
+    def _await(handle, label):
+        deadline = time.monotonic() + _CONNECT_TIMEOUT
+        while time.monotonic() < deadline:
+            if handle.is_connected():
+                return True
+            time.sleep(0.1)
+        return False
+
+    console_connected = _await(iface.console, "Console")
+    left_connected    = _await(iface.left,    "Left sensor")
+    right_connected   = _await(iface.right,   "Right sensor")
+
+    if console_connected and left_connected and right_connected:
         print("MOTION System fully connected.")
     else:
-        print(f'MOTION System NOT Fully Connected. CONSOLE: {console_connected}, SENSOR (LEFT,RIGHT): {left_sensor}, {right_sensor}')
-        
-    if not left_sensor and not right_sensor:
+        print(f"MOTION System NOT Fully Connected. CONSOLE: {console_connected}, SENSOR (LEFT,RIGHT): {left_connected}, {right_connected}")
+
+    if not left_connected and not right_connected:
         print("Sensor Modules not connected.")
+        iface.stop()
+        exit(1)
+
+    sensor = iface.left if args.sensor == "left" else iface.right
+    if not sensor.is_connected():
+        print(f"Requested sensor '{args.sensor}' is not connected.")
+        iface.stop()
         exit(1)
 
     print(f"Connected.  Sensor: {args.sensor}  Camera: {args.cam}\n")
 
     # Run the bitstream deployment
-    driver = HardwareDriver(interface[args.sensor])
+    driver = HardwareDriver(sensor)
     print(f"Programming FPGA from:\n  algo: {args.algo}\n  data: {args.data}\n")
 
-    ret = isp_entry_point(args.algo, args.data, driver=driver)
+    print(f"Selecting camera {args.cam}...")
+    driver.select_camera(args.cam)
+
+    try:
+        ret = isp_entry_point(args.algo, args.data, driver=driver)
+    finally:
+        iface.stop()
 
     if ret < 0:
         msg = ERR_MESSAGES.get(ret, "UNKNOWN ERROR")

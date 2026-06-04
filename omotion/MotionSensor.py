@@ -479,7 +479,7 @@ class MotionSensor(SignalWrapper):
         Raises:
             OWNotConnectedError, OWCommunicationError, OWDeviceError.
         """
-        r = self._send(packet_type=OW_FPGA_PROG, command=OW_FACTORY_I2C_SCAN)
+        r = self._send(packetType=OW_FPGA_PROG, command=OW_FACTORY_I2C_SCAN)
         if r.packet_type in _ERROR_TYPES:
             return False
         addresses = list(r.data[:r.data_len]) if r.data and r.data_len else []
@@ -506,7 +506,7 @@ class MotionSensor(SignalWrapper):
             data = None          # 0-byte payload → firmware reads pin
         else:
             data = bytearray([0x01 if state else 0x00])
-        r = self._send(packet_type=OW_FPGA_PROG, command=OW_FACTORY_CRESET, data=data)
+        r = self._send(packetType=OW_FPGA_PROG, command=OW_FACTORY_CRESET, data=data)
         if r.packet_type in _ERROR_TYPES:
             return False
                 
@@ -534,7 +534,7 @@ class MotionSensor(SignalWrapper):
                               write_len       & 0xFF])
         payload += bytearray(data)
         
-        r = self._send(packet_type=OW_FPGA_PROG, command=OW_FACTORY_I2C_WR, data=payload)
+        r = self._send(packetType=OW_FPGA_PROG, command=OW_FACTORY_I2C_WR, data=payload)
         if r.packet_type in _ERROR_TYPES:
             return False
         
@@ -562,7 +562,7 @@ class MotionSensor(SignalWrapper):
         payload = bytearray([(read_len >> 8) & 0xFF,
                               read_len       & 0xFF])
         
-        r = self._send(packet_type=OW_FPGA_PROG, command=OW_FACTORY_I2C_RD, data=payload)
+        r = self._send(packetType=OW_FPGA_PROG, command=OW_FACTORY_I2C_RD, data=payload)
         if r.packet_type in _ERROR_TYPES:
             return False
         
@@ -601,7 +601,7 @@ class MotionSensor(SignalWrapper):
                               read_len        & 0xFF])
         payload += bytearray(data)
         
-        r = self._send(packet_type=OW_FPGA_PROG, command=OW_FACTORY_I2C_WRRD, data=payload)
+        r = self._send(packetType=OW_FPGA_PROG, command=OW_FACTORY_I2C_WRRD, data=payload)
         if r.packet_type in _ERROR_TYPES:
             return False
         
