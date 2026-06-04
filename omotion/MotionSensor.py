@@ -30,6 +30,11 @@ from omotion.config import (
     OW_CMD_DEBUG_FLAGS,
     OW_CONTROLLER,
     OW_ERROR,
+    OW_FACTORY_CRESET,
+    OW_FACTORY_I2C_SCAN,
+    OW_FACTORY_I2C_RD,
+    OW_FACTORY_I2C_WR,
+    OW_FACTORY_I2C_WRRD,
     OW_FPGA,
     OW_FPGA_ACTIVATE,
     OW_FPGA_BITSTREAM,
@@ -37,6 +42,7 @@ from omotion.config import (
     OW_FPGA_ERASE_SRAM,
     OW_FPGA_EXIT_SRAM_PROG,
     OW_FPGA_ID,
+    OW_FPGA_PROG,
     OW_FPGA_PROG_SRAM,
     OW_FPGA_RESET,
     OW_FPGA_STATUS,
@@ -460,6 +466,150 @@ class MotionSensor(SignalWrapper):
         if r.packet_type in _ERROR_TYPES:
             return False
         return r.reserved == 1
+
+    # ------------------------------------------------------------------
+    # Factory Commands
+    # ------------------------------------------------------------------
+    def i2c_scan(self) -> list[int]:
+        """Scan the I2C bus and return a list of found device addresses.
+
+        Returns:
+            List of 7-bit I2C addresses (integers) that responded.
+
+        Raises:
+            OWNotConnectedError, OWCommunicationError, OWDeviceError.
+        """
+        r = self._send(packet_type=OW_FPGA_PROG, command=OW_FACTORY_I2C_SCAN)
+        if r.packet_type in _ERROR_TYPES:
+            return False
+        addresses = list(r.data[:r.data_len]) if r.data and r.data_len else []
+        logger.info("LP i2c_scan: found %d device(s): %s",
+                    len(addresses),
+                    [f"0x{a:02X}" for a in addresses])
+        return addresses
+    
+    def creset(self, state: bool | None = None) -> int:
+        """Control or read the FPGA CRESET pin.
+
+        Args:
+            state: True  → drive CRESET high (release reset).
+                   False → drive CRESET low  (assert reset).
+                   None  → read current state without changing it.
+
+        Returns:
+            Current CRESET pin state: 1 = high, 0 = low.
+
+        Raises:
+            OWNotConnectedError, OWCommunicationError, OWDeviceError.
+        """
+        if state is None:
+            data = None          # 0-byte payload → firmware reads pin
+        else:
+            data = bytearray([0x01 if state else 0x00])
+        r = self._send(packet_type=OW_FPGA_PROG, command=OW_FACTORY_CRESET, data=data)
+        if r.packet_type in _ERROR_TYPES:
+            return False
+                
+        pin = r.data[0] if r.data and r.data_len >= 1 else 0
+        logger.info("LP creset: pin=%d", pin)
+        return pin
+
+    def i2c_write(self, dev_addr: int, data: bytes | bytearray) -> None:
+        """Write bytes to an I2C device.
+
+        Payload: [dev_addr, write_len_hi, write_len_lo, data...]
+
+        Args:
+            dev_addr: 7-bit I2C device address.
+            data: Bytes to write.
+
+        Raises:
+            ValueError: If data is empty.
+            OWNotConnectedError, OWCommunicationError, OWDeviceError.
+        """
+        if not data:
+            raise ValueError("i2c_write requires at least 1 data byte")
+        write_len = len(data)
+        payload = bytearray([(write_len >> 8) & 0xFF,
+                              write_len       & 0xFF])
+        payload += bytearray(data)
+        
+        r = self._send(packet_type=OW_FPGA_PROG, command=OW_FACTORY_I2C_WR, data=payload)
+        if r.packet_type in _ERROR_TYPES:
+            return False
+        
+        logger.info("LP i2c_write: addr=0x%02X len=%d data=%s",
+                    dev_addr, write_len, [f"0x{b:02X}" for b in data])
+    
+    def i2c_read(self, dev_addr: int, read_len: int) -> bytes:
+        """Read bytes from an I2C device.
+
+        Payload: [dev_addr, read_len_hi, read_len_lo]
+
+        Args:
+            dev_addr: 7-bit I2C device address.
+            read_len: Number of bytes to read.
+
+        Returns:
+            Bytes read from the device.
+
+        Raises:
+            ValueError: If read_len < 1.
+            OWNotConnectedError, OWCommunicationError, OWDeviceError.
+        """
+        if read_len < 1:
+            raise ValueError("i2c_read requires read_len >= 1")
+        payload = bytearray([(read_len >> 8) & 0xFF,
+                              read_len       & 0xFF])
+        
+        r = self._send(packet_type=OW_FPGA_PROG, command=OW_FACTORY_I2C_RD, data=payload)
+        if r.packet_type in _ERROR_TYPES:
+            return False
+        
+        result = bytes(r.data[:r.data_len]) if r.data and r.data_len else b""
+        logger.info("LP i2c_read: addr=0x%02X len=%d data=%s",
+                    dev_addr, len(result), [f"0x{b:02X}" for b in result])
+        return result
+
+    def i2c_write_read(self, dev_addr: int, data: bytes | bytearray,
+                       read_len: int) -> bytes:
+        """Write bytes then read bytes from an I2C device (combined transfer).
+
+        Payload: [dev_addr, write_len_hi, write_len_lo,
+                  read_len_hi, read_len_lo, write_data...]
+
+        Args:
+            dev_addr: 7-bit I2C device address.
+            data: Bytes to write.
+            read_len: Number of bytes to read back.
+
+        Returns:
+            Bytes read from the device.
+
+        Raises:
+            ValueError: If data is empty or read_len < 1.
+            OWNotConnectedError, OWCommunicationError, OWDeviceError.
+        """
+        if not data:
+            raise ValueError("i2c_write_read requires at least 1 write byte")
+        if read_len < 1:
+            raise ValueError("i2c_write_read requires read_len >= 1")
+        write_len = len(data)
+        payload = bytearray([(write_len >> 8) & 0xFF,
+                              write_len       & 0xFF,
+                             (read_len  >> 8) & 0xFF,
+                              read_len        & 0xFF])
+        payload += bytearray(data)
+        
+        r = self._send(packet_type=OW_FPGA_PROG, command=OW_FACTORY_I2C_WRRD, data=payload)
+        if r.packet_type in _ERROR_TYPES:
+            return False
+        
+        result = bytes(r.data[:r.data_len]) if r.data and r.data_len else b""
+        logger.info("LP i2c_write_read: addr=0x%02X wrote=%d read=%d data=%s",
+                    dev_addr, write_len, len(result),
+                    [f"0x{b:02X}" for b in result])
+        return result
 
     # ------------------------------------------------------------------
     # Debug flags
