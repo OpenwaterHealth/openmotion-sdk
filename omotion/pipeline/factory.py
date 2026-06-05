@@ -21,6 +21,7 @@ from .stages.shot_noise import ShotNoiseCorrectionStage
 from .stages.bfi_bvi import BfiBviStage
 from .stages.dark_frame_hold import DarkFrameHoldStage
 from .stages.side_avg import SideAverageStage
+from .stages.timestamp_repair import TimestampRepairStage
 from .tee import Tee
 
 
@@ -54,6 +55,7 @@ def default_pipeline(*,
         )
 
     stages.extend([
+        TimestampRepairStage(tolerance_s=0.002, max_buffer_frames=16),
         NoiseFloorStage(threshold=noise_floor_threshold),
         MomentsStage(),
         PedestalSubtractionStage(pedestals=pedestals),
