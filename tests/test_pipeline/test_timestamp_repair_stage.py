@@ -30,7 +30,7 @@ def _make_batch(cam_ids, frame_ids, side_ids, timestamps, abs_frame_ids=None,
 
 def test_clean_passthrough():
     """Clean frames: timestamps unchanged, all quality='ok', batch size unchanged."""
-    stage = TimestampRepairStage(tolerance_s=0.002, max_buffer_frames=16)
+    stage = TimestampRepairStage()
     # 4 clean frames from cam 0, side 0, 25ms apart
     ts = [0.025, 0.050, 0.075, 0.100]
     batch = _make_batch(
@@ -49,7 +49,7 @@ def test_clean_passthrough():
 
 def test_condition1_bad_timestamp_gets_corrected():
     """A frame with timestamp off by >2ms is corrected via re-anchoring."""
-    stage = TimestampRepairStage(tolerance_s=0.002, max_buffer_frames=16)
+    stage = TimestampRepairStage()
     # Frame 13 (index 2) has a bad timestamp: jumped to 0.130 instead of ~0.075.
     # Frame 14 (index 3) at 0.100 is good and serves as the re-anchor.
     #   frame 11 @0.025 (ok), frame 12 @0.050 (ok),
@@ -81,7 +81,7 @@ def test_condition1_bad_timestamp_gets_corrected():
 
 def test_condition2_frame_id_disagreement():
     """Cameras at the same timestamp with different frame_ids are flagged bad."""
-    stage = TimestampRepairStage(tolerance_s=0.002, max_buffer_frames=16)
+    stage = TimestampRepairStage()
     # Two cameras at t=0.050 disagree: cam0 says frame_id 12, cam1 says frame_id 13
     # Then a good frame (cam0, frame 14) at t=0.100 re-anchors.
     # For cam0: last_good=(11, 0.025), frame 14 ts=0.100.
@@ -103,7 +103,7 @@ def test_condition2_frame_id_disagreement():
 
 def test_nan_fill_for_missing_frames():
     """Missing abs_frame_ids get synthetic NaN-fill rows inserted."""
-    stage = TimestampRepairStage(tolerance_s=0.002, max_buffer_frames=16)
+    stage = TimestampRepairStage()
     # Frame 11 then frame 14 -- frames 12 and 13 are missing
     batch = _make_batch(
         cam_ids=[0, 0],
@@ -134,7 +134,7 @@ def test_nan_fill_for_missing_frames():
 
 def test_buffer_force_flush_at_max():
     """When buffer fills without a re-anchor, force-flush using nominal period."""
-    stage = TimestampRepairStage(tolerance_s=0.002, max_buffer_frames=4)
+    stage = TimestampRepairStage(max_buffer_frames=4)
     # 1 good frame, then 5 bad frames (buffer size 4, so force-flush at frame 4)
     ts = [0.025]
     fids = [11]
@@ -158,7 +158,7 @@ def test_buffer_force_flush_at_max():
 
 def test_logging_one_warning_per_window(caplog):
     """One WARNING per misalignment window, not per frame."""
-    stage = TimestampRepairStage(tolerance_s=0.002, max_buffer_frames=16)
+    stage = TimestampRepairStage()
     # Frame 13 bad (jumps to 0.130), frame 14 at 0.100 re-anchors.
     ts = [0.025, 0.050, 0.130, 0.100]
     batch = _make_batch(
@@ -178,7 +178,7 @@ def test_logging_one_warning_per_window(caplog):
 
 def test_logging_scan_summary(caplog):
     """End-of-scan summary emitted at on_scan_stop."""
-    stage = TimestampRepairStage(tolerance_s=0.002, max_buffer_frames=16)
+    stage = TimestampRepairStage()
     # Frame 13 bad, frame 14 re-anchors
     ts = [0.025, 0.050, 0.130, 0.100]
     batch = _make_batch(
@@ -201,7 +201,7 @@ def test_logging_scan_summary(caplog):
 
 def test_no_logging_on_clean_scan(caplog):
     """Clean scan produces zero log output."""
-    stage = TimestampRepairStage(tolerance_s=0.002, max_buffer_frames=16)
+    stage = TimestampRepairStage()
     ts = [0.025, 0.050, 0.075, 0.100]
     batch = _make_batch(
         cam_ids=[0, 0, 0, 0],
@@ -221,7 +221,7 @@ def test_no_logging_on_clean_scan(caplog):
 
 def test_warmup_and_stale_frames_pass_through_untouched():
     """Warmup and stale frames are not subject to divergence detection."""
-    stage = TimestampRepairStage(tolerance_s=0.002, max_buffer_frames=16)
+    stage = TimestampRepairStage()
     batch = _make_batch(
         cam_ids=[0, 0, 0],
         frame_ids=[1, 2, 10],

@@ -55,7 +55,7 @@ def default_pipeline(*,
         )
 
     stages.extend([
-        TimestampRepairStage(tolerance_s=0.002, max_buffer_frames=16),
+        TimestampRepairStage(),
         NoiseFloorStage(threshold=noise_floor_threshold),
         MomentsStage(),
         PedestalSubtractionStage(pedestals=pedestals),

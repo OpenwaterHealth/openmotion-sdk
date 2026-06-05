@@ -28,6 +28,7 @@ from ..batch import FrameBatch
 logger = logging.getLogger("openmotion.sdk.pipeline.stages.timestamp_repair")
 
 _INITIAL_NOMINAL_PERIOD_S = 0.025
+_DEFAULT_TOLERANCE_S = 0.010
 _EMA_ALPHA = 0.01
 
 
@@ -44,7 +45,7 @@ class _WindowStats:
 class TimestampRepairStage:
     name = "timestamp_repair"
 
-    def __init__(self, *, tolerance_s: float = 0.002,
+    def __init__(self, *, tolerance_s: float = _DEFAULT_TOLERANCE_S,
                  max_buffer_frames: int = 16):
         self._tolerance = float(tolerance_s)
         self._max_buffer = int(max_buffer_frames)
