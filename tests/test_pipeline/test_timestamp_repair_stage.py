@@ -95,7 +95,8 @@ def test_condition2_frame_id_disagreement():
         frame_types=["light", "light", "light", "light"],
     )
     result = stage.process(batch)
-    # Frames at t=0.050 should be flagged as bad (frame_id disagreement)
+    # Both frames at t=0.050 are bad (frame_id disagreement) and same-side
+    # as the re-anchor, so both get re-anchored as ts_corrected
     assert result.quality[1] == "ts_corrected"
     assert result.quality[2] == "ts_corrected"
 

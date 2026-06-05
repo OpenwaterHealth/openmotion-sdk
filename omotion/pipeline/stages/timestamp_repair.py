@@ -18,6 +18,8 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from dataclasses import dataclass
+from itertools import groupby
+from operator import attrgetter
 from typing import Optional
 
 import numpy as np
@@ -33,14 +35,34 @@ _EMA_ALPHA = 0.01  # slow convergence for nominal period
 
 @dataclass
 class _BufferedFrame:
-    """One frame held in the look-ahead buffer during a bad run."""
-    idx: int
+    """One frame held in the look-ahead buffer during a bad run.
+
+    Stores all per-frame data from the batch so the buffer is independent
+    of any batch's arrays.  When flushed, a new row is constructed from
+    the stored data — no stale-index problem across batch or side
+    boundaries.
+
+    ``raw_histograms`` and ``temperature_c`` start as views into the
+    source batch for zero-copy within-batch flushes.  ``_detach_arrays``
+    is called at the top of the *next* ``process()`` to deep-copy any
+    surviving views before the old batch's memory is recycled.
+    """
     cam_id: int
     side_idx: int
     abs_frame_id: int
     frame_id: int
     original_ts: float
     frame_type: str
+    raw_histograms: np.ndarray   # (2, 8, 1024) — view or owned copy
+    temperature_c: np.ndarray    # (2, 8) — view or owned copy
+    _owns_arrays: bool = False
+
+    def detach(self) -> None:
+        """Deep-copy array views so the buffer survives batch turnover."""
+        if not self._owns_arrays:
+            self.raw_histograms = self.raw_histograms.copy()
+            self.temperature_c = self.temperature_c.copy()
+            self._owns_arrays = True
 
 
 @dataclass
@@ -91,6 +113,11 @@ class TimestampRepairStage:
             batch.quality = np.empty(0, dtype="<U14")
             return batch
 
+        # Detach any surviving buffer frames so they own their arrays
+        # before the previous batch's memory is recycled.
+        for bf in self._buffer:
+            bf.detach()
+
         self._total_frames_seen += n
 
         # --- Condition 2: in-packet frame_id disagreement ---
@@ -99,7 +126,9 @@ class TimestampRepairStage:
         # --- Per-row processing: condition 1 + routing ---
         quality = np.full(n, "ok", dtype="<U14")
         output_indices: list[int] = []
-        nan_fill_inserts: list[tuple[int, list[dict]]] = []
+        # Synthetic rows to insert: (position_in_output, list_of_dicts).
+        # Dicts come from _make_nan_fills, _reanchor_flush, _force_flush.
+        synthetic_inserts: list[tuple[int, list[dict]]] = []
 
         for i in range(n):
             ftype = str(batch.frame_type[i])
@@ -132,20 +161,27 @@ class TimestampRepairStage:
                         onset_fid=abs_fid, onset_t=ts,
                     )
                 self._buffer.append(_BufferedFrame(
-                    idx=i, cam_id=cam_id, side_idx=side_idx,
+                    cam_id=cam_id, side_idx=side_idx,
                     abs_frame_id=abs_fid, frame_id=int(batch.frame_ids[i]),
                     original_ts=ts, frame_type=ftype,
+                    raw_histograms=batch.raw_histograms[i],
+                    temperature_c=batch.temperature_c[i],
                 ))
                 if len(self._buffer) >= self._max_buffer:
-                    flushed = self._force_flush_buffer(batch, quality)
-                    output_indices.extend(flushed)
+                    flushed = self._force_flush_buffer()
+                    if flushed:
+                        synthetic_inserts.append(
+                            (len(output_indices), flushed))
             else:
                 if self._in_bad_run:
                     # Re-anchor: this good frame closes the bad run
                     flushed = self._reanchor_flush(
-                        batch, quality, anchor_fid=abs_fid, anchor_ts=ts,
+                        anchor_fid=abs_fid, anchor_ts=ts,
+                        anchor_side=side_idx, anchor_cam=cam_id,
                     )
-                    output_indices.extend(flushed)
+                    if flushed:
+                        synthetic_inserts.append(
+                            (len(output_indices), flushed))
 
                 # Check for NaN-fill gaps
                 if key in self._last_good:
@@ -158,7 +194,8 @@ class TimestampRepairStage:
                             start_ts=prev_ts, end_ts=ts,
                             batch=batch,
                         )
-                        nan_fill_inserts.append((len(output_indices), fills))
+                        synthetic_inserts.append(
+                            (len(output_indices), fills))
 
                 # Update nominal period from good single-step frames
                 if key in self._last_good:
@@ -177,10 +214,13 @@ class TimestampRepairStage:
 
         batch.quality = quality
 
-        # If we have NaN fills that need insertion, rebuild the batch
-        if nan_fill_inserts:
+        # Rebuild the batch when:
+        # - there are synthetic rows to insert (flushed buffer or NaN fills)
+        # - some rows were buffered and excluded from output_indices
+        needs_rebuild = synthetic_inserts or len(output_indices) != n
+        if needs_rebuild:
             batch = self._rebuild_batch_with_fills(
-                batch, output_indices, nan_fill_inserts,
+                batch, output_indices, synthetic_inserts,
             )
 
         return batch
@@ -208,44 +248,65 @@ class TimestampRepairStage:
 
         return bad_indices
 
-    def _reanchor_flush(self, batch: FrameBatch, quality: np.ndarray, *,
-                        anchor_fid: int, anchor_ts: float) -> list[int]:
-        """Interpolate buffered frames between last good and the re-anchor,
-        then flush."""
-        flushed_indices: list[int] = []
+    def _reanchor_flush(self, *, anchor_fid: int, anchor_ts: float,
+                        anchor_side: int, anchor_cam: int) -> list[dict]:
+        """Interpolate buffered frames between last good and the re-anchor.
+
+        Only frames matching the anchor's (side, cam) are re-anchored.
+        Frames from other (side, cam) pairs are passed through with
+        original timestamps and quality="ok" (they were buffered only
+        because they coincided with a bad run on a different stream —
+        e.g. FM-6 scan-end glitch on one side while the other side is
+        clean).
+
+        Returns a list of frame dicts (same schema as _make_nan_fills)
+        suitable for _rebuild_batch_with_fills.
+        """
+        flushed: list[dict] = []
         if not self._buffer:
             self._in_bad_run = False
-            return flushed_indices
+            return flushed
 
-        # Find the left anchor from the buffer's first frame's camera
-        first = self._buffer[0]
-        key = (first.side_idx, first.cam_id)
-        if key in self._last_good:
-            left_fid, left_ts = self._last_good[key]
-        else:
-            left_fid = first.abs_frame_id - 1
-            left_ts = first.original_ts - self._nominal_period
+        # Partition: same-side vs cross-side.
+        # Same-side frames (possibly different cameras) are re-anchored.
+        # Cross-side frames are dropped — they were false-positives from
+        # a side boundary (e.g. FM-6 scan-end frames from the left side
+        # that got buffered and then flushed by the right side's first
+        # frame).  Inserting them into the wrong-side batch would cause
+        # non-monotonic timestamps downstream.
+        same_side = [bf for bf in self._buffer if bf.side_idx == anchor_side]
+        cross_side = [bf for bf in self._buffer if bf.side_idx != anchor_side]
 
-        fid_span = anchor_fid - left_fid
-        ts_span = anchor_ts - left_ts
-
-        for bf in self._buffer:
-            if fid_span > 0:
-                corrected_ts = (
-                    left_ts
-                    + (bf.abs_frame_id - left_fid) / fid_span * ts_span
-                )
+        # --- Re-anchor same-side frames via interpolation ---
+        # Group by (side, cam) for per-camera left-anchor lookup
+        same_side_sorted = sorted(same_side, key=attrgetter("cam_id"))
+        for cam_id, cam_group in groupby(same_side_sorted, key=attrgetter("cam_id")):
+            frames = list(cam_group)
+            key = (anchor_side, cam_id)
+            if key in self._last_good:
+                left_fid, left_ts = self._last_good[key]
             else:
-                corrected_ts = bf.original_ts
-            batch.timestamp_s[bf.idx] = corrected_ts
-            quality[bf.idx] = "ts_corrected"
-            flushed_indices.append(bf.idx)
+                left_fid = frames[0].abs_frame_id - 1
+                left_ts = frames[0].original_ts - self._nominal_period
+
+            fid_span = anchor_fid - left_fid
+            ts_span = anchor_ts - left_ts
+
+            for bf in frames:
+                if fid_span > 0:
+                    corrected_ts = (
+                        left_ts
+                        + (bf.abs_frame_id - left_fid) / fid_span * ts_span
+                    )
+                else:
+                    corrected_ts = bf.original_ts
+                flushed.append(self._bf_to_dict(bf, corrected_ts, "ts_corrected"))
 
         # Log the window
         if self._window_onset is not None:
             self._window_onset.end_fid = self._buffer[-1].abs_frame_id
             self._window_onset.end_t = self._buffer[-1].original_ts
-            self._window_onset.n_corrected = len(self._buffer)
+            self._window_onset.n_corrected = len(same_side)
             self._scan_windows.append(self._window_onset)
             logger.warning(
                 "Misalignment window: frames %d–%d (t=%.2f–%.2fs), "
@@ -254,25 +315,37 @@ class TimestampRepairStage:
                 self._window_onset.onset_t, self._window_onset.end_t,
                 self._window_onset.n_corrected, self._window_onset.n_nan,
             )
-
-        # Update last_good for all cameras that were in the buffer
-        for bf in self._buffer:
-            bk = (bf.side_idx, bf.cam_id)
-            self._last_good[bk] = (
-                bf.abs_frame_id, float(batch.timestamp_s[bf.idx]),
+        if cross_side:
+            logger.warning(
+                "Dropped %d cross-side frame(s) from buffer "
+                "(side boundary / FM-6)",
+                len(cross_side),
             )
+
+        # Update last_good for re-anchored frames
+        for bf in same_side:
+            bk = (bf.side_idx, bf.cam_id)
+            # Find the corrected ts from the flushed dicts
+            for fd in flushed:
+                if (fd["side_idx"] == bf.side_idx
+                        and fd["cam_id"] == bf.cam_id
+                        and fd["abs_frame_id"] == bf.abs_frame_id):
+                    self._last_good[bk] = (bf.abs_frame_id, fd["timestamp_s"])
+                    break
 
         self._buffer.clear()
         self._in_bad_run = False
         self._window_onset = None
-        return flushed_indices
+        return flushed
 
-    def _force_flush_buffer(self, batch: FrameBatch,
-                            quality: np.ndarray) -> list[int]:
-        """Buffer full with no re-anchor: interpolate using nominal period."""
-        flushed_indices: list[int] = []
+    def _force_flush_buffer(self) -> list[dict]:
+        """Buffer full with no re-anchor: interpolate using nominal period.
+
+        Returns frame dicts suitable for _rebuild_batch_with_fills.
+        """
+        flushed: list[dict] = []
         if not self._buffer:
-            return flushed_indices
+            return flushed
 
         first = self._buffer[0]
         key = (first.side_idx, first.cam_id)
@@ -285,9 +358,7 @@ class TimestampRepairStage:
         for bf in self._buffer:
             fid_delta = bf.abs_frame_id - left_fid
             corrected_ts = left_ts + fid_delta * self._nominal_period
-            batch.timestamp_s[bf.idx] = corrected_ts
-            quality[bf.idx] = "ts_corrected"
-            flushed_indices.append(bf.idx)
+            flushed.append(self._bf_to_dict(bf, corrected_ts, "ts_corrected"))
 
         if self._window_onset is not None:
             self._window_onset.end_fid = self._buffer[-1].abs_frame_id
@@ -305,14 +376,34 @@ class TimestampRepairStage:
 
         for bf in self._buffer:
             bk = (bf.side_idx, bf.cam_id)
-            self._last_good[bk] = (
-                bf.abs_frame_id, float(batch.timestamp_s[bf.idx]),
-            )
+            # Find the corrected ts from the flushed dicts
+            for fd in flushed:
+                if (fd["side_idx"] == bf.side_idx
+                        and fd["cam_id"] == bf.cam_id
+                        and fd["abs_frame_id"] == bf.abs_frame_id):
+                    self._last_good[bk] = (bf.abs_frame_id, fd["timestamp_s"])
+                    break
 
         self._buffer.clear()
         self._in_bad_run = False
         self._window_onset = None
-        return flushed_indices
+        return flushed
+
+    @staticmethod
+    def _bf_to_dict(bf: _BufferedFrame, timestamp_s: float,
+                    quality: str) -> dict:
+        """Convert a buffered frame to a dict for _rebuild_batch_with_fills."""
+        return {
+            "cam_id": bf.cam_id,
+            "frame_id": bf.frame_id,
+            "side_idx": bf.side_idx,
+            "abs_frame_id": bf.abs_frame_id,
+            "timestamp_s": timestamp_s,
+            "frame_type": bf.frame_type,
+            "quality": quality,
+            "raw_histograms": bf.raw_histograms,
+            "temperature_c": bf.temperature_c,
+        }
 
     def _make_nan_fills(self, *, side_idx: int, cam_id: int,
                         start_fid: int, end_fid: int,
@@ -343,18 +434,28 @@ class TimestampRepairStage:
         self,
         batch: FrameBatch,
         output_indices: list[int],
-        nan_fill_inserts: list[tuple[int, list[dict]]],
+        synthetic_inserts: list[tuple[int, list[dict]]],
     ) -> FrameBatch:
-        """Rebuild the batch, inserting NaN-fill rows at the right
-        positions."""
-        inserts_by_pos = sorted(nan_fill_inserts, key=lambda x: x[0])
+        """Rebuild the batch, inserting synthetic rows at the right positions.
+
+        Synthetic rows come from three sources:
+          - _make_nan_fills (NaN-fill for missing frames — zero histograms)
+          - _reanchor_flush (buffered frames with stored data)
+          - _force_flush_buffer (buffered frames with stored data)
+
+        Dicts from flushed buffers carry ``raw_histograms`` and
+        ``temperature_c`` numpy arrays; NaN-fill dicts do not (zeros
+        are used).
+        """
+        inserts_by_pos = sorted(synthetic_inserts, key=lambda x: x[0])
 
         total_fills = sum(len(fills) for _, fills in inserts_by_pos)
-        if total_fills == 0:
-            return batch
-
-        n_orig = len(batch.cam_ids)
+        n_orig = len(output_indices)
         n_new = n_orig + total_fills
+
+        # Nothing to do: all original rows kept, no synthetics
+        if total_fills == 0 and n_orig == len(batch.cam_ids):
+            return batch
 
         # Create new arrays
         new_cam_ids = np.zeros(n_new, dtype=np.int8)
@@ -410,7 +511,12 @@ class TimestampRepairStage:
                 new_timestamp_s[out_i] = fd["timestamp_s"]
                 new_frame_type[out_i] = fd["frame_type"]
                 new_quality[out_i] = fd["quality"]
-                # raw_histograms and temperature_c stay zero
+                # Flushed buffer frames carry their own data arrays;
+                # NaN-fill dicts do not (zeros are correct for those).
+                if "raw_histograms" in fd:
+                    new_raw_histograms[out_i] = fd["raw_histograms"]
+                if "temperature_c" in fd:
+                    new_temperature_c[out_i] = fd["temperature_c"]
 
         new_batch = FrameBatch(
             cam_ids=new_cam_ids,
