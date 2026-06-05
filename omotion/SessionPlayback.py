@@ -35,11 +35,11 @@ logger = logging.getLogger(
 )
 
 
-def _corrected_columns(reduced_mode: bool) -> list[str]:
+def _corrected_columns(reduced_mode: bool, include_quality: bool = False) -> list[str]:
     """Match CsvSink._corrected_columns(reduced_mode) exactly."""
     if reduced_mode:
         return ["bfi_left", "bfi_right", "bvi_left", "bvi_right"]
-    return (
+    cols = (
         [f"bfi_l{i}" for i in range(1, 9)]
         + [f"bfi_r{i}" for i in range(1, 9)]
         + [f"bvi_l{i}" for i in range(1, 9)]
@@ -51,12 +51,18 @@ def _corrected_columns(reduced_mode: bool) -> list[str]:
         + [f"temp_l{i}" for i in range(1, 9)]
         + [f"temp_r{i}" for i in range(1, 9)]
     )
+    if include_quality:
+        cols += [f"quality_l{i}" for i in range(1, 9)]
+        cols += [f"quality_r{i}" for i in range(1, 9)]
+    return cols
 
 
 def materialize_corrected_csv(
     db_path: str,
     session_id: int,
     output_path: str,
+    *,
+    include_quality: bool = False,
 ) -> str:
     """
     Read ``session_data`` for ``session_id`` and write a corrected-format
@@ -68,6 +74,9 @@ def materialize_corrected_csv(
     cells without rows in ``session_data`` end up empty in the CSV
     (same behavior as the live writer when a (side, cam) pair was
     masked off).
+
+    When ``include_quality`` is True (non-reduced mode only), per-camera
+    ``quality_l1`` … ``quality_r8`` columns are appended.
 
     Raises ``ValueError`` if the session doesn't exist, or
     ``RuntimeError`` if the session was recorded before #92 Step F
@@ -95,12 +104,16 @@ def materialize_corrected_csv(
                     session_id,
                 )
         reduced_mode = bool(meta.get("sdk_flags", {}).get("reduced_mode", False))
+        emit_quality = include_quality and not reduced_mode
 
         # Pull every per-(side, cam, frame) cell for this session. Order
         # by frame_id so we can stream-merge into per-frame rows.
+        select_cols = "frame_id, timestamp_s, side, cam_id, bfi, bvi, contrast, mean"
+        if emit_quality:
+            select_cols += ", quality"
         cur = db._connection().execute(
-            """
-            SELECT frame_id, timestamp_s, side, cam_id, bfi, bvi, contrast, mean
+            f"""
+            SELECT {select_cols}
             FROM session_data
             WHERE session_id = ?
             ORDER BY frame_id ASC, side ASC, cam_id ASC
@@ -108,7 +121,7 @@ def materialize_corrected_csv(
             (session_id,),
         )
 
-        cols = _corrected_columns(reduced_mode)
+        cols = _corrected_columns(reduced_mode, include_quality=emit_quality)
         rows_written = 0
         first_frame_id: Optional[int] = None
 
@@ -141,6 +154,7 @@ def materialize_corrected_csv(
                 bvi       = db_row[5]
                 contrast  = db_row[6]
                 mean      = db_row[7]
+                quality   = db_row[8] if emit_quality else None
 
                 if first_frame_id is None:
                     first_frame_id = fid
@@ -181,6 +195,7 @@ def materialize_corrected_csv(
                     if bvi      is not None: buf_vals[f"bvi_{suffix}"]      = float(bvi)
                     if contrast is not None: buf_vals[f"contrast_{suffix}"] = float(contrast)
                     if mean     is not None: buf_vals[f"mean_{suffix}"]     = float(mean)
+                    if quality  is not None: buf_vals[f"quality_{suffix}"]  = quality
 
             # Flush the final frame.
             if buf_fid is not None:
