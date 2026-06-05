@@ -183,8 +183,8 @@ def test_corrected_csv_still_written_when_write_corrected_true(tmp_path):
     assert len(corrected) == 1
 
 
-def test_corrected_csv_normal_mode_header_has_82_columns(tmp_path):
-    """Normal mode corrected CSV must have exactly 82 columns matching legacy format."""
+def test_corrected_csv_normal_mode_header_has_83_columns(tmp_path):
+    """Normal mode corrected CSV must have exactly 83 columns (82 metric + quality)."""
     sink = CsvSink(output_dir=tmp_path)
     sink.on_scan_start(_meta_normal())
     sink.consume("final", _make_enriched_interval())
@@ -197,11 +197,11 @@ def test_corrected_csv_normal_mode_header_has_82_columns(tmp_path):
     assert header == _NORMAL_HEADERS, (
         f"Header mismatch.\nExpected: {_NORMAL_HEADERS}\nGot:      {header}"
     )
-    assert len(header) == 82
+    assert len(header) == 83
 
 
-def test_corrected_csv_reduced_mode_header_has_6_columns(tmp_path):
-    """Reduced mode corrected CSV must have 6 columns."""
+def test_corrected_csv_reduced_mode_header_has_7_columns(tmp_path):
+    """Reduced mode corrected CSV must have 7 columns (6 metric + quality)."""
     sink = CsvSink(output_dir=tmp_path)
     sink.on_scan_start(_meta_reduced())
     sink.consume("final", _make_enriched_interval())
@@ -212,7 +212,7 @@ def test_corrected_csv_reduced_mode_header_has_6_columns(tmp_path):
     with open(files[0]) as fh:
         header = next(csv.reader(fh))
     assert header == _REDUCED_HEADERS
-    assert len(header) == 6
+    assert len(header) == 7
 
 
 def test_corrected_csv_normal_mode_places_values_in_correct_columns(tmp_path):
@@ -390,3 +390,19 @@ def test_csv_sink_partial_row_flushed_on_complete(tmp_path):
     assert float(data[header.index("mean_l1")]) == pytest.approx(150.0)
     # cam1 (not contributed) should be empty
     assert data[header.index("mean_l2")] == ""
+
+
+def test_corrected_csv_has_quality_column(tmp_path):
+    """Corrected CSV must include a quality column."""
+    from omotion.pipeline.sinks import _corrected_headers_normal
+    headers = _corrected_headers_normal()
+    assert "quality" in headers
+    assert headers[-1] == "quality"
+
+
+def test_corrected_csv_quality_column_reduced(tmp_path):
+    """Reduced-mode corrected CSV also has quality."""
+    from omotion.pipeline.sinks import _corrected_headers_reduced
+    headers = _corrected_headers_reduced()
+    assert "quality" in headers
+    assert headers[-1] == "quality"
