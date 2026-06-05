@@ -33,6 +33,22 @@ def test_framebatch_events_list_is_mutable():
     assert isinstance(batch.events[0], IntervalClosed)
 
 
+def test_framebatch_has_quality_field():
+    """FrameBatch must expose an optional quality array (spec §5.1)."""
+    batch = FrameBatch(
+        cam_ids=np.array([0], dtype=np.int8),
+        frame_ids=np.array([1], dtype=np.uint8),
+        raw_histograms=np.zeros((1, 2, 8, 1024), dtype=np.uint32),
+        temperature_c=np.zeros((1, 2, 8), dtype=np.float32),
+        timestamp_s=np.array([0.0], dtype=np.float64),
+        pdc=None, tcm=None, tcl=None,
+    )
+    assert batch.quality is None
+
+    batch.quality = np.array(["ok"], dtype="<U14")
+    assert batch.quality[0] == "ok"
+
+
 def _trivial_batch(n: int) -> FrameBatch:
     return FrameBatch(
         cam_ids=np.zeros(n, dtype=np.int8),

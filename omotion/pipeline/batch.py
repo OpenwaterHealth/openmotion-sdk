@@ -262,6 +262,14 @@ class FrameBatch:
     # Nominally 0–10 scale. Same hold behavior as bfi_live.
     bvi_live:       Optional[np.ndarray] = None
 
+    # ── TimestampRepairStage output ──────────────────────────────────────
+
+    # (N,) str — per-frame quality flag. Set by TimestampRepairStage.
+    # "ok" = device timestamp passed through unchanged
+    # "ts_corrected" = timestamp replaced by re-anchoring interpolation
+    # "nan_filled" = synthetic row for a missing frame (zero histogram)
+    quality:        Optional[np.ndarray] = None
+
     # ── Event queue ──────────────────────────────────────────────────────
 
     # Accumulated events from stages during process(). The runner reads
