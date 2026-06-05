@@ -174,6 +174,7 @@ class DarkFrameHoldStage:
             contrast=_interp("contrast"),
             bfi=_interp("bfi"),
             bvi=_interp("bvi"),
+            quality="ok",
         )
 
     # ── Lifecycle ────────────────────────────────────────────────────────
