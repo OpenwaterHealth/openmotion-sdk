@@ -86,9 +86,10 @@ def _replay_degraded(scan_info, output_dir):
         raw_csv_right=scan_info["right_raw"],
         metadata=meta, batch_size_frames=100,
     )
+    pedestal = scan_info.get("pedestal", 128.0)
     pipeline = default_pipeline(
         metadata=meta, calibration=_NullCalibration(),
-        pedestals=SensorPedestals(left=64.0, right=64.0),
+        pedestals=SensorPedestals(left=pedestal, right=pedestal),
     )
     sink = CsvSink(output_dir=str(output_dir))
     runner = ScanRunner(source=source, pipeline=pipeline, sinks=[sink])
