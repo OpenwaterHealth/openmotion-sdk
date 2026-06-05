@@ -125,7 +125,8 @@ class ScanDatabase:
                 bfi              REAL,
                 bvi              REAL,
                 contrast         REAL,
-                mean             REAL
+                mean             REAL,
+                quality          TEXT DEFAULT 'ok'
             );
 
             CREATE INDEX IF NOT EXISTS idx_session_data_session_time
@@ -154,6 +155,13 @@ class ScanDatabase:
             self._connection().execute(
                 "ALTER TABLE session_data ADD COLUMN frame_id INTEGER NOT NULL DEFAULT -1"
             )
+        if "quality" not in cols:
+            try:
+                self._connection().execute(
+                    "ALTER TABLE session_data ADD COLUMN quality TEXT DEFAULT 'ok'"
+                )
+            except sqlite3.OperationalError:
+                pass  # column already exists
         self._connection().execute(
             "CREATE INDEX IF NOT EXISTS idx_session_data_session_frame "
             "ON session_data(session_id, frame_id)"
@@ -464,6 +472,7 @@ class ScanDatabase:
         bvi: Optional[float] = None,
         contrast: Optional[float] = None,
         mean: Optional[float] = None,
+        quality: str = "ok",
     ) -> int:
         # frame_id defaults to the "unknown" sentinel (-1) so callers from
         # before #92 Step F still work; new callers (ScanDBSink) pass the
@@ -474,9 +483,9 @@ class ScanDatabase:
             """
             INSERT INTO session_data (
                 session_id, session_raw_id, cam_id, side,
-                frame_id, timestamp_s, bfi, bvi, contrast, mean
+                frame_id, timestamp_s, bfi, bvi, contrast, mean, quality
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 session_id,
@@ -489,6 +498,7 @@ class ScanDatabase:
                 bvi,
                 contrast,
                 mean,
+                quality,
             ),
         )
         self._connection().commit()
@@ -510,6 +520,7 @@ class ScanDatabase:
                     row.get("bvi"),
                     row.get("contrast"),
                     row.get("mean"),
+                    row.get("quality", "ok"),
                 )
             )
 
@@ -517,9 +528,9 @@ class ScanDatabase:
             """
             INSERT INTO session_data (
                 session_id, session_raw_id, cam_id, side,
-                frame_id, timestamp_s, bfi, bvi, contrast, mean
+                frame_id, timestamp_s, bfi, bvi, contrast, mean, quality
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             params,
         )

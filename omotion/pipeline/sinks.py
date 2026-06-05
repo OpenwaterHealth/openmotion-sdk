@@ -644,6 +644,7 @@ class ScanDBSink:
                 "bvi": round(bvi, 9),
                 "mean": mean_v,
                 "contrast": contrast_v,
+                "quality": str(batch.quality[i]) if batch.quality is not None else "ok",
             })
         if rows:
             try:
@@ -682,6 +683,7 @@ class ScanDBSink:
             "bvi": bvi,
             "mean": _round(getattr(sample, "mean", None)),
             "contrast": _round(getattr(sample, "contrast", None)),
+            "quality": getattr(sample, "quality", "ok") or "ok",
         })
         if len(self._side_buffer) >= self._side_batch_size:
             self._flush_side()
