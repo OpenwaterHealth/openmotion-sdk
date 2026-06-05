@@ -74,29 +74,82 @@ The wheel published fine on the SDK side; every consumer broke.
 
 ## Cutting a release
 
+This is the exact runbook (the `1.6.3` release was cut this way). Commands
+assume you have `gh` authenticated against `OpenwaterHealth/openmotion-sdk`.
+
 1. Land all target commits on `next` via the usual `feature/* → next` PRs.
 2. Open a PR `next → main` titled `Release: SDK next → main (...)`. This
    PR is the release-approval gate — reviewers sign off on the contents of
-   the release here, not at tag time. Choose `X.Y.Z` for the eventual tag.
+   the release here, not at tag time. Choose `X.Y.Z` for the eventual tag
+   using semantic versioning: bump **MINOR** when the release adds public
+   API (`feat:` commits), **PATCH** for fixes-only.
 3. After the PR is merged, tag the merge commit on `main`:
    ```
    git checkout main
-   git pull
-   git tag -a 1.6.2 -m "release 1.6.2"
-   git push origin 1.6.2
+   git pull --ff-only origin main
+   git tag -a 1.6.3 -m "release 1.6.3"
+   git rev-list -n1 1.6.3       # sanity-check: should print the merge commit SHA
+   git push origin 1.6.3
    ```
    The tag MUST point to a commit reachable from `main`. If you tagged a
    commit that's only on `next`, delete the tag and re-tag from `main`
    (see "If you tag wrong" below).
-4. The tag push triggers `.github/workflows/release-build.yml`, which
-   builds the wheel + sdist and creates a GitHub Release with the
-   artifacts attached.
-5. The GitHub Release `published` event triggers
-   `.github/workflows/publish-pypi.yml`, which downloads the release
-   assets and uploads them to PyPI via the OIDC trusted publisher.
+4. The tag push triggers `.github/workflows/release-build.yml`, which builds
+   the wheel + sdist, generates notes from the commit log, and creates a
+   GitHub Release with the artifacts attached (the action runs with
+   `allowUpdates: true`, so a re-run updates the same Release). **Wait for
+   this run to finish** — the wheel must be attached to the Release before
+   the publish step can find it.
+   ```
+   gh run list  --workflow release-build.yml --limit 1 --json databaseId,status
+   gh run watch <run-id> --exit-status
+   gh release view 1.6.3 --json isPrerelease,assets \
+     -q '{pre: .isPrerelease, assets: [.assets[].name]}'   # expect the .whl + .tar.gz, pre=false
+   ```
+5. (Recommended) Replace the auto-generated commit-dump notes with a
+   categorized changelog (Features / Fixes / Docs):
+   ```
+   gh release edit 1.6.3 --notes-file notes.md
+   ```
+6. **Manually trigger the PyPI publish — it does NOT fire on its own**
+   (see "Why the PyPI publish needs a manual trigger" below):
+   ```
+   gh workflow run publish-pypi.yml -f tag=1.6.3
+   gh run watch <run-id> --exit-status   # the run's Preflight + Verify-on-PyPI steps gate success
+   ```
+7. Confirm the version is live on PyPI (the publish workflow self-verifies,
+   but check independently):
+   ```
+   curl -s -o /dev/null -w '%{http_code}\n' https://pypi.org/pypi/openmotion-sdk/1.6.3/json
+   ```
+   Expect `200`. The aggregate index `https://pypi.org/pypi/openmotion-sdk/json`
+   is CDN-cached and can lag a few minutes behind the per-version endpoint —
+   don't be alarmed if it still shows the previous version briefly.
 
-The combination of (a) tag exists in the shape above and (b) the tagged
-commit is reachable from `main` is what gates PyPI publication.
+What gates what: (a) a correctly-shaped tag on (b) a commit reachable from
+`main` produces the GitHub Release; the PyPI upload is gated separately on
+(c) the manual `publish-pypi.yml` dispatch in step 6.
+
+### Why the PyPI publish needs a manual trigger
+
+`publish-pypi.yml` subscribes to `release: { types: [published] }`, so in
+principle creating the GitHub Release in step 4 should publish to PyPI
+automatically. **It does not.** The Release is created by `release-build.yml`
+using the default `GITHUB_TOKEN`, and GitHub deliberately **does not fire
+workflow triggers for events raised by the built-in `GITHUB_TOKEN`** (this
+prevents recursive workflow loops). So the `published` event never reaches
+`publish-pypi.yml`, and the publish silently never runs.
+
+That is why `publish-pypi.yml` also exposes a `workflow_dispatch` with a
+`tag` input — the manual dispatch in step 6 is how every release actually
+reaches PyPI. Editing the release notes (step 5) does not substitute for it:
+note edits raise `edited`/`released` events the workflow isn't subscribed to,
+and the same `GITHUB_TOKEN` rule would suppress them anyway.
+
+> To make the publish fully automatic, `release-build.yml` would have to
+> create the Release with a non-default token (a PAT or GitHub App token), or
+> the PyPI upload would have to be folded into `release-build.yml` itself.
+> Neither is wired up today — until then, dispatch manually.
 
 ## Manual / test builds (no tag)
 
