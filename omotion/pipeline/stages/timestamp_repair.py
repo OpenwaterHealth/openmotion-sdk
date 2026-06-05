@@ -28,7 +28,7 @@ from ..batch import FrameBatch
 logger = logging.getLogger("openmotion.sdk.pipeline.stages.timestamp_repair")
 
 _INITIAL_NOMINAL_PERIOD_S = 0.025
-_DEFAULT_TOLERANCE_S = 0.010
+_DEFAULT_TOLERANCE_S = 0.012
 _EMA_ALPHA = 0.01
 
 
