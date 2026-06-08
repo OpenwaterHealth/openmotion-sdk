@@ -48,12 +48,12 @@ def test_clean_passthrough():
 
 
 def test_condition1_bad_timestamp_gets_corrected():
-    """A frame with timestamp off by >2ms is corrected via re-anchoring."""
+    """A frame with timestamp beyond tolerance is corrected via re-anchoring."""
     stage = TimestampRepairStage()
     # Frame 13 (index 2) has a bad timestamp: jumped to 0.130 instead of ~0.075.
     # Frame 14 (index 3) at 0.100 is good and serves as the re-anchor.
     #   frame 11 @0.025 (ok), frame 12 @0.050 (ok),
-    #   frame 13 @0.130 (BAD: expected_dt=25ms, actual_dt=80ms, off by 55ms > 2ms),
+    #   frame 13 @0.130 (BAD: expected_dt=25ms, actual_dt=80ms, off by 55ms),
     #   frame 14 @0.100 (gap=2 from last_good 12, expected_dt=50ms, actual=50ms => OK)
     # Note: frames 13 and 14 must have DIFFERENT timestamps to avoid cond2 trigger.
     ts = [0.025, 0.050, 0.130, 0.100]
@@ -130,6 +130,72 @@ def test_nan_fill_for_missing_frames():
     assert result.timestamp_s[1] > 0.025
     assert result.timestamp_s[2] > result.timestamp_s[1]
     assert result.timestamp_s[2] < 0.100
+
+
+def test_nan_fill_for_missing_frames_across_process_calls():
+    """Missing abs_frame_ids are detected across source batch boundaries."""
+    stage = TimestampRepairStage()
+    first = _make_batch(
+        cam_ids=[0],
+        frame_ids=[11],
+        side_ids=[0],
+        timestamps=[0.025],
+        abs_frame_ids=[11],
+        frame_types=["light"],
+    )
+    second = _make_batch(
+        cam_ids=[0],
+        frame_ids=[13],
+        side_ids=[0],
+        timestamps=[0.075],
+        abs_frame_ids=[13],
+        frame_types=["light"],
+    )
+
+    stage.process(first)
+    result = stage.process(second)
+
+    assert len(result.cam_ids) == 2
+    np.testing.assert_array_equal(result.abs_frame_ids, [12, 13])
+    np.testing.assert_array_equal(result.quality, ["nan_filled", "ok"])
+    assert result.timestamp_s[0] == pytest.approx(0.050)
+    assert result.timestamp_s[1] == pytest.approx(0.075)
+
+
+def test_default_tolerance_catches_ten_ms_timestamp_error():
+    """Default condition1 tolerance catches the observed 10ms EMI offset."""
+    stage = TimestampRepairStage()
+    batch = _make_batch(
+        cam_ids=[0, 0, 0],
+        frame_ids=[10, 11, 12],
+        side_ids=[0, 0, 0],
+        timestamps=[0.250, 0.285, 0.300],
+        abs_frame_ids=[10, 11, 12],
+        frame_types=["light", "light", "light"],
+    )
+
+    result = stage.process(batch)
+
+    assert result.quality[1] == "ts_corrected"
+    assert result.timestamp_s[1] == pytest.approx(0.275)
+
+
+def test_default_tolerance_allows_two_ms_device_jitter():
+    """Condition1 does not rewrite ordinary 2ms timestamp quantization."""
+    stage = TimestampRepairStage()
+    batch = _make_batch(
+        cam_ids=[0, 0, 0],
+        frame_ids=[10, 11, 12],
+        side_ids=[0, 0, 0],
+        timestamps=[0.250, 0.277, 0.300],
+        abs_frame_ids=[10, 11, 12],
+        frame_types=["light", "light", "light"],
+    )
+
+    result = stage.process(batch)
+
+    np.testing.assert_array_equal(result.quality, ["ok", "ok", "ok"])
+    np.testing.assert_allclose(result.timestamp_s, [0.250, 0.277, 0.300])
 
 
 def test_buffer_force_flush_at_max():

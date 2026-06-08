@@ -28,7 +28,8 @@ from ..batch import FrameBatch
 logger = logging.getLogger("openmotion.sdk.pipeline.stages.timestamp_repair")
 
 _INITIAL_NOMINAL_PERIOD_S = 0.025
-_DEFAULT_TOLERANCE_S = 0.012
+_DEFAULT_TOLERANCE_S = 0.008
+_TOLERANCE_EPS_S = 1e-9
 _EMA_ALPHA = 0.01
 
 
@@ -58,6 +59,7 @@ class TimestampRepairStage:
         self._window_onset: Optional[_WindowStats] = None
         self._scan_windows: list[_WindowStats] = []
         self._total_frames_seen = 0
+        self._nan_last_seen: dict[tuple[int, int], tuple[int, float]] = {}
 
     # ── Main entry ──────────────────────────────────────────────────────
 
@@ -101,7 +103,7 @@ class TimestampRepairStage:
                 if fid_gap > 0:
                     expected_dt = fid_gap * self._nominal_period
                     actual_dt = ts - prev_ts
-                    if abs(actual_dt - expected_dt) > self._tolerance:
+                    if abs(actual_dt - expected_dt) > self._tolerance + _TOLERANCE_EPS_S:
                         is_bad = True
 
             if is_bad:
@@ -223,8 +225,6 @@ class TimestampRepairStage:
         Returns [(insert_after_idx, fill_dict), ...] sorted by insert position.
         """
         fills = []
-        last_seen: dict[tuple[int, int], tuple[int, float, int]] = {}
-
         for i in range(len(batch.cam_ids)):
             ft = str(batch.frame_type[i])
             if ft in ("warmup", "stale"):
@@ -233,8 +233,8 @@ class TimestampRepairStage:
             abs_fid = int(batch.abs_frame_ids[i])
             ts = float(batch.timestamp_s[i])
 
-            if key in last_seen:
-                prev_fid, prev_ts, _ = last_seen[key]
+            if key in self._nan_last_seen:
+                prev_fid, prev_ts = self._nan_last_seen[key]
                 gap = abs_fid - prev_fid
                 if gap > 1:
                     for fid in range(prev_fid + 1, abs_fid):
@@ -251,7 +251,7 @@ class TimestampRepairStage:
                         if self._window_onset is not None:
                             self._window_onset.n_nan += 1
 
-            last_seen[key] = (abs_fid, ts, i)
+            self._nan_last_seen[key] = (abs_fid, ts)
 
         fills.sort(key=lambda x: x[0])
         return fills

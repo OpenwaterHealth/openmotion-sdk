@@ -18,7 +18,7 @@ EMI (electrical fast transients) during clinical scans corrupts the device `time
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
-| Divergence detection tolerance | 2 ms | Tight enough to catch all EMI signatures (which jump 25ms+), loose enough to not false-trigger on normal jitter |
+| Divergence detection tolerance | 8 ms | Tight enough to catch the observed 10ms EMI timestamp offset, loose enough to avoid rewriting normal ~2ms timestamp quantization |
 | Quality representation | String column (`"ok"`, `"ts_corrected"`, `"nan_filled"`) | Human-readable, extensible, simple downstream consumption |
 | Stage position | After FrameClassification, before Tee("raw") moves before it | Raw CSV stays untouched; all downstream stages see corrected timestamps |
 | NaN-fill scope | Pipeline-wide (synthetic FrameBatch rows) | NaN propagates naturally through all stages; no special-casing downstream |
@@ -78,7 +78,7 @@ A frame is **bad** if EITHER condition fires:
 ```
 expected_Δt = (this_abs_frame_id - last_good_abs_frame_id) × nominal_period
 actual_Δt = this_timestamp_s - last_good_timestamp_s
-bad = |actual_Δt - expected_Δt| > 0.002   (2 ms)
+bad = |actual_Δt - expected_Δt| > 0.008   (8 ms)
 ```
 
 The `last_good` reference is per `(side, cam)` since each camera has its own unwrapped `abs_frame_id` stream.
@@ -278,7 +278,7 @@ def default_pipeline(...) -> Pipeline:
 
     stages.append(
         TimestampRepairStage(
-            tolerance_s=0.002,
+            tolerance_s=0.008,
             max_buffer_frames=16,
         )
     )
