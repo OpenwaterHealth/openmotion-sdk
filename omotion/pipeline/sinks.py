@@ -75,18 +75,19 @@ _RAW_PIPELINE_HEADERS: list = [
 
 
 def _corrected_headers_normal() -> list[str]:
-    """82-column legacy corrected CSV header."""
+    """83-column corrected CSV header (82 metric columns + quality)."""
     cols = ["frame_id", "timestamp_s"]
     for metric in ("bfi", "bvi", "mean", "contrast", "temp"):
         for side in ("l", "r"):
             for cam in range(1, 9):
                 cols.append(f"{metric}_{side}{cam}")
+    cols.append("quality")
     return cols
 
 
 def _corrected_headers_reduced() -> list[str]:
-    """6-column reduced corrected CSV header."""
-    return ["frame_id", "timestamp_s", "bfi_left", "bfi_right", "bvi_left", "bvi_right"]
+    """7-column reduced corrected CSV header."""
+    return ["frame_id", "timestamp_s", "bfi_left", "bfi_right", "bvi_left", "bvi_right", "quality"]
 
 
 # Build the column-index lookup once at module load time.
@@ -169,6 +170,10 @@ _NORMAL_COL_IDX: dict[tuple[str, str, int], int] = {
     for cam in range(1, 9)
 }
 
+# Quality ranking: higher rank means worse quality; used to keep the worst
+# quality value seen across all cameras contributing to one output row.
+_QUALITY_RANK: dict[str, int] = {"ok": 0, "ts_corrected": 1, "nan_filled": 2}
+
 
 class CsvSink:
     """Channel-based CSV sink for the pipeline.
@@ -217,6 +222,7 @@ class CsvSink:
         self._corrected_acc: "dict[int, dict]" = {}
         self._corrected_n_cols: int = 0
         self._corrected_reduced: bool = False
+        self._next_flush_id: Optional[int] = None
         self._expected_cams: "dict[str, set[int]]" = {}  # side -> set of cam_ids
 
     def on_scan_start(self, meta: ScanMetadata) -> None:
@@ -226,6 +232,7 @@ class CsvSink:
         self._corrected_csv = None
         self._corrected_acc = {}
         self._corrected_reduced = meta.reduced_mode
+        self._next_flush_id = None
         # Build set of expected cam_ids per side from masks
         self._expected_cams = {
             "left":  {c for c in range(8) if meta.left_camera_mask  & (1 << c)},
@@ -254,6 +261,7 @@ class CsvSink:
                 row = entry["row"]
                 row[0] = abs_id
                 row[1] = round(entry["t"], 9)
+                row[-1] = entry.get("quality", "ok")
                 self._write_corrected_row(row)
         self._corrected_acc.clear()
         for side, fh in list(self._raw_fhs.items()):
@@ -337,9 +345,14 @@ class CsvSink:
             acc = self._corrected_acc
             if abs_id not in acc:
                 row = [""] * self._corrected_n_cols
-                acc[abs_id] = {"t": float(frame.t), "row": row}
+                acc[abs_id] = {"t": float(frame.t), "row": row, "quality": "ok"}
             entry = acc[abs_id]
             row = entry["row"]
+
+            # Track worst quality across all cameras contributing to this row.
+            frame_quality = getattr(frame, "quality", "ok")
+            if _QUALITY_RANK.get(frame_quality, 0) > _QUALITY_RANK.get(entry["quality"], 0):
+                entry["quality"] = frame_quality
 
             if self._corrected_reduced:
                 # Reduced mode: accumulate per-side bfi/bvi, flush when we
@@ -383,50 +396,45 @@ class CsvSink:
             self._maybe_flush_row(abs_id)
 
     def _maybe_flush_row(self, abs_id: int) -> None:
-        """Flush a completed accumulator row to the CSV writer."""
+        """Flush completed rows in abs_frame_id order (watermark).
+
+        Only flushes contiguously from the lowest buffered abs_id upward,
+        preventing out-of-order writes that cause non-monotonic timestamps.
+        """
+        if self._next_flush_id is None:
+            self._next_flush_id = min(self._corrected_acc) if self._corrected_acc else abs_id
+
+        while self._next_flush_id in self._corrected_acc:
+            fid = self._next_flush_id
+            if not self._is_row_complete(fid):
+                break
+            self._flush_single_row(fid)
+            self._next_flush_id += 1
+
+    def _is_row_complete(self, abs_id: int) -> bool:
         entry = self._corrected_acc.get(abs_id)
         if entry is None:
-            return
+            return False
         row = entry["row"]
-        t = entry["t"]
-        # Determine if the row is complete enough to flush.
-        # We check that all expected camera positions for each active side
-        # have contributed at least the mean column (non-empty).
         if self._corrected_reduced:
-            # For reduced mode, check bfi_left and bfi_right presence
-            sides_done = set()
-            if self._expected_cams["left"]:
-                if row[2] != "":
-                    sides_done.add("left")
-            else:
-                sides_done.add("left")  # no left cameras expected
-            if self._expected_cams["right"]:
-                if row[3] != "":
-                    sides_done.add("right")
-            else:
-                sides_done.add("right")
-            if len(sides_done) == 2:
-                row[0] = abs_id
-                row[1] = round(t, 9)
-                self._write_corrected_row(row)
-                del self._corrected_acc[abs_id]
-        else:
-            # Normal mode: check mean columns for all expected cam positions
-            all_done = True
-            for side_name, side_char in (("left", "l"), ("right", "r")):
-                for cam_id in self._expected_cams[side_name]:
-                    cam_1 = cam_id % 8 + 1
-                    col_idx = _NORMAL_COL_IDX[("mean", side_char, cam_1)]
-                    if row[col_idx] == "":
-                        all_done = False
-                        break
-                if not all_done:
-                    break
-            if all_done:
-                row[0] = abs_id
-                row[1] = round(t, 9)
-                self._write_corrected_row(row)
-                del self._corrected_acc[abs_id]
+            left_done = not self._expected_cams["left"] or row[2] != ""
+            right_done = not self._expected_cams["right"] or row[3] != ""
+            return left_done and right_done
+        for side_name, side_char in (("left", "l"), ("right", "r")):
+            for cam_id in self._expected_cams[side_name]:
+                cam_1 = cam_id % 8 + 1
+                col_idx = _NORMAL_COL_IDX[("mean", side_char, cam_1)]
+                if row[col_idx] == "":
+                    return False
+        return True
+
+    def _flush_single_row(self, abs_id: int) -> None:
+        entry = self._corrected_acc.pop(abs_id)
+        row = entry["row"]
+        row[0] = abs_id
+        row[1] = round(entry["t"], 9)
+        row[-1] = entry.get("quality", "ok")
+        self._write_corrected_row(row)
 
     def _write_corrected_row(self, row: list) -> None:
         w = self._get_or_open_corrected_writer()
@@ -631,6 +639,7 @@ class ScanDBSink:
                 "bvi": round(bvi, 9),
                 "mean": mean_v,
                 "contrast": contrast_v,
+                "quality": str(batch.quality[i]) if batch.quality is not None else "ok",
             })
         if rows:
             try:
@@ -669,6 +678,7 @@ class ScanDBSink:
             "bvi": bvi,
             "mean": _round(getattr(sample, "mean", None)),
             "contrast": _round(getattr(sample, "contrast", None)),
+            "quality": getattr(sample, "quality", "ok") or "ok",
         })
         if len(self._side_buffer) >= self._side_batch_size:
             self._flush_side()

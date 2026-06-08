@@ -38,7 +38,7 @@ class Pipeline:
 
     def process(self, batch: FrameBatch) -> FrameBatch:
         for stage in self.stages:
-            stage.process(batch)
+            batch = stage.process(batch)
         return batch
 
     def reset(self) -> None:

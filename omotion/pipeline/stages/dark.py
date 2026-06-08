@@ -147,6 +147,7 @@ class _LightSample:
     t: float
     u1: float
     u2: float
+    quality: str = "ok"
 
 
 @dataclass
@@ -189,6 +190,7 @@ class CorrectedFrame:
     raw_var:       float     # u2 - u1^2 (raw variance before dark sub)
     dark_var:      float     # interpolated dark baseline variance
     contrast:      Optional[float] = None  # set by ShotNoiseCorrectionStage
+    quality:       str = "ok"
 
 
 @dataclass
@@ -212,6 +214,7 @@ class EnrichedCorrectedFrame:
     contrast: float
     bfi:      float
     bvi:      float
+    quality:  str = "ok"
 
 
 @dataclass
@@ -236,9 +239,11 @@ class PendingInterval:
         self._light = []
         self._right = None
 
-    def add_light(self, *, abs_frame_id: int, t: float, u1: float, u2: float) -> None:
+    def add_light(self, *, abs_frame_id: int, t: float, u1: float, u2: float,
+                  quality: str = "ok") -> None:
         self._light.append(_LightSample(
             abs_frame_id=int(abs_frame_id), t=float(t), u1=float(u1), u2=float(u2),
+            quality=str(quality),
         ))
 
     def set_right_dark(self, obs: DarkObservation, *, abs_frame_id: int) -> None:
@@ -306,6 +311,7 @@ class LinearInterpolation:
                 side=side, cam_id=cam_id,
                 mean=mean, std=std,
                 raw_u1=lf.u1, raw_var=raw_var, dark_var=baseline_var,
+                quality=lf.quality,
             ))
 
         return CorrectedInterval(
@@ -489,7 +495,9 @@ class DarkCorrectionStage:
                     pi = self._pending.get((side, cam_id))
                     if pi is not None:
                         u2 = std ** 2 + u1 ** 2
-                        pi.add_light(abs_frame_id=abs_id, t=t, u1=u1, u2=u2)
+                        q = str(batch.quality[i]) if batch.quality is not None else "ok"
+                        pi.add_light(abs_frame_id=abs_id, t=t, u1=u1, u2=u2,
+                                     quality=q)
 
         batch.dark_baseline_rt = baseline_rt
         batch.mean_dc_rt = mean_dc_rt

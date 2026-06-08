@@ -450,3 +450,39 @@ def test_terminal_flush_logs_and_skips_when_no_terminal_dark_found(caplog):
     tdr = [e for e in stop_batch.events if isinstance(e, TerminalDarkResult)]
     assert len(tdr) > 0
     assert tdr[0].found is False
+
+
+def test_corrected_frame_has_quality_field():
+    from omotion.pipeline.stages.dark import (
+        CorrectedFrame, EnrichedCorrectedFrame, _LightSample,
+    )
+    lf = _LightSample(abs_frame_id=10, t=0.25, u1=100.0, u2=10100.0, quality="ts_corrected")
+    assert lf.quality == "ts_corrected"
+
+    cf = CorrectedFrame(
+        abs_frame_id=10, t=0.25, side="left", cam_id=0,
+        mean=36.0, std=5.0, raw_u1=100.0, raw_var=25.0, dark_var=1.0,
+        quality="ts_corrected",
+    )
+    assert cf.quality == "ts_corrected"
+
+    ef = EnrichedCorrectedFrame(
+        abs_frame_id=10, t=0.25, side="left", cam_id=0,
+        mean=36.0, std=4.8, contrast=0.13, bfi=5.0, bvi=5.0,
+        quality="nan_filled",
+    )
+    assert ef.quality == "nan_filled"
+
+
+def test_corrected_frame_quality_defaults_to_ok():
+    from omotion.pipeline.stages.dark import CorrectedFrame, EnrichedCorrectedFrame
+    cf = CorrectedFrame(
+        abs_frame_id=10, t=0.25, side="left", cam_id=0,
+        mean=36.0, std=5.0, raw_u1=100.0, raw_var=25.0, dark_var=1.0,
+    )
+    assert cf.quality == "ok"
+    ef = EnrichedCorrectedFrame(
+        abs_frame_id=10, t=0.25, side="left", cam_id=0,
+        mean=36.0, std=4.8, contrast=0.13, bfi=5.0, bvi=5.0,
+    )
+    assert ef.quality == "ok"

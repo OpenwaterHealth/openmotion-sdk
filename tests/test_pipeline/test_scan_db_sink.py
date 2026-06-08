@@ -244,6 +244,17 @@ def test_scan_db_sink_skips_stale_raw_rows_and_logs(tmp_path, caplog):
     assert "stale raw frame skipped" in caplog.text
 
 
+def test_session_data_has_quality_column(tmp_path):
+    """session_data table must include a quality column."""
+    from omotion.ScanDatabase import ScanDatabase
+    db = ScanDatabase(db_path=str(tmp_path / "test.db"))
+    conn = db._connection()
+    cursor = conn.execute("PRAGMA table_info(session_data)")
+    columns = {row[1] for row in cursor.fetchall()}
+    assert "quality" in columns
+    db.close()
+
+
 def test_scan_db_sink_uses_source_side_ids_for_raw_rows(tmp_path):
     import sqlite3
 

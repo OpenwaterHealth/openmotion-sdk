@@ -21,6 +21,7 @@ from .stages.shot_noise import ShotNoiseCorrectionStage
 from .stages.bfi_bvi import BfiBviStage
 from .stages.dark_frame_hold import DarkFrameHoldStage
 from .stages.side_avg import SideAverageStage
+from .stages.timestamp_repair import TimestampRepairStage
 from .tee import Tee
 
 
@@ -47,13 +48,19 @@ def default_pipeline(*,
         FrameClassificationStage(discard_count=discard_count, dark_interval=dark_interval),
     ]
 
-    # Conditionally add raw tee based on raw_save_max_duration_s
+    # Conditionally add raw tee based on raw_save_max_duration_s.
+    # snapshot=True: the raw tee runs before TimestampRepair/NoiseFloor,
+    # which mutate timestamp_s/raw_histograms in place. Its event is only
+    # dispatched after the full pipeline runs, so it must freeze a copy
+    # now to keep the raw CSV a faithful pre-processing capture.
     if raw_save_max_duration_s is None or raw_save_max_duration_s > 0:
         stages.append(
-            Tee("raw", filter=lambda ft: ft != "stale", max_duration_s=raw_save_max_duration_s)
+            Tee("raw", filter=lambda ft: ft != "stale",
+                max_duration_s=raw_save_max_duration_s, snapshot=True)
         )
 
     stages.extend([
+        TimestampRepairStage(),
         NoiseFloorStage(threshold=noise_floor_threshold),
         MomentsStage(),
         PedestalSubtractionStage(pedestals=pedestals),
