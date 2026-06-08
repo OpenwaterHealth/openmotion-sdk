@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 """
-soft_reset_console.py
+test_console_reset.py
 
 Send a soft reset command to the connected MOTION console.
 
 Usage
 -----
-    python soft_reset_console.py [--no-confirm]
+    python test_console_reset.py [--no-confirm]
 """
 
 import argparse
+import time
 import sys
 
-from omotion.Interface import MOTIONInterface
+from omotion.MotionInterface import MotionInterface
+
+
+_CONNECT_TIMEOUT = 5.0
 
 
 def parse_cli() -> argparse.Namespace:
@@ -31,10 +35,23 @@ def main() -> int:
     args = parse_cli()
 
     print("[*] Acquiring MOTION interface …")
-    interface, console_connected, _, _ = MOTIONInterface.acquire_motion_interface()
+    iface = MotionInterface()
+    iface.start(wait=True, wait_timeout=_CONNECT_TIMEOUT)
+
+    # Poll for connection
+    def _await(handle, label):
+        deadline = time.monotonic() + _CONNECT_TIMEOUT
+        while time.monotonic() < deadline:
+            if handle.is_connected():
+                return True
+            time.sleep(0.1)
+        print(f"❌  {label} not connected after {_CONNECT_TIMEOUT:.0f}s.")
+        return False
+
+    console_connected = _await(iface.console, "Console")
 
     if not console_connected:
-        print("❌  Console module not connected.")
+        iface.stop()
         return 1
 
     if not args.no_confirm:
@@ -43,29 +60,31 @@ def main() -> int:
         ).strip().lower()
         if answer != "y":
             print("Aborted.")
+            iface.stop()
             return 0
 
     # Stop the background telemetry poller before the reset so it exits
     # cleanly while the device is still alive.  If we reset first and then
     # stop, the poller is mid-poll on a dead serial port and logs a cascade
     # of ClearCommError / tec_status / _read_all errors before it notices.
-    interface.console_module.telemetry.stop()
+    iface.console.telemetry.stop()
 
     print("[+] Sending soft reset to console …")
     try:
-        ok = interface.console_module.soft_reset()
+        ok = iface.console.soft_reset()
     except Exception as exc:
         print(f"   ❌  Exception: {exc}")
-        interface.disconnect()
+        iface.stop()
         return 1
 
-    if ok:
-        print("   ✅  Soft reset sent successfully. Console should reboot.")
-        interface.disconnect()
-        return 0
-    print("   ❌  Console did not report success.")
-    interface.disconnect()
-    return 1
+    try:
+        if ok:
+            print("   ✅  Soft reset sent successfully. Console should reboot.")
+            return 0
+        print("   ❌  Console did not report success.")
+        return 1
+    finally:
+        iface.stop()
 
 
 if __name__ == "__main__":
