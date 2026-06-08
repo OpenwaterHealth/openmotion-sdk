@@ -127,3 +127,64 @@ def test_clean_scan_row_count_matches_baseline(scan_info, tmp_path):
     assert new_count == baseline_count, (
         f"Row count mismatch: new={new_count}, baseline={baseline_count}"
     )
+
+
+def _read_raw_rows(path):
+    """Read (cam_id, frame_id, timestamp_s, sum) tuples in file order."""
+    rows = []
+    with open(path) as f:
+        for r in csv.DictReader(f):
+            rows.append((
+                int(r["cam_id"]), int(r["frame_id"]),
+                float(r["timestamp_s"]), int(r["sum"]),
+            ))
+    return rows
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("scan_info", CLEAN_SCANS, ids=[s["name"] for s in CLEAN_SCANS])
+def test_raw_csv_is_faithful_capture(scan_info, tmp_path):
+    """The raw CSV must be a byte-faithful capture, NOT processed data.
+
+    Regression guard for SDK_BUGREPORT.md Defect 1: the raw tee captured the
+    batch by reference, so downstream in-place mutation leaked into the raw
+    CSV — NoiseFloorStage reduced the histogram sums (1b) and
+    TimestampRepairStage synthesized a smooth timestamp grid (1a). The fix
+    snapshots the batch at the raw tee.
+
+    Asserts the replayed raw output matches the input capture:
+      - histogram sums identical row-by-row (no noise-floor leak)
+      - timestamp *structure* identical (deltas match; only the t=0 origin
+        shifts under the source's documented normalization). A synthesized
+        grid would flatten the jitter and fail the delta check.
+    """
+    if not scan_info["left_raw"].exists():
+        pytest.skip(f"Test data not found: {scan_info['left_raw']}")
+    _replay_scan(scan_info, tmp_path)
+
+    for side in ("left", "right"):
+        in_path = scan_info[f"{side}_raw"]
+        out_path = next(tmp_path.glob(f"*_{side}_*_raw.csv"))
+        in_rows = _read_raw_rows(in_path)
+        out_rows = _read_raw_rows(out_path)
+
+        assert len(out_rows) == len(in_rows), (
+            f"{side}: raw row count changed {len(in_rows)} -> {len(out_rows)} "
+            "(no synthetic rows may be added to the raw CSV)"
+        )
+
+        # 1b: histogram sums must be untouched (cam_id, frame_id, sum).
+        in_sums = [(c, f, s) for (c, f, _t, s) in in_rows]
+        out_sums = [(c, f, s) for (c, f, _t, s) in out_rows]
+        assert out_sums == in_sums, (
+            f"{side}: histogram sums altered in raw CSV (noise-floor leak)"
+        )
+
+        # 1a: timestamp jitter structure must survive (deltas match; origin
+        # may shift by a constant under t0 normalization).
+        in_ts = np.array([t for (_c, _f, t, _s) in in_rows])
+        out_ts = np.array([t for (_c, _f, t, _s) in out_rows])
+        np.testing.assert_allclose(
+            np.diff(out_ts), np.diff(in_ts), atol=1e-9,
+            err_msg=f"{side}: raw timestamps were re-synthesized (jitter lost)",
+        )

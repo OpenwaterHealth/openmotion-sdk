@@ -10,7 +10,7 @@ size — typically 10-100 frames per batch from LiveUsbSource.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields as dataclass_fields
 from typing import Optional
 
 import numpy as np
@@ -279,3 +279,25 @@ class FrameBatch:
     #   everything else → routed to "diagnostics" channel sinks
     # Cleared implicitly by creating a new FrameBatch per source iteration.
     events:         list[BatchEvent] = field(default_factory=list)
+
+    def snapshot(self) -> "FrameBatch":
+        """Return a copy with every numpy array deep-copied.
+
+        Used by ``Tee(snapshot=True)`` to freeze the batch's data at tee
+        time. The runner dispatches a Tee's LiveEmit only *after* the whole
+        pipeline has run, so a by-reference payload would expose later
+        in-place mutations (NoiseFloorStage zeroes ``raw_histograms``;
+        TimestampRepairStage rewrites ``timestamp_s``) to a sink that is
+        meant to record the faithful, pre-processing capture.
+
+        ``events`` is deliberately not carried over — a snapshot is a
+        passive data payload, not a live batch, so it starts with a fresh
+        empty event queue (avoiding a payload that references itself).
+        """
+        kwargs = {}
+        for f in dataclass_fields(self):
+            if f.name == "events":
+                continue
+            value = getattr(self, f.name)
+            kwargs[f.name] = value.copy() if isinstance(value, np.ndarray) else value
+        return FrameBatch(**kwargs)

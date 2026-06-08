@@ -100,6 +100,58 @@ def _replay_degraded(scan_info, output_dir):
     return corrected[0]
 
 
+def _read_raw_rows(path):
+    """Read (cam_id, frame_id, timestamp_s, sum) tuples in file order."""
+    rows = []
+    with open(path) as f:
+        for r in csv.DictReader(f):
+            rows.append((
+                int(r["cam_id"]), int(r["frame_id"]),
+                float(r["timestamp_s"]), int(r["sum"]),
+            ))
+    return rows
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("scan_info", DEGRADED_SCANS, ids=[s["name"] for s in DEGRADED_SCANS])
+def test_degraded_raw_csv_is_faithful(scan_info, tmp_path):
+    """On a heavily EMI-degraded scan the raw CSV must stay a faithful capture.
+
+    All five degraded inputs are confirmed-faithful captures (exact
+    2,457,606 sums + real device jitter); owM8T7HS/owSPZMD1 also exhibit
+    FM-5 camera dropout, so this also asserts the raw preserves a dropped
+    camera rather than NaN-filling it.
+
+    Regression guard for SDK_BUGREPORT.md Defect 1 on the EMI path:
+      - histogram sums untouched (no NoiseFloor leak),
+      - timestamp jitter preserved (no re-synthesis),
+      - row count identical to the input — NaN-fill rows go to the corrected
+        output ONLY, never the raw capture (spec §11 R2 guardrail).
+    """
+    if not scan_info["left_raw"].exists():
+        pytest.skip(f"Test data not found: {scan_info['left_raw']}")
+    _replay_degraded(scan_info, tmp_path)
+
+    for side in ("left", "right"):
+        in_rows = _read_raw_rows(scan_info[f"{side}_raw"])
+        out_rows = _read_raw_rows(next(tmp_path.glob(f"*_{side}_*_raw.csv")))
+
+        assert len(out_rows) == len(in_rows), (
+            f"{side}: raw row count changed {len(in_rows)} -> {len(out_rows)} "
+            "(NaN-fill must not add synthetic rows to the raw CSV)"
+        )
+        assert [(c, f, s) for (c, f, _t, s) in out_rows] == \
+               [(c, f, s) for (c, f, _t, s) in in_rows], \
+            f"{side}: histogram sums altered in raw CSV (noise-floor leak)"
+
+        in_ts = np.array([t for (_c, _f, t, _s) in in_rows])
+        out_ts = np.array([t for (_c, _f, t, _s) in out_rows])
+        np.testing.assert_allclose(
+            np.diff(out_ts), np.diff(in_ts), atol=1e-9,
+            err_msg=f"{side}: raw timestamps were re-synthesized (jitter lost)",
+        )
+
+
 @pytest.mark.slow
 @pytest.mark.parametrize("scan_info", DEGRADED_SCANS, ids=[s["name"] for s in DEGRADED_SCANS])
 def test_degraded_monotonic_timestamps(scan_info, tmp_path):

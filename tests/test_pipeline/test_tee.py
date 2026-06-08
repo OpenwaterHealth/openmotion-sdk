@@ -75,3 +75,73 @@ def test_tee_with_max_duration_s_none_means_unbounded():
     tee.process(batch)
     emits = [e for e in batch.events if isinstance(e, LiveEmit)]
     assert len(emits) == 1
+
+
+# ── snapshot semantics (raw-CSV faithfulness, SDK_BUGREPORT.md Defect 1) ──
+
+
+def test_tee_default_emits_payload_by_reference():
+    """Default Tee (snapshot=False) emits the live batch by reference.
+
+    Back-compat: the "live" tee runs last in the pipeline, so reference
+    semantics are correct and cheaper there.
+    """
+    tee = Tee("live", filter=None)
+    batch = _batch_with_frame_types(["light"])
+    tee.process(batch)
+    emit = [e for e in batch.events if isinstance(e, LiveEmit)][0]
+    assert emit.payload is batch
+
+
+def test_tee_snapshot_decouples_payload_from_later_mutation():
+    """Tee(snapshot=True) freezes the batch's arrays at tee time.
+
+    Downstream stages mutate FrameBatch arrays in place (NoiseFloorStage
+    zeroes raw_histograms; TimestampRepairStage rewrites timestamp_s). The
+    raw tee runs *before* those stages but its event is dispatched *after*
+    the whole pipeline finishes — so a by-reference payload would serialize
+    post-mutation data. A snapshot payload must be immune.
+    """
+    tee = Tee("raw", filter=None, snapshot=True)
+    batch = _batch_with_frame_types(["light"])
+    batch.raw_histograms[:] = 100
+    batch.timestamp_s = np.array([1.234], dtype=np.float64)
+
+    tee.process(batch)
+    emit = [e for e in batch.events if isinstance(e, LiveEmit)][0]
+
+    # Simulate later in-place mutation by NoiseFloor + TimestampRepair.
+    batch.raw_histograms[:] = 0
+    batch.timestamp_s[0] = 9.999
+
+    assert emit.payload is not batch
+    assert np.all(emit.payload.raw_histograms == 100)
+    assert emit.payload.timestamp_s[0] == 1.234
+
+
+def test_tee_snapshot_survives_noise_floor_in_pipeline():
+    """Integration: Tee('raw', snapshot=True) → NoiseFloorStage.
+
+    Directly reproduces SDK_BUGREPORT.md Defect 1b — the raw payload's
+    histogram sum must NOT drop when NoiseFloorStage zeroes low bins.
+    """
+    from omotion.pipeline.pipeline import Pipeline
+    from omotion.pipeline.stages.noise_floor import NoiseFloorStage
+
+    tee = Tee("raw", filter=None, snapshot=True)
+    pipe = Pipeline([tee, NoiseFloorStage(threshold=10)])
+
+    batch = _batch_with_frame_types(["light"])
+    batch.raw_histograms[0, 0, 0, 0] = 5     # below threshold — NoiseFloor zeroes
+    batch.raw_histograms[0, 0, 0, 1] = 100   # above threshold — survives
+    orig_sum = int(batch.raw_histograms.sum())
+
+    result = pipe.process(batch)
+    emit = [e for e in result.events
+            if isinstance(e, LiveEmit) and e.channel == "raw"][0]
+
+    # NoiseFloor zeroed the sub-threshold bin in the live batch...
+    assert result.raw_histograms[0, 0, 0, 0] == 0
+    # ...but the raw snapshot kept the faithful capture.
+    assert emit.payload.raw_histograms[0, 0, 0, 0] == 5
+    assert int(emit.payload.raw_histograms.sum()) == orig_sum
