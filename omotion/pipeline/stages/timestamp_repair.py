@@ -35,6 +35,9 @@ _EMA_ALPHA = 0.01
 
 @dataclass
 class _WindowStats:
+    """Running stats for one contiguous misalignment window, used for
+    coalesced logging: the frame-id/time span it spans and how many frames
+    within it were re-timestamped vs NaN-filled."""
     onset_fid: int
     onset_t: float
     end_fid: int = 0
@@ -44,15 +47,33 @@ class _WindowStats:
 
 
 class TimestampRepairStage:
+    """Pipeline stage that repairs EMI-corrupted capture timestamps.
+
+    See the module docstring for the algorithm. One instance per scan;
+    cross-batch state (nominal-period estimate, per-camera last-good
+    anchors, the open misalignment window) persists across process() calls
+    and is cleared by reset()."""
+
     name = "timestamp_repair"
 
     def __init__(self, *, tolerance_s: float = _DEFAULT_TOLERANCE_S,
                  max_buffer_frames: int = 16):
+        """Configure the stage.
+
+        Args:
+            tolerance_s: max |actual Δt − expected Δt| (seconds) before a
+                frame's timestamp is treated as EMI-corrupted (condition 1).
+            max_buffer_frames: reserved bound on the look-ahead used when
+                re-anchoring a divergent run.
+        """
         self._tolerance = float(tolerance_s)
         self._max_buffer = int(max_buffer_frames)
         self._reset_state()
 
     def _reset_state(self) -> None:
+        """Clear all per-scan state — nominal-period estimate, per-camera
+        last-good anchors, the open window and window list, and the running
+        re-timestamped / NaN-filled totals. Called from __init__ and reset()."""
         self._nominal_period = _INITIAL_NOMINAL_PERIOD_S
         self._last_good: dict[tuple[int, int], tuple[int, float]] = {}
         self._in_bad_run = False
@@ -66,6 +87,14 @@ class TimestampRepairStage:
     # ── Main entry ──────────────────────────────────────────────────────
 
     def process(self, batch: FrameBatch) -> FrameBatch:
+        """Detect and repair EMI timestamp corruption for one batch.
+
+        Flags each non-warmup/stale frame via condition 2 (in-packet
+        frame_id disagreement) or condition 1 (timestamp deviation vs the
+        frame_id cadence), rewrites bad timestamps in place by re-anchoring
+        interpolation, and inserts synthetic NaN-fill rows for missing
+        abs_frame_id gaps. Sets ``batch.quality`` and returns the batch
+        (a new, larger batch when NaN-fills were inserted)."""
         if batch.abs_frame_ids is None or batch.frame_type is None:
             return batch
 
@@ -151,7 +180,9 @@ class TimestampRepairStage:
 
     def _build_good_lookahead(self, batch: FrameBatch,
                               bad_set: set[int]) -> dict[tuple[int, int], list]:
-        """For each (side, cam), collect good frames: [(abs_fid, ts), ...]."""
+        """Collect, per (side, cam), the (abs_fid, ts) of frames not flagged
+        by condition 2 and not warmup/stale — the candidate right-anchors
+        that ``_interpolate`` searches when re-anchoring a bad frame."""
         ahead: dict[tuple[int, int], list] = defaultdict(list)
         for i in range(len(batch.cam_ids)):
             if i in bad_set:
@@ -165,7 +196,14 @@ class TimestampRepairStage:
 
     def _interpolate(self, key: tuple[int, int], abs_fid: int,
                      good_frames: list | None) -> float:
-        """Compute a corrected timestamp for a bad frame."""
+        """Re-anchor a bad frame's timestamp by interpolation.
+
+        Interpolates between the last good timestamp for this (side, cam)
+        and the next good one in ``good_frames`` (the within-batch
+        look-ahead), distributed by frame_id count. Falls back to the last
+        good anchor plus the nominal period when there's no right anchor,
+        and to abs_fid × nominal period when there's no anchor at all
+        (start of scan)."""
         if key in self._last_good:
             left_fid, left_ts = self._last_good[key]
         else:
@@ -186,6 +224,10 @@ class TimestampRepairStage:
 
     def _update_nominal_period(self, key: tuple[int, int],
                                abs_fid: int, ts: float) -> None:
+        """Refine the true frame period via an EMA over clean single-step
+        intervals (only when this frame is exactly one frame_id past the
+        last good frame for ``key``). Tracks the real ~25.02 ms cadence so
+        the expected-Δt check in process() doesn't drift off nominal."""
         if key not in self._last_good:
             return
         prev_fid, prev_ts = self._last_good[key]
@@ -199,6 +241,9 @@ class TimestampRepairStage:
     # ── Window tracking (coalesced logging) ─────────────────────────────
 
     def _track_window_open(self, abs_fid: int, ts: float) -> None:
+        """Open a new misalignment window (or extend the current one) and
+        count this re-timestamped frame, for coalesced per-window logging.
+        ``ts`` is the original pre-correction device timestamp."""
         if not self._in_bad_run:
             self._in_bad_run = True
             self._window_onset = _WindowStats(onset_fid=abs_fid, onset_t=ts)
@@ -208,6 +253,10 @@ class TimestampRepairStage:
             self._window_onset.n_corrected += 1
 
     def _track_window_close(self, abs_fid: int, ts: float) -> None:
+        """Close the open misalignment window, if any: record it and emit
+        one coalesced WARNING for the whole window (per spec R3 — never one
+        line per frame). Called on the first good frame after a divergent
+        run."""
         if self._in_bad_run and self._window_onset is not None:
             self._scan_windows.append(self._window_onset)
             logger.warning(
@@ -318,6 +367,10 @@ class TimestampRepairStage:
     # ── Lifecycle ───────────────────────────────────────────────────────
 
     def on_scan_stop(self, batch: FrameBatch) -> None:
+        """End-of-scan lifecycle hook: close any window still open at the
+        final frame, then emit the one-line scan summary (window count,
+        total frames re-timestamped, total NaN-filled, % of scan affected)
+        whenever anything was corrected or filled."""
         # Close any open window
         if self._in_bad_run and self._window_onset is not None:
             self._scan_windows.append(self._window_onset)
@@ -333,4 +386,6 @@ class TimestampRepairStage:
             )
 
     def reset(self) -> None:
+        """Pipeline lifecycle hook — drop all per-scan state so the stage is
+        ready for a fresh scan or replay."""
         self._reset_state()
