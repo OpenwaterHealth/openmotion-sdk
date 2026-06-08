@@ -101,6 +101,23 @@ def test_condition2_frame_id_disagreement():
     assert result.quality[2] == "ts_corrected"
 
 
+def test_condition2_frame_id_disagreement_is_per_side():
+    """Equal timestamps on different modules do not imply a shared packet."""
+    stage = TimestampRepairStage()
+    batch = _make_batch(
+        cam_ids=[0, 0, 0, 0],
+        frame_ids=[11, 12, 21, 22],
+        side_ids=[0, 0, 1, 1],
+        timestamps=[0.025, 0.050, 0.025, 0.050],
+        abs_frame_ids=[11, 12, 21, 22],
+        frame_types=["light", "light", "light", "light"],
+    )
+
+    result = stage.process(batch)
+
+    np.testing.assert_array_equal(result.quality, ["ok", "ok", "ok", "ok"])
+
+
 def test_nan_fill_for_missing_frames():
     """Missing abs_frame_ids get synthetic NaN-fill rows inserted."""
     stage = TimestampRepairStage()
@@ -263,6 +280,34 @@ def test_logging_scan_summary(caplog):
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     summary = [w for w in warnings if "Scan summary" in w.message]
     assert len(summary) == 1
+
+
+def test_logging_summary_for_nan_fill_without_timestamp_correction(caplog):
+    """Clean-cadence frame loss still appears in the end-of-scan summary."""
+    stage = TimestampRepairStage()
+    batch = _make_batch(
+        cam_ids=[0, 0, 0],
+        frame_ids=[11, 12, 15],
+        side_ids=[0, 0, 0],
+        timestamps=[0.025, 0.050, 0.125],
+        abs_frame_ids=[11, 12, 15],
+        frame_types=["light", "light", "light"],
+    )
+
+    result = stage.process(batch)
+    np.testing.assert_array_equal(
+        result.quality,
+        ["ok", "ok", "nan_filled", "nan_filled", "ok"],
+    )
+
+    flush_batch = _make_batch([], [], [], [], abs_frame_ids=[], frame_types=[])
+    with caplog.at_level(logging.WARNING, logger="openmotion.sdk.pipeline.stages.timestamp_repair"):
+        stage.on_scan_stop(flush_batch)
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    summary = [w for w in warnings if "Scan summary" in w.message]
+    assert len(summary) == 1
+    assert "0 frames re-timestamped, 2 frames NaN-filled" in summary[0].message
 
 
 def test_no_logging_on_clean_scan(caplog):

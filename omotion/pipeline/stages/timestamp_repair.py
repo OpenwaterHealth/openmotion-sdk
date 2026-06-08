@@ -60,6 +60,8 @@ class TimestampRepairStage:
         self._scan_windows: list[_WindowStats] = []
         self._total_frames_seen = 0
         self._nan_last_seen: dict[tuple[int, int], tuple[int, float]] = {}
+        self._total_corrected = 0
+        self._total_nan = 0
 
     # ── Main entry ──────────────────────────────────────────────────────
 
@@ -110,6 +112,7 @@ class TimestampRepairStage:
                 corrected_ts = self._interpolate(key, abs_fid, good_ahead.get(key))
                 batch.timestamp_s[i] = corrected_ts
                 quality[i] = "ts_corrected"
+                self._total_corrected += 1
                 self._track_window_open(abs_fid, ts)
                 self._last_good[key] = (abs_fid, corrected_ts)
             else:
@@ -131,12 +134,12 @@ class TimestampRepairStage:
     def _detect_frame_id_disagreement(self, batch: FrameBatch) -> set[int]:
         """Condition 2: cameras at the same timestamp with different frame_ids."""
         bad: set[int] = set()
-        groups: dict[float, list[int]] = defaultdict(list)
+        groups: dict[tuple[int, float], list[int]] = defaultdict(list)
         for i in range(len(batch.cam_ids)):
             ft = str(batch.frame_type[i])
             if ft in ("warmup", "stale"):
                 continue
-            groups[float(batch.timestamp_s[i])].append(i)
+            groups[(int(batch.side_ids[i]), float(batch.timestamp_s[i]))].append(i)
         for indices in groups.values():
             if len(indices) < 2:
                 continue
@@ -248,6 +251,7 @@ class TimestampRepairStage:
                             "frame_type": "light",
                             "quality": "nan_filled",
                         }))
+                        self._total_nan += 1
                         if self._window_onset is not None:
                             self._window_onset.n_nan += 1
 
@@ -320,14 +324,12 @@ class TimestampRepairStage:
             self._in_bad_run = False
             self._window_onset = None
 
-        if self._scan_windows:
-            total_c = sum(w.n_corrected for w in self._scan_windows)
-            total_n = sum(w.n_nan for w in self._scan_windows)
-            pct = (total_c + total_n) / max(1, self._total_frames_seen) * 100
+        if self._total_corrected or self._total_nan:
+            pct = (self._total_corrected + self._total_nan) / max(1, self._total_frames_seen) * 100
             logger.warning(
                 "Scan summary: %d misalignment window(s), %d frames "
                 "re-timestamped, %d frames NaN-filled (%.1f%% of scan affected)",
-                len(self._scan_windows), total_c, total_n, pct,
+                len(self._scan_windows), self._total_corrected, self._total_nan, pct,
             )
 
     def reset(self) -> None:
