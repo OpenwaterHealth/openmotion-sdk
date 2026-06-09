@@ -612,24 +612,29 @@ class MotionSensor(SignalWrapper):
                     [f"0x{b:02X}" for b in result])
         return result
 
-    def nvcm_check(self, isc_operand: int = 0x08, num_rows: int = 1) -> bytes:
-        """Probe the active camera's CrossLink NVCM state (read-back, no boot).
+    def nvcm_check(self, isc_operand: int = 0x08, num_rows: int = 1,
+                   boot_test: bool = True) -> bytes:
+        """Probe the active camera's CrossLink NVCM state.
 
-        Holds the FPGA config port in slave mode and reads every NVCM
-        discriminator over I2C without booting the FPGA or touching camera
-        power.  Select the camera first with switch_camera() and make sure it
-        is powered.
+        Reads NVCM discriminators over I2C (config-mode read-back) and, if
+        boot_test is set, additionally performs a behaviorally-definitive
+        auto-boot test: releases CRESETB without the activation key and checks
+        whether the config port at 0x40 still answers.  Neither phase touches
+        camera power.  Select the camera first with switch_camera() and make
+        sure it is powered.
 
         Args:
             isc_operand: ISC_ENABLE operand1 — 0x08 = NVCM access (default),
                          0x00 = SRAM access.
             num_rows:    Number of 16-byte NVCM array rows to read back (0-8).
+            boot_test:   Run the auto-boot 0x40-disappearance test (default True).
 
         Returns:
             Raw fixed-layout response blob (see scripts/nvcm_probe.py for the
             field layout), or b"" on error.
         """
-        payload = bytearray([isc_operand & 0xFF, num_rows & 0xFF])
+        payload = bytearray([isc_operand & 0xFF, num_rows & 0xFF,
+                             1 if boot_test else 0])
         r = self._send(packetType=OW_FPGA_PROG,
                        command=OW_FACTORY_NVCM_CHECK,
                        data=payload,

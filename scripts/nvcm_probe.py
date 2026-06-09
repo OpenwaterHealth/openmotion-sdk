@@ -55,7 +55,7 @@ def _hex(b):
 
 def parse_blob(blob: bytes) -> dict:
     """Parse the fixed-layout OW_FACTORY_NVCM_CHECK response."""
-    if len(blob) < 25:
+    if len(blob) < 27:
         raise ValueError(f"response too short: {len(blob)} bytes ({_hex(blob)})")
     d = {}
     d["idcode"] = blob[0:4]
@@ -65,9 +65,11 @@ def parse_blob(blob: bytes) -> dict:
     d["feature_row"] = blob[10:18]
     d["feabits"] = blob[18:20]
     d["usercode"] = blob[20:24]
-    d["num_rows_read"] = blob[24]
+    d["boot_probe_done"] = blob[24]
+    d["boot_0x40_responds"] = blob[25]
+    d["num_rows_read"] = blob[26]
     rows = []
-    off = 25
+    off = 27
     for _ in range(d["num_rows_read"]):
         if off + 16 <= len(blob):
             rows.append(blob[off:off + 16])
@@ -91,31 +93,51 @@ def interpret(d: dict) -> None:
     print(f"  FEATURE_ROW : {_hex(d['feature_row'])}")
     print(f"  FEABITS     : {_hex(d['feabits'])}")
     print(f"  USERCODE    : {_hex(d['usercode'])}")
+    boot_done = d["boot_probe_done"]
+    boot_ack = d["boot_0x40_responds"]
+    print(f"  BOOT TEST   : done={boot_done}  0x40_responds={boot_ack}"
+          f"  ({'ran' if boot_done else 'skipped'})")
     print(f"  NVCM rows   : {d['num_rows_read']} read")
     for i, row in enumerate(d["nvcm_rows"]):
         print(f"    row{i}: {_hex(row)}")
 
-    # ---- verdict -------------------------------------------------------
-    featrow_nz = any(d["feature_row"])
+    # ---- signals -------------------------------------------------------
+    # NOTE: the content reads (feature_row / NVCM array) come back as floating
+    # 0xFF on this part because a bare ISC_ENABLE 0x08 doesn't read-enable the
+    # NVCM array — they are NOT trustworthy yet.  The auto-boot test is the
+    # primary, behaviorally-definitive signal.
+    featrow_real = any(d["feature_row"]) and not all(b == 0xFF for b in d["feature_row"])
     usercode_nz = any(d["usercode"])
-    nvcm_nz = any(any(r) for r in d["nvcm_rows"])
+    nvcm_real = any(any(b for b in r if b != 0xFF) for r in d["nvcm_rows"])
     done_bit = bool((s_msb >> 8) & 1)
 
     print("\n  --- signals ---")
-    print(f"    feature_row != 0 : {featrow_nz}")
-    print(f"    usercode    != 0 : {usercode_nz}")
-    print(f"    nvcm row    != 0 : {nvcm_nz}")
-    print(f"    status Done bit  : {done_bit}")
+    print(f"    [primary] boot test ran   : {bool(boot_done)}")
+    print(f"    [primary] 0x40 after boot : "
+          f"{'ACKs (blank)' if boot_ack else 'gone (programmed)'}")
+    print(f"    feature_row real (non-FF) : {featrow_real}")
+    print(f"    usercode    != 0          : {usercode_nz}")
+    print(f"    nvcm row real (non-FF)    : {nvcm_real}")
+    print(f"    status Done bit           : {done_bit}")
 
+    print()
     if d["idcode_ok"] != 1:
-        print("\n  VERDICT: INCONCLUSIVE — IDCODE mismatch; config port not "
-              "answering. Check power / mux / CRESETB before trusting reads.")
-    elif featrow_nz or usercode_nz or nvcm_nz or done_bit:
-        print("\n  VERDICT: *** NVCM PROGRAMMED *** (at least one fuse-backed "
-              "read is non-blank)")
+        print("  VERDICT: INCONCLUSIVE — IDCODE mismatch; config port not "
+              "answering in forced config mode. Check power / mux / CRESETB.")
+    elif boot_done:
+        # Primary, behaviorally-definitive signal.
+        if boot_ack == 0:
+            print("  VERDICT: *** NVCM PROGRAMMED *** — config port reachable when "
+                  "forced (IDCODE ok), but 0x40 DISAPPEARS after auto-boot, i.e. "
+                  "the FPGA booted a user design from NVCM.")
+        else:
+            print("  VERDICT: BLANK — 0x40 still ACKs after releasing CRESETB "
+                  "without the activation key, i.e. nothing auto-booted.")
+        if featrow_real or nvcm_real or usercode_nz or done_bit:
+            print("  (corroborated by a non-blank content read)")
     else:
-        print("\n  VERDICT: BLANK — every NVCM read came back all-zero "
-              "(blank reads as 0x00 on this part).")
+        print("  VERDICT: boot test was skipped; content reads on this part are "
+              "untrustworthy (floating 0xFF). Re-run without --no-boot-test.")
     print("==================================================\n")
 
 
@@ -130,6 +152,8 @@ def main():
                     help="NVCM array rows to read (0-8, default 1)")
     ap.add_argument("--no-power", action="store_true",
                     help="skip power-on (assume the camera is already powered)")
+    ap.add_argument("--no-boot-test", action="store_true",
+                    help="skip the auto-boot 0x40-disappearance test")
     ap.add_argument("--verbose", action="store_true",
                     help="show all SDK debug logging")
     args = ap.parse_args()
@@ -178,7 +202,8 @@ def main():
         time.sleep(0.1)
 
         print("Running NVCM probe...\n")
-        blob = sensor.nvcm_check(isc_operand=args.operand, num_rows=args.rows)
+        blob = sensor.nvcm_check(isc_operand=args.operand, num_rows=args.rows,
+                                 boot_test=not args.no_boot_test)
         if not blob:
             print("nvcm_check returned no data (firmware error). "
                   "Re-run with --verbose to see firmware printf.")
