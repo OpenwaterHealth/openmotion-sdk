@@ -127,11 +127,11 @@ def interpret(d: dict) -> None:
     elif boot_done:
         # Primary, behaviorally-definitive signal.
         if boot_ack == 0:
-            print("  VERDICT: *** NVCM PROGRAMMED *** — config port reachable when "
+            print("  VERDICT: *** NVCM PROGRAMMED *** -- config port reachable when "
                   "forced (IDCODE ok), but 0x40 DISAPPEARS after auto-boot, i.e. "
                   "the FPGA booted a user design from NVCM.")
         else:
-            print("  VERDICT: BLANK — 0x40 still ACKs after releasing CRESETB "
+            print("  VERDICT: BLANK -- 0x40 still ACKs after releasing CRESETB "
                   "without the activation key, i.e. nothing auto-booted.")
         if featrow_real or nvcm_real or usercode_nz or done_bit:
             print("  (corroborated by a non-blank content read)")
