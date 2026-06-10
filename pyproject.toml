@@ -63,6 +63,7 @@ include-package-data = true
     "dfu-util/**/*.a",
     "dfu-util/**/*.la",
     "models/*.csv",
+    "nvcm/*",
 ]
 
 [tool.pytest.ini_options]

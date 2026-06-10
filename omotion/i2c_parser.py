@@ -252,14 +252,24 @@ class I2CParser:
         # Get read data from driver (0xFF in simulation, real bytes on hardware)
         read_data = self.driver.read(num_bytes)
 
-        # Consume TDO / DTDO expected bytes (verification skipped in simulation)
+        # Consume TDO / DTDO expected bytes and verify the read data against
+        # them (masked, when the algo provides a MASK). On hardware this is
+        # what makes VERIFY phases real and what makes polling loops actually
+        # poll: a busy-status TRANSIN that doesn't match retries instead of
+        # falling through. Simulation drivers skip the comparison.
+        verify = not self.driver.is_simulation()
+        ret = 0
+        byte_i = 0
         for bit_idx in range(data_size):
             if bit_idx % 8 == 0:
+                expected = None
                 if self.g_usDataType & TDO_DATA:
+                    expected = self.get_byte(self.g_iTDOIndex, True)
                     self.g_iTDOIndex += 1
                 elif self.g_usDataType & DTDO_DATA:
                     if self.g_ucCompressCounter:
                         self.g_ucCompressCounter -= 1
+                        expected = 0xFF
                     else:
                         b = self.get_byte(self.g_iMovingDataIndex, False)
                         self.g_iMovingDataIndex += 1
@@ -268,9 +278,20 @@ class I2CParser:
                                 self.g_iMovingDataIndex, False)
                             self.g_iMovingDataIndex += 1
                             self.g_ucCompressCounter -= 1
+                        expected = b
+                if expected is not None:
+                    mask = 0xFF
+                    if self.g_usDataType & MASK_DATA:
+                        mask = self.get_byte(self.g_iMASKIndex, True)
+                        self.g_iMASKIndex += 1
+                    if verify:
+                        actual = (read_data[byte_i]
+                                  if byte_i < len(read_data) else 0xFF)
+                        if (actual & mask) != (expected & mask):
+                            ret = ERR_VERIFY_FAIL
+                byte_i += 1
 
-        # Simulation mode: always pass verification
-        return 0
+        return ret
 
     # -----------------------------------------------------------------------
     # ispVMSend: send data to device (log the bytes)
@@ -346,6 +367,7 @@ class I2CParser:
     def ispVMLoop(self, loop_count: int) -> int:
         self.g_iLoopMovingIndex     = self.g_iMovingAlgoIndex
         self.g_iLoopDataMovingIndex = self.g_iMovingDataIndex
+        last_ret = 0
 
         for _ in range(loop_count):
             self.g_iMovingAlgoIndex = self.g_iLoopMovingIndex
@@ -372,6 +394,8 @@ class I2CParser:
                         # Success - exit polling loop immediately
                         return ret
                     else:
+                        # Mismatch (e.g. device still busy) - retry the loop
+                        last_ret = ret
                         cont = False
                 elif opcode == I2C_WAIT:
                     ms = self.ispVMDataSize()
@@ -381,7 +405,8 @@ class I2CParser:
                 else:
                     cont = False
 
-        return 0
+        # All iterations exhausted without a matching TRANSIN.
+        return last_ret
 
     # -----------------------------------------------------------------------
     # ispProcessI2C: main opcode dispatch loop

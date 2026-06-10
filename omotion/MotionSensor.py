@@ -35,6 +35,7 @@ from omotion.config import (
     OW_FACTORY_I2C_RD,
     OW_FACTORY_I2C_WR,
     OW_FACTORY_I2C_WRRD,
+    OW_FACTORY_NVCM_CHECK,
     OW_FPGA,
     OW_FPGA_ACTIVATE,
     OW_FPGA_BITSTREAM,
@@ -511,7 +512,7 @@ class MotionSensor(SignalWrapper):
             return False
                 
         pin = r.data[0] if r.data and r.data_len >= 1 else 0
-        logger.info("LP creset: pin=%d", pin)
+        logger.debug("LP creset: pin=%d", pin)
         return pin
 
     def i2c_write(self, dev_addr: int, data: bytes | bytearray) -> None:
@@ -538,8 +539,8 @@ class MotionSensor(SignalWrapper):
         if r.packetType in _ERROR_TYPES:
             return False
         
-        logger.info("LP i2c_write: addr=0x%02X len=%d data=%s",
-                    dev_addr, write_len, [f"0x{b:02X}" for b in data])
+        logger.debug("LP i2c_write: addr=0x%02X len=%d data=%s",
+                     dev_addr, write_len, [f"0x{b:02X}" for b in data])
     
     def i2c_read(self, dev_addr: int, read_len: int) -> bytes:
         """Read bytes from an I2C device.
@@ -567,8 +568,8 @@ class MotionSensor(SignalWrapper):
             return False
         
         result = bytes(r.data[:r.data_len]) if r.data and r.data_len else b""
-        logger.info("LP i2c_read: addr=0x%02X len=%d data=%s",
-                    dev_addr, len(result), [f"0x{b:02X}" for b in result])
+        logger.debug("LP i2c_read: addr=0x%02X len=%d data=%s",
+                     dev_addr, len(result), [f"0x{b:02X}" for b in result])
         return result
 
     def i2c_write_read(self, dev_addr: int, data: bytes | bytearray,
@@ -606,10 +607,43 @@ class MotionSensor(SignalWrapper):
             return False
         
         result = bytes(r.data[:r.data_len]) if r.data and r.data_len else b""
-        logger.info("LP i2c_write_read: addr=0x%02X wrote=%d read=%d data=%s",
-                    dev_addr, write_len, len(result),
-                    [f"0x{b:02X}" for b in result])
+        logger.debug("LP i2c_write_read: addr=0x%02X wrote=%d read=%d data=%s",
+                     dev_addr, write_len, len(result),
+                     [f"0x{b:02X}" for b in result])
         return result
+
+    def nvcm_check(self, isc_operand: int = 0x08, num_rows: int = 1,
+                   boot_test: bool = True) -> bytes:
+        """Probe the active camera's CrossLink NVCM state.
+
+        Reads NVCM discriminators over I2C (config-mode read-back) and, if
+        boot_test is set, additionally performs a behaviorally-definitive
+        auto-boot test: releases CRESETB without the activation key and checks
+        whether the config port at 0x40 still answers.  Neither phase touches
+        camera power.  Select the camera first with switch_camera() and make
+        sure it is powered.
+
+        Args:
+            isc_operand: ISC_ENABLE operand1 — 0x08 = NVCM access (default),
+                         0x00 = SRAM access.
+            num_rows:    Number of 16-byte NVCM array rows to read back (0-8).
+            boot_test:   Run the auto-boot 0x40-disappearance test (default True).
+
+        Returns:
+            Raw fixed-layout response blob (see scripts/nvcm_probe.py for the
+            field layout), or b"" on error.
+        """
+        payload = bytearray([isc_operand & 0xFF, num_rows & 0xFF,
+                             1 if boot_test else 0])
+        r = self._send(packetType=OW_FPGA_PROG,
+                       command=OW_FACTORY_NVCM_CHECK,
+                       data=payload,
+                       timeout=8)
+        if r.packetType in _ERROR_TYPES:
+            logger.error("nvcm_check: firmware returned error type 0x%02X",
+                         r.packetType)
+            return b""
+        return bytes(r.data[:r.data_len]) if r.data and r.data_len else b""
 
     # ------------------------------------------------------------------
     # Debug flags

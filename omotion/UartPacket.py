@@ -84,16 +84,18 @@ class UartPacket:
             raise ValueError("CRC mismatch")
 
     def print_packet(self, full=False):
-        logger.debug("UartPacket:")
-        logger.debug("  Packet ID:", self.id)
-        logger.debug("  Packet Type:", hex(self.packetType))
-        logger.debug("  Command:", hex(self.command))
-        logger.debug("  Data Length:", self.data_len)
-        if full:
-            logger.debug("  Address:", hex(self.addr))
-            logger.debug("  Reserved:", hex(self.reserved))
-            logger.debug("  Data:", self.data.hex())
-            logger.debug("  CRC:", hex(self.crc))
+        logger.debug(
+            "UartPacket: id=%s type=0x%02X cmd=0x%02X addr=0x%02X reserved=0x%02X "
+            "data_len=%s data=%s crc=0x%04X",
+            self.id,
+            self.packetType,
+            self.command,
+            self.addr,
+            self.reserved,
+            self.data_len,
+            self.data.hex() if self.data else "",
+            self.crc,
+        )
 
     def __str__(self):
         return (
