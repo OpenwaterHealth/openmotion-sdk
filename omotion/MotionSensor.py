@@ -512,7 +512,7 @@ class MotionSensor(SignalWrapper):
             return False
                 
         pin = r.data[0] if r.data and r.data_len >= 1 else 0
-        logger.info("LP creset: pin=%d", pin)
+        logger.debug("LP creset: pin=%d", pin)
         return pin
 
     def i2c_write(self, dev_addr: int, data: bytes | bytearray) -> None:
@@ -539,8 +539,8 @@ class MotionSensor(SignalWrapper):
         if r.packetType in _ERROR_TYPES:
             return False
         
-        logger.info("LP i2c_write: addr=0x%02X len=%d data=%s",
-                    dev_addr, write_len, [f"0x{b:02X}" for b in data])
+        logger.debug("LP i2c_write: addr=0x%02X len=%d data=%s",
+                     dev_addr, write_len, [f"0x{b:02X}" for b in data])
     
     def i2c_read(self, dev_addr: int, read_len: int) -> bytes:
         """Read bytes from an I2C device.
@@ -568,8 +568,8 @@ class MotionSensor(SignalWrapper):
             return False
         
         result = bytes(r.data[:r.data_len]) if r.data and r.data_len else b""
-        logger.info("LP i2c_read: addr=0x%02X len=%d data=%s",
-                    dev_addr, len(result), [f"0x{b:02X}" for b in result])
+        logger.debug("LP i2c_read: addr=0x%02X len=%d data=%s",
+                     dev_addr, len(result), [f"0x{b:02X}" for b in result])
         return result
 
     def i2c_write_read(self, dev_addr: int, data: bytes | bytearray,
@@ -607,9 +607,9 @@ class MotionSensor(SignalWrapper):
             return False
         
         result = bytes(r.data[:r.data_len]) if r.data and r.data_len else b""
-        logger.info("LP i2c_write_read: addr=0x%02X wrote=%d read=%d data=%s",
-                    dev_addr, write_len, len(result),
-                    [f"0x{b:02X}" for b in result])
+        logger.debug("LP i2c_write_read: addr=0x%02X wrote=%d read=%d data=%s",
+                     dev_addr, write_len, len(result),
+                     [f"0x{b:02X}" for b in result])
         return result
 
     def nvcm_check(self, isc_operand: int = 0x08, num_rows: int = 1,
