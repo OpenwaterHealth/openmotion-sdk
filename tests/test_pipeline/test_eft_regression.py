@@ -25,15 +25,12 @@ pytestmark = pytest.mark.timeout(900)
 
 SCANS_DIR = Path(r"C:\Users\ethan\Projects\eft-testing\scans")
 
+# NOTE: owYWB8TN was originally listed here as a clean scan, but it was
+# recorded with the stimulator running at 300 ms cadence — the detector
+# correctly flags its ~10 ms-early stamps (one packet per ~12 frames on the
+# right module). It now lives in test_eft_correction.py's DEGRADED_SCANS
+# with a stim-specific grid-restoration assertion.
 CLEAN_SCANS = [
-    {
-        "name": "owYWB8TN",
-        "left_raw": SCANS_DIR / "20260602_135759_owYWB8TN_left_mask66_raw.csv",
-        "right_raw": SCANS_DIR / "20260602_135759_owYWB8TN_right_mask66_raw.csv",
-        "baseline_corrected": SCANS_DIR / "20260602_135759_owYWB8TN.csv",
-        "left_mask": 0x66,
-        "right_mask": 0x66,
-    },
     {
         "name": "owYZ7T66_clean",
         "left_raw": SCANS_DIR / "20260603_130423_owYZ7T66_left_maskC3_raw.csv",
