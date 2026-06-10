@@ -84,7 +84,8 @@ def default_pipeline(*,
         # Combined realtime + corrected per-side average (reduced mode).
         # Realtime: emits LiveEmit("live_side") for the UI trace.
         # Corrected: reads IntervalClosed events from DarkCorrectionStage,
-        # emits LiveEmit("final_side") for DB persistence.
+        # emits synthetic IntervalClosed intervals whose frames carry
+        # cam_id=-1 (the side-average convention) on the "final" channel.
         SideAverageStage(
             enabled=metadata.reduced_mode,
             left_camera_mask=metadata.left_camera_mask,

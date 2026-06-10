@@ -100,13 +100,12 @@ class TriggerStateEvent(BatchEvent):
 
 @dataclass
 class SideAverageSample:
-    """One reduced-mode per-side average for a single capture instant.
+    """One reduced-mode realtime per-side average for a single capture instant.
 
-    Carried as the payload of a ``LiveEmit`` — channel ``"live_side"`` for the
-    realtime average (SideAverageStage, ``"live_side"``) and ``"final_side"`` for the
-    dark-corrected average (SideAverageStage, ``"final_side"``). One sample per capture
-    (``frame_id``) per side. ``mean`` / ``contrast`` are populated only on the
-    corrected path; the live path leaves them ``None``."""
+    Carried as the payload of a ``LiveEmit`` on the ``"live_side"`` channel
+    (SideAverageStage realtime path), one sample per capture (``frame_id``)
+    per side. The corrected side average does NOT use this type — it rides
+    the ``"final"`` channel as cam_id=-1 EnrichedCorrectedFrames."""
     t:         float
     frame_id:  int
     side:      int            # 0 = left, 1 = right
@@ -132,8 +131,9 @@ class FrameBatch:
       ShotNoise:       std_sn_rt, contrast_sn_rt
       BfiBvi:          bfi_live, bvi_live
       SideAverage:     appends LiveEmit(channel="live_side", SideAverageSample)
-                       and LiveEmit(channel="final_side", SideAverageSample)
-                       per capture (reduced mode only)
+                       per capture, plus synthetic IntervalClosed events whose
+                       frames carry cam_id=-1 (corrected side averages, routed
+                       to "final") — reduced mode only
       Tee:             appends LiveEmit to events
     """
 

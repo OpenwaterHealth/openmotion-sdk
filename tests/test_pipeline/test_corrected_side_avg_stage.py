@@ -1,16 +1,15 @@
-"""CorrectedSideAverageStage — dark-corrected per-side average (DB record).
+"""SideAverageStage corrected path — dark-corrected per-side average (DB record).
 
 DarkCorrectionStage emits one IntervalClosed(EnrichedCorrectedInterval) per
-(side, cam). This stage gathers those per-camera intervals across the active
+(side, cam). The stage gathers those per-camera intervals across the active
 cameras of a side, groups by frame_id, spatially averages the selected cameras,
-and emits one LiveEmit(channel="final_side", SideAverageSample) per capture.
+and emits one synthetic IntervalClosed per side whose EnrichedCorrectedFrames
+carry cam_id=-1 — the side-average convention on the "final" channel.
 """
 
 import numpy as np
 import pytest
-from omotion.pipeline.batch import (
-    FrameBatch, IntervalClosed, LiveEmit, SideAverageSample,
-)
+from omotion.pipeline.batch import FrameBatch, IntervalClosed
 from omotion.pipeline.stages.dark import EnrichedCorrectedFrame, EnrichedCorrectedInterval
 from omotion.pipeline.stages.side_avg import CorrectedSideAverageStage
 
@@ -39,9 +38,17 @@ def _batch(intervals=()):
     return b
 
 
-def _final_side(batch):
-    return [e.payload for e in batch.events
-            if isinstance(e, LiveEmit) and e.channel == "final_side"]
+def _avg_frames(batch):
+    """All cam_id=-1 EnrichedCorrectedFrames from synthetic side-average
+    IntervalClosed events appended by the stage."""
+    out = []
+    for e in batch.events:
+        if not isinstance(e, IntervalClosed):
+            continue
+        for f in getattr(e.corrected_batch, "frames", []):
+            if int(getattr(f, "cam_id", -99)) == -1:
+                out.append(f)
+    return out
 
 
 def _stage(mask=0x03):  # cams 0, 1
@@ -53,7 +60,7 @@ def test_disabled_stage_emits_nothing():
     b = _batch([_interval(10, 20, [_ef(12, 5.0, "left", 0, 2.0, 20.0)])])
     stage.process(b)
     stage.on_scan_stop(b)
-    assert _final_side(b) == []
+    assert _avg_frames(b) == []
 
 
 def test_emits_per_frame_spatial_average_across_cameras():
@@ -67,9 +74,10 @@ def test_emits_per_frame_spatial_average_across_cameras():
     stage.process(b)
     flush = _batch()
     stage.on_scan_stop(flush)  # window finalizes at scan stop
-    by_fid = {p.frame_id: p for p in _final_side(flush)}
-    assert isinstance(by_fid[12], SideAverageSample)
-    assert by_fid[12].side == 0
+    by_fid = {f.abs_frame_id: f for f in _avg_frames(flush)}
+    assert isinstance(by_fid[12], EnrichedCorrectedFrame)
+    assert by_fid[12].side == "left"
+    assert by_fid[12].cam_id == -1
     assert by_fid[12].bfi == pytest.approx(4.0)   # mean(2, 6)
     assert by_fid[12].bvi == pytest.approx(40.0)  # mean(20, 60)
     assert by_fid[13].bfi == pytest.approx(6.0)   # mean(4, 8)
@@ -84,9 +92,24 @@ def test_window_finalizes_when_next_window_begins():
         _interval(20, 30, [_ef(22, 5.5, "left", 0, 1.0, 10.0)]),  # new window → finalize prev
     ])
     stage.process(b)
-    by_fid = {p.frame_id: p for p in _final_side(b)}
+    by_fid = {f.abs_frame_id: f for f in _avg_frames(b)}
     assert 12 in by_fid and by_fid[12].bfi == pytest.approx(4.0)  # mean(2, 6)
     assert 22 not in by_fid  # window 2 still open until next window / stop
+
+
+def test_synthetic_interval_carries_window_bounds():
+    stage = _stage()
+    b = _batch([
+        _interval(10, 20, [_ef(12, 5.0, "left", 0, 2.0, 20.0)]),
+        _interval(20, 30, [_ef(22, 5.5, "left", 0, 1.0, 10.0)]),  # closes window 1
+    ])
+    stage.process(b)
+    synth = [e.corrected_batch for e in b.events
+             if isinstance(e, IntervalClosed)
+             and any(int(getattr(f, "cam_id", 0)) == -1
+                     for f in getattr(e.corrected_batch, "frames", []))]
+    assert len(synth) == 1
+    assert (synth[0].left_abs, synth[0].right_abs) == (10, 20)
 
 
 def test_averages_mean_and_contrast_too():
@@ -98,9 +121,9 @@ def test_averages_mean_and_contrast_too():
     stage.process(b)
     flush = _batch()
     stage.on_scan_stop(flush)
-    p = _final_side(flush)[0]
-    assert p.mean == pytest.approx(150.0)      # mean(100, 200)
-    assert p.contrast == pytest.approx(0.3)    # mean(0.2, 0.4)
+    f = _avg_frames(flush)[0]
+    assert f.mean == pytest.approx(150.0)      # mean(100, 200)
+    assert f.contrast == pytest.approx(0.3)    # mean(0.2, 0.4)
 
 
 def test_only_selected_cameras_averaged():
@@ -112,7 +135,7 @@ def test_only_selected_cameras_averaged():
     stage.process(b)
     flush = _batch()
     stage.on_scan_stop(flush)
-    assert _final_side(flush)[0].bfi == pytest.approx(2.0)  # only cam 0
+    assert _avg_frames(flush)[0].bfi == pytest.approx(2.0)  # only cam 0
 
 
 def test_left_and_right_independent():
@@ -124,9 +147,21 @@ def test_left_and_right_independent():
     stage.process(b)
     flush = _batch()
     stage.on_scan_stop(flush)
-    by_side = {p.side: p for p in _final_side(flush)}
-    assert by_side[0].bfi == pytest.approx(3.0)  # left mean(2,4)
-    assert by_side[1].bfi == pytest.approx(7.0)  # right mean(6,8)
+    by_side = {f.side: f for f in _avg_frames(flush)}
+    assert by_side["left"].bfi == pytest.approx(3.0)   # left mean(2,4)
+    assert by_side["right"].bfi == pytest.approx(7.0)  # right mean(6,8)
+
+
+def test_worst_contributing_quality_propagates():
+    stage = _stage()
+    good = _ef(12, 5.0, "left", 0, 2.0, 20.0)
+    bad = _ef(12, 5.0, "left", 1, 6.0, 60.0)
+    bad.quality = "nan_filled"
+    b = _batch([_interval(10, 20, [good]), _interval(10, 20, [bad])])
+    stage.process(b)
+    flush = _batch()
+    stage.on_scan_stop(flush)
+    assert _avg_frames(flush)[0].quality == "nan_filled"
 
 
 def test_reset_clears_pending_window():
@@ -135,4 +170,4 @@ def test_reset_clears_pending_window():
     stage.reset()
     flush = _batch()
     stage.on_scan_stop(flush)
-    assert _final_side(flush) == []
+    assert _avg_frames(flush) == []

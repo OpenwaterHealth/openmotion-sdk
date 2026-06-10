@@ -1,22 +1,25 @@
 # Scan Database
 
-Open-Motion supports persisting scan output to a per-installation SQLite database in
-addition to (or eventually instead of) the per-scan CSVs the SDK has always written.
-This document covers the rationale, configuration, schema, lifecycle, and how to
-inspect the data.
+Open-Motion persists each scan's **corrected science record** to a
+per-installation SQLite database. This document covers the rationale,
+configuration, schema, lifecycle, and how to inspect the data.
 
 ## TL;DR
 
 * **One file per installation** (typically `<scan_data>/scans.db`) that accumulates
   every scan as its own row in a `sessions` table.
-* **Three data tables** — `sessions` (one row per scan), `session_data` (corrected
-  per-camera per-frame BFI/BVI/contrast/mean), and `session_raw` (optional raw
-  histogram blobs).
-* **Opt-in at SDK construction.** Default off. Apps pass `db_path=...` to
+* **Two data tables** — `sessions` (one row per scan) and `session_data`
+  (corrected per-camera per-frame BFI/BVI/contrast/mean — the final-branch
+  output of the science pipeline).
+* **The DB stores corrected data only.** Raw histograms are written exclusively
+  to the per-side raw CSVs (the pipeline's `Tee("raw")` → `CsvSink`); realtime
+  ("live") values exist only on the in-process channels feeding the GUI and are
+  never persisted. Databases created by older SDKs may contain a `session_raw`
+  table and live-valued `session_data` rows — see "Legacy databases" below.
+* **Opt-in at SDK construction.** Default off. Apps pass `scan_db_path=...` to
   `MotionInterface(...)`; when set, every scan writes to that file. When unset,
-  the SDK behaves byte-for-byte the same as it always has — no DB code runs.
-* **CSVs are unaffected.** The DB is additive. CSVs are still written; the two
-  endpoints agree cell-for-cell.
+  the SDK falls back to writing the corrected CSV so there is always at least
+  one persisted record.
 
 ## Configuration
 
@@ -25,166 +28,134 @@ The DB is enabled at SDK construction:
 ```python
 from omotion import MotionInterface
 
-iface = MotionInterface(db_path="/path/to/scans.db")
+iface = MotionInterface(scan_db_path="/path/to/scans.db")
 iface.start()
 ```
 
-`db_path=None` (the default) means no sink is constructed; the SDK behaves
-identically to today and no DB file is ever created.
+`scan_db_path=None` (the default) means no DB sink is constructed; the SDK
+forces the corrected CSV on instead.
 
-The Open-Motion Bloodflow app exposes this via two `app_config.json` keys:
+The Open-Motion Bloodflow app exposes this via `app_config.json`:
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `scanDbEnabled` | bool | `false` | Toggles the SDK sink on. **Startup-only** — changing it at runtime requires an app restart because the path is fixed at `MotionInterface` construction. When `true`, the path is `<output_base>/scan_data/scans.db`. |
-| `writeRawData` | bool | `false` | Master raw-histogram persistence switch. Drives both raw-CSV writes and raw-DB writes when their respective targets are active. Live-toggleable from Settings → Developer → "Save raw data". |
-| `writeRawDataDurationSec` | float \| null | `null` | Cap for how long raw data is recorded per scan. Applies to **both** the raw CSV writer and the DB `session_raw` sink — once any writer-thread deadline fires, both targets stop accepting new raw frames so they capture the same window. `null` means full scan duration. **Important:** without this cap, a multi-hour scan with `writeRawData=true` and `scanDbEnabled=true` will write one `session_raw` row per camera per frame for the entire duration (roughly 320 rows/s × scan length × ~250 B of compressed histogram payload + ~80 B row meta), so a 12-hour scan produces ~7–8 GB of raw rows in the DB on top of the corrected data. |
+| `writeRawData` | bool | `false` | Raw-histogram persistence switch — gates the pipeline's `Tee("raw")`, which feeds the raw CSVs (the only raw target). |
+| `writeRawDataDurationSec` | float \| null | `null` | Cap for how long raw data is recorded per scan (the raw tee's `max_duration_s`). `null` means full scan duration. |
+
+## Configuration semantics — final-branch only
+
+`session_data` holds the pipeline's **final-branch** output: the
+interval-corrected values emitted on the `"final"` channel after each dark
+interval closes (linear dark interpolation between bounding darks, shot-noise
+correction, BFI/BVI calibration, and the quadratic-stencilled dark row — see
+[`SciencePipeline.md`](SciencePipeline.md) §5.7). The realtime values shown
+live in the GUI use a forward-predicted dark baseline and are deliberately
+not stored.
+
+Consequences:
+
+* DB rows trail the scan by up to one dark interval (~15 s at defaults). An
+  unclean shutdown (crash, power loss) loses that tail — accepted trade-off.
+* The record is gapless at 40 Hz except warmup frames (1..`discard_count`)
+  and the scan's terminal dark frame.
 
 ## Schema
 
-`omotion.ScanDatabase` creates four tables and three indexes on first open. The
+`omotion.ScanDatabase` creates three tables and three indexes on first open. The
 schema lives in [`omotion/ScanDatabase.py`](../omotion/ScanDatabase.py); this is
 a reference rendering.
 
 ### `sessions`
 
-One row per scan, written at the moment `ScanWorkflow._worker` produces the
-canonical `YYYYMMDD_HHMMSS` timestamp (which is also the prefix of the CSV
-filenames). The row gets `session_end` populated when the scan completes
-(success or cancel).
+One row per scan, written by `ScanDBSink.on_scan_start()`. The row gets
+`session_end` populated when the scan completes (success or cancel).
 
 ```sql
 CREATE TABLE sessions (
     id             INTEGER PRIMARY KEY,
-    session_label  TEXT    NOT NULL,    -- "{ts}_{subject_id}" — matches CSV naming
+    session_label  TEXT    NOT NULL,    -- "{scan_id}_{subject_id}" — matches CSV naming
     session_start  REAL    NOT NULL,    -- wall-clock seconds (time.time()) at scan start
     session_end    REAL,                -- wall-clock seconds at scan end
-    session_notes  TEXT,                -- free text from ScanRequest.notes
+    session_notes  TEXT,                -- free text
     session_meta   TEXT                 -- JSON blob, see "Session metadata" below
 );
 ```
 
 #### Session metadata
 
-`session_meta` is a JSON blob populated at scan start by the pipeline's
+`session_meta` is a JSON blob stamped at scan start by the pipeline's
 `ScanDBSink.on_scan_start()` (see `omotion/pipeline/sinks.py`). Stored as
 text and re-parsed on read.
 
 ```json
 {
+  "scan_id": "20260610_104500",
   "subject_id": "owUCEKHF",
+  "operator": "tech1",
+  "started_at_iso": "2026-06-10T10:45:00Z",
   "duration_sec": 3600,
-  "expected_size": 32837,
-  "fps": 40,
-  "left_camera_mask": 102,
-  "right_camera_mask": 102,
-  "active_left_cams": [2, 3, 6, 7],
-  "active_right_cams": [2, 3, 6, 7],
-  "disable_laser": false,
-  "sdk_version": "1.6.0",
-  "console_fw_version": "1.5.8-rc.2",
-  "console_hw_id": "23004c00065133333735383300000000",
-  "left_fw_version": "1.5.4-dev.0",
-  "right_fw_version": "1.5.4-dev.0",
-  "left_hw_id": "2d004e00065133333735383300000000",
-  "right_hw_id": "28004f00065133333735383300000000",
+  "data_semantics": "final",
   "sdk_flags": {
-    "write_raw_csv": true,
-    "write_corrected_csv": true,
-    "write_telemetry_csv": true,
-    "write_raw_to_db": true
+    "reduced_mode": false,
+    "left_camera_mask": 102,
+    "right_camera_mask": 102
   }
 }
 ```
 
-Firmware versions / hardware IDs are filled in best-effort — `MotionInterface`
-wraps every accessor in a `_safe_call`, so disconnected handles produce `null`
-placeholders rather than failing the scan.
+* `data_semantics: "final"` marks the session as holding final-branch
+  (interval-corrected) values. **Sessions missing this key were written by
+  older SDKs whose `session_data` held realtime (live-branch) values** —
+  readers should treat the missing key as "legacy live-valued data".
+* `sdk_flags.reduced_mode` drives the column layout chosen by
+  `materialize_corrected_csv` (see "Playback" below).
 
 ### `session_data`
 
-The corrected per-camera per-frame data — one row per `Sample` emitted by the
-science pipeline. This is the load-bearing analytical surface.
+The corrected per-camera per-frame data — the load-bearing analytical surface.
 
 ```sql
 CREATE TABLE session_data (
     id               INTEGER PRIMARY KEY,
     session_id       INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-    session_raw_id   INTEGER REFERENCES session_raw(id) ON DELETE SET NULL,
-    cam_id           INTEGER NOT NULL,                      -- 0-indexed (0..7)
+    cam_id           INTEGER NOT NULL,                      -- 0-indexed (0..7); -1 = side average
     side             INTEGER NOT NULL CHECK(side IN (0, 1)),-- 0 = left, 1 = right
+    frame_id         INTEGER NOT NULL DEFAULT -1,           -- absolute (unwrapped) frame id
     timestamp_s      REAL    NOT NULL,                      -- seconds since scan start
     bfi              REAL,
     bvi              REAL,
     contrast         REAL,
-    mean             REAL
+    mean             REAL,
+    quality          TEXT DEFAULT 'ok'
 );
 
-CREATE INDEX idx_session_data_session_time ON session_data(session_id, timestamp_s);
-CREATE INDEX idx_session_data_session_cam  ON session_data(session_id, side, cam_id, timestamp_s);
+CREATE INDEX idx_session_data_session_time  ON session_data(session_id, timestamp_s);
+CREATE INDEX idx_session_data_session_cam   ON session_data(session_id, side, cam_id, timestamp_s);
+CREATE INDEX idx_session_data_session_frame ON session_data(session_id, frame_id);
 ```
 
 Notes:
 
-* All `REAL` fields are stored rounded to 6 decimals (project-wide precision
-  policy, matches the corrected CSV writer). Anything beyond 6 decimals is
-  measurement noise.
-* `timestamp_s` is **seconds since scan start**, not firmware-clock seconds. The
-  per-scan baseline is captured by `parse_histogram_stream`'s `t0_normalizer`
-  at the first sample observed across both sides, so every output of the same
-  scan agrees on the time origin.
+* **`cam_id = -1` means "side average"** — the reduced-mode spatial average
+  across the side's enabled cameras, emitted by `SideAverageStage` on the
+  `"final"` channel. In reduced mode these are the *only* rows written; in
+  normal mode only per-camera rows (`cam_id` 0..7) exist.
+* Metric values are stored rounded (matching the corrected CSV writer's
+  precision policy). Non-finite values (NaN) are stored as NULL; a frame with
+  no finite metric at all is skipped.
+* `timestamp_s` is **seconds since scan start**, not firmware-clock seconds.
 * `cam_id` is **0-indexed**. The corrected CSV column names use 1-indexed
   cameras (e.g. `bfi_l3` is camera 3 (1-indexed) = `cam_id=2` (0-indexed)).
 * Left and right sensors have **independent firmware clocks**. The shared
-  `t0_normalizer` captures whichever side fires first; the other side's per-row
-  timestamp can therefore be offset by a few ms from its sibling's. Cell values
-  agree exactly with the merged CSV row format, but joining a CSV row to the
-  DB on `timestamp_s` directly will only match the side that defined `t0`.
-
-### `session_raw`
-
-Optional per-frame raw histogram blobs (1024 × `uint32` bins per frame). Only
-populated when `ScanRequest.write_raw_to_db=True` (gated upstream by the app's
-`writeRawData` master flag).
-
-```sql
-CREATE TABLE session_raw (
-    id           INTEGER PRIMARY KEY,
-    session_id   INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-    side         TEXT    NOT NULL CHECK(side IN ('left', 'right')),
-    cam_id       INTEGER NOT NULL,                  -- 0-indexed
-    frame_id     INTEGER NOT NULL,                  -- per-side firmware frame id
-    timestamp_s  REAL    NOT NULL,                  -- seconds since scan start
-    hist         BLOB    NOT NULL,                  -- 1024 × uint32, optionally zlib-compressed
-    temp         REAL,                              -- camera temperature, °C
-    sum          INTEGER,                           -- sum of histogram bins
-    tcm          REAL    NOT NULL DEFAULT 0,        -- console TCM telemetry
-    tcl          REAL    NOT NULL DEFAULT 0,        -- console TCL telemetry
-    pdc          REAL    NOT NULL DEFAULT 0         -- console PDC telemetry
-);
-
-CREATE INDEX idx_session_raw_session_time     ON session_raw(session_id, timestamp_s);
-CREATE INDEX idx_session_raw_session_cam_time ON session_raw(session_id, side, cam_id, timestamp_s);
-```
-
-`side` is stored as `TEXT` ('left' / 'right') in `session_raw` but as
-`INTEGER` (0 / 1) in `session_data`. This is historical — the raw path
-came first and preserved the SDK's string convention; `session_data` uses
-an integer for compactness. `ScanDatabase.get_raw_frame` /
-`ScanDatabase.stream_raw_frames` return the side as text either way.
-
-`hist` is `bytes` on the way in. If the database's `compress_raw_hist`
-setting is on (default for new DBs), the blob is zlib-compressed at write
-time and transparently decompressed by `get_raw_frame` /
-`stream_raw_frames`. Compression ratios of ~10–20× are typical for histograms
-that have only a few dozen non-zero bins.
+  t0 captures whichever side fires first; the other side's per-row
+  timestamp can therefore be offset by a few ms from its sibling's.
 
 ### `database_settings`
 
 A tiny key/value table for per-DB settings that have to outlive a single
-process (currently just `compress_raw_hist`). Set on first open; checked on
-every subsequent open so a mismatch raises rather than silently corrupting
-the read-back of older blobs.
+process. Currently unused by the writer; reserved for a future
+`schema_version` key.
 
 ```sql
 CREATE TABLE database_settings (
@@ -195,93 +166,35 @@ CREATE TABLE database_settings (
 
 ## Lifecycle
 
-> **NOTE:** The lifecycle diagram below describes the legacy callback-based
-> sink architecture. The pipeline cutover replaced it with channel-subscribed
-> sinks; see `docs/SciencePipeline.md` §8 (Sinks) for the current
-> architecture. The DB schema + semantics described elsewhere in this doc
-> are unchanged.
+`ScanDBSink` (in `omotion/pipeline/sinks.py`) is a channel-subscribed pipeline
+sink — see [`SciencePipeline.md`](SciencePipeline.md) §8.2.
 
 ```
 MotionInterface.start_scan(request)
         │
-        │  ScanWorkflow auto-injects ScanDBSink based on
-        │  MotionInterface(scan_db_path=...) ctor kwarg
-        │
+        │  ScanWorkflow auto-injects ScanDBSink when
+        │  MotionInterface(scan_db_path=...) is set
         ▼
-ScanWorkflow.start_scan(request)
+ScanRunner
+        │  on_scan_start(meta)  ──► INSERT INTO sessions (label, meta...)
         │
-        ▼  _worker thread spawned
-ScanWorkflow._worker
-        │
-        │  ts = datetime.now().strftime("YYYYMMDD_HHMMSS")
-        │  on_scan_start_fn(ts, time.time())     ──► ScanDBSink.open(label, start_ts, notes, meta)
-        │                                              └── INSERT INTO sessions ...
-        │
-        │  ┌───────────────────────────────────────────────────────────────────┐
-        │  │ per-side writer threads run parse_histogram_stream                │
-        │  │   ├── normalize sample.timestamp_s to scan-start via t0_normalizer│
-        │  │   ├── csv_writer.writerow(sample.to_csv_row(...))                 │
-        │  │   └── on_row_fn(...)  ─► p.enqueue(...) (science pipeline)        │
-        │  │                       ─► on_raw_frame_fn(...) ─► ScanDBSink       │
-        │  │                                                  .on_raw_frame() │
-        │  │                                                  └── batched     │
-        │  │                                                       executemany│
-        │  │                                                       on flush   │
-        │  └───────────────────────────────────────────────────────────────────┘
-        │
-        │  science_pipeline emits CorrectedBatch
-        │     └── on_corrected_batch_fn(batch)
-        │            └── ScanDBSink.on_corrected_batch(batch)
-        │                  ├── flushes pending raw buffer
-        │                  └── insert_session_data_rows(rows)
+        │  per closed dark interval (~15 s):
+        │    IntervalClosed → "final" channel → ScanDBSink._consume_final()
+        │       └── buffered rows → insert_session_data_rows (executemany)
         │
         ▼  scan ends (cancel, error, or duration reached)
-on_complete_fn(result)
-        │
-        ▼
-ScanDBSink.close(end_ts)
-        ├── flush any remaining raw frames
-        ├── UPDATE sessions SET session_end = end_ts WHERE id = self._session_id
+on_complete()
+        ├── flush remaining buffered rows
+        ├── UPDATE sessions SET session_end = ...
         └── close the connection
 ```
 
-Two write-amplification properties worth knowing:
-
-* **Raw frames buffer at the sink, not at the DB.** `on_raw_frame_fn` fires
-  ~40 × (active cameras) times per second per side. `ScanDBSink` appends each
-  call to an in-memory list and flushes via `insert_raw_frames` (which uses
-  `executemany` inside one transaction) when the buffer hits `raw_batch_size`
-  (default 200 frames, ~5 s of data per side) — or when `on_corrected_batch`
-  fires (the corrected pipeline is a natural sync point) — or on `close()`.
-* **Corrected rows write per-batch.** A dark-frame interval is 600 frames
-  / 15 s at 40 Hz, so `on_corrected_batch` fires every ~15 s with up to
-  600 × `cams_per_side` × 2 rows in a single `executemany`.
-
-## Sink internals (`omotion.ScanDBSink`)
-
-The sink is a thin adapter between `ScanWorkflow`'s callback surface and
-`ScanDatabase`'s SQL inserts. It owns:
-
-* one `ScanDatabase` connection (one file per scan);
-* one open session row (one `INSERT INTO sessions` per scan);
-* a `threading.Lock` to serialize the raw-frame buffer between writer threads.
-
-```python
-class ScanDBSink:
-    def __init__(self, db_path, *, write_raw=False, compress_raw_hist=True,
-                 raw_batch_size=200): ...
-    def open(self, *, label, start_ts, notes, meta) -> int: ...
-    def close(self, end_ts: float) -> None: ...
-    def on_corrected_batch(self, batch: CorrectedBatch) -> None: ...
-    def on_raw_frame(self, side, cam_id, frame_id, timestamp_s, hist,
-                     temp, sum_counts, tcm, tcl, pdc) -> None: ...
-```
-
-* `close()` is idempotent (second call is a no-op; doesn't bump `session_end`).
-* Callbacks raise `RuntimeError` if invoked before `open()`.
-* Both callbacks swallow exceptions internally and count failures via
-  `sink.insert_errors`, so a transient DB error doesn't propagate into the
-  worker thread and abort the scan.
+* The sink is **critical**: if the DB can't be opened at scan start, the scan
+  is aborted rather than run with no durable record
+  (`ScanRunner.CriticalSinkError`).
+* Rows buffer in memory (default 200) and flush via a single `executemany`
+  transaction.
+* `on_complete()` is idempotent.
 
 ## Querying
 
@@ -296,8 +209,8 @@ sqlite3 /path/to/scans.db <<'SQL'
 
 SELECT id, session_label,
        session_end - session_start AS duration_s,
-       json_extract(session_meta, '$.subject_id')         AS subject,
-       json_extract(session_meta, '$.console_fw_version') AS console_fw
+       json_extract(session_meta, '$.subject_id')      AS subject,
+       json_extract(session_meta, '$.data_semantics')  AS semantics
 FROM sessions
 ORDER BY session_start DESC
 LIMIT 10;
@@ -325,51 +238,26 @@ try:
     for batch in db.stream_session_data(sid):
         for row in batch:
             print(row["side"], row["cam_id"], row["timestamp_s"], row["bfi"])
-
-    for batch in db.stream_raw_frames(sid):
-        for row in batch:
-            print(row["frame_id"], len(row["hist"]), row["sum"])
 finally:
     db.close()
 ```
 
 `session_meta` is automatically JSON-decoded into a Python dict by
-`get_session` / `iter_sessions`. `hist` blobs are transparently decompressed
-by `get_raw_frame` / `stream_raw_frames` based on the DB's
-`compress_raw_hist` setting.
-
-### GUI browser
-
-The repo ships a PyQt-based browser under `stream-db/db_browser.py`:
-
-```sh
-python stream-db/db_browser.py /path/to/scans.db
-```
-
-It enumerates sessions, lets you scrub through `session_data` columns, and
-plots stored histograms from `session_raw`. Same dependencies as the rest of
-the SDK plus `pyqtgraph`.
+`get_session` / `iter_sessions`.
 
 ## Relationship to the CSV outputs
 
-For every scan the sink runs, the SDK *also* writes the existing files:
+| File | Source | Contents |
+| --- | --- | --- |
+| `{ts}_{subject}_{side}_mask{XX}_raw.csv` | `Tee("raw")` → `CsvSink` | **The only raw-histogram record.** Gated by `writeRawData` / capped by `writeRawDataDurationSec`. |
+| `{ts}_{subject}.csv` (corrected) | `"final"` channel → `CsvSink` | Same final-branch values as `session_data`. Opt-in when the DB is active (`writeCorrectedCsv`); forced on when no DB is configured. |
+| `{ts}_{subject}_telemetry.csv` | `"telemetry"` channel → `TelemetrySink` | Console telemetry snapshots. |
+| `scans.db / session_data` | `"final"` channel → `ScanDBSink` | The corrected record (this document). |
 
-| File | Source | Has frame_id | Time origin |
-| --- | --- | --- | --- |
-| `{ts}_{subject}_left_mask{XX}_raw.csv` | per-side raw stream | yes | scan start (`Sample.timestamp_s`) |
-| `{ts}_{subject}_right_mask{XX}_raw.csv` | per-side raw stream | yes | scan start |
-| `{ts}_{subject}.csv` (corrected) | science pipeline | yes (per row) | scan start, merged across sides |
-| `{ts}_{subject}_telemetry.csv` (developerMode only) | telemetry poller | n/a | scan start |
-| `scans.db / session_data` | science pipeline | yes (Step F) | scan start, per-side |
-| `scans.db / session_raw` | per-side raw stream | yes | scan start, per-side |
-
-The most surprising difference is the **timestamp origin within a single
-frame**: the corrected CSV uses the minimum of left and right timestamps for
-the merged row, while `session_data` stores per-side rows with each side's
-own timestamp. The two sensors have independent firmware clocks, so the
-per-side rows can differ by a few milliseconds even within the same
-`frame_id`. Both representations are correct; the DB just preserves the
-per-side resolution that the CSV flattens away.
+The corrected CSV and `session_data` are fed by the same `"final"` channel, so
+their values agree. One subtlety: the corrected CSV uses the minimum of left
+and right timestamps for a merged row, while `session_data` stores per-side
+rows with each side's own timestamp.
 
 ## Playback — rebuild a corrected CSV from the DB
 
@@ -397,9 +285,7 @@ What's preserved exactly:
   across all (side, cam) cells.
 - Per-frame `timestamp_s` — minimum of all contributing samples,
   same rule as `CsvSink`.
-- `bfi`, `bvi`, `contrast`, `mean` cell values — rounded to 6
-  decimals at sink-insert time, so playback is byte-identical to the
-  on-disk corrected CSV for these columns.
+- `bfi`, `bvi`, `contrast`, `mean` cell values.
 
 What's *not* preserved:
 
@@ -411,15 +297,32 @@ Pre-#92 Step F sessions raise `RuntimeError` — their `frame_id` rows
 are all the sentinel `-1`, so the row layout can't be reconstructed.
 Callers should fall back to the on-disk corrected CSV in that case.
 
+## Legacy databases
+
+Databases written by older SDK versions can differ in three ways. Current
+code opens them safely (`CREATE TABLE IF NOT EXISTS` is idempotent and
+schema migrations only ever ADD columns), but readers should know:
+
+* **`session_raw` table** — older SDKs wrote raw histogram blobs to the DB.
+  Current code neither reads nor writes that table; the data is left
+  untouched. (The blobs may be zlib-compressed, indicated by the
+  `compress_raw_hist` key in `database_settings`.)
+* **Live-valued `session_data`** — sessions whose `session_meta` lacks
+  `data_semantics` hold realtime (live-branch) values written per-frame,
+  with dark frames skipped. They are *not* the corrected record.
+* **`session_raw_id` column** — old `session_data` rows may carry a
+  (now-meaningless) foreign key into `session_raw`. New DBs are created
+  without the column; inserts name their columns explicitly so both layouts
+  accept writes.
+
 ## Notes on schema evolution
 
-There is no schema version column yet. The DB-only mode shipped recently
-(issue #92); when a forward-incompatible schema change becomes necessary,
-the convention will be to write a `schema_version` key into
-`database_settings` and have `ScanDatabase._init_schema()` perform a guarded
-migration. Until then, existing DBs are safely opened by current code — the
-`CREATE TABLE IF NOT EXISTS` and `CREATE INDEX IF NOT EXISTS` clauses make
-every open idempotent.
+There is no schema version column yet. When a forward-incompatible schema
+change becomes necessary, the convention will be to write a `schema_version`
+key into `database_settings` and have `ScanDatabase._init_schema()` perform a
+guarded migration. Until then, existing DBs are safely opened by current
+code — the `CREATE TABLE IF NOT EXISTS` and `CREATE INDEX IF NOT EXISTS`
+clauses make every open idempotent.
 
 #### #92 Step F: `session_data.frame_id`
 

@@ -57,8 +57,8 @@ A separate **data pipeline** layer sits between the workflow orchestration and t
    │ (omotion/pipeline/sources.py)│ (omotion/pipeline/*.py)      │ (omotion/pipeline/sinks.py)
    │                              │                              │
    │  LiveUsbSource               │ default_pipeline():          │  CsvSink  (raw, final)
-   │  CsvReplaySource             │  Classify → TelemetryIngest  │  ScanDBSink (raw, final)
-   │  DbReplaySource              │  → Tee(raw) → NoiseFloor     │  TelemetrySink (telemetry)
+   │  CsvReplaySource             │  Classify → TelemetryIngest  │  ScanDBSink (final)
+   │                              │  → Tee(raw) → NoiseFloor     │  TelemetrySink (telemetry)
    │                              │  → Moments → PedestalSub     │  app live/final plot sinks
    │  ConsoleTelemetrySource      │  → DarkCorrection → ShotNoise│  CalibrationWorkflow sinks
    │  (separate thread)           │  → BfiBvi → SideAvg          │  ContactQuality sink
@@ -206,7 +206,7 @@ Always creates `CommInterface` in async mode. Claims all three on `connect()`, r
 | `pipeline/batch.py` | `FrameBatch` dataclass — the typed data carrier; `BatchEvent` family (`LiveEmit`, `IntervalClosed`, `DarkIntegrityWarning`, `StencilFallback`, `TelemetryEvent`) |
 | `pipeline/pipeline.py` | `Stage` protocol; `Pipeline` (ordered stage list + `reset()` + `on_scan_stop()` lifecycle) |
 | `pipeline/runner.py` | `ScanRunner` — iterates a `Source`, runs the `Pipeline`, dispatches events to subscribed sinks, manages the parallel telemetry thread |
-| `pipeline/sources.py` | `Source` protocol; `LiveUsbSource`, `CsvReplaySource`, `DbReplaySource`, `ConsoleTelemetrySource`; `_BaseSource` timestamp normalisation |
+| `pipeline/sources.py` | `Source` protocol; `LiveUsbSource`, `CsvReplaySource`, `ConsoleTelemetrySource`; `_BaseSource` timestamp normalisation |
 | `pipeline/sinks.py` | `Sink` protocol; `ScanMetadata`; built-in `CsvSink`, `ScanDBSink`, `TelemetrySink`. The live-plot UI sinks live in the bloodflow-app (`_LivePlotSink` + `_FinalBatchSink` in `motion_connector.py`), not here. |
 | `pipeline/tee.py` | `Tee(channel)` — positional marker that emits `LiveEmit` for sinks subscribed to the named channel; supports `filter` and `max_duration_s` |
 | `pipeline/factory.py` | `default_pipeline()` — composes the canonical 8-stage + 2-tee chain |
@@ -220,8 +220,7 @@ Always creates `CommInterface` in async mode. Claims all three on `connect()`, r
 | `pipeline/stages/shot_noise.py` | `ShotNoiseCorrectionStage` — Poisson-variance subtraction on the realtime path |
 | `pipeline/stages/bfi_bvi.py` | `BfiBviStage` — affine calibration map (contrast, mean) → (BFI, BVI) |
 | `pipeline/stages/dark_frame_hold.py` | `DarkFrameHoldStage` — hold last light BFI/BVI across dark frames |
-| `pipeline/stages/side_avg.py` | `LiveSideAverageStage` — realtime per-side spatial average (reduced mode) → `live_side` |
-| `pipeline/stages/corrected_side_avg.py` | `CorrectedSideAverageStage` — dark-corrected per-side average (reduced mode) → `final_side` |
+| `pipeline/stages/side_avg.py` | `SideAverageStage` — reduced-mode per-side spatial average; realtime → `live_side` LiveEmits, corrected → cam_id=-1 `IntervalClosed` intervals on `"final"` |
 
 **`ScanWorkflow`** — orchestrates a complete acquisition:
 1. Build a `ScanMetadata` and `SensorPedestals` from the connected sensors.
@@ -232,7 +231,7 @@ Always creates `CommInterface` in async mode. Claims all three on `connect()`, r
 6. The runner streams `FrameBatch`es through the pipeline, dispatches events to sinks on the appropriate channels, and runs `Pipeline.on_scan_stop()` at the end for the terminal-dark flush.
 7. On cancellation or completion, the runner calls `source.close()` and `sink.on_complete()` in a `finally` block.
 
-**`ScanDBSink` / `ScanDatabase`** — optional SQLite endpoint for both raw histogram blobs and final corrected output. Off by default; enabled by constructing `MotionInterface(db_path=...)`. When enabled, every scan opens a row in a `sessions` table; the sink subscribes to `"raw"` and `"final"` channels and writes `session_raw` blobs / `session_data` corrected rows accordingly. See [`ScanDatabase.md`](ScanDatabase.md) for schema, lifecycle, and how to query.
+**`ScanDBSink` / `ScanDatabase`** — optional SQLite endpoint for the corrected (final-branch) record. Off by default; enabled by constructing `MotionInterface(scan_db_path=...)`. When enabled, every scan opens a row in a `sessions` table; the sink subscribes to the `"final"` channel only and writes `session_data` corrected rows (per-camera in normal mode, cam_id=-1 side averages in reduced mode). Raw histograms are persisted only via the raw CSVs from `Tee("raw")`. See [`ScanDatabase.md`](ScanDatabase.md) for schema, lifecycle, and how to query.
 
 ---
 
@@ -255,8 +254,9 @@ DarkCorrectionStage         — dual-output: realtime (predicted) + batched (int
 ShotNoiseCorrectionStage    — Poisson variance subtraction on the realtime path
 BfiBviStage                 — affine calibration (contrast, mean) → (BFI, BVI)
 DarkFrameHoldStage          — hold last light BFI/BVI across dark frames
-LiveSideAverageStage        — realtime per-side spatial average (reduced) → "live_side"
-CorrectedSideAverageStage   — dark-corrected per-side average (reduced) → "final_side"
+SideAverageStage            — reduced-mode per-side spatial average:
+                              realtime → "live_side"; corrected → cam_id=-1
+                              IntervalClosed intervals on "final"
 Tee("live")                 — corrected per-frame FrameBatch to "live" sinks
 ```
 

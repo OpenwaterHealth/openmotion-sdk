@@ -34,7 +34,7 @@ from .runner import ScanRunner, CriticalSinkError
 from .factory import default_pipeline
 from .pedestal import SensorPedestals
 from .sinks import Sink, ScanMetadata, CsvSink, ScanDBSink
-from .sources import Source, LiveUsbSource, CsvReplaySource, DbReplaySource
+from .sources import Source, LiveUsbSource, CsvReplaySource
 
 
 __all__ = [
@@ -46,5 +46,5 @@ __all__ = [
     "SensorPedestals",
     "Sink", "ScanMetadata",
     "CsvSink", "ScanDBSink",
-    "Source", "LiveUsbSource", "CsvReplaySource", "DbReplaySource",
+    "Source", "LiveUsbSource", "CsvReplaySource",
 ]

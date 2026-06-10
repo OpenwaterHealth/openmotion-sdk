@@ -85,7 +85,7 @@ Three things characterise this design and make it auditable:
 | `contrast_sn_rt` | `(N, 2, 8)` float32 | ShotNoiseCorrectionStage | `std_sn_rt / mean_dc_rt`, 0 where mean ≤ 0 |
 | `bfi_live` | `(N, 2, 8)` float32 | BfiBviStage | BFI from realtime corrected (K, μ₁) via calibration |
 | `bvi_live` | `(N, 2, 8)` float32 | BfiBviStage | BVI from realtime corrected mean via calibration |
-| `events` | `list[BatchEvent]` | Stages append | Out-of-band events: `LiveEmit`, `IntervalClosed`, diagnostics. Reduced-mode per-side averages ride here as `LiveEmit(channel="live_side"/"final_side", SideAverageSample)` (see §5.10) rather than as batch arrays |
+| `events` | `list[BatchEvent]` | Stages append | Out-of-band events: `LiveEmit`, `IntervalClosed`, diagnostics. Reduced-mode side averages ride here too: realtime as `LiveEmit(channel="live_side", SideAverageSample)`, corrected as synthetic `IntervalClosed` intervals whose frames carry `cam_id=-1` (see §5.10) |
 
 ### 2.2 BatchEvent types
 
@@ -93,10 +93,10 @@ Stages produce events when something doesn't fit cleanly into per-frame arrays. 
 
 | Event | Producer | Routed to |
 |---|---|---|
-| `LiveEmit(channel, payload)` | `Tee` stages | The named channel's sinks |
-| `IntervalClosed(corrected_batch)` | `DarkCorrectionStage` | `"final"` channel sinks |
+| `LiveEmit(channel, payload)` | `Tee` stages, `SideAverageStage` (realtime path, `"live_side"`) | The named channel's sinks |
+| `IntervalClosed(corrected_batch)` | `DarkCorrectionStage` (per-camera; enriched + stencilled downstream), `SideAverageStage` (reduced-mode `cam_id=-1` side averages) | `"final"` channel sinks |
 | `DarkIntegrityWarning(...)` | `DarkIntegrityGuard` (inside DarkCorrectionStage) | `"diagnostics"` |
-| `StencilFallback(...)` | `DarkFrameQuadraticStencil` | `"diagnostics"` |
+| `StencilFallback(...)` | `DarkFrameQuadraticStencil` (inside DarkFrameHoldStage) | `"diagnostics"` |
 | `TelemetryEvent(...)` | `ConsoleTelemetrySource` (out of band) | `"telemetry"` and `TelemetryAggregator` |
 
 ---
@@ -123,6 +123,7 @@ The full chain assembled by `default_pipeline()` is:
 FrameClassificationStage
 TelemetryIngestStage
 Tee("raw", filter=ft != "stale", max_duration_s=…)   # conditional
+TimestampRepairStage
 NoiseFloorStage
 MomentsStage
 PedestalSubtractionStage
@@ -130,8 +131,8 @@ DarkCorrectionStage
 ShotNoiseCorrectionStage
 BfiBviStage
 DarkFrameHoldStage
-LiveSideAverageStage         (reduced mode; emits LiveEmit "live_side")
-CorrectedSideAverageStage    (reduced mode; emits LiveEmit "final_side")
+SideAverageStage             (reduced mode; emits LiveEmit "live_side" +
+                              cam_id=-1 IntervalClosed → "final")
 Tee("live", filter=ft not in {"warmup","stale"})
 ```
 
@@ -258,7 +259,7 @@ display_mean = max(0, mean_raw − pedestal)        # per-side broadcast (1, 2, 
 This is the largest stage. It runs **two parallel corrections**:
 
 - **Realtime (per-frame, predicted)** — produces `dark_baseline_rt`, `mean_dc_rt`, `std_dc_rt` on every light frame using the rolling dark history. Available immediately; lower fidelity at interval boundaries. Used by the live UI.
-- **Batched (per dark-interval, interpolated)** — buffers all light frames in the open interval, and when the closing dark arrives, emits `IntervalClosed(EnrichedCorrectedInterval)` containing fully dark-subtracted, shot-noise-corrected, BFI/BVI-calibrated frames. Used by the corrected CSV, the scan DB, and any consumer that needs reproducible offline-grade output.
+- **Batched (per dark-interval, interpolated)** — buffers all light frames in the open interval, and when the closing dark arrives, emits `IntervalClosed` carrying a raw `CorrectedInterval` (dark-subtracted mean/std only). The event is then **mutated in place by the downstream stages in the same pass**: `ShotNoiseCorrectionStage` applies shot-noise correction (§5.7.5 math), `BfiBviStage` upgrades it to an `EnrichedCorrectedInterval` with calibrated BFI/BVI, and `DarkFrameHoldStage` prepends the quadratic-stencilled dark row (§5.7.6). By the time the runner dispatches it to the `"final"` channel it is the fully corrected interval. Used by the corrected CSV, the scan DB, and any consumer that needs reproducible offline-grade output.
 
 The realtime predictor and the batched corrector share one `DarkHistory` (a per-`(side, cam_id)` ring buffer of `DarkObservation(t, u1, std)`, default capacity 4).
 
@@ -339,7 +340,7 @@ The two clamps to zero prevent imaginary standard deviations when dark subtracti
 
 #### 5.7.5 Enrichment — shot-noise correction + BFI/BVI calibration
 
-After linear interpolation, the stage applies **shot-noise correction** and **BFI/BVI calibration** in-line to produce `EnrichedCorrectedFrame`s. Same math as the dedicated downstream stages (§5.8, §5.9) but performed once per interval rather than once per batch — needed here because the dark-frame stencil (§5.7.6) interpolates already-enriched values, not raw means.
+After linear interpolation, the in-flight `IntervalClosed` event is enriched by the **downstream stages in the same pipeline pass**: `ShotNoiseCorrectionStage` applies shot-noise correction to each `CorrectedFrame`, then `BfiBviStage` replaces the payload with an `EnrichedCorrectedInterval` of `EnrichedCorrectedFrame`s. Same math as the realtime arrays (§5.8, §5.9) but applied once per interval — the dark-frame stencil (§5.7.6) interpolates already-enriched values, not raw means.
 
 For one corrected frame `f`:
 
@@ -361,13 +362,13 @@ When `c_min == c_max` (degenerate calibration), the fallback is identity scaling
 | `ADC_GAIN` | `(1024 − pedestal_height) / 11_000`. ≈ 0.0873 DN/e⁻ at pedestal 64 (FW ≤ 1.5.2); ≈ 0.0815 at pedestal 128 (current). | `omotion/pipeline/pedestal.py` (`adc_gain_for_pedestal`) |
 | `CAMERA_GAIN_MAP` | `[16, 4, 2, 1, 1, 2, 4, 16]` indexed by `cam_id % 8` | `omotion/config.py` |
 
-`ADC_GAIN` is **per-side**, derived from each sensor's pedestal at stage construction. Both `DarkCorrectionStage` (enrichment) and `ShotNoiseCorrectionStage` take a `SensorPedestals` and compute `[adc_gain_for_pedestal(left), adc_gain_for_pedestal(right)]` once, indexing by `side_idx ∈ {0, 1}` per frame. Mixed-firmware sensor modules (left and right with different pedestals) get the right gain on each side.
+`ADC_GAIN` is **per-side**, derived from each sensor's pedestal at stage construction. `ShotNoiseCorrectionStage` takes a `SensorPedestals` and computes `[adc_gain_for_pedestal(left), adc_gain_for_pedestal(right)]` once, indexing by `side_idx ∈ {0, 1}` per frame — for both the realtime arrays and the in-flight intervals. Mixed-firmware sensor modules (left and right with different pedestals) get the right gain on each side.
 
 Outer cameras (positions 0 and 7) use higher analog gain to compensate for reduced illumination at the array periphery; central cameras (3 and 4) run at unity gain.
 
 #### 5.7.6 DarkFrameQuadraticStencil — the dark frame's own corrected value
 
-The leading dark frame `D_prev` of the interval is included in the emitted interval. Its corrected value is not computed by baseline subtraction (its histogram *is* the baseline). Instead each metric (`mean`, `std`, `contrast`, `bfi`, `bvi`) is filled in with a 4-point quadratic stencil:
+The leading dark frame `D_prev` of the interval is included in the emitted interval. Its corrected value is not computed by baseline subtraction (its histogram *is* the baseline). Instead, **`DarkFrameHoldStage`** (which runs after `BfiBviStage`, so the interval is already enriched) fills in each metric (`mean`, `std`, `contrast`, `bfi`, `bvi`) with a 4-point quadratic stencil and prepends the resulting row:
 
 ```
 v(D_prev) = (−1/6)·v(D_prev − 2)
@@ -393,7 +394,7 @@ After producing the stencil value, the stage updates `_prev_interval_tail` with 
 
 #### 5.7.7 Interval emission
 
-The stage emits `IntervalClosed(corrected_batch=EnrichedCorrectedInterval(...))` with frames in chronological order: `[D_prev_stencilled, L_1, L_2, …, L_k]`. The closing dark `D_next` is **not** in this interval — it becomes `D_prev` of the next interval and gets its stencil value then.
+By dispatch time the `IntervalClosed` carries an `EnrichedCorrectedInterval` with frames in chronological order: `[D_prev_stencilled, L_1, L_2, …, L_k]`. The closing dark `D_next` is **not** in this interval — it becomes `D_prev` of the next interval and gets its stencil value then. (The scan's terminal dark therefore never receives a corrected row — the one by-design gap besides warmup.)
 
 #### 5.7.8 Terminal-dark flush — `on_scan_stop(batch)`
 
@@ -446,16 +447,16 @@ Fallback (degenerate calibration where the span is zero): identity scaling `bfi 
 
 The calibration object passed to `default_pipeline()` must expose `c_min`, `c_max`, `i_min`, `i_max` as `(2, 8)` ndarrays. `omotion.Calibration.Calibration` provides this; in practice it is loaded from the console EEPROM at scan start, or computed by `CalibrationWorkflow` (§11.1).
 
-### 5.10 Reduced-mode side averages (`LiveSideAverageStage`, `CorrectedSideAverageStage`)
+### 5.10 Reduced-mode side averages (`SideAverageStage`)
 
-**Files:** `omotion/pipeline/stages/side_avg.py`, `omotion/pipeline/stages/corrected_side_avg.py`. Both active only when `metadata.reduced_mode` is True; pass-throughs otherwise.
+**File:** `omotion/pipeline/stages/side_avg.py`. Active only when `metadata.reduced_mode` is True; a pass-through otherwise.
 
-The reduced-mode per-side average is a **purely spatial** mean across the enabled cameras at one capture instant (the shared `spatial_side_average` helper) — never a temporal/rolling average. The live USB path delivers one camera per frame row, so each stage gathers a capture's cameras (sharing a `frame_id`) and emits **one value per capture per side** as a `LiveEmit` carrying a `SideAverageSample(t, frame_id, side, bfi, bvi, mean?, contrast?)`:
+The reduced-mode per-side average is a **purely spatial** mean across the enabled cameras at one capture instant (the shared `spatial_side_average` helper) — never a temporal/rolling average. The live USB path delivers one camera per frame row, so the stage gathers a capture's cameras (sharing a `frame_id`) and emits **one value per capture per side**. One stage implements both paths:
 
-- **`LiveSideAverageStage`** — averages the realtime `bfi_live`/`bvi_live` → `LiveEmit(channel="live_side")`. Drives the live reduced-mode display (immediate, best-effort). After `DarkFrameHoldStage`, so dark intervals hold steady.
-- **`CorrectedSideAverageStage`** — gathers the per-`(side,cam)` `EnrichedCorrectedInterval` events (`IntervalClosed`), averages the dark-corrected BFI/BVI → `LiveEmit(channel="final_side")`. This is the accurate record `ScanDBSink` persists at `cam_id=-1` and replay reads.
+- **Realtime path** — averages the realtime `bfi_live`/`bvi_live` → `LiveEmit(channel="live_side", SideAverageSample(t, frame_id, side, bfi, bvi))`. Drives the live reduced-mode display (immediate, best-effort). After `DarkFrameHoldStage`, so dark intervals hold steady.
+- **Corrected path** — gathers the per-`(side,cam)` `EnrichedCorrectedInterval` events (`IntervalClosed`), averages the dark-corrected BFI/BVI/mean/contrast per capture, and emits one synthetic `IntervalClosed` per side whose `EnrichedCorrectedFrame`s carry **`cam_id=-1`** — the side-average convention. These ride the ordinary `"final"` channel: `ScanDBSink` persists them as the reduced-mode record (skipping per-camera frames in reduced mode), and `CsvSink` reads them for the reduced corrected CSV.
 
-Both finalize a capture/window when the next begins and flush the last at `on_scan_stop`. The live (`live_side`) and corrected (`final_side`) averages differ by design — realtime display vs corrected record. Enabled cameras come from `metadata.left_camera_mask` / `right_camera_mask`.
+Both paths finalize a capture/window when the next begins and flush the last at `on_scan_stop`. The live and corrected averages differ by design — realtime display vs corrected record. Enabled cameras come from `metadata.left_camera_mask` / `right_camera_mask`.
 
 ### 5.11 Tee("live")
 
@@ -469,9 +470,10 @@ Sinks subscribe to channels by declaring a `channels: set[str]` attribute. The r
 
 | Channel | Payload | Cadence | Source | Typical consumers |
 |---|---|---|---|---|
-| `"raw"` | `FrameBatch` (full, including warmup) | Per batch (~10–100 frames) | `Tee("raw")` | `CsvSink` (raw per-cam CSV), `ScanDBSink` (`session_raw` blobs) |
+| `"raw"` | `FrameBatch` (full, including warmup) | Per batch (~10–100 frames) | `Tee("raw")` | `CsvSink` (raw per-cam CSV — **the only raw record**; the scan DB does not store raw histograms) |
 | `"live"` | `FrameBatch` (excluding warmup/stale) | Per batch | `Tee("live")` | bloodflow-app `_LivePlotSink` (realtime per-frame plot — later overwritten by `"final"` corrections, see §8.3), `ContactQualityWorkflow._ContactQualitySink` (DN thresholding), `CalibrationWorkflow._CalibrationCollectorSink` (dark frames) |
-| `"final"` | `EnrichedCorrectedInterval` | Per closed dark interval (~1 per `dark_interval/40` seconds; default ~15 s) | `IntervalClosed` from `DarkCorrectionStage` | `CsvSink` (corrected CSV), `ScanDBSink` (`session_data`), bloodflow-app `_FinalBatchSink` (overwrites the realtime points plotted from `"live"` with interval-corrected BFI/BVI/mean/contrast), `CalibrationWorkflow` (corrected light samples) |
+| `"live_side"` | `SideAverageSample` | Per capture per side (reduced mode only) | `SideAverageStage` (realtime path) | bloodflow-app `_LivePlotSink` (reduced-mode live trace) |
+| `"final"` | `EnrichedCorrectedInterval` | Per closed dark interval (~1 per `dark_interval/40` seconds; default ~15 s) | `IntervalClosed` from `DarkCorrectionStage` (per-camera; enriched + stencilled by downstream stages) and `SideAverageStage` (reduced-mode `cam_id=-1` side averages) | `CsvSink` (corrected CSV), `ScanDBSink` (`session_data` — the DB's only science record), bloodflow-app `_FinalBatchSink` (overwrites the realtime points plotted from `"live"` with interval-corrected BFI/BVI/mean/contrast), `CalibrationWorkflow` (corrected light samples) |
 | `"telemetry"` | `TelemetryEvent` | ~10 Hz (independent of frame cadence) | `ConsoleTelemetrySource` (separate runner thread) | `TelemetrySink` (CSV) plus the pipeline's `TelemetryAggregator` |
 | `"diagnostics"` | `DarkIntegrityWarning`, `StencilFallback`, future events | As they occur | Stages append to `batch.events` | Any sink subscribing to `"diagnostics"` |
 
@@ -514,13 +516,7 @@ Replays a raw-histogram CSV produced by `CsvSink` (one CSV per side, optionally 
 
 The metadata to attach is the caller's responsibility — replay sources don't know the original scan's `scan_id` / `subject_id` / camera masks.
 
-### 7.3 DbReplaySource
-
-**Used by:** scan-DB session playback (`SessionPlayback`, future analytics tooling).
-
-Reads `session_raw` rows from a `ScanDatabase` SQLite file in order, decodes the 4096-byte histogram blob (1024 × uint32 LE) per row, and yields `FrameBatch`es. Schema match is tied to `omotion/ScanDatabase.py`; see [`ScanDatabase.md`](ScanDatabase.md).
-
-### 7.4 ConsoleTelemetrySource
+### 7.3 ConsoleTelemetrySource
 
 **Used by:** every live scan (auto-wired when a sink subscribes to `"telemetry"`).
 
@@ -533,7 +529,7 @@ Runs on a dedicated thread inside `ScanRunner._telemetry_loop`. Events flow to t
 
 The aggregator and the telemetry sinks are independent; clearing one does not clear the other.
 
-### 7.5 ScanMetadata
+### 7.4 ScanMetadata
 
 `ScanMetadata` (in `omotion/pipeline/sinks.py`) is the immutable per-scan handle every sink receives at `on_scan_start`:
 
@@ -582,12 +578,14 @@ On `on_complete`, any partial accumulator rows are flushed verbatim (with blanks
 
 ### 8.2 ScanDBSink
 
-**Channels:** `{"raw", "final"}`.
+**Channels:** `{"final"}`.
 
-SQLite endpoint. On `on_scan_start`, opens a `ScanDatabase` and creates a session row labelled `{scan_id}_{subject_id}` with the scan metadata.
+SQLite endpoint — **the corrected (final-branch) record only**. On `on_scan_start`, opens a `ScanDatabase` and creates a session row labelled `{scan_id}_{subject_id}`, stamping `session_meta` with `scan_id`, `subject_id`, `operator`, `started_at_iso`, `duration_sec`, `data_semantics: "final"`, and `sdk_flags` (`reduced_mode`, camera masks). Sessions without `data_semantics` were written by older SDKs and hold realtime (live-branch) values in `session_data`.
 
-- **Raw** — per-frame rows accumulated in a 200-row buffer (`raw_batch_size`) and flushed via `ScanDatabase.insert_raw_frames`. Each row includes the packed 4096-byte histogram blob (`<1024I` little-endian), `temp`, `sum_counts`, `tcm`, `tcl`, `pdc`.
-- **Final** — per-`EnrichedCorrectedInterval`, one `session_data` row per `CorrectedFrame` carrying `mean`, `contrast`, `bfi`, `bvi`. (PR 3 will carry per-camera identifiers through the interval; today's writer uses sentinel `cam_id = −1, side = 0` so rows are queryable.)
+- **Normal mode** — one `session_data` row per per-camera `EnrichedCorrectedFrame` (`cam_id` 0..7, `side` 0/1, `frame_id` = absolute frame id) carrying `bfi`, `bvi`, `mean`, `contrast`, `quality`. The stencilled leading dark frame of each interval is included, so the record is gapless at 40 Hz (except warmup frames 1..`discard_count` and the scan's terminal dark frame).
+- **Reduced mode** — only the `cam_id=-1` side-average frames emitted by `SideAverageStage` are persisted; per-camera frames are skipped.
+
+The DB stores **no raw histograms and no realtime values**: raw lives only in the raw CSVs (`Tee("raw")` → `CsvSink`), and live values exist only on the `"live"`/`"live_side"` channels for the GUI. Consequence: corrected rows trail the scan by up to one dark interval (~15 s) and an unclean shutdown loses that tail — an accepted trade-off.
 
 See [`ScanDatabase.md`](ScanDatabase.md) for the full schema. The CSV-vs-DB
 output model (DB-if-present-else-CSV; CSV forced on when no DB) is described in

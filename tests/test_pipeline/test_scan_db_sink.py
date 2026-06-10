@@ -1,15 +1,24 @@
-"""ScanDBSink (pipeline) — channel-based, same raw-gating contract as CsvSink."""
+"""ScanDBSink (pipeline) — final-channel-only SQLite sink.
 
+The DB persists the corrected (final-branch) record exclusively:
+per-camera EnrichedCorrectedFrames in normal mode, cam_id=-1 side
+averages in reduced mode. Live/realtime values and raw histograms are
+never written (raw lives in the CSVs from Tee("raw")).
+"""
+
+import json
 import logging
+import sqlite3
 
-import numpy as np
 import pytest
-from omotion.pipeline.batch import FrameBatch, SideAverageSample
 from omotion.pipeline.sinks import ScanDBSink, ScanMetadata
+from omotion.pipeline.stages.dark import (
+    EnrichedCorrectedFrame,
+    EnrichedCorrectedInterval,
+)
 
 
 def _meta_simple():
-    """Simple ScanMetadata for testing — no raw CSV gate fields."""
     return ScanMetadata(
         scan_id="abc", subject_id="subj", operator="op",
         started_at_iso="2026-05-22T00:00:00Z", duration_sec=300,
@@ -25,19 +34,18 @@ def _meta_reduced():
     )
 
 
-def _dummy_raw_batch():
-    n = 1
-    raw = np.zeros((n, 2, 8, 1024), dtype=np.uint32)
-    raw[0, 0, 0, 5] = 42
-    return FrameBatch(
-        cam_ids=np.array([0], dtype=np.int8),
-        frame_ids=np.array([10], dtype=np.uint8),
-        raw_histograms=raw,
-        temperature_c=np.zeros((n, 2, 8), dtype=np.float32),
-        timestamp_s=np.array([0.25], dtype=np.float64),
-        pdc=None, tcm=None, tcl=None,
-        abs_frame_ids=np.array([10], dtype=np.int64),
-        frame_type=np.array(["light"], dtype="<U8"),
+def _frame(abs_id, *, side="left", cam_id=0, t=None, mean=100.0, std=2.0,
+           contrast=0.02, bfi=4.0, bvi=6.0, quality="ok"):
+    return EnrichedCorrectedFrame(
+        abs_frame_id=abs_id, t=(t if t is not None else abs_id * 0.025),
+        side=side, cam_id=cam_id, mean=mean, std=std,
+        contrast=contrast, bfi=bfi, bvi=bvi, quality=quality,
+    )
+
+
+def _interval(frames, left_abs=10, right_abs=610):
+    return EnrichedCorrectedInterval(
+        left_abs=left_abs, right_abs=right_abs, frames=frames,
     )
 
 
@@ -51,43 +59,116 @@ def test_scan_db_sink_creates_session_at_scan_start(tmp_path):
 
 def test_scan_db_sink_channels_attribute():
     sink = ScanDBSink(db_path=":memory:")
-    assert "raw" in sink.channels
-    assert "live" in sink.channels
-    assert "final_side" in sink.channels
-    # The per-cam corrected interval ("final") is no longer persisted by the
-    # DB sink — the corrected side average comes via "final_side".
-    assert "final" not in sink.channels
+    # Final-branch record only. Live values reach the GUI via channels;
+    # raw histograms live in the CSVs written from Tee("raw").
+    assert sink.channels == {"final"}
 
 
-def test_scan_db_sink_reduced_mode_live_writes_no_per_cam_rows(tmp_path):
-    """Reduced mode persists only the corrected side average (cam_id=-1) — the
-    per-camera realtime 'live' rows are not written."""
-    import sqlite3
+def test_scan_db_sink_stamps_session_meta(tmp_path):
+    """session_meta carries sdk_flags (reduced_mode, masks) — required by
+    SessionPlayback — plus a data_semantics marker distinguishing
+    final-branch sessions from legacy live-valued ones."""
     db_path = str(tmp_path / "scan.db")
     sink = ScanDBSink(db_path=db_path)
     sink.on_scan_start(_meta_reduced())
-    batch = _dummy_live_batch(
-        frame_types=["light", "light"], side_ids=[0, 0], cam_ids=[0, 1],
-        bfi=[0.4, 0.5], bvi=[5.0, 5.1],
-    )
-    sink.consume("live", batch)
     sink.on_complete()
 
     conn = sqlite3.connect(db_path)
-    n = conn.execute("SELECT COUNT(*) FROM session_data").fetchone()[0]
+    meta_json = conn.execute("SELECT session_meta FROM sessions").fetchone()[0]
     conn.close()
-    assert n == 0
+    meta = json.loads(meta_json)
+    assert meta["data_semantics"] == "final"
+    assert meta["sdk_flags"]["reduced_mode"] is True
+    assert meta["sdk_flags"]["left_camera_mask"] == 0x03
+    assert meta["sdk_flags"]["right_camera_mask"] == 0x03
+    assert meta["scan_id"] == "r"
+    assert meta["subject_id"] == "subj"
 
 
-def test_scan_db_sink_final_side_writes_cam_id_minus_1(tmp_path):
-    """The corrected side average lands as a cam_id=-1 row carrying real
-    bfi/bvi/mean/contrast (superseding the old NULL-bfi placeholder)."""
-    import sqlite3
+def test_scan_db_sink_final_writes_per_cam_rows(tmp_path):
+    """Normal mode: one session_data row per per-camera corrected frame,
+    with real cam_id and side."""
+    db_path = str(tmp_path / "scan.db")
+    sink = ScanDBSink(db_path=db_path)
+    sink.on_scan_start(_meta_simple())
+    sink.consume("final", _interval([
+        _frame(10, side="left", cam_id=0, bfi=0.42, bvi=5.1),
+        _frame(11, side="right", cam_id=2, bfi=0.31, bvi=4.9),
+        _frame(12, side="left", cam_id=7, bfi=0.50, bvi=5.3),
+    ]))
+    sink.on_complete()
+
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute(
+        "SELECT side, cam_id, frame_id, bfi, bvi, mean, contrast "
+        "FROM session_data ORDER BY frame_id"
+    ).fetchall()
+    conn.close()
+    assert len(rows) == 3
+    assert rows[0] == (0, 0, 10, pytest.approx(0.42), pytest.approx(5.1),
+                       pytest.approx(100.0), pytest.approx(0.02))
+    assert rows[1] == (1, 2, 11, pytest.approx(0.31), pytest.approx(4.9),
+                       pytest.approx(100.0), pytest.approx(0.02))
+    assert rows[2] == (0, 7, 12, pytest.approx(0.50), pytest.approx(5.3),
+                       pytest.approx(100.0), pytest.approx(0.02))
+
+
+def test_scan_db_sink_final_includes_stencilled_dark_row(tmp_path):
+    """The interval's leading dark frame (stencil-interpolated by
+    DarkFrameHoldStage) is persisted like any other frame — the DB record
+    is gapless at 40 Hz."""
+    db_path = str(tmp_path / "scan.db")
+    sink = ScanDBSink(db_path=db_path)
+    sink.on_scan_start(_meta_simple())
+    sink.consume("final", _interval([
+        _frame(10, cam_id=0, bfi=0.40),   # D_prev, stencilled
+        _frame(11, cam_id=0, bfi=0.42),
+        _frame(12, cam_id=0, bfi=0.44),
+    ]))
+    sink.on_complete()
+
+    conn = sqlite3.connect(db_path)
+    fids = [r[0] for r in conn.execute(
+        "SELECT frame_id FROM session_data ORDER BY frame_id").fetchall()]
+    conn.close()
+    assert fids == [10, 11, 12]
+
+
+def test_scan_db_sink_normal_mode_skips_side_average_rows(tmp_path):
+    """cam_id=-1 side-average frames are a reduced-mode concept; in normal
+    mode (where SideAverageStage is disabled anyway) they are skipped
+    defensively."""
+    db_path = str(tmp_path / "scan.db")
+    sink = ScanDBSink(db_path=db_path)
+    sink.on_scan_start(_meta_simple())
+    sink.consume("final", _interval([
+        _frame(10, cam_id=-1, bfi=0.40),
+        _frame(10, cam_id=0, bfi=0.42),
+    ]))
+    sink.on_complete()
+
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute("SELECT cam_id FROM session_data").fetchall()
+    conn.close()
+    assert rows == [(0,)]
+
+
+def test_scan_db_sink_reduced_mode_persists_only_side_averages(tmp_path):
+    """Reduced mode: per-camera frames are skipped; only the cam_id=-1
+    side-average frames emitted by SideAverageStage land in session_data."""
     db_path = str(tmp_path / "scan.db")
     sink = ScanDBSink(db_path=db_path)
     sink.on_scan_start(_meta_reduced())
-    sink.consume("final_side", SideAverageSample(
-        t=1.5, frame_id=42, side=1, bfi=3.5, bvi=7.5, mean=120.0, contrast=0.25))
+    # Per-camera interval — must NOT be persisted in reduced mode.
+    sink.consume("final", _interval([
+        _frame(10, cam_id=0, bfi=0.42),
+        _frame(11, cam_id=1, bfi=0.44),
+    ]))
+    # Side-average interval from SideAverageStage (cam_id=-1).
+    sink.consume("final", _interval([
+        _frame(42, side="right", cam_id=-1, bfi=3.5, bvi=7.5,
+               mean=120.0, contrast=0.25, t=1.5),
+    ]))
     sink.on_complete()
 
     conn = sqlite3.connect(db_path)
@@ -99,149 +180,88 @@ def test_scan_db_sink_final_side_writes_cam_id_minus_1(tmp_path):
                      pytest.approx(120.0), pytest.approx(0.25))]
 
 
-def _dummy_live_batch(*, frame_types=None, side_ids=None, cam_ids=None,
-                     bfi=None, bvi=None):
-    """A post-BfiBvi batch: bfi_live/bvi_live/mean_dc_rt/contrast_sn_rt
-    set per-cam, side_ids+cam_ids pointing to the source camera for
-    each frame. n_frames inferred from the longest input."""
-    n = max(len(x) for x in (frame_types or ["light"],
-                              side_ids if side_ids is not None else [0],
-                              cam_ids if cam_ids is not None else [0]))
-    bfi_arr = np.zeros((n, 2, 8), dtype=np.float32)
-    bvi_arr = np.zeros((n, 2, 8), dtype=np.float32)
-    mean_arr = np.full((n, 2, 8), 100.0, dtype=np.float32)
-    contrast_arr = np.full((n, 2, 8), 0.3, dtype=np.float32)
-    if bfi is not None:
-        for i, val in enumerate(bfi):
-            bfi_arr[i, int(side_ids[i]), int(cam_ids[i])] = val
-    if bvi is not None:
-        for i, val in enumerate(bvi):
-            bvi_arr[i, int(side_ids[i]), int(cam_ids[i])] = val
-    return FrameBatch(
-        cam_ids=np.array(cam_ids if cam_ids is not None else [0] * n, dtype=np.int8),
-        frame_ids=np.array([10 + i for i in range(n)], dtype=np.uint8),
-        raw_histograms=None,
-        temperature_c=np.full((n, 2, 8), 35.0, dtype=np.float32),
-        timestamp_s=np.array([0.025 * (10 + i) for i in range(n)], dtype=np.float64),
-        pdc=None, tcm=None, tcl=None,
-        abs_frame_ids=np.array([100 + i for i in range(n)], dtype=np.int64),
-        frame_type=np.array(frame_types or ["light"] * n, dtype="<U8"),
-        side_ids=np.array(side_ids if side_ids is not None else [0] * n, dtype=np.int8),
-        bfi_live=bfi_arr, bvi_live=bvi_arr,
-        mean_dc_rt=mean_arr, contrast_sn_rt=contrast_arr,
-    )
-
-
-def test_scan_db_sink_live_writes_per_cam_rows(tmp_path):
-    """Phase 1: the 'live' channel writes per-frame per-cam rows with
-    BFI/BVI/mean/contrast — the foundation for past-scan replay from
-    the DB. One row per frame, side+cam from side_ids/cam_ids."""
-    import sqlite3
+def test_scan_db_sink_nan_values_stored_as_null(tmp_path):
+    """NaN metrics (e.g. the side average's undefined fields, degenerate
+    calibration) are stored as NULL, not as NaN floats; rows with no finite
+    metric at all are skipped."""
     db_path = str(tmp_path / "scan.db")
     sink = ScanDBSink(db_path=db_path)
     sink.on_scan_start(_meta_simple())
-    batch = _dummy_live_batch(
-        frame_types=["light", "light", "light"],
-        side_ids=[0, 1, 0],
-        cam_ids=[0, 2, 7],
-        bfi=[0.42, 0.31, 0.50],
-        bvi=[5.1, 4.9, 5.3],
-    )
-    sink.consume("live", batch)
+    nan = float("nan")
+    sink.consume("final", _interval([
+        _frame(10, cam_id=0, bfi=0.42, bvi=nan, mean=nan, contrast=nan),
+        _frame(11, cam_id=0, bfi=nan, bvi=nan, mean=nan, contrast=nan),
+    ]))
     sink.on_complete()
 
     conn = sqlite3.connect(db_path)
     rows = conn.execute(
-        "SELECT side, cam_id, bfi, bvi FROM session_data ORDER BY frame_id"
+        "SELECT frame_id, bfi, bvi, mean, contrast FROM session_data"
     ).fetchall()
     conn.close()
-    assert len(rows) == 3
-    assert rows[0] == (0, 0, pytest.approx(0.42), pytest.approx(5.1))
-    assert rows[1] == (1, 2, pytest.approx(0.31), pytest.approx(4.9))
-    assert rows[2] == (0, 7, pytest.approx(0.50), pytest.approx(5.3))
+    assert rows == [(10, pytest.approx(0.42), None, None, None)]
 
 
-def test_scan_db_sink_live_skips_dark_and_warmup_frames(tmp_path):
-    """Dark frames have no useful display BFI/BVI; warmup/stale frames
-    are already filtered by the pipeline's Tee but the sink double-
-    checks. Only light frames should land in session_data."""
-    import sqlite3
+def test_scan_db_sink_flushes_buffer_below_batch_size_on_complete(tmp_path):
+    """Rows buffered below batch_size still land via the on_complete flush."""
     db_path = str(tmp_path / "scan.db")
-    sink = ScanDBSink(db_path=db_path)
+    sink = ScanDBSink(db_path=db_path, batch_size=1000)
     sink.on_scan_start(_meta_simple())
-    batch = _dummy_live_batch(
-        frame_types=["warmup", "dark", "light", "stale"],
-        side_ids=[0, 0, 0, 0],
-        cam_ids=[0, 0, 0, 0],
-        bfi=[0.10, 0.20, 0.30, 0.40],
-        bvi=[1.0, 2.0, 3.0, 4.0],
-    )
-    sink.consume("live", batch)
+    sink.consume("final", _interval([_frame(10, cam_id=0)]))
     sink.on_complete()
 
     conn = sqlite3.connect(db_path)
-    rows = conn.execute("SELECT bfi FROM session_data").fetchall()
+    n = conn.execute("SELECT COUNT(*) FROM session_data").fetchone()[0]
     conn.close()
-    assert rows == [(pytest.approx(0.30),)]
+    assert n == 1
 
 
-def test_scan_db_sink_live_skips_nan_bfi_or_bvi(tmp_path):
-    """Early frames before the first dark observation can emit NaN for
-    BFI or BVI — skip them so the DB doesn't carry display noise."""
-    import sqlite3
+def test_scan_db_sink_quality_persisted(tmp_path):
     db_path = str(tmp_path / "scan.db")
     sink = ScanDBSink(db_path=db_path)
     sink.on_scan_start(_meta_simple())
-    batch = _dummy_live_batch(
-        frame_types=["light", "light"],
-        side_ids=[0, 0],
-        cam_ids=[0, 0],
-        bfi=[float("nan"), 0.45],
-        bvi=[5.0, 5.5],
-    )
-    sink.consume("live", batch)
+    sink.consume("final", _interval([
+        _frame(10, cam_id=0, quality="ts_corrected"),
+    ]))
     sink.on_complete()
 
     conn = sqlite3.connect(db_path)
-    rows = conn.execute("SELECT bfi FROM session_data").fetchall()
+    rows = conn.execute("SELECT quality FROM session_data").fetchall()
     conn.close()
-    assert rows == [(pytest.approx(0.45),)]
+    assert rows == [("ts_corrected",)]
 
 
-def test_scan_db_sink_raw_always_writes_when_consume_called(tmp_path):
-    """Sink always writes raw when consume('raw', ...) is called.
-    Duration/enable gating happens upstream at the Tee layer, not in the sink."""
-    import sqlite3
+def test_scan_db_sink_ignores_other_channels(tmp_path):
+    """Payloads on channels the sink doesn't subscribe to are ignored even
+    if delivered directly (the runner wouldn't, but be defensive)."""
     db_path = str(tmp_path / "scan.db")
     sink = ScanDBSink(db_path=db_path)
     sink.on_scan_start(_meta_simple())
-    sink.consume("raw", _dummy_raw_batch())
+    sink.consume("live", object())
+    sink.consume("raw", object())
+    sink.consume("final_side", object())
     sink.on_complete()
 
     conn = sqlite3.connect(db_path)
-    count = conn.execute("SELECT COUNT(*) FROM session_raw").fetchone()[0]
+    n = conn.execute("SELECT COUNT(*) FROM session_data").fetchone()[0]
     conn.close()
-    assert count >= 1
+    assert n == 0
 
 
-def test_scan_db_sink_skips_stale_raw_rows_and_logs(tmp_path, caplog):
-    import sqlite3
-
+def test_scan_db_sink_no_session_raw_table_in_new_dbs(tmp_path):
+    """New databases are created without the session_raw table — raw
+    histograms are persisted only via the raw CSVs (Tee("raw") → CsvSink)."""
     db_path = str(tmp_path / "scan.db")
     sink = ScanDBSink(db_path=db_path)
     sink.on_scan_start(_meta_simple())
-
-    batch = _dummy_raw_batch()
-    batch.frame_type = np.array(["stale"], dtype="<U8")
-    with caplog.at_level(logging.WARNING, logger="omotion.pipeline.sinks"):
-        sink.consume("raw", batch)
     sink.on_complete()
 
     conn = sqlite3.connect(db_path)
-    count = conn.execute("SELECT COUNT(*) FROM session_raw").fetchone()[0]
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
     conn.close()
-    assert count == 0
-    assert "stale raw frame skipped" in caplog.text
+    assert "session_raw" not in tables
+    assert {"sessions", "session_data"} <= tables
 
 
 def test_session_data_has_quality_column(tmp_path):
@@ -253,30 +273,3 @@ def test_session_data_has_quality_column(tmp_path):
     columns = {row[1] for row in cursor.fetchall()}
     assert "quality" in columns
     db.close()
-
-
-def test_scan_db_sink_uses_source_side_ids_for_raw_rows(tmp_path):
-    import sqlite3
-
-    db_path = str(tmp_path / "scan.db")
-    sink = ScanDBSink(db_path=db_path)
-    meta = ScanMetadata(
-        scan_id="side_test", subject_id="subj", operator="op",
-        started_at_iso="2026-05-22T00:00:00Z", duration_sec=300,
-        left_camera_mask=0x01,
-        right_camera_mask=0x01,
-        reduced_mode=False,
-    )
-    sink.on_scan_start(meta)
-
-    batch = _dummy_raw_batch()
-    batch.side_ids = np.array([1], dtype=np.int8)
-    batch.raw_histograms[0, 0, 0, :] = 0
-    batch.raw_histograms[0, 1, 0, 5] = 42
-    sink.consume("raw", batch)
-    sink.on_complete()
-
-    conn = sqlite3.connect(db_path)
-    rows = conn.execute("SELECT side, sum FROM session_raw").fetchall()
-    conn.close()
-    assert rows == [("right", 42)]

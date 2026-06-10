@@ -336,7 +336,7 @@ with a custom sink.
 ```python
 from omotion.pipeline import (
     default_pipeline, ScanRunner, ScanMetadata, SensorPedestals,
-    CsvReplaySource, DbReplaySource, CsvSink, ScanDBSink, CriticalSinkError,
+    CsvReplaySource, CsvSink, ScanDBSink, CriticalSinkError,
 )
 ```
 
@@ -371,18 +371,19 @@ class MySink:
 | `"raw"` | `FrameBatch` (raw histograms) | per batch |
 | `"live"` | `FrameBatch` after BFI/BVI (realtime) | per batch |
 | `"live_side"` | `SideAverageSample` (realtime per-side avg) | per capture, reduced mode |
-| `"final_side"` | `SideAverageSample` (dark-corrected per-side avg) | per capture, reduced mode |
+| `"final"` | `EnrichedCorrectedInterval` (dark-corrected frames; in reduced mode also the cam_id=-1 side-average intervals) | per closed dark interval (~15 s) |
 | `"diagnostics"` | `BatchEvent` (e.g. `DarkIntegrityWarning`, trigger transitions) | as they occur |
 
-`SideAverageSample` carries `t, frame_id, side, bfi, bvi, mean?, contrast?`. A
+`SideAverageSample` carries `t, frame_id, side, bfi, bvi`. A
 sink whose `on_scan_start` raises is disabled for the scan unless it sets
 `critical = True`, in which case `ScanRunner` raises `CriticalSinkError` and the
 scan aborts (this is how `ScanDBSink` guarantees no silent data loss). Pass
 custom sinks via `ScanRequest.sinks` (+ `skip_default_storage=True` to suppress
 the auto-injected CSV/DB sinks).
 
-Sources: `LiveUsbSource` (hardware), `CsvReplaySource` (raw CSV), `DbReplaySource`
-(scan DB). See [SciencePipeline.md](./SciencePipeline.md) for the stage chain.
+Sources: `LiveUsbSource` (hardware), `CsvReplaySource` (raw CSV — the only
+raw record; the scan DB stores corrected data only). See
+[SciencePipeline.md](./SciencePipeline.md) for the stage chain.
 
 ---
 

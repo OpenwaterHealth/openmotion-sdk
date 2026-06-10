@@ -10,7 +10,7 @@ def test_public_api_symbols_importable() -> None:
         FrameBatch, BatchEvent, IntervalClosed, LiveEmit,
         DarkIntegrityWarning, StencilFallback, TerminalDarkResult,
         ScanRunner, CriticalSinkError,
-        Source, LiveUsbSource, CsvReplaySource, DbReplaySource,
+        Source, LiveUsbSource, CsvReplaySource,
         Sink, ScanMetadata,
         CsvSink, ScanDBSink,
         Tee, default_pipeline,
@@ -19,7 +19,7 @@ def test_public_api_symbols_importable() -> None:
     for sym in (
         Pipeline, Stage, FrameBatch, BatchEvent, IntervalClosed, LiveEmit,
         DarkIntegrityWarning, StencilFallback, TerminalDarkResult, ScanRunner, CriticalSinkError,
-        Source, LiveUsbSource, CsvReplaySource, DbReplaySource,
+        Source, LiveUsbSource, CsvReplaySource,
         Sink, ScanMetadata, CsvSink, ScanDBSink,
         Tee, default_pipeline, SensorPedestals,
     ):
@@ -39,7 +39,7 @@ def test_public_api_all_list_complete() -> None:
         "SensorPedestals",
         "Sink", "ScanMetadata",
         "CsvSink", "ScanDBSink",
-        "Source", "LiveUsbSource", "CsvReplaySource", "DbReplaySource",
+        "Source", "LiveUsbSource", "CsvReplaySource",
     }
 
     assert set(pkg.__all__) == expected

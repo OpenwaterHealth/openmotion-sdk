@@ -7,8 +7,10 @@ Combines realtime and corrected side averaging into a single stage:
 
   Corrected path: reads IntervalClosed events from DarkCorrectionStage,
   groups the per-camera corrected frames by frame_id, spatially averages
-  the selected cameras, emits LiveEmit("final_side", SideAverageSample)
-  for DB persistence (cam_id=-1 row).
+  the selected cameras, and emits a synthetic IntervalClosed whose
+  EnrichedCorrectedFrames carry ``cam_id=-1`` — the side-average
+  convention. These ride the ordinary "final" channel; ScanDBSink
+  persists them as the reduced-mode record.
 
 Both paths use spatial_side_average — a purely spatial operation (across
 cameras at one instant, no temporal element). Gated on ``enabled``
@@ -26,9 +28,15 @@ from typing import Optional
 import numpy as np
 
 from ..batch import FrameBatch, IntervalClosed, LiveEmit, SideAverageSample
+from .dark import EnrichedCorrectedFrame, EnrichedCorrectedInterval
 
 
 _SIDE_STR_TO_INT = {"left": 0, "right": 1}
+_SIDE_INT_TO_STR = ("left", "right")
+
+# Higher rank = worse quality; the side average inherits the worst quality
+# of any camera that contributed to it. Mirrors sinks._QUALITY_RANK.
+_QUALITY_RANK = {"ok": 0, "ts_corrected": 1, "nan_filled": 2}
 
 
 def _mask_to_cam_indices(mask: int) -> np.ndarray:
@@ -66,8 +74,9 @@ class SideAverageStage:
     Corrected: DarkCorrectionStage emits one IntervalClosed per (side, cam)
     when that camera's dark-bounded interval closes. This stage gathers
     those per-camera intervals, groups by frame_id, spatially averages the
-    selected cameras, and emits LiveEmit(channel="final_side",
-    SideAverageSample) for DB persistence.
+    selected cameras, and emits one synthetic IntervalClosed per side whose
+    frames are EnrichedCorrectedFrames with cam_id=-1 — routed to "final"
+    sinks like any other interval.
     """
 
     name = "side_average"
@@ -145,7 +154,11 @@ class SideAverageStage:
     # ── Corrected path ───────────────────────────────────────────────────
 
     def _process_corrected(self, batch: FrameBatch) -> None:
-        for event in batch.events:
+        # Snapshot: _emit_corrected appends our own synthetic IntervalClosed
+        # events to batch.events; iterating the live list would re-scan them.
+        # (Their cam_id=-1 frames are skipped by the cam-range guard anyway,
+        # but a snapshot keeps the traversal well-defined.)
+        for event in list(batch.events):
             if not isinstance(event, IntervalClosed):
                 continue
             ci = event.corrected_batch
@@ -176,26 +189,43 @@ class SideAverageStage:
                 "t": float(getattr(f, "t", 0.0)),
                 "bfi": np.full(8, np.nan), "bvi": np.full(8, np.nan),
                 "mean": np.full(8, np.nan), "contrast": np.full(8, np.nan),
+                "quality": "ok",
             }
             self._frames[side][fid] = rec
         rec["bfi"][cam] = float(getattr(f, "bfi", np.nan))
         rec["bvi"][cam] = float(getattr(f, "bvi", np.nan))
         rec["mean"][cam] = float(getattr(f, "mean", np.nan))
         rec["contrast"][cam] = float(getattr(f, "contrast", np.nan))
+        fq = str(getattr(f, "quality", "ok") or "ok")
+        if _QUALITY_RANK.get(fq, 0) > _QUALITY_RANK.get(rec["quality"], 0):
+            rec["quality"] = fq
 
     def _emit_corrected(self, side: int, batch: FrameBatch) -> None:
         cams = self._cams[side]
+        bounds = self._window[side]
+        left_abs, right_abs = (bounds if bounds is not None else (-1, -1))
+        avg_frames: list[EnrichedCorrectedFrame] = []
         for fid in sorted(self._frames[side]):
             rec = self._frames[side][fid]
-            batch.events.append(LiveEmit(
-                channel="final_side",
-                payload=SideAverageSample(
-                    t=rec["t"], frame_id=int(fid), side=side,
-                    bfi=spatial_side_average(rec["bfi"], cams),
-                    bvi=spatial_side_average(rec["bvi"], cams),
-                    mean=spatial_side_average(rec["mean"], cams),
-                    contrast=spatial_side_average(rec["contrast"], cams),
-                ),
+            avg_frames.append(EnrichedCorrectedFrame(
+                abs_frame_id=int(fid),
+                t=rec["t"],
+                side=_SIDE_INT_TO_STR[side],
+                cam_id=-1,
+                mean=spatial_side_average(rec["mean"], cams),
+                std=float("nan"),  # std of a spatial average is undefined here
+                contrast=spatial_side_average(rec["contrast"], cams),
+                bfi=spatial_side_average(rec["bfi"], cams),
+                bvi=spatial_side_average(rec["bvi"], cams),
+                quality=rec["quality"],
+            ))
+        if avg_frames:
+            batch.events.append(IntervalClosed(
+                corrected_batch=EnrichedCorrectedInterval(
+                    left_abs=int(left_abs if left_abs is not None else -1),
+                    right_abs=int(right_abs if right_abs is not None else -1),
+                    frames=avg_frames,
+                )
             ))
         self._window[side] = None
         self._frames[side] = {}

@@ -111,10 +111,10 @@ print("OK")
 Run a 60-second scan.
 
 **Pass criteria**:
-- [ ] **No new CSV files** appeared in `scan_data/` (the existing `scans.db` is the only thing that changed).
+- [ ] **No new corrected CSV** appeared in `scan_data/` — only the raw CSVs (gated by `writeRawData`, capped at 30 s) and `scans.db` changed.
 - [ ] App log shows `Scan DB sink enabled, ...` AND `CSV output disabled`.
-- [ ] `scans.db` has a new `sessions` row; `session_data` row count ≈ `60 × 40 × active_cams × 2 sides`.
-- [ ] `session_raw` row count ≈ `30 × 40 × active_cams × 2 sides` (cap honored).
+- [ ] `scans.db` has a new `sessions` row; `session_data` row count ≈ `60 × 40 × active_cams × 2 sides` (final-branch rows — warmup frames and the terminal dark are absent, and rows trail the live scan by up to one dark interval).
+- [ ] Raw CSV rows cover ≈ the first 30 s (cap honored). No `session_raw` table appears in a fresh DB — raw is CSV-only.
 
 ## Smoke checks for regressions
 

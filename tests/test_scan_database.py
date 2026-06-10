@@ -36,40 +36,20 @@ def test_create_and_get_session(tmp_db: ScanDatabase) -> None:
     assert session["session_meta"] == {"subject_id": "owTEST", "fps": 40}
 
 
-def test_insert_and_read_raw_frame_uncompressed(tmp_path: Path) -> None:
-    db = ScanDatabase(db_path=str(tmp_path / "raw.db"), compress_raw_hist=False)
+def test_no_raw_frame_api_or_table(tmp_path: Path) -> None:
+    """Raw histograms are not stored in the DB (raw CSVs are the only raw
+    record). New databases have no session_raw table and the class exposes
+    no raw-frame API."""
+    db = ScanDatabase(db_path=str(tmp_path / "noraw.db"))
     try:
-        sid = db.create_session(
-            session_label="label",
-            session_start=0.0,
-        )
-        hist = bytes(range(256)) * 16  # 4096-byte blob
-        rid = db.insert_raw_frame(
-            sid, "left", 0, 1, 1.25, hist,
-            temp=27.0, sum_counts=100, tcm=1.0, tcl=2.0, pdc=3.0,
-        )
-        assert rid > 0
-
-        row = db.get_raw_frame(rid)
-        assert row is not None
-        assert row["side"] == "left"
-        assert row["cam_id"] == 0
-        assert row["frame_id"] == 1
-        assert row["hist"] == hist
-        assert row["temp"] == 27.0
-        assert row["sum"] == 100
-    finally:
-        db.close()
-
-
-def test_raw_frame_roundtrip_compressed(tmp_path: Path) -> None:
-    db = ScanDatabase(db_path=str(tmp_path / "zraw.db"), compress_raw_hist=True)
-    try:
-        sid = db.create_session(session_label="z", session_start=0.0)
-        hist = bytes([0, 1, 2, 3]) * 1024
-        rid = db.insert_raw_frame(sid, "right", 2, 5, 0.1, hist)
-        row = db.get_raw_frame(rid)
-        assert row["hist"] == hist  # transparently decompressed on read
+        tables = {
+            r[0] for r in db._connection().execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        assert "session_raw" not in tables
+        assert not hasattr(db, "insert_raw_frame")
+        assert not hasattr(db, "insert_raw_frames")
     finally:
         db.close()
 

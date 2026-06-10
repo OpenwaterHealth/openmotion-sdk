@@ -204,7 +204,7 @@ def test_corrected_csv_reduced_mode_header_has_7_columns(tmp_path):
     """Reduced mode corrected CSV must have 7 columns (6 metric + quality)."""
     sink = CsvSink(output_dir=tmp_path)
     sink.on_scan_start(_meta_reduced())
-    sink.consume("final", _make_enriched_interval())
+    sink.consume("final", _make_enriched_interval(cam_id=-1))
     sink.on_complete()
 
     files = [p for p in tmp_path.glob("*.csv") if not p.name.endswith("_raw.csv")]
@@ -263,10 +263,11 @@ def test_corrected_csv_normal_mode_right_side_cam3(tmp_path):
 
 
 def test_corrected_csv_reduced_mode_populates_left_columns(tmp_path):
-    """Reduced mode: left-side frame populates bfi_left/bvi_left columns."""
+    """Reduced mode: the cam_id=-1 left-side average frame populates the
+    bfi_left/bvi_left columns."""
     sink = CsvSink(output_dir=tmp_path)
     sink.on_scan_start(_meta_reduced())
-    sink.consume("final", _make_enriched_interval(side="left", cam_id=0))
+    sink.consume("final", _make_enriched_interval(side="left", cam_id=-1))
     sink.on_complete()
 
     files = [p for p in tmp_path.glob("*.csv") if not p.name.endswith("_raw.csv")]
@@ -276,6 +277,31 @@ def test_corrected_csv_reduced_mode_populates_left_columns(tmp_path):
     data = rows[1]
     assert float(data[header.index("bfi_left")]) == pytest.approx(7.5)
     assert float(data[header.index("bvi_left")]) == pytest.approx(8.0)
+
+
+def test_corrected_csv_reduced_mode_ignores_per_cam_frames(tmp_path):
+    """Reduced mode records ONLY the cam_id=-1 side averages — per-camera
+    frames must not write into the side columns (the old behavior wrote an
+    arbitrary single camera's value, last-writer-wins)."""
+    sink = CsvSink(output_dir=tmp_path)
+    sink.on_scan_start(_meta_reduced())
+    sink.consume("final", _make_enriched_interval(side="left", cam_id=0))
+    sink.on_complete()
+
+    files = [p for p in tmp_path.glob("*.csv") if not p.name.endswith("_raw.csv")]
+    assert files == []  # no side-average frames → nothing written
+
+
+def test_corrected_csv_normal_mode_ignores_side_average_frames(tmp_path):
+    """Normal mode skips cam_id=-1 frames — without the guard they would
+    alias into the cam-8 columns via cam_id % 8 + 1."""
+    sink = CsvSink(output_dir=tmp_path)
+    sink.on_scan_start(_meta_normal())
+    sink.consume("final", _make_enriched_interval(side="left", cam_id=-1))
+    sink.on_complete()
+
+    files = [p for p in tmp_path.glob("*.csv") if not p.name.endswith("_raw.csv")]
+    assert files == []
 
 
 def test_csv_sink_flushes_row_when_all_expected_cams_contribute_including_nan(tmp_path):
