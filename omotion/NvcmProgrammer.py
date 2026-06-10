@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from omotion.i2c_parser import I2CDriver, isp_entry_point, ERR_MESSAGES
+from omotion.MotionSensor import _ERROR_TYPES
 
 logger = logging.getLogger(__name__)
 
@@ -31,10 +32,28 @@ DEFAULT_DATA_PATH = _NVCM_DIR / "impl1_data.ied"
 _EARLY_FAIL_TX = 200
 
 
-@dataclass
+class NvcmTransportError(RuntimeError):
+    """A MotionSensor factory call reported failure mid-replay.
+
+    Raised by _SensorI2CDriver when i2c_write/i2c_read/i2c_write_read/creset/
+    switch_camera return an error indication. Callers of NvcmProgrammer.burn()
+    never see this — burn() converts it into a failed NvcmResult.
+    """
+
+
+@dataclass(frozen=True)
 class NvcmResult:
+    """Outcome of an NVCM burn.
+
+    On real hardware, polling-loop retries (busy-status reads that mismatch
+    and are retried) make the executed transaction count exceed the simulated
+    total used for progress reporting; progress callbacks are clamped to 100%.
+    """
+
     success: bool
     error: Optional[str]
+    #: Countable transactions executed (stop + read + creset). May exceed the
+    #: simulated total when polling loops retried — see class docstring.
     transactions: int
 
 
@@ -116,10 +135,13 @@ class _SensorI2CDriver(I2CDriver):
         self.count += 1
         if self._progress_cb is None or self._total <= 0:
             return
-        pct = self.count * 100 // self._total
+        # Clamp: polling-loop retries on hardware can push count past the
+        # simulated total. done is monotonic and never exceeds total.
+        done = min(self.count, self._total)
+        pct = done * 100 // self._total
         if pct != self._last_pct:
             self._last_pct = pct
-            self._progress_cb(self.count, self._total)
+            self._progress_cb(done, self._total)
 
     # ------------------------------------------------------------------
 
@@ -132,8 +154,14 @@ class _SensorI2CDriver(I2CDriver):
         self._state = _TxState.AFTER_RESTART
 
     def stop(self) -> None:
+        # Empty-buffer STOPs (e.g. the parser's EnableHardware bus test)
+        # dispatch nothing — counted on both sim and hardware drivers.
         if self._state == _TxState.WRITE_PHASE and self._write_buf:
-            self._sensor.i2c_write(self._addr, bytes(self._write_buf))
+            # MotionSensor.i2c_write returns None on success, False on a
+            # firmware error packet (despite its docstring claiming it raises).
+            if self._sensor.i2c_write(self._addr, bytes(self._write_buf)) is False:
+                raise NvcmTransportError(
+                    f"i2c_write failed at transaction {self.count}")
         self._state = _TxState.IDLE
         self._write_buf = bytearray()
         self._tick()
@@ -165,8 +193,19 @@ class _SensorI2CDriver(I2CDriver):
         if self._state == _TxState.READ_PHASE and self._write_buf:
             result = self._sensor.i2c_write_read(
                 self._addr, bytes(self._write_buf), num_bytes)
+            what = "i2c_write_read"
         else:
             result = self._sensor.i2c_read(self._addr, num_bytes)
+            what = "i2c_read"
+        # MotionSensor returns bytes on success, False on a firmware error
+        # packet (despite its docstring claiming it raises).
+        if result is False or result is None:
+            raise NvcmTransportError(
+                f"{what} failed at transaction {self.count}")
+        if len(result) != num_bytes:
+            raise NvcmTransportError(
+                f"short read: got {len(result)} of {num_bytes} bytes"
+                f" at transaction {self.count}")
         self._write_buf = bytearray()
         self._tick()
         return result
@@ -174,10 +213,19 @@ class _SensorI2CDriver(I2CDriver):
     def select_camera(self, camera: int) -> None:
         if not (1 <= camera <= 8):
             raise ValueError(f"camera must be 1-8, got {camera}")
-        self._sensor.switch_camera(camera - 1)
+        # MotionSensor.switch_camera returns the raw response packet; a NAK
+        # shows up as packetType in _ERROR_TYPES (same check the other
+        # MotionSensor methods use).
+        r = self._sensor.switch_camera(camera - 1)
+        if r is None or r is False or getattr(r, "packetType", None) in _ERROR_TYPES:
+            raise NvcmTransportError(f"switch_camera({camera}) failed")
 
     def creset(self, value: int) -> None:
-        self._sensor.creset(value != 0)
+        # MotionSensor.creset returns the pin state int (0 or 1) on success,
+        # False on a firmware error packet — identity check only, 0 is valid.
+        if self._sensor.creset(value != 0) is False:
+            raise NvcmTransportError(
+                f"creset({value}) failed at transaction {self.count}")
         self._tick()
 
     def wait(self, ms: int) -> None:
@@ -195,7 +243,18 @@ class NvcmProgrammer:
              data_path: Optional[str] = None,
              progress_cb: Optional[Callable[[int, int], None]] = None,
              ) -> NvcmResult:
-        """Burn `camera` (1-8). progress_cb(done, total) fires per percent."""
+        """Burn `camera` (1-8). progress_cb(done, total) fires per percent.
+
+        Always returns an NvcmResult — never raises, except ValueError for an
+        out-of-range camera. Transport failures (sensor NAKs, short reads,
+        unexpected exceptions) come back as a failed NvcmResult.
+
+        progress_cb is invoked synchronously on the calling thread; GUI
+        consumers must marshal updates to their UI thread. `done` is clamped
+        to `total` (hardware polling retries can execute more transactions
+        than the simulated total). There is deliberately no cancellation
+        mid-burn: an OTP write must not be aborted partway.
+        """
         if not (1 <= camera <= 8):
             raise ValueError(f"camera must be 1-8, got {camera}")
         algo = str(algo_path or DEFAULT_ALGO_PATH)
@@ -211,15 +270,22 @@ class NvcmProgrammer:
         total = sim.count
 
         # Power the target camera and route the mux.
-        self._sensor.enable_camera_power(1 << (camera - 1))
+        if not self._sensor.enable_camera_power(1 << (camera - 1)):
+            return NvcmResult(False, "failed to power camera", 0)
         time.sleep(0.5)
 
         driver = _SensorI2CDriver(self._sensor, total=total,
                                   progress_cb=progress_cb)
-        driver.select_camera(camera)
-        logger.info("NVCM burn start: camera %d, %d transactions", camera, total)
+        try:
+            driver.select_camera(camera)
+            logger.info("NVCM burn start: camera %d, %d transactions",
+                        camera, total)
+            ret = isp_entry_point(algo, data, driver=driver)
+        except Exception as exc:  # incl. NvcmTransportError — never leak
+            logger.exception("NVCM burn ABORTED: camera %d after %d tx",
+                             camera, driver.count)
+            return NvcmResult(False, str(exc), driver.count)
 
-        ret = isp_entry_point(algo, data, driver=driver)
         if ret < 0:
             msg = ERR_MESSAGES.get(ret, f"error {ret}")
             if driver.count < _EARLY_FAIL_TX:
