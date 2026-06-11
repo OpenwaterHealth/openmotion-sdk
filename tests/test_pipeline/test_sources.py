@@ -203,34 +203,35 @@ def test_live_usb_source_reader_loop_builds_batches_from_packet_queue(monkeypatc
 
 
 @pytest.mark.sensor
-def test_live_usb_source_smoke_yields_framebatches():
-    """Hardware-marked smoke test — requires a connected sensor."""
-    from omotion import MotionInterface
+def test_live_usb_source_smoke_yields_framebatches(console, sensor_left):
+    """Hardware-marked smoke test — requires a connected sensor.
+
+    Uses the session ``console``/``sensor_left`` fixtures so it skips
+    gracefully on a rig with no sensor attached. Passing an unconnected
+    ``motion.left`` handle (whose ``uart`` is still None) straight into
+    LiveUsbSource would crash in __iter__ at ``sensor.uart.histo`` — the
+    source legitimately assumes it only ever sees connected handles, so the
+    presence gate belongs here in the test, matching every other HIL test."""
     from omotion.pipeline.sources import LiveUsbSource
     from omotion.pipeline.sinks import ScanMetadata
 
-    motion = MotionInterface(data_dir=None, scan_db_path=None, operator_id="test")
-    motion.start()
-    try:
-        meta = ScanMetadata(
-            scan_id="smoke", subject_id="x", operator="test",
-            started_at_iso="2026-05-22T00:00:00Z", duration_sec=2,
-            left_camera_mask=0xFF, right_camera_mask=0, reduced_mode=False,
-        )
-        src = LiveUsbSource(
-            console=motion.console, left=motion.left, right=motion.right,
-            batch_size_frames=10, metadata=meta,
-        )
-        batches_seen = 0
-        for batch in src:
-            batches_seen += 1
-            assert batch.raw_histograms.shape[-1] == 1024
-            if batches_seen >= 3:
-                src.close()
-                break
-        assert batches_seen >= 1
-    finally:
-        motion.stop()
+    meta = ScanMetadata(
+        scan_id="smoke", subject_id="x", operator="test",
+        started_at_iso="2026-05-22T00:00:00Z", duration_sec=2,
+        left_camera_mask=0xFF, right_camera_mask=0, reduced_mode=False,
+    )
+    src = LiveUsbSource(
+        console=console, left=sensor_left, right=None,
+        batch_size_frames=10, metadata=meta,
+    )
+    batches_seen = 0
+    for batch in src:
+        batches_seen += 1
+        assert batch.raw_histograms.shape[-1] == 1024
+        if batches_seen >= 3:
+            src.close()
+            break
+    assert batches_seen >= 1
 
 
 # ---------------------------------------------------------------------------
