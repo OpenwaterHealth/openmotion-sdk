@@ -451,7 +451,9 @@ class MotionConsole(SignalWrapper):
                     ver = "v0.0.0"
             else:
                 ver = "v0.0.0"
-            logger.info(ver)
+            # Bare version at DEBUG — callers (log_console_info) compose
+            # the INFO "Console: firmware=... hw_id=..." line.
+            logger.debug(ver)
             return ver
         except ValueError as v:
             logger.error("ValueError: %s", v)
@@ -1602,7 +1604,7 @@ class MotionConsole(SignalWrapper):
                 return 0
             elif r.data_len == 4:
                 tec_voltage = struct.unpack("<f", r.data)[0]
-                logger.info(f"TEC Voltage is {tec_voltage} V")
+                logger.info("TEC Voltage is %.3f V", tec_voltage)
                 return tec_voltage
 
         except ValueError as v:

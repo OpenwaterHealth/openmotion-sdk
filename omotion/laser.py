@@ -171,7 +171,7 @@ def apply_laser_power(
             data_to_send = bytearray(laser_param["dataToSend"])
 
             if (channel, offset) in skip_entries:
-                logger.info(
+                logger.debug(
                     "Skipping JSON entry ch=%d off=0x%02X (overridden by user config)",
                     channel, offset,
                 )
@@ -196,7 +196,7 @@ def apply_laser_power(
                         friendly_name, e,
                     )
 
-            logger.info(
+            logger.debug(
                 "(%d/%d) Writing I2C: muxIdx=%d, channel=%d, i2cAddr=0x%02X, "
                 "offset=0x%02X, data=%s",
                 idx, len(laser_params), mux_idx, channel, i2c_addr, offset,

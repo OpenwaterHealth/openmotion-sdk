@@ -373,7 +373,10 @@ class CommInterface(USBInterfaceBase):
                 except Exception:
                     _text = ""
                 if _text:
-                    logger.warning("[%s PRINTF] %s", self.desc, _text)
+                    # Firmware debug printf passthrough — an informational
+                    # relay of the MCU's own messages, not a host-side
+                    # warning condition.
+                    logger.info("[%s PRINTF] %s", self.desc, _text)
                 else:
                     logger.warning("[%s] MCU echo: data=%s", self.desc, _raw.hex() if _raw else "")
             else:
