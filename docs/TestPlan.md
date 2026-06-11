@@ -759,6 +759,14 @@ is intentionally **excluded** from this backlog — see §6.)
     timestamps land back on the 25 ms frame grid — per camera,
     `|t(fid) − t(anchor) − (fid − anchor)·25.02 ms| < tolerance` for the
     re-timestamped rows, against the raw CSV as the pre-repair reference.
+- **Configure skip-if-programmed** (PR #72). `start_configure_camera_sensors`
+  now skips `program_fpga`/`camera_configure_registers` when camera status
+  bits 1+2 are already set; verified only with mocked sensors so far. On
+  hardware: (a) warm path — configure twice in a row, assert the second call
+  completes in <1 s per camera and the FPGA still streams (run a short scan);
+  (b) power-cycle path — power-cycle the sensor, assert status bits read
+  clear and the next configure re-flashes; (c) `force_program=True`
+  re-flashes a live, already-programmed camera.
 - **Dual-sensor aligned-frame acquisition** (replaces the dead §5.8). Bring up
   left + right, run a short streamed scan, assert both sides produce frames with
   matching `abs_frame_id` within each `FrameBatch` (frame alignment across
