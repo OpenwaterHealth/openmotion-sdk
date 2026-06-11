@@ -268,6 +268,13 @@ iface.start_configure_camera_sensors(
                      power_off_unused_cameras=False))
 ```
 
+Cameras whose status already reports firmware programmed (bit 1) and
+configured (bit 2) are skipped — repeat configure calls are cheap, so callers
+can run this before every scan. The status bits are read fresh from the sensor
+each time, so a power cycle (which clears the FPGA SRAM and the bits) is
+re-flashed automatically. Pass `force_program=True` to re-flash live,
+already-programmed cameras anyway.
+
 ### Contact quality
 
 `iface.contact_quality_workflow.check(duration_sec=..., rolling_window=...,

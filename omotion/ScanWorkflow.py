@@ -146,6 +146,11 @@ class ConfigureRequest:
     left_camera_mask: int
     right_camera_mask: int
     power_off_unused_cameras: bool = False
+    # Re-flash even when the camera reports firmware programmed + configured.
+    # Status bits are read fresh from the sensor each time, so a power cycle
+    # (which clears the FPGA SRAM) is detected without forcing — this is only
+    # for callers that need a guaranteed re-flash of a live, programmed camera.
+    force_program: bool = False
 
 
 @dataclass
@@ -941,6 +946,21 @@ class ScanWorkflow:
                             raise RuntimeError(
                                 f"{side} camera {pos1} not READY for FPGA/config."
                             )
+
+                        # Skip cameras already programmed (bit 1) and configured
+                        # (bit 2) — same check as get_camera_histogram. A power
+                        # cycle clears these bits, so a stale skip can't happen.
+                        if not request.force_program and (
+                            status & (1 << 1) and status & (1 << 2)
+                        ):
+                            _emit_log(
+                                f"{side} camera {pos1} already programmed & "
+                                f"configured (status 0x{status:02X}) — skipping."
+                            )
+                            with done_lock:
+                                done[0] += 2
+                                _emit_progress(int((done[0] / total) * 100))
+                            continue
 
                         _emit_log(
                             f"Programming {side} camera FPGA at position {pos1} "
