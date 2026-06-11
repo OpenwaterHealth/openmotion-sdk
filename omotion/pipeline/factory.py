@@ -1,4 +1,4 @@
-"""default_pipeline() — assembles the canonical 8-stage + 2-Tee chain."""
+"""default_pipeline() — assembles the canonical 10-stage + 2-Tee chain."""
 
 from __future__ import annotations
 
@@ -55,7 +55,7 @@ def default_pipeline(*,
     # now to keep the raw CSV a faithful pre-processing capture.
     if raw_save_max_duration_s is None or raw_save_max_duration_s > 0:
         stages.append(
-            Tee("raw", filter=lambda ft: ft != "stale",
+            Tee("raw", emit_if_any=lambda ft: ft != "stale",
                 max_duration_s=raw_save_max_duration_s, snapshot=True)
         )
 
@@ -84,13 +84,14 @@ def default_pipeline(*,
         # Combined realtime + corrected per-side average (reduced mode).
         # Realtime: emits LiveEmit("live_side") for the UI trace.
         # Corrected: reads IntervalClosed events from DarkCorrectionStage,
-        # emits LiveEmit("final_side") for DB persistence.
+        # emits synthetic IntervalClosed intervals whose frames carry
+        # cam_id=-1 (the side-average convention) on the "final" channel.
         SideAverageStage(
             enabled=metadata.reduced_mode,
             left_camera_mask=metadata.left_camera_mask,
             right_camera_mask=metadata.right_camera_mask,
         ),
-        Tee("live", filter=not_warmup_or_stale),
+        Tee("live", emit_if_any=not_warmup_or_stale),
     ])
 
     return Pipeline(stages)

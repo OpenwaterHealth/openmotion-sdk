@@ -4,7 +4,7 @@ import logging
 
 import numpy as np
 import pytest
-from omotion.pipeline.batch import FrameBatch
+from omotion.pipeline.batch import FrameBatch, TimestampMisalignmentWindow
 from omotion.pipeline.stages.timestamp_repair import TimestampRepairStage
 
 
@@ -328,6 +328,103 @@ def test_no_logging_on_clean_scan(caplog):
         stage.on_scan_stop(flush_batch)
     warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
     assert len(warnings) == 0
+
+
+def test_terminal_stop_frame_not_warned(caplog):
+    """The firmware's terminal laser-off frame arrives ~151 ms off-grid on
+    every scan. A window still open at scan stop whose flagged frames are
+    each camera's final frame is the expected stop artifact: INFO, no
+    WARNING, no summary, no diagnostics event."""
+    stage = TimestampRepairStage()
+    # Clean cadence on two cameras, then both cameras' final frame +151 ms.
+    batch = _make_batch(
+        cam_ids=[0, 1, 0, 1, 0, 1],
+        frame_ids=[11, 11, 12, 12, 13, 13],
+        side_ids=[0, 0, 0, 0, 0, 0],
+        timestamps=[0.025, 0.025, 0.050, 0.050, 0.201, 0.201],
+        abs_frame_ids=[11, 11, 12, 12, 13, 13],
+        frame_types=["light"] * 6,
+    )
+    flush = _make_batch([], [], [], [], abs_frame_ids=[], frame_types=[])
+    with caplog.at_level(logging.INFO, logger="openmotion.sdk.pipeline.stages.timestamp_repair"):
+        result = stage.process(batch)
+        stage.on_scan_stop(flush)
+
+    # The terminal frames were still re-timestamped (harmless — they never
+    # reach the corrected record), but nothing alarms.
+    assert result.quality[4] == "ts_corrected"
+    assert result.quality[5] == "ts_corrected"
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings == [], [w.message for w in warnings]
+    infos = [r for r in caplog.records if r.levelno == logging.INFO
+             and "Terminal stop frame" in r.message]
+    assert len(infos) == 1
+    assert not any(isinstance(e, TimestampMisalignmentWindow)
+                   for e in list(batch.events) + list(flush.events))
+
+
+def test_terminal_artifact_per_side_independent(caplog):
+    """Both sides' terminal frames reclassify independently — a clean
+    dual-sensor scan ends fully silent."""
+    stage = TimestampRepairStage()
+    batch = _make_batch(
+        cam_ids=[0, 0, 0, 0, 0, 0],
+        frame_ids=[11, 11, 12, 12, 13, 13],
+        side_ids=[0, 1, 0, 1, 0, 1],
+        timestamps=[0.025, 0.026, 0.050, 0.051, 0.201, 0.202],
+        abs_frame_ids=[11, 11, 12, 12, 13, 13],
+        frame_types=["light"] * 6,
+    )
+    flush = _make_batch([], [], [], [], abs_frame_ids=[], frame_types=[])
+    with caplog.at_level(logging.WARNING, logger="openmotion.sdk.pipeline.stages.timestamp_repair"):
+        stage.process(batch)
+        stage.on_scan_stop(flush)
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+def test_end_of_scan_bad_run_still_warns(caplog):
+    """A multi-frame divergent run at scan end is NOT the terminal artifact
+    (the stop frame flags each camera exactly once) — it must close as a
+    real window at on_scan_stop: WARNING + summary + diagnostics event."""
+    stage = TimestampRepairStage()
+    # Clean frames, then TWO consecutive bad frames on the same camera.
+    batch = _make_batch(
+        cam_ids=[0, 0, 0, 0],
+        frame_ids=[11, 12, 13, 14],
+        side_ids=[0, 0, 0, 0],
+        timestamps=[0.025, 0.050, 0.201, 0.226],
+        abs_frame_ids=[11, 12, 13, 14],
+        frame_types=["light"] * 4,
+    )
+    flush = _make_batch([], [], [], [], abs_frame_ids=[], frame_types=[])
+    with caplog.at_level(logging.WARNING, logger="openmotion.sdk.pipeline.stages.timestamp_repair"):
+        stage.process(batch)
+        stage.on_scan_stop(flush)
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("Misalignment window" in w.message for w in warnings)
+    assert any("Scan summary" in w.message for w in warnings)
+    events = [e for e in flush.events if isinstance(e, TimestampMisalignmentWindow)]
+    assert len(events) == 1 and events[0].n_corrected == 2
+
+
+def test_real_window_emits_diagnostics_event():
+    """A mid-scan window closed by a good frame appends a
+    TimestampMisalignmentWindow event to the batch."""
+    stage = TimestampRepairStage()
+    batch = _make_batch(
+        cam_ids=[0, 0, 0, 0],
+        frame_ids=[11, 12, 13, 14],
+        side_ids=[0, 0, 0, 0],
+        timestamps=[0.025, 0.050, 0.130, 0.100],
+        abs_frame_ids=[11, 12, 13, 14],
+        frame_types=["light"] * 4,
+    )
+    stage.process(batch)
+    events = [e for e in batch.events if isinstance(e, TimestampMisalignmentWindow)]
+    assert len(events) == 1
+    assert events[0].side == 0
+    assert events[0].n_corrected == 1
+    assert events[0].onset_fid == 13
 
 
 def test_warmup_and_stale_frames_pass_through_untouched():

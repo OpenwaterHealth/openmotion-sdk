@@ -11,6 +11,13 @@ same camera). If no re-anchor exists in the batch, it falls back to
 nominal-period interpolation. Missing abs_frame_id gaps get synthetic
 NaN-fill rows inserted (the only case that rebuilds the batch).
 
+Misalignment windows are tracked PER SIDE, log one coalesced WARNING
+each, and emit a TimestampMisalignmentWindow diagnostics event so the
+scan DB's session_meta summary records them. The firmware's terminal
+stop frame — the laser-off frame fired ~150 ms off the 25 ms grid at
+every scan stop — is recognised at on_scan_stop and reclassified as an
+expected artifact (INFO, excluded from the misalignment record).
+
 See docs/superpowers/specs/2026-06-05-eft-timestamp-repair-design.md.
 """
 
@@ -18,12 +25,12 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
 
-from ..batch import FrameBatch
+from ..batch import FrameBatch, TimestampMisalignmentWindow
 
 logger = logging.getLogger("openmotion.sdk.pipeline.stages.timestamp_repair")
 
@@ -35,15 +42,20 @@ _EMA_ALPHA = 0.01
 
 @dataclass
 class _WindowStats:
-    """Running stats for one contiguous misalignment window, used for
-    coalesced logging: the frame-id/time span it spans and how many frames
-    within it were re-timestamped vs NaN-filled."""
+    """Running stats for one contiguous per-side misalignment window, used
+    for coalesced logging: the frame-id/time span it spans, how many frames
+    within it were re-timestamped vs NaN-filled, and which (side, cam)
+    frames it flagged (for the terminal stop-frame check)."""
+    side: int
     onset_fid: int
     onset_t: float
     end_fid: int = 0
     end_t: float = 0.0
     n_corrected: int = 0
     n_nan: int = 0
+    # (key, abs_fid) of each flagged frame — consulted at scan stop to
+    # recognise the firmware's terminal stop-frame artifact.
+    frames: list = field(default_factory=list)
 
 
 class TimestampRepairStage:
@@ -72,17 +84,18 @@ class TimestampRepairStage:
 
     def _reset_state(self) -> None:
         """Clear all per-scan state — nominal-period estimate, per-camera
-        last-good anchors, the open window and window list, and the running
-        re-timestamped / NaN-filled totals. Called from __init__ and reset()."""
+        last-good anchors, the open per-side windows and window list, and the
+        running re-timestamped / NaN-filled totals. Called from __init__ and
+        reset()."""
         self._nominal_period = _INITIAL_NOMINAL_PERIOD_S
         self._last_good: dict[tuple[int, int], tuple[int, float]] = {}
-        self._in_bad_run = False
-        self._window_onset: Optional[_WindowStats] = None
+        self._open_window: dict[int, Optional[_WindowStats]] = {0: None, 1: None}
         self._scan_windows: list[_WindowStats] = []
         self._total_frames_seen = 0
         self._nan_last_seen: dict[tuple[int, int], tuple[int, float]] = {}
         self._total_corrected = 0
         self._total_nan = 0
+        self._terminal_frames = 0
 
     # ── Main entry ──────────────────────────────────────────────────────
 
@@ -142,10 +155,10 @@ class TimestampRepairStage:
                 batch.timestamp_s[i] = corrected_ts
                 quality[i] = "ts_corrected"
                 self._total_corrected += 1
-                self._track_window_open(abs_fid, ts)
+                self._track_window_open(side_idx, key, abs_fid, ts)
                 self._last_good[key] = (abs_fid, corrected_ts)
             else:
-                self._track_window_close(abs_fid, ts)
+                self._track_window_close(side_idx, batch.events)
                 self._update_nominal_period(key, abs_fid, ts)
                 self._last_good[key] = (abs_fid, ts)
 
@@ -240,34 +253,62 @@ class TimestampRepairStage:
 
     # ── Window tracking (coalesced logging) ─────────────────────────────
 
-    def _track_window_open(self, abs_fid: int, ts: float) -> None:
-        """Open a new misalignment window (or extend the current one) and
-        count this re-timestamped frame, for coalesced per-window logging.
-        ``ts`` is the original pre-correction device timestamp."""
-        if not self._in_bad_run:
-            self._in_bad_run = True
-            self._window_onset = _WindowStats(onset_fid=abs_fid, onset_t=ts)
-        if self._window_onset is not None:
-            self._window_onset.end_fid = abs_fid
-            self._window_onset.end_t = ts
-            self._window_onset.n_corrected += 1
+    def _track_window_open(self, side: int, key: tuple[int, int],
+                           abs_fid: int, ts: float) -> None:
+        """Open this side's misalignment window (or extend it) and count the
+        re-timestamped frame, for coalesced per-window logging. ``ts`` is the
+        original pre-correction device timestamp."""
+        w = self._open_window[side]
+        if w is None:
+            w = _WindowStats(side=side, onset_fid=abs_fid, onset_t=ts)
+            self._open_window[side] = w
+        w.end_fid = abs_fid
+        w.end_t = ts
+        w.n_corrected += 1
+        w.frames.append((key, abs_fid))
 
-    def _track_window_close(self, abs_fid: int, ts: float) -> None:
-        """Close the open misalignment window, if any: record it and emit
-        one coalesced WARNING for the whole window (per spec R3 — never one
-        line per frame). Called on the first good frame after a divergent
-        run."""
-        if self._in_bad_run and self._window_onset is not None:
-            self._scan_windows.append(self._window_onset)
-            logger.warning(
-                "Misalignment window: frames %d-%d (t=%.2f-%.2fs), "
-                "%d frames re-timestamped, %d frames NaN-filled",
-                self._window_onset.onset_fid, self._window_onset.end_fid,
-                self._window_onset.onset_t, self._window_onset.end_t,
-                self._window_onset.n_corrected, self._window_onset.n_nan,
-            )
-            self._in_bad_run = False
-            self._window_onset = None
+    def _track_window_close(self, side: int, events: list) -> None:
+        """Close this side's open misalignment window, if any: record it,
+        emit one coalesced WARNING for the whole window (per spec R3 — never
+        one line per frame), and append a TimestampMisalignmentWindow event
+        so the diagnostics channel / scan-DB summary record it. Called on the
+        first good same-side frame after a divergent run."""
+        w = self._open_window[side]
+        if w is None:
+            return
+        self._open_window[side] = None
+        self._scan_windows.append(w)
+        logger.warning(
+            "Misalignment window: side=%d frames %d-%d (t=%.2f-%.2fs), "
+            "%d frames re-timestamped, %d frames NaN-filled",
+            w.side, w.onset_fid, w.end_fid, w.onset_t, w.end_t,
+            w.n_corrected, w.n_nan,
+        )
+        events.append(TimestampMisalignmentWindow(
+            side=w.side, onset_fid=w.onset_fid, end_fid=w.end_fid,
+            onset_t=w.onset_t, end_t=w.end_t,
+            n_corrected=w.n_corrected, n_nan=w.n_nan,
+        ))
+
+    def _is_terminal_artifact(self, w: _WindowStats) -> bool:
+        """True when a window still open at scan stop is the firmware's
+        terminal stop frame: every flagged frame is the LAST frame its
+        (side, cam) ever produced, and each camera was flagged exactly once.
+        (The laser-off stop frame fires ~150 ms off the 25 ms grid by
+        protocol — its timestamp is truthful, just not on the capture
+        schedule.) A genuine end-of-scan EMI burst flags multiple frames per
+        camera and stays a real window."""
+        if not w.frames:
+            return False
+        seen_keys: set = set()
+        for key, fid in w.frames:
+            if key in seen_keys:
+                return False  # >1 flagged frame for this camera — real run
+            seen_keys.add(key)
+            last = self._nan_last_seen.get(key)
+            if last is None or fid != last[0]:
+                return False  # frames followed it — not the terminal frame
+        return True
 
     # ── NaN-fill for missing frames ─────────────────────────────────────
 
@@ -301,8 +342,9 @@ class TimestampRepairStage:
                             "quality": "nan_filled",
                         }))
                         self._total_nan += 1
-                        if self._window_onset is not None:
-                            self._window_onset.n_nan += 1
+                        w = self._open_window[key[0]]
+                        if w is not None:
+                            w.n_nan += 1
 
             self._nan_last_seen[key] = (abs_fid, ts)
 
@@ -367,15 +409,31 @@ class TimestampRepairStage:
     # ── Lifecycle ───────────────────────────────────────────────────────
 
     def on_scan_stop(self, batch: FrameBatch) -> None:
-        """End-of-scan lifecycle hook: close any window still open at the
-        final frame, then emit the one-line scan summary (window count,
-        total frames re-timestamped, total NaN-filled, % of scan affected)
-        whenever anything was corrected or filled."""
-        # Close any open window
-        if self._in_bad_run and self._window_onset is not None:
-            self._scan_windows.append(self._window_onset)
-            self._in_bad_run = False
-            self._window_onset = None
+        """End-of-scan lifecycle hook.
+
+        Windows still open at the final frame are either reclassified as the
+        expected terminal stop-frame artifact (INFO, excluded from the
+        misalignment record — the firmware's laser-off frame fires ~150 ms
+        off-grid on every scan) or closed normally with their WARNING +
+        diagnostics event. Then the one-line scan summary (real window count,
+        frames re-timestamped, NaN-filled, % of scan affected) is emitted
+        whenever any genuine correction or fill occurred."""
+        for side in (0, 1):
+            w = self._open_window[side]
+            if w is None:
+                continue
+            if self._is_terminal_artifact(w):
+                self._open_window[side] = None
+                self._total_corrected -= w.n_corrected
+                self._terminal_frames += w.n_corrected
+                logger.info(
+                    "Terminal stop frame re-timestamped on side=%d "
+                    "(%d camera(s)) — expected firmware stop artifact "
+                    "(laser-off frame fires ~150 ms off-grid); not counted "
+                    "as misalignment", side, w.n_corrected,
+                )
+            else:
+                self._track_window_close(side, batch.events)
 
         if self._total_corrected or self._total_nan:
             pct = (self._total_corrected + self._total_nan) / max(1, self._total_frames_seen) * 100

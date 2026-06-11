@@ -7,8 +7,6 @@ the legacy ContactQuality module semantics.
 
 import numpy as np
 import pytest
-from dataclasses import dataclass
-from typing import Optional
 from unittest.mock import MagicMock
 
 from omotion.ContactQualityWorkflow import (
@@ -17,45 +15,43 @@ from omotion.ContactQualityWorkflow import (
     ContactQualityResult,
     _ContactQualitySink,
 )
+from omotion.pipeline.batch import FrameBatch
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-@dataclass
-class _FakeFrameBatch:
-    """Minimal FrameBatch stub for sink unit tests.
-
-    The CQ sink reads ``subtracted_mean`` for dark frames and ``mean_dc_rt``
-    for light frames; the fixture seeds both with the same DN value so a
-    single ``dn_value`` argument exercises whichever branch the test cares
-    about.
-    """
-    subtracted_mean: np.ndarray            # shape (n_frames, 2, 8) — used for dark frames
-    mean_dc_rt:   np.ndarray            # shape (n_frames, 2, 8) — used for light frames
-    std_raw:      Optional[np.ndarray] = None
-    frame_type:   Optional[np.ndarray] = None
-
-
 def _dn_batch(
     n_frames: int,
     dn_value: float,
     frame_types=None,
-) -> _FakeFrameBatch:
-    """Return a FrameBatch-like stub with uniform DN across all cams.
+) -> FrameBatch:
+    """Return a real FrameBatch with uniform DN across all cams.
 
+    The live pipeline delivers one (side, cam) per row, so each logical
+    frame expands to 16 rows (2 sides × 8 cams) sharing the frame_type.
     Both subtracted_mean and mean_dc_rt get the same value so the test stays
     valid regardless of which the sink reads for a given frame_type.
     """
     if frame_types is None:
         frame_types = ["light"] * n_frames
-    arr = np.full((n_frames, 2, 8), dn_value, dtype=np.float32)
-    return _FakeFrameBatch(
+    rows = n_frames * 16
+    cam_ids = np.tile(np.arange(8, dtype=np.int8), n_frames * 2)
+    side_ids = np.tile(np.repeat(np.array([0, 1], dtype=np.int8), 8), n_frames)
+    arr = np.full((rows, 2, 8), dn_value, dtype=np.float32)
+    return FrameBatch(
+        cam_ids=cam_ids,
+        frame_ids=np.tile(np.arange(n_frames, dtype=np.uint8).repeat(16), 1),
+        side_ids=side_ids,
+        raw_histograms=None,
+        temperature_c=None,
+        timestamp_s=np.zeros(rows, dtype=np.float64),
+        pdc=None, tcm=None, tcl=None,
+        frame_type=np.repeat(np.array(frame_types, dtype="<U8"), 16),
         subtracted_mean=arr,
         mean_dc_rt=arr.copy(),
-        std_raw=np.full((n_frames, 2, 8), 2.5, dtype=np.float32),
-        frame_type=np.array(frame_types, dtype="<U8"),
+        std_raw=np.full((rows, 2, 8), 2.5, dtype=np.float32),
     )
 
 
@@ -100,12 +96,8 @@ def test_cq_sink_records_light_std_without_thresholding_it():
         light_thresholds=[15.0] * 8,
     )
     sink.on_scan_start(None)
-    batch = _FakeFrameBatch(
-        subtracted_mean=np.full((2, 2, 8), 20.0, dtype=np.float32),
-        mean_dc_rt=np.full((2, 2, 8), 20.0, dtype=np.float32),
-        std_raw=np.full((2, 2, 8), 500.0, dtype=np.float32),
-        frame_type=np.array(["light", "light"], dtype="<U8"),
-    )
+    batch = _dn_batch(2, 20.0)
+    batch.std_raw[:] = 500.0
     sink.consume("live", batch)
 
     result = sink.result(left_mask=0x01, right_mask=0, duration_sec=1.0)
@@ -197,13 +189,9 @@ def test_cq_sink_overall_passed_requires_all_cams():
         light_thresholds=[15.0] * 8,
     )
     sink.on_scan_start(None)
-    arr = np.full((1, 2, 8), 20.0, dtype=np.float32)
-    arr[0, 0, 1] = 5.0   # left cam 1 below light threshold
-    batch = _FakeFrameBatch(
-        subtracted_mean=arr,
-        mean_dc_rt=arr.copy(),
-        frame_type=np.array(["light"], dtype="<U8"),
-    )
+    batch = _dn_batch(1, 20.0)
+    batch.subtracted_mean[:, 0, 1] = 5.0   # left cam 1 below light threshold
+    batch.mean_dc_rt[:, 0, 1] = 5.0
     sink.consume("live", batch)
     result = sink.result(left_mask=0x03, right_mask=0, duration_sec=1.0)
 

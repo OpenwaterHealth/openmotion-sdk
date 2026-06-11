@@ -9,18 +9,21 @@ def test_public_api_symbols_importable() -> None:
         Pipeline, Stage,
         FrameBatch, BatchEvent, IntervalClosed, LiveEmit,
         DarkIntegrityWarning, StencilFallback, TerminalDarkResult,
+        PipelineError, TimestampMisalignmentWindow,
         ScanRunner, CriticalSinkError,
-        Source, LiveUsbSource, CsvReplaySource, DbReplaySource,
+        Source, LiveUsbSource, CsvReplaySource,
         Sink, ScanMetadata,
-        CsvSink, ScanDBSink,
+        CsvSink, ScanDBSink, DiagnosticsLogSink,
         Tee, default_pipeline,
         SensorPedestals,
     )
     for sym in (
         Pipeline, Stage, FrameBatch, BatchEvent, IntervalClosed, LiveEmit,
-        DarkIntegrityWarning, StencilFallback, TerminalDarkResult, ScanRunner, CriticalSinkError,
-        Source, LiveUsbSource, CsvReplaySource, DbReplaySource,
-        Sink, ScanMetadata, CsvSink, ScanDBSink,
+        DarkIntegrityWarning, StencilFallback, TerminalDarkResult,
+        PipelineError, TimestampMisalignmentWindow,
+        ScanRunner, CriticalSinkError,
+        Source, LiveUsbSource, CsvReplaySource,
+        Sink, ScanMetadata, CsvSink, ScanDBSink, DiagnosticsLogSink,
         Tee, default_pipeline, SensorPedestals,
     ):
         assert sym is not None
@@ -33,13 +36,14 @@ def test_public_api_all_list_complete() -> None:
     expected = {
         "FrameBatch", "BatchEvent", "IntervalClosed", "LiveEmit",
         "DarkIntegrityWarning", "StencilFallback", "TerminalDarkResult",
+        "PipelineError", "TimestampMisalignmentWindow",
         "Pipeline", "Stage", "Tee",
         "ScanRunner", "CriticalSinkError",
         "default_pipeline",
         "SensorPedestals",
         "Sink", "ScanMetadata",
-        "CsvSink", "ScanDBSink",
-        "Source", "LiveUsbSource", "CsvReplaySource", "DbReplaySource",
+        "CsvSink", "ScanDBSink", "DiagnosticsLogSink",
+        "Source", "LiveUsbSource", "CsvReplaySource",
     }
 
     assert set(pkg.__all__) == expected

@@ -368,7 +368,9 @@ class ScanWorkflow:
         from omotion.pipeline.factory import default_pipeline
         from omotion.pipeline.runner import ScanRunner
         from omotion.pipeline.sources import LiveUsbSource
-        from omotion.pipeline.sinks import CsvSink as PipelineCsvSink, ScanDBSink, ScanMetadata
+        from omotion.pipeline.sinks import (
+            CsvSink as PipelineCsvSink, DiagnosticsLogSink, ScanDBSink, ScanMetadata,
+        )
         from omotion.pipeline.pedestal import SensorPedestals, pedestal_for_fw
 
         # Clear the prior scan's outcome up front so a refusal below (busy, or
@@ -430,8 +432,11 @@ class ScanWorkflow:
             raw_save_max_duration_s=request.raw_save_max_duration_s,
         )
 
-        # ── Auto-inject default storage sinks ─────────────────────────────
-        default_sinks: list = []
+        # ── Auto-inject default sinks ──────────────────────────────────────
+        # DiagnosticsLogSink is unconditional (not storage — it logs
+        # correction-integrity events that would otherwise vanish; the DB
+        # sink persists the matching summary when a DB is configured).
+        default_sinks: list = [DiagnosticsLogSink()]
         telemetry_writer: Optional[_TelemetryCsvWriter] = None
         if not request.skip_default_storage:
             data_dir = getattr(self._interface, "data_dir", None)

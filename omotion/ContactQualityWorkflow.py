@@ -120,50 +120,48 @@ class _ContactQualitySink:
         # present.
         if batch.subtracted_mean is None or getattr(batch, "mean_dc_rt", None) is None:
             return
-        n = batch.subtracted_mean.shape[0]
-        for i in range(n):
-            ft = None
-            if batch.frame_type is not None:
-                ft = str(batch.frame_type[i])
-                if ft in ("warmup", "stale"):
+        # Each row carries exactly one (side, cam) — iter_rows is the
+        # canonical per-row filter (warmup/stale rows still reach "live"
+        # sinks because the Tee gate is batch-level).
+        for i, side_idx, cam_id, ft in batch.iter_rows(exclude={"warmup", "stale"}):
+            if side_idx < 0 or not (0 <= cam_id < 8):
+                continue
+            side = ("left", "right")[side_idx]
+            std_v = float("nan")
+            if getattr(batch, "std_raw", None) is not None:
+                std_v = float(batch.std_raw[i, side_idx, cam_id])
+            key = (side, cam_id)
+            if ft == "dark":
+                v = float(batch.subtracted_mean[i, side_idx, cam_id])
+                if not math.isfinite(v):
                     continue
-            for side_idx, side in enumerate(("left", "right")):
-                for cam_id in range(8):
-                    std_v = float("nan")
-                    if getattr(batch, "std_raw", None) is not None:
-                        std_v = float(batch.std_raw[i, side_idx, cam_id])
-                    key = (side, cam_id)
-                    if ft == "dark":
-                        v = float(batch.subtracted_mean[i, side_idx, cam_id])
-                        if not math.isfinite(v):
-                            continue
-                        prev = self._dark_max.get(key, float("-inf"))
-                        if v > prev:
-                            self._dark_max[key] = v
-                            self._dark_std[key] = std_v
-                    else:
-                        # Light or unclassified — treat as light for CQ purposes.
-                        # mean_dc_rt is NaN for early light frames before any
-                        # dark has been observed (predictor returns None →
-                        # baseline_rt/mean_dc_rt stay at their NaN init).
-                        # Skip those frames; the rolling window will fill up
-                        # once the first dark lands.
-                        v = float(batch.mean_dc_rt[i, side_idx, cam_id])
-                        if not math.isfinite(v):
-                            continue
-                        w = self._light_window.get(key)
-                        if w is None:
-                            w = collections.deque(maxlen=self._window_size)
-                            self._light_window[key] = w
-                        sw = self._light_std_window.get(key)
-                        if sw is None:
-                            sw = collections.deque(maxlen=self._window_size)
-                            self._light_std_window[key] = sw
-                        w.append(v)
-                        if math.isfinite(std_v):
-                            sw.append(std_v)
-                        self._light_sum[key]   = self._light_sum.get(key, 0.0) + v
-                        self._light_count[key] = self._light_count.get(key, 0) + 1
+                prev = self._dark_max.get(key, float("-inf"))
+                if v > prev:
+                    self._dark_max[key] = v
+                    self._dark_std[key] = std_v
+            else:
+                # Light or unclassified — treat as light for CQ purposes.
+                # mean_dc_rt is NaN for early light frames before any
+                # dark has been observed (predictor returns None →
+                # baseline_rt/mean_dc_rt stay at their NaN init).
+                # Skip those frames; the rolling window will fill up
+                # once the first dark lands.
+                v = float(batch.mean_dc_rt[i, side_idx, cam_id])
+                if not math.isfinite(v):
+                    continue
+                w = self._light_window.get(key)
+                if w is None:
+                    w = collections.deque(maxlen=self._window_size)
+                    self._light_window[key] = w
+                sw = self._light_std_window.get(key)
+                if sw is None:
+                    sw = collections.deque(maxlen=self._window_size)
+                    self._light_std_window[key] = sw
+                w.append(v)
+                if math.isfinite(std_v):
+                    sw.append(std_v)
+                self._light_sum[key]   = self._light_sum.get(key, 0.0) + v
+                self._light_count[key] = self._light_count.get(key, 0) + 1
 
     def on_complete(self) -> None:
         pass

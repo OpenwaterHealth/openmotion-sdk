@@ -5,8 +5,11 @@ LiveEmit events from batch.events and dispatches the payload to sinks
 subscribed to the named channel.
 
 A Tee may carry:
-- an optional `filter` predicate over frame_type. If supplied and no
-  frame in the batch passes the filter, no LiveEmit is appended.
+- an optional `emit_if_any` predicate over frame_type. This is a
+  BATCH-LEVEL gate, not a row filter: if ANY frame in the batch passes,
+  the WHOLE batch (non-passing rows included) is emitted. Sinks must do
+  their own per-row filtering — use FrameBatch.iter_rows(exclude=...),
+  the canonical helper, instead of hand-rolling the loop.
 - an optional `max_duration_s` cap. If supplied and the batch's first
   frame timestamp exceeds it, no LiveEmit is appended. Used to cap
   raw-CSV writing at a configurable duration.
@@ -27,19 +30,20 @@ from .batch import FrameBatch, LiveEmit
 
 
 class Tee:
-    """Emits one LiveEmit per batch (or zero, if filter excludes all frames).
+    """Emits one LiveEmit per batch (or zero, if no frame passes the gate).
 
-    The default payload is the FrameBatch itself; sinks slice out the rows
-    they care about based on the channel and their own logic.
+    The payload is the whole FrameBatch (zero-copy by default — slicing
+    rows here would force a per-batch copy on the hot live channel); sinks
+    slice out the rows they care about via FrameBatch.iter_rows.
     """
 
     def __init__(self, channel: str, *,
-                 filter: Optional[Callable[[str], bool]] = None,
+                 emit_if_any: Optional[Callable[[str], bool]] = None,
                  max_duration_s: Optional[float] = None,
                  snapshot: bool = False):
         self.name = f"tee:{channel}"
         self.channel = channel
-        self.filter = filter
+        self.emit_if_any = emit_if_any
         self.max_duration_s = max_duration_s
         self.snapshot = snapshot
 
@@ -48,10 +52,10 @@ class Tee:
             if float(batch.timestamp_s[0]) > self.max_duration_s:
                 return batch
 
-        if self.filter is not None:
+        if self.emit_if_any is not None:
             if batch.frame_type is None:
                 return batch
-            if not any(self.filter(ft) for ft in batch.frame_type):
+            if not any(self.emit_if_any(ft) for ft in batch.frame_type):
                 return batch
         payload = batch.snapshot() if self.snapshot else batch
         batch.events.append(LiveEmit(channel=self.channel, payload=payload))

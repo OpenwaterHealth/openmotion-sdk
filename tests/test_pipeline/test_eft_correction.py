@@ -22,6 +22,10 @@ from omotion.pipeline.sinks import CsvSink, ScanMetadata
 from omotion.pipeline.sources import CsvReplaySource
 
 
+# Full-scan replays run for minutes; the project-wide 30 s pytest timeout
+# (pyproject.toml) would kill every test here without this override.
+pytestmark = pytest.mark.timeout(900)
+
 SCANS_DIR = Path(r"C:\Users\ethan\Projects\eft-testing\scans")
 FINAL_TESTS_DIR = Path(
     r"C:\Users\ethan\Projects\eft-testing\final_tests-20260603T234709Z-3-001\final_tests"
@@ -57,6 +61,19 @@ DEGRADED_SCANS = [
         "right_mask": 0x66,
     },
     {
+        # Recorded with the stimulator at 300 ms cadence (was mislabeled as a
+        # clean scan). Mild signature: one packet per ~12 frames on the right
+        # module stamped ~10 ms early (per-camera dt pattern 25,…,15,35,…,25).
+        # The left side's single 151 ms step at the end of the data is the
+        # ordinary terminal stop frame (firmware laser-off frame fires
+        # ~150 ms off-grid on every scan), not an anomaly.
+        "name": "owYWB8TN_stim300ms",
+        "left_raw": SCANS_DIR / "20260602_135759_owYWB8TN_left_mask66_raw.csv",
+        "right_raw": SCANS_DIR / "20260602_135759_owYWB8TN_right_mask66_raw.csv",
+        "left_mask": 0x66,
+        "right_mask": 0x66,
+    },
+    {
         "name": "owSPZMD1",
         "left_raw": SCANS_DIR / "20260602_140215_owSPZMD1_left_mask66_raw.csv",
         "right_raw": SCANS_DIR / "20260602_140215_owSPZMD1_right_mask66_raw.csv",
@@ -64,6 +81,10 @@ DEGRADED_SCANS = [
         "right_mask": 0x66,
     },
 ]
+
+# Scans with the 300 ms stimulator signature specifically — used by the
+# grid-restoration test below in addition to the structural DEGRADED tests.
+STIM_300MS_SCANS = [s for s in DEGRADED_SCANS if s["name"] == "owYWB8TN_stim300ms"]
 
 
 class _NullCalibration:
@@ -183,6 +204,44 @@ def test_degraded_has_quality_column(scan_info, tmp_path):
     assert len(non_ok) > 0, "Degraded scan should have at least some corrected/NaN-filled frames"
     for q in qualities:
         assert q in ("ok", "ts_corrected", "nan_filled"), f"Unexpected quality value: {q!r}"
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("scan_info", STIM_300MS_SCANS, ids=[s["name"] for s in STIM_300MS_SCANS])
+def test_stim_corrected_timestamps_return_to_grid(scan_info, tmp_path):
+    """The corrector must put stim-perturbed stamps back on the 25 ms grid.
+
+    The 300 ms stimulator perturbs one packet's timestamp by ~10 ms while the
+    capture cadence itself never deviates. After repair, the corrected CSV
+    must contain no residual off-grid step: for every pair of consecutive
+    frame_ids, |dt − nominal| must be within the detector's own tolerance
+    (8 ms). This is the software twin of the HIL check in TestPlan.md §8
+    ("corrected timestamps land back on the 25 ms frame grid").
+    """
+    if not scan_info["left_raw"].exists():
+        pytest.skip(f"Test data not found: {scan_info['left_raw']}")
+    csv_path = _replay_degraded(scan_info, tmp_path)
+    with open(csv_path) as f:
+        rows = [(int(r["frame_id"]), float(r["timestamp_s"]), r["quality"])
+                for r in csv.DictReader(f)]
+
+    fids = np.array([r[0] for r in rows])
+    ts = np.array([r[1] for r in rows])
+    single_step = np.diff(fids) == 1
+    dts = np.diff(ts)[single_step]
+    nominal = float(np.median(dts))
+    assert 0.024 < nominal < 0.026, f"implausible nominal period {nominal}"
+
+    off_grid = np.abs(dts - nominal) > 0.008
+    assert not off_grid.any(), (
+        f"{int(off_grid.sum())} residual off-grid steps after repair "
+        f"(worst: {float(np.abs(dts - nominal).max()) * 1000:.1f} ms); "
+        "the corrector failed to restore the frame grid"
+    )
+    # And the repair must actually have fired — this is a stim recording.
+    assert any(q == "ts_corrected" for _, _, q in rows), (
+        "no ts_corrected rows — detector missed the stim signature entirely"
+    )
 
 
 @pytest.mark.slow

@@ -2,7 +2,7 @@
 
 import numpy as np
 import pytest
-from omotion.pipeline.batch import FrameBatch, LiveEmit, IntervalClosed
+from omotion.pipeline.batch import FrameBatch, LiveEmit, IntervalClosed, PipelineError
 from omotion.pipeline.pipeline import Pipeline
 from omotion.pipeline.runner import ScanRunner, CriticalSinkError
 from omotion.pipeline.sinks import ScanMetadata
@@ -105,6 +105,47 @@ def test_runner_routes_interval_closed_to_final_sinks():
     )
     runner.run()
     assert final_sink.consumed == [("final", "payload_x")]
+
+
+def test_runner_drops_failed_batch_without_resetting_stage_state():
+    """A stage exception mid-scan drops that batch only: stage state is
+    preserved (reset() must NOT be called — it would re-trip the stale-first
+    guard and misalign the dark schedule), later batches still flow, and a
+    PipelineError lands on the diagnostics channel."""
+
+    class _FlakyStatefulStage:
+        name = "flaky"
+        def __init__(self):
+            self.calls = 0
+            self.resets = 0
+        def process(self, batch):
+            self.calls += 1
+            if self.calls == 2:
+                raise RuntimeError("boom on batch 2")
+            batch.events.append(LiveEmit(channel="live", payload=self.calls))
+            return batch
+        def reset(self):
+            self.resets += 1
+
+    stage = _FlakyStatefulStage()
+    live_sink = _RecordingSink(channels={"live"})
+    diag_sink = _RecordingSink(channels={"diagnostics"})
+    runner = ScanRunner(
+        source=_FakeSource([_empty_batch(), _empty_batch(), _empty_batch()], _meta()),
+        pipeline=Pipeline([stage]),
+        sinks=[live_sink, diag_sink],
+    )
+    runner.run()
+
+    # Batches 1 and 3 dispatched; batch 2 dropped.
+    assert [p for _, p in live_sink.consumed] == [1, 3]
+    # State preserved: no mid-scan reset.
+    assert stage.resets == 0
+    # The drop is visible on the diagnostics channel.
+    errors = [p for _, p in diag_sink.consumed if isinstance(p, PipelineError)]
+    assert len(errors) == 1
+    assert "boom on batch 2" in errors[0].error
+    assert errors[0].n_frames == 1
 
 
 def test_runner_isolates_sink_exceptions():

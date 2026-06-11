@@ -7,12 +7,25 @@ DB sink writes. The bloodflow-app's "Visualize BFI/BVI" button expects
 a corrected CSV next to the session, so this module gives callers a
 one-call way to materialize that CSV on demand from ``session_data``.
 
-The output is byte-identical to what ``CsvSink`` would have written
-during the scan **for the columns ``session_data`` carries** (bfi,
-bvi, contrast, mean). Columns the science pipeline produces but the
-DB doesn't store today — ``temp_*``, ``std_*`` — are emitted as empty
-cells. The visualizer (``plot_corrected_scan.py``) ignores those
-columns, so the resulting plot matches the live-scan output.
+``session_data`` holds the final-branch (interval-corrected) record:
+per-camera rows in normal mode, cam_id=-1 side-average rows in reduced
+mode. Sessions whose ``session_meta`` lacks the ``data_semantics``
+marker were written by older SDKs and hold realtime (live-branch)
+values instead — playback still works, but the values are the
+pre-refinement ones.
+
+The output matches what ``CsvSink`` writes during the scan **for the
+columns ``session_data`` carries** (bfi, bvi, contrast, mean). Columns
+the science pipeline produces but the DB doesn't store — ``temp_*``,
+``std_*`` — are emitted as empty cells. The visualizer
+(``plot_corrected_scan.py``) ignores those columns, so the resulting
+plot matches the live-scan output.
+
+Reduced-mode column layout is recovered from
+``session_meta.sdk_flags.reduced_mode`` (stamped by ScanDBSink).
+Legacy reduced sessions without that key are mis-detected as
+non-reduced and produce an empty-celled CSV — callers should treat
+sessions without ``sdk_flags`` as not playback-capable in reduced mode.
 
 Requires the post-#92-Step-F schema (``session_data.frame_id``
 present). For sessions older than that migration, ``frame_id`` is

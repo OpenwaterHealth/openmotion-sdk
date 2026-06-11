@@ -84,6 +84,41 @@ class TerminalDarkResult(BatchEvent):
 
 
 @dataclass
+class TimestampMisalignmentWindow(BatchEvent):
+    """A contiguous run of frames on one side whose timestamps deviated from
+    the frame-id cadence and were re-timestamped / NaN-filled by
+    TimestampRepairStage. Routed to "diagnostics" so the scan DB's
+    session_meta summary records it.
+
+    The expected terminal stop-frame artifact — the firmware's laser-off
+    frame fires ~150 ms off the 25 ms grid at scan stop, on every scan —
+    is deliberately NOT reported as one of these.
+    """
+    side:        int
+    onset_fid:   int
+    end_fid:     int
+    onset_t:     float
+    end_t:       float
+    n_corrected: int
+    n_nan:       int
+
+
+@dataclass
+class PipelineError(BatchEvent):
+    """A stage raised during pipeline.process(); the batch was dropped.
+
+    Stage state is deliberately preserved (no reset): frame-id alignment and
+    dark history survive, and the gap left by the dropped batch is equivalent
+    to USB packet loss for those frames. Resetting instead would re-trip the
+    stale-first guard and permanently misalign the positional dark schedule.
+    Routed to the "diagnostics" channel.
+    """
+    error:             str              # repr of the exception
+    n_frames:          int              # rows in the dropped batch
+    first_timestamp_s: Optional[float]  # batch's first timestamp, if any
+
+
+@dataclass
 class TriggerStateEvent(BatchEvent):
     """Emitted whenever the laser trigger transitions ON or OFF.
 
@@ -100,13 +135,12 @@ class TriggerStateEvent(BatchEvent):
 
 @dataclass
 class SideAverageSample:
-    """One reduced-mode per-side average for a single capture instant.
+    """One reduced-mode realtime per-side average for a single capture instant.
 
-    Carried as the payload of a ``LiveEmit`` — channel ``"live_side"`` for the
-    realtime average (SideAverageStage, ``"live_side"``) and ``"final_side"`` for the
-    dark-corrected average (SideAverageStage, ``"final_side"``). One sample per capture
-    (``frame_id``) per side. ``mean`` / ``contrast`` are populated only on the
-    corrected path; the live path leaves them ``None``."""
+    Carried as the payload of a ``LiveEmit`` on the ``"live_side"`` channel
+    (SideAverageStage realtime path), one sample per capture (``frame_id``)
+    per side. The corrected side average does NOT use this type — it rides
+    the ``"final"`` channel as cam_id=-1 EnrichedCorrectedFrames."""
     t:         float
     frame_id:  int
     side:      int            # 0 = left, 1 = right
@@ -132,8 +166,9 @@ class FrameBatch:
       ShotNoise:       std_sn_rt, contrast_sn_rt
       BfiBvi:          bfi_live, bvi_live
       SideAverage:     appends LiveEmit(channel="live_side", SideAverageSample)
-                       and LiveEmit(channel="final_side", SideAverageSample)
-                       per capture (reduced mode only)
+                       per capture, plus synthetic IntervalClosed events whose
+                       frames carry cam_id=-1 (corrected side averages, routed
+                       to "final") — reduced mode only
       Tee:             appends LiveEmit to events
     """
 
@@ -301,3 +336,26 @@ class FrameBatch:
             value = getattr(self, f.name)
             kwargs[f.name] = value.copy() if isinstance(value, np.ndarray) else value
         return FrameBatch(**kwargs)
+
+    def iter_rows(self, *, exclude: "set[str] | frozenset[str]" = frozenset()):
+        """Yield ``(i, side_idx, cam_id, frame_type)`` per row, skipping rows
+        whose ``frame_type`` is in ``exclude``.
+
+        The canonical per-row filter for sinks. Tee gates are BATCH-level —
+        a batch is emitted if any row passes, so stale/warmup rows still
+        reach every subscribed sink and must be skipped per row. Use this
+        instead of hand-rolling the loop so the skip policy can't drift
+        between sinks.
+
+        ``side_idx`` is -1 when the batch carries no ``side_ids`` (legacy
+        replay batches); ``frame_type`` is "" before classification.
+        """
+        ft = self.frame_type
+        side_ids = self.side_ids
+        n = self.cam_ids.shape[0]
+        for i in range(n):
+            ftype = str(ft[i]) if ft is not None else ""
+            if ftype in exclude:
+                continue
+            side_idx = int(side_ids[i]) if side_ids is not None else -1
+            yield i, side_idx, int(self.cam_ids[i]), ftype

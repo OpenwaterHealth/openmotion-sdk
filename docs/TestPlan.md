@@ -737,6 +737,28 @@ is intentionally **excluded** from this backlog — see §6.)
   collector sink — and assert: N corrected frames emitted, `abs_frame_id`
   monotonic per side, BFI/BVI in a physically plausible range. This is the actual
   product acquisition path and has no HIL test today.
+- **EFT timestamp-repair: clean-scan false-positive + stim detection check.**
+  Two-part verification of `TimestampRepairStage` against live hardware
+  (background: the recorded "clean" fixture `owYWB8TN` turned out to have been
+  captured with the stimulator running at 300 ms cadence, whose signature —
+  one packet per ~12 frames stamped ~10 ms early, dt pattern `25,…,15,35,…,25`
+  per camera — the detector correctly caught; we have never verified the
+  no-stim baseline on hardware).
+  - **(a) Clean baseline — no alerts for no reason.** Stimulator OFF, run a
+    ≥5-minute scan with the scan DB enabled. Assert: zero `"ts_corrected"` /
+    `"nan_filled"` rows in `session_data`, **zero WARNINGs** from
+    `timestamp_repair` (the terminal stop frame — the firmware's laser-off
+    frame fires ~151 ms off-grid at every scan stop — is reclassified at
+    INFO and must not warn), and `session_meta` has **no** `"diagnostics"`
+    key. Repeat across both sensor modules and with IMU streaming on/off,
+    since periodic firmware tasks are the suspected jitter source if this
+    ever trips.
+  - **(b) Stim — detector and corrector behave.** Stimulator ON at 300 ms,
+    same scan. Assert: misalignment windows are detected at the stim cadence
+    (~3.3 Hz), `session_meta["diagnostics"]` records them, and the corrected
+    timestamps land back on the 25 ms frame grid — per camera,
+    `|t(fid) − t(anchor) − (fid − anchor)·25.02 ms| < tolerance` for the
+    re-timestamped rows, against the raw CSV as the pre-repair reference.
 - **Dual-sensor aligned-frame acquisition** (replaces the dead §5.8). Bring up
   left + right, run a short streamed scan, assert both sides produce frames with
   matching `abs_frame_id` within each `FrameBatch` (frame alignment across

@@ -19,7 +19,7 @@ def _batch_with_frame_types(types):
 
 
 def test_tee_with_no_filter_emits_one_event_per_call():
-    tee = Tee("raw", filter=None)
+    tee = Tee("raw", emit_if_any=None)
     batch = _batch_with_frame_types(["light"])
     tee.process(batch)
     emits = [e for e in batch.events if isinstance(e, LiveEmit)]
@@ -29,7 +29,7 @@ def test_tee_with_no_filter_emits_one_event_per_call():
 
 
 def test_tee_with_filter_skips_emit_when_filter_excludes_all_frames():
-    tee = Tee("live", filter=lambda ft: ft != "warmup" and ft != "stale")
+    tee = Tee("live", emit_if_any=lambda ft: ft != "warmup" and ft != "stale")
     batch = _batch_with_frame_types(["warmup", "stale", "warmup"])
     tee.process(batch)
     emits = [e for e in batch.events if isinstance(e, LiveEmit)]
@@ -37,7 +37,7 @@ def test_tee_with_filter_skips_emit_when_filter_excludes_all_frames():
 
 
 def test_tee_with_filter_emits_when_any_frame_passes():
-    tee = Tee("live", filter=lambda ft: ft != "warmup" and ft != "stale")
+    tee = Tee("live", emit_if_any=lambda ft: ft != "warmup" and ft != "stale")
     batch = _batch_with_frame_types(["warmup", "light", "warmup"])
     tee.process(batch)
     emits = [e for e in batch.events if isinstance(e, LiveEmit)]
@@ -46,12 +46,12 @@ def test_tee_with_filter_emits_when_any_frame_passes():
 
 
 def test_tee_reset_is_a_noop():
-    tee = Tee("raw", filter=None)
+    tee = Tee("raw", emit_if_any=None)
     tee.reset()
 
 
 def test_tee_with_max_duration_s_emits_within_budget():
-    tee = Tee("raw", filter=None, max_duration_s=60.0)
+    tee = Tee("raw", emit_if_any=None, max_duration_s=60.0)
     batch = _batch_with_frame_types(["light"])
     batch.timestamp_s = np.array([0.0], dtype=np.float64)
     tee.process(batch)
@@ -60,7 +60,7 @@ def test_tee_with_max_duration_s_emits_within_budget():
 
 
 def test_tee_with_max_duration_s_skips_after_budget():
-    tee = Tee("raw", filter=None, max_duration_s=60.0)
+    tee = Tee("raw", emit_if_any=None, max_duration_s=60.0)
     batch = _batch_with_frame_types(["light"])
     batch.timestamp_s = np.array([65.0], dtype=np.float64)
     tee.process(batch)
@@ -69,7 +69,7 @@ def test_tee_with_max_duration_s_skips_after_budget():
 
 
 def test_tee_with_max_duration_s_none_means_unbounded():
-    tee = Tee("raw", filter=None, max_duration_s=None)
+    tee = Tee("raw", emit_if_any=None, max_duration_s=None)
     batch = _batch_with_frame_types(["light"])
     batch.timestamp_s = np.array([9999.0], dtype=np.float64)
     tee.process(batch)
@@ -86,7 +86,7 @@ def test_tee_default_emits_payload_by_reference():
     Back-compat: the "live" tee runs last in the pipeline, so reference
     semantics are correct and cheaper there.
     """
-    tee = Tee("live", filter=None)
+    tee = Tee("live", emit_if_any=None)
     batch = _batch_with_frame_types(["light"])
     tee.process(batch)
     emit = [e for e in batch.events if isinstance(e, LiveEmit)][0]
@@ -102,7 +102,7 @@ def test_tee_snapshot_decouples_payload_from_later_mutation():
     the whole pipeline finishes — so a by-reference payload would serialize
     post-mutation data. A snapshot payload must be immune.
     """
-    tee = Tee("raw", filter=None, snapshot=True)
+    tee = Tee("raw", emit_if_any=None, snapshot=True)
     batch = _batch_with_frame_types(["light"])
     batch.raw_histograms[:] = 100
     batch.timestamp_s = np.array([1.234], dtype=np.float64)
@@ -128,7 +128,7 @@ def test_tee_snapshot_survives_noise_floor_in_pipeline():
     from omotion.pipeline.pipeline import Pipeline
     from omotion.pipeline.stages.noise_floor import NoiseFloorStage
 
-    tee = Tee("raw", filter=None, snapshot=True)
+    tee = Tee("raw", emit_if_any=None, snapshot=True)
     pipe = Pipeline([tee, NoiseFloorStage(threshold=10)])
 
     batch = _batch_with_frame_types(["light"])

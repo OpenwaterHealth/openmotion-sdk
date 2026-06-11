@@ -7,8 +7,10 @@ Combines realtime and corrected side averaging into a single stage:
 
   Corrected path: reads IntervalClosed events from DarkCorrectionStage,
   groups the per-camera corrected frames by frame_id, spatially averages
-  the selected cameras, emits LiveEmit("final_side", SideAverageSample)
-  for DB persistence (cam_id=-1 row).
+  the selected cameras, and emits a synthetic IntervalClosed whose
+  EnrichedCorrectedFrames carry ``cam_id=-1`` — the side-average
+  convention. These ride the ordinary "final" channel; ScanDBSink
+  persists them as the reduced-mode record.
 
 Both paths use spatial_side_average — a purely spatial operation (across
 cameras at one instant, no temporal element). Gated on ``enabled``
@@ -26,9 +28,15 @@ from typing import Optional
 import numpy as np
 
 from ..batch import FrameBatch, IntervalClosed, LiveEmit, SideAverageSample
+from .dark import EnrichedCorrectedFrame, EnrichedCorrectedInterval
 
 
 _SIDE_STR_TO_INT = {"left": 0, "right": 1}
+_SIDE_INT_TO_STR = ("left", "right")
+
+# Higher rank = worse quality; the side average inherits the worst quality
+# of any camera that contributed to it. Mirrors sinks._QUALITY_RANK.
+_QUALITY_RANK = {"ok": 0, "ts_corrected": 1, "nan_filled": 2}
 
 
 def _mask_to_cam_indices(mask: int) -> np.ndarray:
@@ -66,8 +74,9 @@ class SideAverageStage:
     Corrected: DarkCorrectionStage emits one IntervalClosed per (side, cam)
     when that camera's dark-bounded interval closes. This stage gathers
     those per-camera intervals, groups by frame_id, spatially averages the
-    selected cameras, and emits LiveEmit(channel="final_side",
-    SideAverageSample) for DB persistence.
+    selected cameras, and emits one synthetic IntervalClosed per side whose
+    frames are EnrichedCorrectedFrames with cam_id=-1 — routed to "final"
+    sinks like any other interval.
     """
 
     name = "side_average"
@@ -89,11 +98,16 @@ class SideAverageStage:
         self._acc_t = [0.0, 0.0]
 
         # ── Corrected accumulator state ──
-        # Per side: the bounds (left_abs, right_abs) of the interval window
-        # currently accumulating (None = none open), and that window's frames
-        # keyed by frame_id -> {"t", "bfi"(8), "bvi"(8), "mean"(8), "contrast"(8)}.
-        self._window: list[Optional[tuple]] = [None, None]
+        # Per side: accumulated frames keyed by frame_id ->
+        # {"t", "bfi"(8), "bvi"(8), "mean"(8), "contrast"(8), "quality"},
+        # plus per-camera progress: cam_id -> right_abs of the last interval
+        # that camera closed. A capture is flushed once EVERY mask-enabled
+        # camera's progress has moved past it (the cross-camera watermark),
+        # so each frame_id is emitted exactly once even when one camera's
+        # interval spans a missed dark or closes a batch later than its
+        # siblings.
         self._frames: list[dict] = [dict(), dict()]
+        self._progress: list[dict] = [dict(), dict()]
 
     def process(self, batch: FrameBatch) -> FrameBatch:
         if not self.enabled:
@@ -145,14 +159,19 @@ class SideAverageStage:
     # ── Corrected path ───────────────────────────────────────────────────
 
     def _process_corrected(self, batch: FrameBatch) -> None:
-        for event in batch.events:
+        # Snapshot: _flush_ready appends our own synthetic IntervalClosed
+        # events to batch.events; iterating the live list would re-scan them.
+        # (Their cam_id=-1 frames are skipped by the cam-range guard anyway,
+        # but a snapshot keeps the traversal well-defined.)
+        changed = [False, False]
+        for event in list(batch.events):
             if not isinstance(event, IntervalClosed):
                 continue
             ci = event.corrected_batch
             frames = getattr(ci, "frames", None)
             if not frames:
                 continue
-            bounds = (getattr(ci, "left_abs", None), getattr(ci, "right_abs", None))
+            right_abs = getattr(ci, "right_abs", None)
             for f in frames:
                 side = _SIDE_STR_TO_INT.get(getattr(f, "side", None))
                 if side is None:
@@ -160,13 +179,47 @@ class SideAverageStage:
                 cam = int(getattr(f, "cam_id", -1))
                 if cam < 0 or cam >= 8:
                     continue
-                # A new interval window for this side → finalize the previous.
-                if self._window[side] is not None and bounds != self._window[side]:
-                    self._emit_corrected(side, batch)
-                if self._window[side] != bounds:
-                    self._window[side] = bounds
-                    self._frames[side] = {}
                 self._ingest_corrected(side, cam, f)
+                changed[side] = True
+                # Track how far this camera has progressed: everything below
+                # its interval's right boundary has been delivered.
+                if right_abs is not None:
+                    prev = self._progress[side].get(cam, -1)
+                    if int(right_abs) > prev:
+                        self._progress[side][cam] = int(right_abs)
+
+        # Flush AFTER ingesting the whole batch, so sibling cameras whose
+        # intervals close in the same batch all contribute before emission.
+        for side in (0, 1):
+            if changed[side]:
+                self._flush_ready(side, batch)
+
+    def _watermark(self, side: int) -> Optional[int]:
+        """Highest frame_id (exclusive) that every enabled camera has
+        delivered. None until each mask-enabled camera has closed at least
+        one interval — flushing earlier would emit partial averages and
+        re-emit (duplicate) the frame when the late camera caught up.
+        A mask-enabled camera that never streams stalls the corrected side
+        average until on_scan_stop, which flushes everything regardless."""
+        cams = self._cams[side]
+        if len(cams) == 0:
+            return None
+        progress = self._progress[side]
+        wm = None
+        for cam in cams:
+            p = progress.get(int(cam))
+            if p is None:
+                return None
+            wm = p if wm is None else min(wm, p)
+        return wm
+
+    def _flush_ready(self, side: int, batch: FrameBatch) -> None:
+        wm = self._watermark(side)
+        if wm is None:
+            return
+        ready = sorted(fid for fid in self._frames[side] if fid < wm)
+        if ready:
+            self._emit_frames(side, ready, batch, right_abs=wm)
 
     def _ingest_corrected(self, side: int, cam: int, f) -> None:
         fid = int(getattr(f, "abs_frame_id"))
@@ -176,38 +229,62 @@ class SideAverageStage:
                 "t": float(getattr(f, "t", 0.0)),
                 "bfi": np.full(8, np.nan), "bvi": np.full(8, np.nan),
                 "mean": np.full(8, np.nan), "contrast": np.full(8, np.nan),
+                "quality": "ok",
             }
             self._frames[side][fid] = rec
         rec["bfi"][cam] = float(getattr(f, "bfi", np.nan))
         rec["bvi"][cam] = float(getattr(f, "bvi", np.nan))
         rec["mean"][cam] = float(getattr(f, "mean", np.nan))
         rec["contrast"][cam] = float(getattr(f, "contrast", np.nan))
+        fq = str(getattr(f, "quality", "ok") or "ok")
+        if _QUALITY_RANK.get(fq, 0) > _QUALITY_RANK.get(rec["quality"], 0):
+            rec["quality"] = fq
 
-    def _emit_corrected(self, side: int, batch: FrameBatch) -> None:
+    def _emit_frames(self, side: int, fids: list, batch: FrameBatch,
+                     *, right_abs: int) -> None:
+        """Average and emit the given frame_ids as one synthetic interval of
+        cam_id=-1 frames, removing them from the accumulator."""
         cams = self._cams[side]
-        for fid in sorted(self._frames[side]):
-            rec = self._frames[side][fid]
-            batch.events.append(LiveEmit(
-                channel="final_side",
-                payload=SideAverageSample(
-                    t=rec["t"], frame_id=int(fid), side=side,
-                    bfi=spatial_side_average(rec["bfi"], cams),
-                    bvi=spatial_side_average(rec["bvi"], cams),
-                    mean=spatial_side_average(rec["mean"], cams),
-                    contrast=spatial_side_average(rec["contrast"], cams),
-                ),
+        avg_frames: list[EnrichedCorrectedFrame] = []
+        for fid in fids:
+            rec = self._frames[side].pop(fid)
+            avg_frames.append(EnrichedCorrectedFrame(
+                abs_frame_id=int(fid),
+                t=rec["t"],
+                side=_SIDE_INT_TO_STR[side],
+                cam_id=-1,
+                mean=spatial_side_average(rec["mean"], cams),
+                std=float("nan"),  # std of a spatial average is undefined here
+                contrast=spatial_side_average(rec["contrast"], cams),
+                bfi=spatial_side_average(rec["bfi"], cams),
+                bvi=spatial_side_average(rec["bvi"], cams),
+                quality=rec["quality"],
             ))
-        self._window[side] = None
-        self._frames[side] = {}
+        if avg_frames:
+            batch.events.append(IntervalClosed(
+                corrected_batch=EnrichedCorrectedInterval(
+                    left_abs=int(fids[0]),
+                    right_abs=int(right_abs),
+                    frames=avg_frames,
+                )
+            ))
 
     # ── Lifecycle ────────────────────────────────────────────────────────
 
     def on_scan_stop(self, batch: FrameBatch) -> None:
-        """Flush final open realtime captures and any remaining corrected windows."""
+        """Flush the final open realtime captures and every corrected capture
+        still below the watermark (including the terminal-flush intervals
+        DarkCorrectionStage appends during its own on_scan_stop, which runs
+        before this stage's)."""
+        if not self.enabled:
+            return
+        self._process_corrected(batch)
         for side in (0, 1):
             self._emit_realtime(side, batch)
-            if self._window[side] is not None:
-                self._emit_corrected(side, batch)
+            remaining = sorted(self._frames[side])
+            if remaining:
+                self._emit_frames(side, remaining, batch,
+                                  right_abs=remaining[-1] + 1)
 
     def reset(self) -> None:
         self._reset_state()

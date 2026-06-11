@@ -1,10 +1,11 @@
-"""Reduced-mode round-trip — stored cam_id=-1 == CorrectedSideAverageStage output.
+"""Reduced-mode round-trip — stored cam_id=-1 == SideAverageStage corrected output.
 
 Runs a synthetic reduced-mode scan through default_pipeline + ScanDBSink, reads
-the persisted cam_id=-1 side-average rows back, and asserts they equal what
-Stage B emitted on the "final_side" channel. This is the single-source-of-truth
-guarantee: what the DB stores (and replay reads) IS the corrected side average
-the pipeline produced — no divergence, no re-derivation.
+the persisted cam_id=-1 side-average rows back, and asserts they equal the
+cam_id=-1 EnrichedCorrectedFrames SideAverageStage emitted on the "final"
+channel. This is the single-source-of-truth guarantee: what the DB stores
+(and replay reads) IS the corrected side average the pipeline produced —
+no divergence, no re-derivation.
 
 Note: this compares the DB against the CORRECTED-path output, NOT the realtime
 live display — those differ by design.
@@ -30,6 +31,8 @@ from omotion.pipeline.pedestal import SensorPedestals
 HERE = pathlib.Path(__file__).parent / "data"
 _PEDESTAL = 64.0
 _DARK_INTERVAL = 20  # matches the golden fixture
+
+_SIDE_STR_TO_INT = {"left": 0, "right": 1}
 
 
 @dataclass
@@ -57,20 +60,23 @@ def _reduced_meta() -> ScanMetadata:
     )
 
 
-class _FinalSideCapture:
-    """Records every SideAverageSample dispatched on the 'final_side' channel —
-    i.e. exactly what CorrectedSideAverageStage emitted."""
-    channels = {"final_side"}
+class _SideAverageCapture:
+    """Records every cam_id=-1 EnrichedCorrectedFrame dispatched on the
+    'final' channel — i.e. exactly what SideAverageStage emitted."""
+    channels = {"final"}
 
     def __init__(self):
-        self.samples = []
+        self.frames = []
 
     def on_scan_start(self, meta):
         pass
 
     def consume(self, channel, payload):
-        if channel == "final_side":
-            self.samples.append(payload)
+        if channel != "final":
+            return
+        for f in getattr(payload, "frames", []):
+            if int(getattr(f, "cam_id", -99)) == -1:
+                self.frames.append(f)
 
     def on_complete(self):
         pass
@@ -101,11 +107,12 @@ def test_reduced_round_trip_stored_equals_corrected_output(tmp_path):
     )
     db_path = tmp_path / "scan.db"
     db_sink = ScanDBSink(db_path=str(db_path))
-    capture = _FinalSideCapture()
+    capture = _SideAverageCapture()
     ScanRunner(source=source, pipeline=pipeline, sinks=[db_sink, capture]).run()
 
-    # Stage B must have produced a corrected side average (an interval closed).
-    assert capture.samples, "no final_side emitted — no interval closed in reduced mode"
+    # SideAverageStage must have produced a corrected side average
+    # (an interval closed in reduced mode).
+    assert capture.frames, "no cam_id=-1 side average emitted — no interval closed in reduced mode"
 
     # What the DB persisted at cam_id=-1.
     conn = sqlite3.connect(str(db_path))
@@ -120,14 +127,16 @@ def test_reduced_round_trip_stored_equals_corrected_output(tmp_path):
     conn.close()
     assert per_cam == 0, "reduced mode must not persist per-camera rows"
 
-    # Expected = exactly Stage B's output, rounded as the sink rounds, skipping
-    # samples the sink drops (both bfi and bvi non-finite).
+    # Expected = exactly the stage's output, rounded as the sink rounds,
+    # skipping frames the sink drops (no finite metric at all).
     expected = {}
-    for s in capture.samples:
-        bfi, bvi = _r9(s.bfi), _r9(s.bvi)
-        if bfi is None and bvi is None:
+    for f in capture.frames:
+        bfi, bvi = _r9(f.bfi), _r9(f.bvi)
+        mean, contrast = _r9(f.mean), _r9(f.contrast)
+        if bfi is None and bvi is None and mean is None and contrast is None:
             continue
-        expected[(int(s.frame_id), int(s.side))] = (bfi, bvi, _r9(s.mean), _r9(s.contrast))
+        key = (int(f.abs_frame_id), _SIDE_STR_TO_INT[f.side])
+        expected[key] = (bfi, bvi, mean, contrast)
 
     assert len(db_rows) == len(expected)
     for side, frame_id, bfi, bvi, mean, contrast in db_rows:

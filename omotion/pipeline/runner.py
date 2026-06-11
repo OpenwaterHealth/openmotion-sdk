@@ -7,7 +7,7 @@ import logging
 
 import numpy as np
 
-from .batch import FrameBatch, LiveEmit, IntervalClosed, BatchEvent
+from .batch import FrameBatch, LiveEmit, IntervalClosed, BatchEvent, PipelineError
 from .pipeline import Pipeline
 from .sinks import Sink
 from .sources import Source
@@ -22,8 +22,8 @@ class CriticalSinkError(RuntimeError):
 
     Sinks opt in by setting ``critical = True`` (default is False). The
     canonical critical sink is ScanDBSink: if the scan database can't be
-    opened there is nowhere to persist the live per-camera signal, and
-    (when the corrected CSV is opt-in and off) the scan would otherwise
+    opened there is nowhere to persist the corrected (final-branch) record,
+    and (when the corrected CSV is opt-in and off) the scan would otherwise
     complete with no data at all."""
 
 
@@ -98,9 +98,28 @@ class ScanRunner:
             for batch in self.source:
                 try:
                     result = self.pipeline.process(batch)
-                except Exception:
-                    logger.exception("pipeline.process raised — resetting and continuing")
-                    self.pipeline.reset()
+                except Exception as exc:
+                    # Drop the batch but PRESERVE stage state. Resetting here
+                    # would clear the frame unwrappers — re-tripping the
+                    # stale-first guard (~6.4 s of dropped frames per camera)
+                    # and permanently misaligning the positional dark schedule
+                    # for the rest of the scan. A dropped batch is the same
+                    # gap shape as USB packet loss, which stages already
+                    # tolerate.
+                    n = int(batch.frame_ids.shape[0])
+                    logger.exception(
+                        "pipeline.process raised — dropping batch (%d frames), "
+                        "stage state preserved", n,
+                    )
+                    self.dispatch_event(PipelineError(
+                        error=repr(exc),
+                        n_frames=n,
+                        first_timestamp_s=(
+                            float(batch.timestamp_s[0])
+                            if batch.timestamp_s is not None and batch.timestamp_s.size > 0
+                            else None
+                        ),
+                    ))
                     continue
                 self._dispatch(result)
 
@@ -121,30 +140,22 @@ class ScanRunner:
 
     def _dispatch(self, batch: FrameBatch) -> None:
         for event in batch.events:
-            if isinstance(event, LiveEmit):
-                for sink in self._sinks_for(event.channel):
-                    self._safe_consume(sink, event.channel, event.payload)
-            elif isinstance(event, IntervalClosed):
-                for sink in self._sinks_for("final"):
-                    self._safe_consume(sink, "final", event.corrected_batch)
-            elif isinstance(event, BatchEvent):
-                for sink in self._sinks_for("diagnostics"):
-                    self._safe_consume(sink, "diagnostics", event)
+            self.dispatch_event(event)
 
     def dispatch_event(self, event: BatchEvent) -> None:
-        """Push a single out-of-band event to the appropriate channel.
+        """Route one event to the sinks subscribed to its channel.
 
-        Used by ScanWorkflow to emit TriggerStateEvent transitions that
-        aren't tied to a FrameBatch. Diagnostic events route to the
-        "diagnostics" channel; IntervalClosed routes to "final"; LiveEmit
-        routes to its declared channel.
+        LiveEmit routes to its declared channel; IntervalClosed routes to
+        "final"; everything else (DarkIntegrityWarning, PipelineError,
+        TriggerStateEvent, …) routes to "diagnostics". Also the entry point
+        for out-of-band events not tied to a FrameBatch (e.g. ScanWorkflow's
+        TriggerStateEvent transitions).
         """
         if isinstance(event, LiveEmit):
-            for sink in self._sinks_for(event.channel):
-                self._safe_consume(sink, event.channel, event.payload)
+            channel, payload = event.channel, event.payload
         elif isinstance(event, IntervalClosed):
-            for sink in self._sinks_for("final"):
-                self._safe_consume(sink, "final", event.corrected_batch)
+            channel, payload = "final", event.corrected_batch
         else:
-            for sink in self._sinks_for("diagnostics"):
-                self._safe_consume(sink, "diagnostics", event)
+            channel, payload = "diagnostics", event
+        for sink in self._sinks_for(channel):
+            self._safe_consume(sink, channel, payload)

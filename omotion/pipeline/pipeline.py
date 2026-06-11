@@ -42,8 +42,13 @@ class Pipeline:
         return batch
 
     def reset(self) -> None:
-        """Call reset() on every stage. Done at scan start and after any
-        stage exception during a scan."""
+        """Call reset() on every stage, clearing all cross-batch state.
+
+        Scan-start / replay-reuse only. Deliberately NOT called on a
+        mid-scan stage exception: the runner drops the failed batch and
+        preserves stage state instead, because clearing the frame
+        unwrappers mid-scan re-trips the stale-first guard and permanently
+        misaligns the positional dark schedule (see ScanRunner.run)."""
         for stage in self.stages:
             stage.reset()
 
