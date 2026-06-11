@@ -33,13 +33,19 @@ def default_pipeline(*,
                      discard_count: int = 9,
                      dark_interval: int = 600,
                      realtime_dark_history_size: int = 4,
-                     raw_save_max_duration_s: Optional[float] = None) -> Pipeline:
+                     raw_save_max_duration_s: Optional[float] = None,
+                     telemetry: Optional[Any] = None) -> Pipeline:
     """Build the canonical pipeline. See SciencePipeline.md for the algorithm.
 
     Args:
         raw_save_max_duration_s: If provided and > 0, includes Tee("raw") with
             max_duration_s set. If 0 or negative, omits the raw tee. If None
             (default), includes unbounded raw tee.
+        telemetry: Optional TelemetryAggregator. When provided, a
+            TelemetryIngestStage is inserted after classification (before the
+            raw tee) so every frame — including the raw CSV record — carries
+            the pdc/tcm/tcl context at its capture time. None (default)
+            omits the stage (replay sources, tests, no console telemetry).
     """
 
     not_warmup_or_stale = lambda ft: ft != "warmup" and ft != "stale"
@@ -47,6 +53,10 @@ def default_pipeline(*,
     stages: list = [
         FrameClassificationStage(discard_count=discard_count, dark_interval=dark_interval),
     ]
+
+    if telemetry is not None:
+        from .telemetry import TelemetryIngestStage
+        stages.append(TelemetryIngestStage(telemetry))
 
     # Conditionally add raw tee based on raw_save_max_duration_s.
     # snapshot=True: the raw tee runs before TimestampRepair/NoiseFloor,

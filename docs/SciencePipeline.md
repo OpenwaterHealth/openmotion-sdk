@@ -17,10 +17,11 @@ A scan is driven by a `ScanRunner` (`omotion/pipeline/runner.py`). It pulls `Fra
 ```
 ┌────────────┐   FrameBatch  ┌─────────────────────────────────────────┐
 │   Source   ├──────────────►│           Pipeline (Stage list)         │
-│ (live USB, │  N frames per │ Classify → Tee(raw) → TimestampRepair → │
-│ CSV)       │  batch        │ NoiseFloor → Moments → PedestalSub →    │
-└────────────┘               │ DarkCorrection → ShotNoise → BfiBvi →   │
-                             │ DarkFrameHold → SideAvg → Tee(live)     │
+│ (live USB, │  N frames per │ Classify → TelemetryIngest* → Tee(raw) →│
+│ CSV)       │  batch        │ TimestampRepair → NoiseFloor → Moments →│
+└────────────┘               │ PedestalSub → DarkCorrection →          │
+                             │ ShotNoise → BfiBvi → DarkFrameHold →    │
+                             │ SideAvg → Tee(live)                     │
                              └──────────────┬──────────────────────────┘
                                             │ batch.events (LiveEmit /
                                             │ IntervalClosed / diagnostics)
@@ -38,9 +39,9 @@ A scan is driven by a `ScanRunner` (`omotion/pipeline/runner.py`). It pulls `Fra
                                   live/final plot sinks, …)
 ```
 
-(Console telemetry is currently handled *outside* the pipeline: a listener on
-the legacy `ConsoleTelemetryPoller` thread writes the per-scan telemetry CSV —
-see §9. The per-frame telemetry fields on `FrameBatch` are reserved.)
+(*TelemetryIngest is present when a `TelemetryAggregator` is wired — every
+live scan with a running console telemetry poller. The poller also feeds the
+per-scan telemetry CSV via a separate listener, outside the pipeline. See §9.)
 
 The pipeline is **pure transformation**: stages mutate a typed `FrameBatch` dataclass in place and append events to `batch.events`. They never perform I/O. All side effects — file writes, UI emission, DB inserts — happen in sinks downstream of the runner.
 
@@ -65,9 +66,9 @@ Three things characterise this design and make it auditable:
 | `raw_histograms` | `(N, 2, 8, 1024)` uint32 | Source (parse) | Raw 1024-bin histogram per side × cam; mutated in place by NoiseFloorStage |
 | `temperature_c` | `(N, 2, 8)` float32 | Source (parse) | Sensor-reported temperature |
 | `timestamp_s` | `(N,)` float64 | Source (parse) | Sensor timestamp; normalised to scan start by `_BaseSource` |
-| `pdc` | `(N,)` float32 \| None | **Reserved** (always None today) | Mean PDC reading (mA) at the frame's timestamp — per-frame telemetry stamping was removed and is planned to return (§9) |
-| `tcm` | `(N,)` int64 \| None | **Reserved** (always None today) | MCU trigger counter (lsync pulses) |
-| `tcl` | `(N,)` int64 \| None | **Reserved** (always None today) | Laser trigger counter |
+| `pdc` | `(N,)` float32 \| None | TelemetryIngestStage (or replay source) | PDC reading (mA) at the frame's capture time; NaN before the first telemetry sample; None when no aggregator is wired |
+| `tcm` | `(N,)` int64 \| None | TelemetryIngestStage (or replay source) | MCU trigger counter (lsync pulses) |
+| `tcl` | `(N,)` int64 \| None | TelemetryIngestStage (or replay source) | Laser trigger counter |
 | `abs_frame_ids` | `(N,)` int64 | FrameClassificationStage | Monotonic unwrapped frame counter |
 | `frame_type` | `(N,)` `<U8` | FrameClassificationStage | One of `"warmup"`, `"dark"`, `"light"`, `"stale"` |
 | `mean_raw` | `(N, 2, 8)` float32 | MomentsStage | First moment μ₁ of raw histogram (NaN where count == 0) |
@@ -120,6 +121,7 @@ The full chain assembled by `default_pipeline()` is:
 
 ```
 FrameClassificationStage
+TelemetryIngestStage                                       # when telemetry wired
 Tee("raw", emit_if_any=ft != "stale", max_duration_s=…)   # conditional
 TimestampRepairStage
 NoiseFloorStage
@@ -181,17 +183,27 @@ A `delta > 128` (apparent large backward jump) is treated as a packet anomaly an
 
 Under the defaults, dark frames occur at `n = 10, 601, 1201, 1801, …`. Every other frame with `n > d` is `"light"`.
 
-### 5.2 Per-frame telemetry — RESERVED (not currently in the pipeline)
+### 5.2 TelemetryIngestStage
 
-There is no telemetry stage today. A `TelemetryIngestStage` that stamped each
-frame with `pdc`/`tcm`/`tcl` from a `TelemetryAggregator` existed and was
-removed (commit `9a2d8e0`, "drop telemetry stage/source/sink for now"); it is
-**planned to return**. Until then:
+**File:** `omotion/pipeline/telemetry.py`. **Writes:** `pdc`, `tcm`, `tcl`.
+Present only when `default_pipeline(telemetry=...)` receives a
+`TelemetryAggregator` (every live scan with a running console telemetry
+poller; omitted for replays and tests).
 
-- `FrameBatch.pdc` / `tcm` / `tcl` are always `None`.
-- The raw CSV's `tcm,tcl,pdc` columns are always blank (the schema keeps them
-  so old and new files stay column-compatible).
-- The per-scan telemetry CSV is written *outside* the pipeline — see §9.
+Stamps each frame with the most recent `TelemetrySample` at-or-before the
+frame's capture time: `pdc[i]` (photodiode current, mA), `tcm[i]` (MCU
+trigger count), `tcl[i]` (laser trigger count). Frames before the first
+sample get `pdc = NaN`, `tcm = tcl = 0` — the CSV writers render those as
+blank cells.
+
+**Clock bridging.** Frame timestamps are sensor-firmware clock normalised
+to scan start; telemetry samples carry host `time.time()`. The stage
+captures `wall_offset = time.time() − first_frame_ts` on its first
+non-empty batch — alignment error is bounded by the source's flush
+latency (~0.25 s), comfortably inside the poller's ~10 Hz cadence.
+
+`reset()` re-anchors the offset but deliberately does **not** clear the
+aggregator — telemetry history is owned by the scan, not the pipeline pass.
 
 ### 5.3 Tee("raw")
 
@@ -554,7 +566,7 @@ The runner calls `on_scan_start(metadata)` on every sink before the first batch,
 
 Writes the two legacy CSV families. File creation is lazy on first `consume()`.
 
-- **Raw CSV** — one file per side, named `{scan_id}_{subject_id}_{side}_mask{XX}_raw.csv`. Schema: `cam_id, frame_id, timestamp_s, type, 0..1023, temperature, sum, tcm, tcl, pdc`. Each frame's `type` column is the `frame_type` written by FrameClassificationStage (`"warmup" | "dark" | "light" | "stale"`). Telemetry columns (`tcm`, `tcl`, `pdc`) are **always blank today** — per-frame telemetry stamping is reserved (§5.2/§9); the columns stay so old and new files are column-compatible.
+- **Raw CSV** — one file per side, named `{scan_id}_{subject_id}_{side}_mask{XX}_raw.csv`. Schema: `cam_id, frame_id, timestamp_s, type, 0..1023, temperature, sum, tcm, tcl, pdc`. Each frame's `type` column is the `frame_type` written by FrameClassificationStage (`"warmup" | "dark" | "light" | "stale"`). Telemetry columns (`tcm`, `tcl`, `pdc`) carry TelemetryIngestStage's per-frame stamps (§5.2); cells are blank when no telemetry sample preceded the frame or no aggregator was wired (replays of pre-telemetry scans stay column-compatible).
 - **Corrected CSV** — one file per scan, named `{scan_id}_corrected.csv`.
   - **Normal mode** (82 columns): `frame_id, timestamp_s, {bfi,bvi,mean,contrast,temp}_{l,r}{1..8}`. Per-frame rows are accumulated in `_corrected_acc` until every expected `(side, cam)` slot has contributed a `mean`; only then is the row written.
   - **Reduced mode** (6 columns): `frame_id, timestamp_s, bfi_left, bfi_right, bvi_left, bvi_right`. Each `EnrichedCorrectedFrame` writes into the row's `bfi_{side}`/`bvi_{side}` slot based on `frame.side`; a row is flushed once both expected sides have contributed (or only one, if the other's camera mask is zero).
@@ -625,25 +637,30 @@ Sink-authoring rules:
 
 ---
 
-## 9. Telemetry — current state and reservation
+## 9. Telemetry
 
-**Per-frame telemetry stamping is currently absent from the pipeline.** The
-`TelemetryIngestStage` / `TelemetryAggregator` / `ConsoleTelemetrySource` /
-`TelemetrySink` subsystem was removed in commit `9a2d8e0` ("drop telemetry
-stage/source/sink for now") and is **planned to return**. The reserved
-surface that remains:
+Two independent telemetry paths exist, both fed by the long-lived
+`ConsoleTelemetryPoller` daemon thread (~10 Hz; see
+[`ConsoleTelemetry.md`](ConsoleTelemetry.md)) via per-scan listeners that
+`ScanWorkflow` registers at scan start and removes in the worker's
+`finally`:
 
-- `FrameBatch.pdc` / `tcm` / `tcl` fields — always `None`.
-- The raw CSV's `tcm,tcl,pdc` columns — always blank.
+- **Per-frame stamping (in the pipeline)** — `omotion/pipeline/telemetry.py`.
+  A `TelemetryFeeder` listener converts each snapshot to a
+  `TelemetrySample(timestamp_s, pdc_ma, tcm, tcl)` and pushes it into a
+  per-scan `TelemetryAggregator` (thread-safe ring buffer, default 256
+  entries ≈ 25 s). `TelemetryIngestStage` (§5.2) queries
+  `snapshot_at(t)` per frame and stamps `batch.pdc/tcm/tcl`, which flow
+  into the raw CSV's `tcm,tcl,pdc` columns. `CsvReplaySource` reads those
+  columns back, so replays carry the recorded telemetry without needing a
+  live aggregator.
+- **Telemetry CSV (outside the pipeline)** — the `_TelemetryCsvWriter`
+  listener writes one row per snapshot to
+  `{scan_id}_{subject_id}_telemetry.csv` (full snapshot: TEC, PDU,
+  safety, counters). Not a pipeline sink; no channel.
 
-What runs today instead: `ScanWorkflow` registers a `_TelemetryCsvWriter`
-listener on the legacy `ConsoleTelemetryPoller` daemon thread for the
-duration of each scan, writing one row per ~10 Hz snapshot to
-`{scan_id}_{subject_id}_telemetry.csv` (columns: `timestamp_s,
-pdc_samples_ma, tec_setpoint_c, tec_actual_c, tec_setpoint_raw,
-tec_actual_raw, tcm, tcl, safety_status`). This path bypasses the pipeline
-entirely — it is not a pipeline sink and has no channel. See
-[`ConsoleTelemetry.md`](ConsoleTelemetry.md) for the poller itself.
+The aggregator and the CSV writer are independent listeners; closing one
+does not affect the other.
 
 ---
 
@@ -652,7 +669,7 @@ entirely — it is not a pipeline sink and has no channel. See
 | Thread | Owner | Lifecycle | Purpose |
 |---|---|---|---|
 | `LiveUsbSource-{left,right}` | `LiveUsbSource` | per scan, daemon | Per-side packet parsing → FrameBatch → shared batch queue |
-| `ConsoleTelemetryPoller` | `MotionConsole.telemetry` | long-lived, daemon | ~10 Hz console telemetry snapshots; `_TelemetryCsvWriter` listener writes the per-scan telemetry CSV (outside the pipeline, §9) |
+| `ConsoleTelemetryPoller` | `MotionConsole.telemetry` | long-lived, daemon | ~10 Hz console telemetry snapshots; per-scan listeners feed the `TelemetryAggregator` (per-frame stamping, §5.2) and the telemetry CSV writer (§9) |
 | Runner thread (`ScanWorkflow._worker`) | `ScanWorkflow` | per scan, non-daemon | Iterate the source, call `pipeline.process(batch)`, dispatch events to sinks |
 
 The pipeline stages and all pipeline sinks run **on the runner thread** — there is no cross-thread interaction inside the pipeline itself.
@@ -705,6 +722,7 @@ Both consumers are pure sinks — they add no pipeline stages, do not modify Fra
 | `_FRAME_ROLLOVER_THRESHOLD` | 128 | `FrameClassificationStage` | Max forward delta before rollover is detected |
 | `batch_size_frames` | 10 (live) / 100 (replay) | `LiveUsbSource` / `CsvReplaySource` | N frames per FrameBatch |
 | `flush_interval_s` | 0.25 | `LiveUsbSource` | Time-based flush so partial batches don't stall the live UI |
+| `TelemetryAggregator` ring size | 256 (≈25 s at ~10 Hz) | `omotion/pipeline/telemetry.py` | Telemetry samples retained for per-frame stamping |
 
 ---
 

@@ -129,11 +129,27 @@ class CsvReplaySource(_BaseSource):
 
         raw_hist = np.zeros((n, 2, 8, 1024), dtype=np.uint32)
         temp_arr = np.zeros((n, 2, 8), dtype=np.float32)
+        # Recorded telemetry context (blank cells on scans captured without
+        # console telemetry → NaN / 0, matching TelemetryIngestStage's
+        # no-sample convention). Carried through so a replay's raw CSV is
+        # column-faithful to the original.
+        pdc = np.full(n, np.nan, dtype=np.float32)
+        tcm = np.zeros(n, dtype=np.int64)
+        tcl = np.zeros(n, dtype=np.int64)
         for i, row in enumerate(rows):
             cam = int(row["cam_id"])
             for b in range(1024):
                 raw_hist[i, side_idx, cam, b] = int(row[str(b)])
             temp_arr[i, side_idx, cam] = float(row["temperature"])
+            v = row.get("pdc")
+            if v:
+                pdc[i] = float(v)
+            v = row.get("tcm")
+            if v:
+                tcm[i] = int(float(v))
+            v = row.get("tcl")
+            if v:
+                tcl[i] = int(float(v))
 
         return FrameBatch(
             cam_ids=cam_ids,
@@ -142,7 +158,7 @@ class CsvReplaySource(_BaseSource):
             raw_histograms=raw_hist,
             temperature_c=temp_arr,
             timestamp_s=timestamp_s,
-            pdc=None, tcm=None, tcl=None,
+            pdc=pdc, tcm=tcm, tcl=tcl,
         )
 
 

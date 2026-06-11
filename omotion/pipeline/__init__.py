@@ -37,6 +37,9 @@ from .factory import default_pipeline
 from .pedestal import SensorPedestals
 from .sinks import Sink, ScanMetadata, CsvSink, ScanDBSink, DiagnosticsLogSink
 from .sources import Source, LiveUsbSource, CsvReplaySource
+from .telemetry import (
+    TelemetryAggregator, TelemetryFeeder, TelemetryIngestStage, TelemetrySample,
+)
 
 
 __all__ = [
@@ -50,4 +53,6 @@ __all__ = [
     "Sink", "ScanMetadata",
     "CsvSink", "ScanDBSink", "DiagnosticsLogSink",
     "Source", "LiveUsbSource", "CsvReplaySource",
+    "TelemetryAggregator", "TelemetryFeeder", "TelemetryIngestStage",
+    "TelemetrySample",
 ]

@@ -14,6 +14,8 @@ def test_public_api_symbols_importable() -> None:
         Source, LiveUsbSource, CsvReplaySource,
         Sink, ScanMetadata,
         CsvSink, ScanDBSink, DiagnosticsLogSink,
+        TelemetryAggregator, TelemetryFeeder, TelemetryIngestStage,
+        TelemetrySample,
         Tee, default_pipeline,
         SensorPedestals,
     )
@@ -24,6 +26,8 @@ def test_public_api_symbols_importable() -> None:
         ScanRunner, CriticalSinkError,
         Source, LiveUsbSource, CsvReplaySource,
         Sink, ScanMetadata, CsvSink, ScanDBSink, DiagnosticsLogSink,
+        TelemetryAggregator, TelemetryFeeder, TelemetryIngestStage,
+        TelemetrySample,
         Tee, default_pipeline, SensorPedestals,
     ):
         assert sym is not None
@@ -44,6 +48,8 @@ def test_public_api_all_list_complete() -> None:
         "Sink", "ScanMetadata",
         "CsvSink", "ScanDBSink", "DiagnosticsLogSink",
         "Source", "LiveUsbSource", "CsvReplaySource",
+        "TelemetryAggregator", "TelemetryFeeder", "TelemetryIngestStage",
+        "TelemetrySample",
     }
 
     assert set(pkg.__all__) == expected

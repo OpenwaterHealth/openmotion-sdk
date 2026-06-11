@@ -423,6 +423,25 @@ class ScanWorkflow:
             right=_safe_pedestal(self._interface.right),
         )
 
+        # ── Per-frame telemetry stamping ──────────────────────────────────
+        # When the console's telemetry poller is running, feed its snapshots
+        # into a per-scan aggregator and insert TelemetryIngestStage so every
+        # frame (including the raw CSV record) carries pdc/tcm/tcl context.
+        # The feeder is a poller listener (same pattern as the telemetry CSV
+        # writer below) — no extra thread; unregistered in _worker's finally.
+        telemetry_feeder = None
+        telemetry_aggregator = None
+        _poller = getattr(getattr(self._interface, "console", None), "telemetry", None)
+        if _poller is not None:
+            try:
+                from omotion.pipeline.telemetry import TelemetryAggregator, TelemetryFeeder
+                telemetry_aggregator = TelemetryAggregator()
+                telemetry_feeder = TelemetryFeeder(telemetry_aggregator, _poller)
+            except Exception:
+                logger.exception("failed to wire per-frame telemetry; continuing without")
+                telemetry_aggregator = None
+                telemetry_feeder = None
+
         # ── Build pipeline ────────────────────────────────────────────────
         calibration = self._calibration
         pipeline = default_pipeline(
@@ -430,6 +449,7 @@ class ScanWorkflow:
             calibration=calibration,
             pedestals=pedestals,
             raw_save_max_duration_s=request.raw_save_max_duration_s,
+            telemetry=telemetry_aggregator,
         )
 
         # ── Auto-inject default sinks ──────────────────────────────────────
@@ -689,6 +709,8 @@ class ScanWorkflow:
             finally:
                 if telemetry_writer is not None:
                     telemetry_writer.close()
+                if telemetry_feeder is not None:
+                    telemetry_feeder.close()
                 with self._lock:
                     self._running = False
                     self._thread = None

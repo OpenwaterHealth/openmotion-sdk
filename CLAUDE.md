@@ -37,7 +37,7 @@ Three-tier API: facade → device wrapper → transport.
 | Transport | `omotion/StreamInterface.py` | 382 | USB bulk streaming (sensor IF 1 = histo, IF 2 = IMU). Daemon reader thread per endpoint. |
 | Workflow | `omotion/ScanWorkflow.py` | 1110 | Full acquisition orchestration. Owns hardware bring-up + lifecycle; feeds frames into the pipeline. |
 | Workflow | `omotion/CalibrationWorkflow.py` | 1643 | Per-camera gain / I_max calibration. |
-| **Science** | `omotion/pipeline/` | — | **Stage-based BFI/BVI pipeline** (`sources`, stages in `pipeline.py`, `sinks`, `runner`, `factory`, `pedestal`, `batch`, `tee`). **The science lives here.** Full reference: `docs/SciencePipeline.md`. |
+| **Science** | `omotion/pipeline/` | — | **Stage-based BFI/BVI pipeline** (`sources`, stages in `pipeline.py`, `sinks`, `runner`, `factory`, `pedestal`, `batch`, `tee`, `telemetry`). **The science lives here.** Full reference: `docs/SciencePipeline.md`. |
 | Science | `omotion/MotionProcessing.py` | 730 | Wire-level histogram packet **parsing only** — a thin shim feeding the pipeline. (BFI/BVI moved to `omotion/pipeline/`; this module is slated to dissolve eventually.) |
 | Config | `omotion/config.py` | 291 | VID/PID, baud, packet types, command opcodes, `DEBUG_FLAG_*` bits. Single source of truth. |
 | Programming | `omotion/FPGAProgrammer.py` | 567 | Page-by-page Lattice XO2 flash. |
