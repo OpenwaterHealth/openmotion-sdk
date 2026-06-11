@@ -467,9 +467,25 @@ class DarkCorrectionStage:
                         self._emit_interval((side, cam_id), interval, batch.events)
 
             else:  # light
-                pred = self._realtime.predict(
-                    side, cam_id, history=self._history, target_t=t,
-                )
+                # Dark-like "light" frame — the laser was actually off; most
+                # commonly the firmware's terminal laser-off frame at scan
+                # stop, which never falls on a scheduled dark position so the
+                # classifier types it "light". Realtime dark subtraction
+                # would emit a near-zero mean and a garbage contrast that
+                # rails the live BFI/BVI display, so suppress realtime
+                # emission (row stays NaN) and keep _last_realtime on the
+                # last genuine light. Same threshold as the on_scan_stop tail
+                # detection, which still needs the frame buffered below for
+                # the batch path.
+                pedestal = (self._pedestals.left if side == "left"
+                            else self._pedestals.right)
+                dark_like = u1 <= pedestal + self._guard.max_above_pedestal
+
+                pred = None
+                if not dark_like:
+                    pred = self._realtime.predict(
+                        side, cam_id, history=self._history, target_t=t,
+                    )
                 if pred is not None:
                     u1_hat, std_hat = pred
                     baseline_rt[i, side_idx, cam_id] = np.float32(u1_hat)
@@ -492,12 +508,15 @@ class DarkCorrectionStage:
                         float(std_dc_rt[i, side_idx, cam_id]),
                     )
 
-                    pi = self._pending.get((side, cam_id))
-                    if pi is not None:
-                        u2 = std ** 2 + u1 ** 2
-                        q = str(batch.quality[i]) if batch.quality is not None else "ok"
-                        pi.add_light(abs_frame_id=abs_id, t=t, u1=u1, u2=u2,
-                                     quality=q)
+                # Buffer for the batch path even when realtime emission was
+                # suppressed (dark-like frame) — the terminal flush finds the
+                # dark-like tail in the pending light list.
+                pi = self._pending.get((side, cam_id))
+                if pi is not None:
+                    u2 = std ** 2 + u1 ** 2
+                    q = str(batch.quality[i]) if batch.quality is not None else "ok"
+                    pi.add_light(abs_frame_id=abs_id, t=t, u1=u1, u2=u2,
+                                 quality=q)
 
         batch.dark_baseline_rt = baseline_rt
         batch.mean_dc_rt = mean_dc_rt

@@ -89,6 +89,36 @@ def test_realtime_dark_frame_reuses_previous_live_corrected_values():
     assert batch.dark_baseline_rt[2, 0, 0] == pytest.approx(batch.dark_baseline_rt[1, 0, 0])
 
 
+def test_dark_like_light_frame_suppresses_realtime_emission():
+    """The firmware-guaranteed terminal laser-off frame is positionally
+    classified as "light" (it doesn't fall on a scheduled dark position).
+    Dark-subtracting it realtime yields a near-zero mean and a garbage
+    contrast that rails the live BFI/BVI display at scan end. A light frame
+    whose u1 is within the dark-integrity threshold (pedestal +
+    max_above_pedestal) must not emit realtime values — NaN, the established
+    "no valid realtime sample" convention.
+    """
+    # dark@10 (u1=65), genuine light@11 (u1=500), laser-off frame@12 typed
+    # "light" but dark-like (u1=66 <= pedestal 64 + guard 5).
+    mean = np.array([[65.0], [500.0], [66.0]], dtype=np.float32).reshape(3, 1, 1) * np.ones((1, 2, 8))
+    std  = np.array([[10.0], [20.0], [11.0]], dtype=np.float32).reshape(3, 1, 1) * np.ones((1, 2, 8))
+    batch = _batch(3, ["dark", "light", "light"], [10, 11, 12],
+                   mean_raw=mean.astype(np.float32), std_raw=std.astype(np.float32))
+
+    stage = DarkCorrectionStage(
+        realtime_estimator=HybridRealtimePredictor(),
+        batch_estimator=LinearInterpolation(),
+    )
+    stage.process(batch)
+
+    # Genuine light frame emits normally: 500 - 65 = 435.
+    assert batch.mean_dc_rt[1, 0, 0] == pytest.approx(435.0)
+    # Dark-like light frame must not emit realtime values.
+    assert np.isnan(batch.mean_dc_rt[2, 0, 0])
+    assert np.isnan(batch.std_dc_rt[2, 0, 0])
+    assert np.isnan(batch.dark_baseline_rt[2, 0, 0])
+
+
 def test_emits_corrected_interval():
     """DarkCorrectionStage emits raw CorrectedInterval (enrichment is done
     by downstream stages ShotNoiseCorrectionStage and BfiBviStage)."""
