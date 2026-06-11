@@ -37,6 +37,7 @@ dev = [
   "pytest-html>=4.0",
   "pytest-timeout>=2.3",
   "pytest-benchmark>=4.0",
+  "hidapi>=0.14",  # tests/ykush.py — YKUSH USB hub control for HIL tests
 ]
 
 [project.urls]
