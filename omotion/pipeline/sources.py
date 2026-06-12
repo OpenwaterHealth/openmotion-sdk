@@ -14,6 +14,7 @@ import logging
 import queue
 import threading
 import time
+from functools import partial
 from pathlib import Path
 from typing import Any, Iterator, Optional, Protocol, runtime_checkable
 
@@ -43,6 +44,7 @@ class _BaseSource:
         self.metadata = metadata
         self._normalize_timestamps = normalize_timestamps
         self._t0: Optional[float] = None
+        self._t0_by_side: dict[str, float] = {}
 
     def _apply_timestamp_normalization(self, timestamp_s: np.ndarray) -> np.ndarray:
         """Subtract the first observed timestamp so scans always start at t=0.
@@ -51,9 +53,11 @@ class _BaseSource:
         batches in the same scan. Thread-safety is not a concern here because
         sources are consumed by a single thread.
 
-        Replay sources (CSV, DB) use this array-based form. LiveUsbSource
-        receives samples one at a time and uses ``_t0_normalize`` below
-        instead; both share ``self._t0`` so whichever fires first sets it.
+        Replay sources (CSV, DB) use this array-based form: a recording's
+        timestamps already share one coherent timebase (they were normalized
+        when recorded), so one shared zero is correct there. LiveUsbSource
+        uses the per-SIDE ``_t0_normalize`` below instead — deliberately NOT
+        shared with this method's ``self._t0``.
         """
         if not self._normalize_timestamps:
             return timestamp_s
@@ -64,17 +68,30 @@ class _BaseSource:
                 return timestamp_s
         return timestamp_s - self._t0
 
-    def _t0_normalize(self, ts: float) -> float:
-        """Scalar version of ``_apply_timestamp_normalization`` for callbacks
-        that fire per-sample (e.g. ``parse_histogram_stream`` in
-        LiveUsbSource). Shares ``self._t0`` with the array form so the first
-        sample seen by either path sets the per-scan zero.
+    def _t0_normalize(self, side_name: str, ts: float) -> float:
+        """Per-SIDE scalar normalization for callbacks that fire per-sample
+        (``parse_histogram_stream`` in LiveUsbSource). Each side anchors its
+        own zero at its first sample.
+
+        Frame timestamps are each sensor's since-boot firmware clock (TIM5),
+        and the two sensors boot independently — one shared zero (the old
+        behavior: whichever side's first sample arrived set it) left the
+        later-booted side offset by the whole boot-time difference. Bench
+        repro 2026-06-11: sensors booted ~83 s apart put one side's entire
+        live trace outside the plot window while its numeric readouts kept
+        updating. Both sides start streaming within milliseconds of scan
+        start, so per-side anchoring is what actually aligns the sides.
+
+        Called concurrently from the two per-side reader threads; safe
+        because each thread only ever touches its own dict key.
         """
         if not self._normalize_timestamps:
             return ts
-        if self._t0 is None:
-            self._t0 = float(ts)
-        return float(ts) - self._t0
+        t0 = self._t0_by_side.get(side_name)
+        if t0 is None:
+            t0 = float(ts)
+            self._t0_by_side[side_name] = t0
+        return float(ts) - t0
 
     def close(self) -> None:
         pass
@@ -348,7 +365,7 @@ class LiveUsbSource(_BaseSource):
             self._packet_queues[side_name], self._stop, buf,
             on_row_fn=on_row,
             expected_row_sum=EXPECTED_HISTOGRAM_SUM,
-            t0_normalizer=self._t0_normalize,
+            t0_normalizer=partial(self._t0_normalize, side_name),
         )
         # Flush any remaining samples after parse_histogram_stream returns
         if accumulated:
