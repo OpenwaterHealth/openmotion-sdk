@@ -89,6 +89,36 @@ def test_realtime_dark_frame_reuses_previous_live_corrected_values():
     assert batch.dark_baseline_rt[2, 0, 0] == pytest.approx(batch.dark_baseline_rt[1, 0, 0])
 
 
+def test_dark_like_light_frame_suppresses_realtime_emission():
+    """The firmware-guaranteed terminal laser-off frame is positionally
+    classified as "light" (it doesn't fall on a scheduled dark position).
+    Dark-subtracting it realtime yields a near-zero mean and a garbage
+    contrast that rails the live BFI/BVI display at scan end. A light frame
+    whose u1 is within the dark-integrity threshold (pedestal +
+    max_above_pedestal) must not emit realtime values — NaN, the established
+    "no valid realtime sample" convention.
+    """
+    # dark@10 (u1=65), genuine light@11 (u1=500), laser-off frame@12 typed
+    # "light" but dark-like (u1=66 <= pedestal 64 + guard 5).
+    mean = np.array([[65.0], [500.0], [66.0]], dtype=np.float32).reshape(3, 1, 1) * np.ones((1, 2, 8))
+    std  = np.array([[10.0], [20.0], [11.0]], dtype=np.float32).reshape(3, 1, 1) * np.ones((1, 2, 8))
+    batch = _batch(3, ["dark", "light", "light"], [10, 11, 12],
+                   mean_raw=mean.astype(np.float32), std_raw=std.astype(np.float32))
+
+    stage = DarkCorrectionStage(
+        realtime_estimator=HybridRealtimePredictor(),
+        batch_estimator=LinearInterpolation(),
+    )
+    stage.process(batch)
+
+    # Genuine light frame emits normally: 500 - 65 = 435.
+    assert batch.mean_dc_rt[1, 0, 0] == pytest.approx(435.0)
+    # Dark-like light frame must not emit realtime values.
+    assert np.isnan(batch.mean_dc_rt[2, 0, 0])
+    assert np.isnan(batch.std_dc_rt[2, 0, 0])
+    assert np.isnan(batch.dark_baseline_rt[2, 0, 0])
+
+
 def test_emits_corrected_interval():
     """DarkCorrectionStage emits raw CorrectedInterval (enrichment is done
     by downstream stages ShotNoiseCorrectionStage and BfiBviStage)."""
@@ -375,6 +405,161 @@ def test_terminal_flush_discards_trailing_dark_like_tail():
     assert 12 in abs_ids_in_iv
     assert 13 not in abs_ids_in_iv
     assert 14 not in abs_ids_in_iv
+
+
+def test_terminal_fsync_count_positively_identifies_terminal_dark():
+    """When the workflow reports the firmware's final fsync pulse index,
+    the terminal flush identifies the terminal dark by abs_frame_id instead
+    of content-scanning, and verifies it is dark-like.
+
+    Scenario: dark@10 (u1=65), lights@11-12 (bright), terminal laser-off
+    frame@13 (u1=66, typed "light"). Firmware count maps to abs_id 13.
+    """
+    from omotion.pipeline.stages.dark import _TERMINAL_FSYNC_ABS_OFFSET
+
+    stage = _make_stage_with_cal()
+    n = 4
+    mean_raw = np.array(
+        [[[65.0]*8]*2, [[500.0]*8]*2, [[510.0]*8]*2, [[66.0]*8]*2],
+        dtype=np.float32,
+    )
+    std_raw = np.array(
+        [[[10.0]*8]*2, [[20.0]*8]*2, [[21.0]*8]*2, [[11.0]*8]*2],
+        dtype=np.float32,
+    )
+    raw_hist = np.zeros((n, 2, 8, 1024), dtype=np.uint32)
+    raw_hist[:, 0, 0, 0] = 1
+
+    process_batch = FrameBatch(
+        cam_ids=np.zeros(n, dtype=np.int8),
+        frame_ids=np.arange(n, dtype=np.uint8),
+        side_ids=np.zeros(n, dtype=np.int8),
+        raw_histograms=raw_hist,
+        temperature_c=np.zeros((n, 2, 8), dtype=np.float32),
+        timestamp_s=np.arange(n, dtype=np.float64) * 0.025,
+        pdc=None, tcm=None, tcl=None,
+        abs_frame_ids=np.array([10, 11, 12, 13], dtype=np.int64),
+        frame_type=np.array(["dark", "light", "light", "light"], dtype="<U8"),
+        mean_raw=mean_raw, std_raw=std_raw,
+    )
+    stage.process(process_batch)
+
+    stage.set_terminal_fsync_count(13 - _TERMINAL_FSYNC_ABS_OFFSET)
+
+    stop_batch = _batch(
+        0, [], [], mean_raw=np.zeros((0, 2, 8), dtype=np.float32),
+        std_raw=np.zeros((0, 2, 8), dtype=np.float32)
+    )
+    stage.on_scan_stop(stop_batch)
+
+    closed = [e.corrected_batch for e in stop_batch.events if isinstance(e, IntervalClosed)]
+    assert len(closed) == 1
+    abs_ids_in_iv = [f.abs_frame_id for f in closed[0].frames]
+    assert 11 in abs_ids_in_iv
+    assert 12 in abs_ids_in_iv
+    assert 13 not in abs_ids_in_iv
+
+    from omotion.pipeline.batch import TerminalDarkResult
+    tdr = [e for e in stop_batch.events if isinstance(e, TerminalDarkResult)]
+    assert len(tdr) == 1
+    assert tdr[0].found is True
+    assert tdr[0].abs_frame_id == 13
+    # Identified by firmware fsync count, not content scan.
+    assert tdr[0].identified_by == "fsync"
+
+
+def _process_dark_lights_terminal(stage, mean_last=66.0):
+    """dark@10 (65), lights@11-12 (bright), final frame@13 with u1=mean_last."""
+    n = 4
+    mean_raw = np.array(
+        [[[65.0]*8]*2, [[500.0]*8]*2, [[510.0]*8]*2, [[mean_last]*8]*2],
+        dtype=np.float32,
+    )
+    std_raw = np.array(
+        [[[10.0]*8]*2, [[20.0]*8]*2, [[21.0]*8]*2, [[11.0]*8]*2],
+        dtype=np.float32,
+    )
+    raw_hist = np.zeros((n, 2, 8, 1024), dtype=np.uint32)
+    raw_hist[:, 0, 0, 0] = 1
+    batch = FrameBatch(
+        cam_ids=np.zeros(n, dtype=np.int8),
+        frame_ids=np.arange(n, dtype=np.uint8),
+        side_ids=np.zeros(n, dtype=np.int8),
+        raw_histograms=raw_hist,
+        temperature_c=np.zeros((n, 2, 8), dtype=np.float32),
+        timestamp_s=np.arange(n, dtype=np.float64) * 0.025,
+        pdc=None, tcm=None, tcl=None,
+        abs_frame_ids=np.array([10, 11, 12, 13], dtype=np.int64),
+        frame_type=np.array(["dark", "light", "light", "light"], dtype="<U8"),
+        mean_raw=mean_raw, std_raw=std_raw,
+    )
+    stage.process(batch)
+
+
+def _flush(stage):
+    stop_batch = _batch(
+        0, [], [], mean_raw=np.zeros((0, 2, 8), dtype=np.float32),
+        std_raw=np.zeros((0, 2, 8), dtype=np.float32)
+    )
+    stage.on_scan_stop(stop_batch)
+    return stop_batch
+
+
+def test_terminal_fsync_count_mismatch_falls_back_to_content(caplog):
+    """A count that matches no buffered frame must not break the flush —
+    log it as a camera dropout (how early the camera stopped) and use the
+    legacy content-based detection."""
+    from omotion.pipeline.batch import TerminalDarkResult
+
+    stage = _make_stage_with_cal()
+    _process_dark_lights_terminal(stage)
+    stage.set_terminal_fsync_count(99)  # matches nothing
+
+    with caplog.at_level(logging.WARNING,
+                         logger="openmotion.sdk.pipeline.stages.dark"):
+        stop_batch = _flush(stage)
+
+    assert "falling back to content-based detection" in caplog.text
+    # HIL 2026-06-11 confirmed the count↔abs_id mapping is exact, so a
+    # mismatch means the camera stopped delivering before scan end.
+    assert "stopped delivering" in caplog.text
+    assert "86 frames before scan end" in caplog.text  # 99 - 13
+    closed = [e.corrected_batch for e in stop_batch.events
+              if isinstance(e, IntervalClosed)]
+    assert len(closed) == 1
+    assert [f.abs_frame_id for f in closed[0].frames] == [11, 12]
+    tdr = [e for e in stop_batch.events if isinstance(e, TerminalDarkResult)]
+    assert tdr[0].found is True
+    assert tdr[0].identified_by == "content"
+
+
+def test_terminal_frame_bright_with_fsync_id_logs_contaminated(caplog):
+    """Firmware says frame 13 was the final laser-off pulse, but it's bright:
+    the laser was on during the terminal pulse. Refuse the interval with a
+    distinct error (not TERMINAL DARK MISSING)."""
+    from omotion.pipeline.batch import TerminalDarkResult
+    from omotion.pipeline.stages.dark import _TERMINAL_FSYNC_ABS_OFFSET
+
+    stage = _make_stage_with_cal()
+    _process_dark_lights_terminal(stage, mean_last=500.0)  # bright terminal
+    stage.set_terminal_fsync_count(13 - _TERMINAL_FSYNC_ABS_OFFSET)
+
+    with caplog.at_level(logging.ERROR,
+                         logger="openmotion.sdk.pipeline.stages.dark"):
+        stop_batch = _flush(stage)
+
+    assert "TERMINAL DARK CONTAMINATED" in caplog.text
+    assert [e for e in stop_batch.events if isinstance(e, IntervalClosed)] == []
+    tdr = [e for e in stop_batch.events if isinstance(e, TerminalDarkResult)]
+    assert tdr[0].found is False
+    assert tdr[0].identified_by == "fsync"
+
+
+def test_reset_clears_terminal_fsync_count():
+    stage = _make_stage_with_cal()
+    stage.set_terminal_fsync_count(123)
+    stage.reset()
+    assert stage._terminal_fsync_count is None
 
 
 def test_terminal_flush_uses_actual_terminal_dark_moments():

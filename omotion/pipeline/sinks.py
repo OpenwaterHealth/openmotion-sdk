@@ -504,12 +504,12 @@ class CsvSink:
 def _is_integrity_event(event) -> bool:
     """True for events that indicate a correction-integrity problem.
 
-    TriggerStateEvent is routine operational telemetry, and a
-    TerminalDarkResult with found=True is the expected happy path —
-    neither belongs in the integrity record.
+    TriggerStateEvent and TerminalFsyncCount are routine operational
+    telemetry, and a TerminalDarkResult with found=True is the expected
+    happy path — none belongs in the integrity record.
     """
-    from .batch import TerminalDarkResult, TriggerStateEvent
-    if isinstance(event, TriggerStateEvent):
+    from .batch import TerminalDarkResult, TerminalFsyncCount, TriggerStateEvent
+    if isinstance(event, (TriggerStateEvent, TerminalFsyncCount)):
         return False
     if isinstance(event, TerminalDarkResult) and event.found:
         return False
