@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import csv
+import threading
 import time
+from unittest import mock
 
 import numpy as np
 import pytest
@@ -202,6 +204,56 @@ def test_live_usb_source_reader_loop_builds_batches_from_packet_queue(monkeypatc
         assert b.raw_histograms.shape[-1] == 1024
 
 
+def _consume_bounded(src, *, want_batches: int, timeout_s: float):
+    """Consume FrameBatches from `src` on a worker thread, bounded by
+    timeout_s. Returns (batches_seen, error).
+
+    LiveUsbSource.__iter__ blocks indefinitely while a started-but-idle
+    sensor produces no frames, so the iteration must happen off-thread
+    with a deadline. On timeout the source is closed, which pushes the
+    close() sentinel and unblocks the worker; the worker is daemon as a
+    backstop so a wedged close can never hang the pytest process.
+    """
+    result = {"n": 0, "error": None}
+
+    def _consume():
+        try:
+            for batch in src:
+                assert batch.raw_histograms.shape[-1] == 1024
+                result["n"] += 1
+                if result["n"] >= want_batches:
+                    src.close()
+                    break
+        except Exception as exc:
+            result["error"] = exc
+
+    t = threading.Thread(target=_consume, daemon=True, name="smoke-consume")
+    t.start()
+    t.join(timeout=timeout_s)
+    if t.is_alive():
+        src.close()  # bounded: 10s teardown + 5s reader join + sentinel
+        t.join(timeout=20.0)
+    return result["n"], result["error"]
+
+
+def test_smoke_consume_bounded_returns_zero_when_source_idle():
+    """A LiveUsbSource whose sensors never produce packets must not hang
+    the bounded consumer: it returns 0 batches within the timeout. (The
+    smoke test below then SKIPs, instead of blocking until pytest-timeout
+    dumps stacks and kills the entire run — the present-but-idle-sensor
+    failure mode that PR #74's absent-hardware skip didn't cover.)"""
+    src = LiveUsbSource(
+        console=mock.MagicMock(), left=mock.MagicMock(), right=None,
+        batch_size_frames=10, metadata=_meta(),
+    )
+    t0 = time.monotonic()
+    batches_seen, error = _consume_bounded(src, want_batches=3, timeout_s=1.5)
+    assert batches_seen == 0
+    assert error is None
+    # Bounded well under pytest-timeout's 30 s, including close() teardown.
+    assert time.monotonic() - t0 < 25.0
+
+
 @pytest.mark.sensor
 def test_live_usb_source_smoke_yields_framebatches(console, sensor_left):
     """Hardware-marked smoke test — requires a connected sensor.
@@ -224,13 +276,19 @@ def test_live_usb_source_smoke_yields_framebatches(console, sensor_left):
         console=console, left=sensor_left, right=None,
         batch_size_frames=10, metadata=meta,
     )
-    batches_seen = 0
-    for batch in src:
-        batches_seen += 1
-        assert batch.raw_histograms.shape[-1] == 1024
-        if batches_seen >= 3:
-            src.close()
-            break
+    # Bounded consume: a sensor that is attached but not streaming (cameras
+    # disabled, or the device held by another process) never yields a batch;
+    # unbounded iteration would block until pytest-timeout kills the whole
+    # run. No data within the deadline is an environment problem, not a
+    # code failure — skip, like the absent-hardware case.
+    batches_seen, error = _consume_bounded(src, want_batches=3, timeout_s=8.0)
+    if error is not None:
+        raise error
+    if batches_seen == 0:
+        pytest.skip(
+            "sensor attached but not streaming (no FrameBatch within 8s) — "
+            "cameras disabled or device held by another process"
+        )
     assert batches_seen >= 1
 
 
