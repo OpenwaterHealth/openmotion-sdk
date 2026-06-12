@@ -293,3 +293,100 @@ def test_csv_replay_no_normalization_when_disabled(tmp_path):
     )
     batches = list(src)
     assert batches[0].timestamp_s[0] == pytest.approx(630.915)
+
+
+def test_t0_normalize_anchors_each_side_independently():
+    """The scalar (live-path) normalizer must anchor each side at its OWN
+    first sample. Frame timestamps are each sensor's since-boot firmware
+    clock, and the sensors boot independently — here the right sensor
+    booted ~83 s before the left (bench repro, 2026-06-11)."""
+    class _Sub(_BaseSource):
+        def __iter__(self): yield from []
+
+    src = _Sub(metadata=_meta())
+    assert src._t0_normalize("left", 100.000) == pytest.approx(0.0)
+    assert src._t0_normalize("right", 8283.000) == pytest.approx(0.0)
+    assert src._t0_normalize("left", 100.025) == pytest.approx(0.025)
+    assert src._t0_normalize("right", 8283.025) == pytest.approx(0.025)
+
+
+def test_t0_normalize_passthrough_when_disabled():
+    """normalize_timestamps=False preserves raw firmware timestamps in the
+    scalar (live-path) form, same as the array form."""
+    class _Sub(_BaseSource):
+        def __iter__(self): yield from []
+
+    src = _Sub(metadata=_meta(), normalize_timestamps=False)
+    assert src._t0_normalize("left", 630.915) == pytest.approx(630.915)
+    assert src._t0_normalize("right", 8283.000) == pytest.approx(8283.000)
+
+
+def test_live_usb_reader_loops_anchor_t0_per_side(monkeypatch):
+    """Two sensors with divergent since-boot clocks must each anchor their
+    own t=0. A single shared t0 (whichever side's first sample wins) leaves
+    the other side offset by the boot-time difference, and the live plot
+    prunes that side to empty (bench repro 2026-06-11: left 0.2-12.8 s vs
+    right 82.9-95.5 s within the same scan)."""
+
+    class _FakeSensor:
+        class _FakeStream:
+            def start_streaming(self, q, expected_size):
+                pass
+            def stop_streaming(self):
+                pass
+            def drain_final(self, expected_size):
+                return []
+        class _FakeUart:
+            def __init__(self, stream):
+                self.histo = stream
+        def __init__(self):
+            self.uart = self._FakeUart(self._FakeStream())
+
+    src = LiveUsbSource(
+        console=None, left=_FakeSensor(), right=_FakeSensor(),
+        batch_size_frames=10, metadata=_meta(),
+    )
+
+    # Absolute firmware clocks: right booted ~82.6 s before left.
+    clock_base = {"left": 100.0, "right": 8283.0}
+
+    def _fake_parse_histogram_stream(q, stop_evt, buf, *, on_row_fn=None,
+                                     expected_row_sum=None, t0_normalizer=None):
+        side = next(s for s, sq in src._packet_queues.items() if sq is q)
+        base = clock_base[side]
+        for i in range(15):
+            ts = base + 0.025 * i
+            # Same call the real parser makes before firing on_row_fn.
+            if t0_normalizer is not None:
+                ts = t0_normalizer(ts)
+            if on_row_fn is not None:
+                on_row_fn(0, i + 1, ts,
+                          np.ones(1024, dtype=np.uint32), 1024, 27.0)
+        return 15
+
+    monkeypatch.setattr(
+        "omotion.MotionProcessing.parse_histogram_stream",
+        _fake_parse_histogram_stream,
+    )
+
+    # 15 samples per side at batch_size=10 → 2 batches per side (10 + 5).
+    batches = []
+    for batch in src:
+        batches.append(batch)
+        if len(batches) >= 4:
+            src.close()
+            break
+
+    seen_sides = set()
+    for b in batches:
+        seen_sides.add(int(b.side_ids[0]))
+        # Every side's samples must sit on its own near-zero time axis.
+        assert float(b.timestamp_s.min()) >= 0.0, (
+            f"side {int(b.side_ids[0])} timestamps below its own zero: "
+            f"{b.timestamp_s[:3]}"
+        )
+        assert float(b.timestamp_s.max()) <= 1.0, (
+            f"side {int(b.side_ids[0])} timestamps not anchored at its own "
+            f"zero: {b.timestamp_s[:3]}"
+        )
+    assert seen_sides == {0, 1}
