@@ -23,6 +23,13 @@ from ..pedestal import SensorPedestals
 
 logger = logging.getLogger("openmotion.sdk.pipeline.stages.dark")
 
+# Maps the console's fsync pulse count (OW_CTRL_GET_FSYNC, read by the
+# workflow after stop_trigger) onto the camera-side abs_frame_id of the
+# terminal laser-off frame: expected_abs = count + offset. Initial value
+# pending HIL confirmation — a mismatch logs the observed delta and falls
+# back to content-based detection, so a wrong offset cannot corrupt data.
+_TERMINAL_FSYNC_ABS_OFFSET = 0
+
 
 @dataclass(frozen=True)
 class DarkObservation:
@@ -395,6 +402,19 @@ class DarkCorrectionStage:
             max_above_pedestal=integrity_max_above_pedestal
         )
         self._last_realtime: dict[tuple[str, int], tuple[float, float, float]] = {}
+        self._terminal_fsync_count: Optional[int] = None
+
+    def set_terminal_fsync_count(self, count: int) -> None:
+        """Ground-truth index of the final FSYNC pulse, from the console
+        firmware (OW_CTRL_GET_FSYNC). Trigger_Stop hard-disables the laser
+        timer before the deferred final pulse fires, so the frame captured
+        on that pulse is laser-off by construction — this count identifies
+        the terminal dark positively; content is demoted to verification.
+
+        Called from the workflow teardown thread after stop_trigger; read
+        in on_scan_stop, which runs strictly after source close, so plain
+        assignment is safely ordered."""
+        self._terminal_fsync_count = int(count)
 
     def _emit_interval(
         self,
@@ -527,6 +547,7 @@ class DarkCorrectionStage:
         self._history.clear()
         self._pending.clear()
         self._last_realtime.clear()
+        self._terminal_fsync_count = None
 
     def on_scan_stop(self, batch: FrameBatch) -> None:
         """Terminal dark flush — see SciencePipeline.md §8.6.
@@ -538,7 +559,13 @@ class DarkCorrectionStage:
         dark-like frames at the end are removed from the light list.
 
         Following the legacy SciencePipeline._flush_terminal_dark logic:
-          1. Find the trailing dark-like tail in pi._light.
+          0. When the workflow reported the firmware's final fsync pulse
+             index (set_terminal_fsync_count), identify the terminal frame
+             by abs_frame_id — ground truth from the chip that fired the
+             pulse — and use content only to VERIFY it is dark-like. A
+             count that matches no buffered frame falls back to step 1.
+          1. Find the trailing dark-like tail in pi._light (content-based,
+             used when no fsync count is available or it didn't match).
           2. Use the last tail frame's actual data (not the last scheduled dark's)
              as the right boundary of the synthetic interval.
           3. Remove the whole tail from the light list so it is not double-counted.
@@ -546,6 +573,11 @@ class DarkCorrectionStage:
              The stencil for D_prev is applied as normal; if there are no lights,
              D_prev cannot be stencilled (no right neighbours) and is skipped.
         """
+        expected_abs = (
+            None if self._terminal_fsync_count is None
+            else self._terminal_fsync_count + _TERMINAL_FSYNC_ABS_OFFSET
+        )
+
         for (side, cam_id), pi in self._pending.items():
             if not pi._light:
                 continue
@@ -558,39 +590,85 @@ class DarkCorrectionStage:
             def _is_dark_like(light_frame) -> bool:
                 return light_frame.u1 <= threshold
 
-            # The final buffered frame should be the hardware-guaranteed
-            # terminal dark.  If it is not dark-like, leave the interval open
-            # and log loudly — the firmware did not produce the expected
-            # laser-off frame, which indicates a trigger/firmware issue.
+            # ── Step 0: positive identification by fsync count ────────────
+            identified_by = "content"
+            if expected_abs is not None:
+                match_idx = next(
+                    (j for j in range(len(pi._light) - 1, -1, -1)
+                     if pi._light[j].abs_frame_id == expected_abs),
+                    None,
+                )
+                if match_idx is None:
+                    logger.warning(
+                        "terminal fsync count %d (expected abs_id %d) matches "
+                        "no buffered light for side=%s cam_id=%d (last buffered "
+                        "abs_id=%d) — falling back to content-based detection; "
+                        "_TERMINAL_FSYNC_ABS_OFFSET may need calibration "
+                        "(observed delta %+d)",
+                        self._terminal_fsync_count, expected_abs, side, cam_id,
+                        pi._light[-1].abs_frame_id,
+                        pi._light[-1].abs_frame_id - expected_abs,
+                    )
+                else:
+                    identified_by = "fsync"
+                    if match_idx != len(pi._light) - 1:
+                        # No pulse can follow the final pulse — anything after
+                        # it is drain garbage; drop it with the tail.
+                        logger.warning(
+                            "%d buffered frames follow the firmware-identified "
+                            "terminal frame abs_id=%d for side=%s cam_id=%d — "
+                            "dropping them",
+                            len(pi._light) - 1 - match_idx, expected_abs,
+                            side, cam_id,
+                        )
+                        pi._light = pi._light[:match_idx + 1]
+
+            # The terminal candidate must be dark-like. If not, leave the
+            # interval open and log loudly: with an fsync identification the
+            # laser was demonstrably ON during the final pulse (trigger/laser
+            # fault); without one, the firmware did not produce the expected
+            # laser-off frame at all.
             terminal_light = pi._light[-1]
             if not _is_dark_like(terminal_light):
-                logger.error(
-                    "TERMINAL DARK MISSING: side=%s cam_id=%d — "
-                    "last frame abs_id=%d u1=%.3f exceeds dark threshold %.3f. "
-                    "Firmware did not produce a laser-off frame at scan stop. "
-                    "Interval left open; corrected data for this interval is lost.",
-                    side, cam_id, terminal_light.abs_frame_id,
-                    terminal_light.u1, threshold,
-                )
+                if identified_by == "fsync":
+                    logger.error(
+                        "TERMINAL DARK CONTAMINATED: side=%s cam_id=%d — "
+                        "firmware reports abs_id=%d was the final (laser-off) "
+                        "pulse but u1=%.3f exceeds dark threshold %.3f; the "
+                        "laser appears to have been on during the terminal "
+                        "pulse. Interval left open; corrected data for this "
+                        "interval is lost.",
+                        side, cam_id, terminal_light.abs_frame_id,
+                        terminal_light.u1, threshold,
+                    )
+                else:
+                    logger.error(
+                        "TERMINAL DARK MISSING: side=%s cam_id=%d — "
+                        "last frame abs_id=%d u1=%.3f exceeds dark threshold %.3f. "
+                        "Firmware did not produce a laser-off frame at scan stop. "
+                        "Interval left open; corrected data for this interval is lost.",
+                        side, cam_id, terminal_light.abs_frame_id,
+                        terminal_light.u1, threshold,
+                    )
                 batch.events.append(TerminalDarkResult(
                     side=side, cam_id=cam_id,
                     abs_frame_id=terminal_light.abs_frame_id,
                     u1=terminal_light.u1, threshold=threshold,
-                    found=False,
+                    found=False, identified_by=identified_by,
                 ))
                 continue
 
             logger.info(
-                "terminal dark confirmed: side=%s cam_id=%d "
+                "terminal dark confirmed (%s): side=%s cam_id=%d "
                 "abs_id=%d u1=%.3f (threshold=%.3f)",
-                side, cam_id, terminal_light.abs_frame_id,
+                identified_by, side, cam_id, terminal_light.abs_frame_id,
                 terminal_light.u1, threshold,
             )
             batch.events.append(TerminalDarkResult(
                 side=side, cam_id=cam_id,
                 abs_frame_id=terminal_light.abs_frame_id,
                 u1=terminal_light.u1, threshold=threshold,
-                found=True,
+                found=True, identified_by=identified_by,
             ))
 
             tail_start = len(pi._light) - 1

@@ -655,6 +655,10 @@ class ScanWorkflow:
                     except Exception:
                         logger.warning("stop_trigger raised in duration guard", exc_info=True)
                     time.sleep(0.5)
+                    # The deferred final FSYNC pulse (the terminal dark) has
+                    # fired by now — report its index for positive terminal-
+                    # dark identification in the flush.
+                    self._report_terminal_fsync()
                     for side, mask, _ in active_sides:
                         try:
                             self._interface.run_on_sensors(
@@ -749,6 +753,43 @@ class ScanWorkflow:
         except Exception:
             logger.warning("_emit_trigger_event raised", exc_info=True)
 
+    def _report_terminal_fsync(self) -> None:
+        """Read the console's final fsync pulse count and deliver it to the
+        dark stage + diagnostics channel.
+
+        Trigger_Stop hard-disables the laser timer before the FSYNC timer's
+        deferred final pulse fires, so the frame captured on the last pulse
+        is laser-off by construction — the count positively identifies the
+        terminal dark frame (content checking demotes to verification).
+
+        Must be called >= ~150 ms after stop_trigger (the deferred final
+        pulse's worst-case latency) so the firmware counter includes it;
+        both call sites sit after the teardown's 0.5 s settle sleep.
+        Best-effort: failure must never break scan teardown.
+        """
+        try:
+            from omotion.pipeline.batch import TerminalFsyncCount
+            runner = self._runner
+            if runner is None:
+                return
+            count = self._interface.console.get_fsync_pulsecount()
+            if not isinstance(count, int) or count <= 0:
+                logger.warning(
+                    "get_fsync_pulsecount returned %r — terminal dark will "
+                    "be identified content-based", count,
+                )
+                return
+            for stage in runner.pipeline.stages:
+                if getattr(stage, "name", "") == "dark_correction":
+                    stage.set_terminal_fsync_count(count)
+                    break
+            t0 = getattr(self, "_scan_t0_monotonic", None)
+            ts = (time.monotonic() - t0) if t0 is not None else 0.0
+            runner.dispatch_event(TerminalFsyncCount(count=count, timestamp_s=ts))
+            logger.info("terminal fsync count reported: %d", count)
+        except Exception:
+            logger.warning("_report_terminal_fsync raised", exc_info=True)
+
     @property
     def last_scan_error(self) -> str | None:
         """Error message from the most recent scan worker, or None on
@@ -824,6 +865,10 @@ class ScanWorkflow:
         active = list(self._scan_active_sides)
         if active:
             time.sleep(0.5)
+            # Deferred final FSYNC pulse has fired — report the terminal
+            # frame index before the source drains it (same as the
+            # duration-guard path).
+            self._report_terminal_fsync()
             for side, mask, _ in active:
                 try:
                     self._interface.run_on_sensors(

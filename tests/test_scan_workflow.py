@@ -275,6 +275,56 @@ def test_duration_guard_skips_redundant_stop_trigger_and_close_on_cancel(tmp_pat
         )
 
 
+class _DiagnosticsCollector:
+    """Minimal sink capturing diagnostics-channel events."""
+    channels = {"diagnostics"}
+
+    def __init__(self):
+        self.events = []
+
+    def on_scan_start(self, meta):
+        pass
+
+    def consume(self, channel, payload):
+        self.events.append(payload)
+
+    def on_complete(self):
+        pass
+
+
+def test_duration_guard_reports_terminal_fsync_count(tmp_path):
+    """After stop_trigger (+ settle), the duration guard reads the console's
+    final fsync pulse count — the index of the laser-off terminal pulse —
+    hands it to the dark stage for positive terminal-dark identification,
+    and emits a TerminalFsyncCount diagnostics event."""
+    from omotion.pipeline.batch import TerminalFsyncCount
+
+    motion = _build_motion_with_data_dir(None)
+    collector = _DiagnosticsCollector()
+    request = ScanRequest(
+        subject_id="x", duration_sec=1,
+        left_camera_mask=0xFF, right_camera_mask=0, reduced_mode=False,
+        skip_default_storage=True, sinks=[collector],
+    )
+
+    with mock.patch.object(motion.console, "get_fsync_pulsecount",
+                           return_value=842):
+        assert motion.scan_workflow.start_scan(request)
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline and motion.scan_workflow.running:
+            time.sleep(0.05)
+        assert not motion.scan_workflow.running, "scan did not finish"
+
+    dark_stage = next(s for s in motion.scan_workflow._runner.pipeline.stages
+                      if s.name == "dark_correction")
+    assert dark_stage._terminal_fsync_count == 842
+
+    fsync_events = [e for e in collector.events
+                    if isinstance(e, TerminalFsyncCount)]
+    assert len(fsync_events) == 1
+    assert fsync_events[0].count == 842
+
+
 def test_start_scan_passes_raw_save_max_duration_s_to_pipeline():
     motion = _build_motion_with_data_dir(None)
     request = ScanRequest(

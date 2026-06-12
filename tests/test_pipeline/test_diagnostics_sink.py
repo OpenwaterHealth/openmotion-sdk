@@ -49,6 +49,7 @@ def test_log_sink_warns_on_integrity_events(caplog):
 
 
 def test_log_sink_ignores_routine_events(caplog):
+    from omotion.pipeline.batch import TerminalFsyncCount
     sink = DiagnosticsLogSink()
     sink.on_scan_start(_meta())
     with caplog.at_level(logging.WARNING, logger="openmotion.sdk.pipeline.sinks"):
@@ -56,6 +57,7 @@ def test_log_sink_ignores_routine_events(caplog):
         sink.consume("diagnostics", TerminalDarkResult(
             side="left", cam_id=0, abs_frame_id=100, u1=64.0,
             threshold=69.0, found=True))
+        sink.consume("diagnostics", TerminalFsyncCount(count=842, timestamp_s=60.0))
         sink.on_complete()
     assert caplog.text == ""
 

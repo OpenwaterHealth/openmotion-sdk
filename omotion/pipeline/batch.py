@@ -74,6 +74,12 @@ class TerminalDarkResult(BatchEvent):
     appears to have been on for the final frame. This is a firmware issue:
     the trigger-stop did not produce the expected laser-off frame. The
     interval is left open (data for this interval is lost).
+
+    ``identified_by``: "fsync" when the terminal frame was identified by
+    the console's reported final fsync pulse index (ground truth, content
+    used only as verification); "content" when identified by the legacy
+    dark-like content scan (no fsync count available, or it didn't match
+    a buffered frame).
     """
     side:           str
     cam_id:         int
@@ -81,6 +87,7 @@ class TerminalDarkResult(BatchEvent):
     u1:             float
     threshold:      float
     found:          bool
+    identified_by:  str = "content"
 
 
 @dataclass
@@ -130,6 +137,24 @@ class TriggerStateEvent(BatchEvent):
     ``timestamp_s`` is scan-relative, matching the other event types.
     """
     state:        str    # "ON" or "OFF"
+    timestamp_s:  float
+
+
+@dataclass
+class TerminalFsyncCount(BatchEvent):
+    """The console's fsync pulse count read after stop_trigger.
+
+    Trigger_Stop hard-disables the laser timer, then the FSYNC timer fires
+    one final deferred pulse — so the frame captured on the last pulse is
+    laser-off by construction, and this count is the ground-truth identity
+    of the terminal dark frame. ScanWorkflow reads it via OW_CTRL_GET_FSYNC
+    during teardown, hands it to DarkCorrectionStage (positive terminal-dark
+    identification), and dispatches this event on the "diagnostics" channel
+    for observability.
+
+    ``timestamp_s`` is scan-relative, matching the other event types.
+    """
+    count:        int
     timestamp_s:  float
 
 
