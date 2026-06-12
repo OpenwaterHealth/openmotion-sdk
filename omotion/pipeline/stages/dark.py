@@ -25,9 +25,11 @@ logger = logging.getLogger("openmotion.sdk.pipeline.stages.dark")
 
 # Maps the console's fsync pulse count (OW_CTRL_GET_FSYNC, read by the
 # workflow after stop_trigger) onto the camera-side abs_frame_id of the
-# terminal laser-off frame: expected_abs = count + offset. Initial value
-# pending HIL confirmation — a mismatch logs the observed delta and falls
-# back to content-based detection, so a wrong offset cannot corrupt data.
+# terminal laser-off frame: expected_abs = count + offset. Confirmed exact
+# on HIL 2026-06-11: every live camera across four scans (counts 47 to
+# 20851) matched abs_id == count. A camera whose last buffered frame is
+# older than the count stopped delivering before scan end (dropout); the
+# flush logs that and falls back to content-based detection per camera.
 _TERMINAL_FSYNC_ABS_OFFSET = 0
 
 
@@ -600,14 +602,13 @@ class DarkCorrectionStage:
                 )
                 if match_idx is None:
                     logger.warning(
-                        "terminal fsync count %d (expected abs_id %d) matches "
-                        "no buffered light for side=%s cam_id=%d (last buffered "
-                        "abs_id=%d) — falling back to content-based detection; "
-                        "_TERMINAL_FSYNC_ABS_OFFSET may need calibration "
-                        "(observed delta %+d)",
+                        "terminal fsync count %d names abs_id %d but side=%s "
+                        "cam_id=%d last delivered abs_id=%d — camera stopped "
+                        "delivering %d frames before scan end (dropout); "
+                        "falling back to content-based detection",
                         self._terminal_fsync_count, expected_abs, side, cam_id,
                         pi._light[-1].abs_frame_id,
-                        pi._light[-1].abs_frame_id - expected_abs,
+                        expected_abs - pi._light[-1].abs_frame_id,
                     )
                 else:
                     identified_by = "fsync"

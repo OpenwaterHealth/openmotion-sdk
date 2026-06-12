@@ -507,7 +507,8 @@ def _flush(stage):
 
 def test_terminal_fsync_count_mismatch_falls_back_to_content(caplog):
     """A count that matches no buffered frame must not break the flush —
-    log the observed delta and use the legacy content-based detection."""
+    log it as a camera dropout (how early the camera stopped) and use the
+    legacy content-based detection."""
     from omotion.pipeline.batch import TerminalDarkResult
 
     stage = _make_stage_with_cal()
@@ -519,6 +520,10 @@ def test_terminal_fsync_count_mismatch_falls_back_to_content(caplog):
         stop_batch = _flush(stage)
 
     assert "falling back to content-based detection" in caplog.text
+    # HIL 2026-06-11 confirmed the count↔abs_id mapping is exact, so a
+    # mismatch means the camera stopped delivering before scan end.
+    assert "stopped delivering" in caplog.text
+    assert "86 frames before scan end" in caplog.text  # 99 - 13
     closed = [e.corrected_batch for e in stop_batch.events
               if isinstance(e, IntervalClosed)]
     assert len(closed) == 1
