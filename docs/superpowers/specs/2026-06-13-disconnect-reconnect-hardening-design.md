@@ -215,8 +215,9 @@ Lifecycle stages to exercise:
 | L6 | Calibration workflow | a `CalibrationWorkflow` run in flight |
 | L7 | Rapid repeated cuts | stress / debounce |
 
-Transport dimension for each stage: **console-only**, **sensor-only**
-(left, right, or both), **both simultaneously**.
+Transport dimension: a **whole-system USB cut** (the only physical disconnect —
+the hub is internal to the console, so console + both sensors share one uplink).
+Plus a **mains cut** (Shelly) for the full power-cycle path.
 
 **"Handled correctly" — pass criteria for every cell:**
 
@@ -259,29 +260,30 @@ above. Concrete anchor cases:
 9. **Non-blocking monitor**: a fake handle whose connect blocks must not delay
    another handle's connect — the regression test for failure mode **A**.
 
-### Cabling
+### Cabling / topology
 
-Under the current single-hub-on-YKUSH-port-1 wiring, only **system-wide
-(both-link) cuts** are physically possible — the console-only and sensor-only
-rows of the matrix (cases 2, 3, and the starvation check) **cannot** be tested.
-To cover the full matrix the bench must be **re-cabled** so the console and each
-sensor sit on **separate YKUSH ports**. This is a prerequisite for the
-independent-transport cells, captured as decision **D1** below.
+The hub that the console and both sensors branch off of is **internal to the
+console module**. The whole system presents a **single USB uplink** to the host
+(console CDC + both sensor composites, multiplexed through the internal hub).
+Therefore a **whole-system USB cut is the only physically possible disconnect** —
+you cannot unplug a single sensor mid-scan; there is no external per-device
+cable. The combined-link cut (YKUSH port 1) is not a test *limitation*, it is an
+accurate model of the only real-world disconnect (pulling the console's USB
+cable). The console-only / sensor-only matrix rows are **not real scenarios** and
+are intentionally not tested.
 
 The scratch characterization harnesses (`scratch/char_connection.py`,
 `scratch/char_laser.py`) are the prototypes these tests derive from.
 
 ## Decisions
 
-- **D1 — cabling for independent cuts → RESOLVED: combined-only this pass.**
-  Keep the current wiring. The redesign is implemented and **every lifecycle
-  stage (L0–L7) is tested with both links cut at once** via YKUSH (USB) and via
-  the Shelly (mains). The console-only / sensor-only rows of the matrix and the
-  cross-handle starvation *hardware* check are **deferred** until the bench is
-  re-cabled onto separate YKUSH ports. Note: the cross-handle starvation
-  guarantee (failure mode **A**) is still verified in this pass by the
-  **software-only non-blocking-monitor test** (case 9), which does not need
-  independent hardware cuts.
+- **D1 — independent (console-only / sensor-only) cuts → NOT APPLICABLE.**
+  The hub is internal to the console, so the system has a single USB uplink and
+  the only physical disconnect is a whole-system cut (see *Cabling / topology*).
+  Independent-transport cuts are not a real scenario; the combined-cut tests are
+  the complete model. The cross-handle starvation guarantee (failure mode **A**)
+  is still verified by the software-only non-blocking-monitor test, and is also
+  visible on hardware (sensors recover while the console firmware is wedged).
 
 ## Risks / trade-offs
 
