@@ -9,9 +9,9 @@ What these tests guarantee (the operational contract):
   - After a USB cut+restore the system returns to all-connected. When the
     console firmware wedges on an abrupt cut (an intermittent firmware bug —
     failure mode B, ~1 in 6 single cuts, recoverable only by a mains cycle;
-    see docs/superpowers/specs/2026-06-13-console-fw-host-loss-watchdog-spec.md)
-    a mains cycle restores it. So the contract is "USB-recovers, else mains
-    recovers", and each test records which path was needed.
+    tracked in openmotion-console-fw issue #26) a mains cycle restores it. So
+    the contract is "USB-recovers, else mains recovers", and each test records
+    which path was needed.
   - The SDK never wedges its own threads: reconnect is bounded and the monitor
     keeps servicing, so the sensors recover independently of the console. That
     SDK guarantee is locked in by the software-only test_monitor_nonblocking.py.
