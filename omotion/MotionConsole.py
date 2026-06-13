@@ -1185,9 +1185,14 @@ class MotionConsole(SignalWrapper):
             self._log_command_error("start_trigger", e)
             raise  # Re-raise the exception for the caller to handle
 
-    def stop_trigger(self) -> bool:
+    def stop_trigger(self, timeout: int = 20) -> bool:
         """
         Stop the trigger on the Console device.
+
+        Args:
+            timeout: UART response timeout in seconds. The default suits normal
+                use; the connect-time force-safe call passes a short bound so a
+                non-responsive console can't stall the connect worker.
 
         Returns:
             bool: True if the trigger was started successfully, False otherwise.
@@ -1204,7 +1209,8 @@ class MotionConsole(SignalWrapper):
                 raise ValueError("Console controller not connected")
 
             r = self.uart.send_packet(
-                id=None, packetType=OW_CONTROLLER, command=OW_CTRL_STOP_TRIG, data=None
+                id=None, packetType=OW_CONTROLLER, command=OW_CTRL_STOP_TRIG,
+                data=None, timeout=timeout,
             )
             self.uart.clear_buffer()
             # r.print_packet()
