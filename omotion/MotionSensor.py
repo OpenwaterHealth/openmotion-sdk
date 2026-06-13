@@ -150,6 +150,7 @@ class MotionSensor(SignalWrapper):
         self._state = ConnectionState.DISCONNECTED
         self._state_cv = threading.Condition()
         self._monitor = None  # set by MotionInterface.start()
+        self._worker = None  # ConnectWorker, created in _attach_monitor
 
     # ──────────────────────────────────────────────────────────────────
     # Compatibility: MotionSensor itself does not support demo mode in the
@@ -193,6 +194,18 @@ class MotionSensor(SignalWrapper):
 
     def _attach_monitor(self, monitor) -> None:
         self._monitor = monitor
+        self._start_worker()
+
+    def _start_worker(self) -> None:
+        from omotion.connect_worker import ConnectWorker
+
+        if self._worker is None:
+            self._worker = ConnectWorker(
+                name=self.name,
+                do_connect=self._drive_connecting,
+                do_disconnect=self._drive_disconnecting,
+            )
+            self._worker.start()
 
     def _on_uart_io_error(self, errno, message: str) -> None:
         if self._monitor is None:
@@ -234,22 +247,25 @@ class MotionSensor(SignalWrapper):
             UserStop,
         )
 
+        if self._worker is None:
+            return
         st = self._state
         if isinstance(event, PollArrived):
             if st == ConnectionState.DISCONNECTED:
-                self._drive_connecting(reason="poll_arrived")
+                self._worker.post("connect", "poll_arrived")
         elif isinstance(event, (PollGone, IoError)):
-            if st == ConnectionState.CONNECTED:
+            # Include CONNECTING so a mid-connect removal trips the worker's
+            # abort and _drive_connecting bails instead of grinding its backoff.
+            if st in (ConnectionState.CONNECTED, ConnectionState.CONNECTING):
                 reason = (
                     f"usb_io_error:errno={event.errno}"
                     if isinstance(event, IoError)
                     else "poll_gone"
                 )
-                self._drive_disconnecting(reason=reason)
-            # Already DISCONNECTING/DISCONNECTED/CONNECTING → no-op (dedup).
+                self._worker.post("disconnect", reason)
         elif isinstance(event, UserStop):
             if st in (ConnectionState.CONNECTED, ConnectionState.CONNECTING):
-                self._drive_disconnecting(reason="user_stop")
+                self._worker.post("disconnect", "user_stop")
 
     def _find_dev(self):
         """Locate the libusb device matching this sensor's VID/PID + port suffix."""
@@ -265,12 +281,18 @@ class MotionSensor(SignalWrapper):
                 continue
         return None
 
-    def _drive_connecting(self, reason: str) -> None:
+    def _drive_connecting(self, reason: str, abort_evt=None) -> bool:
+        """Runs on the connect worker thread. Returns True iff CONNECTED."""
+        if self._state != ConnectionState.DISCONNECTED:
+            return self._state == ConnectionState.CONNECTED
+
         self._set_state(ConnectionState.CONNECTING, reason=reason)
 
         backoff = [0.05, 0.1, 0.25, 0.5, 1.0]
         last_error: Optional[Exception] = None
         for delay in backoff:
+            if abort_evt is not None and abort_evt.is_set():
+                break
             try:
                 dev = self._find_dev()
                 if dev is None:
@@ -287,44 +309,31 @@ class MotionSensor(SignalWrapper):
                 composite.open()
                 self.uart = composite
 
-                # Ping to confirm firmware is responsive. Bound the wait so
-                # a non-responsive device falls into our retry/backoff
-                # loop instead of hanging on the default 10 s timeout
-                # inherited from CommInterface.send_packet (which is sized
-                # for normal in-scan command latency, not connect probes).
-                # 2 s per attempt × 5 attempts + backoffs ≈ 12 s worst case,
-                # which covers typical post-power-on firmware boot.
                 r = self.uart.comm.send_packet(
                     id=None, packetType=OW_CMD, command=OW_CMD_PING,
-                    timeout=2.0,
+                    timeout=2.0, cancel_evt=abort_evt,
                 )
                 if r is None or r.packetType in _ERROR_TYPES:
                     raise RuntimeError("sensor ping failed or returned error")
 
-                # Read HWID + 8 camera security UIDs. HWID failure → retry.
-                # Per-camera UID failures are tolerated (dead camera marks
-                # its slot as "" but the connect still succeeds — same
-                # lenient policy as the legacy refresh_id_cache).
                 self.refresh_id_cache()
                 if not self._cached_hwid:
                     raise RuntimeError("sensor HWID read returned empty")
                 self.hardware_id = self._cached_hwid
 
-                # Cache version (best-effort).
                 try:
                     self._version = self.get_version()
                 except Exception as e:
                     logger.debug("get_version during connect failed: %s", e)
 
                 self._set_state(ConnectionState.CONNECTED, reason="ping_ok")
-                return
+                return True
             except Exception as e:
                 last_error = e
                 logger.warning(
                     "%s connect attempt failed (%s); retrying in %.0f ms",
                     self.name, e, delay * 1000,
                 )
-                # Roll back any partial open.
                 try:
                     if self.uart is not None:
                         self.uart.close()
@@ -334,14 +343,20 @@ class MotionSensor(SignalWrapper):
                 self._cached_camera_uids = None
                 self._cached_hwid = None
                 self.hardware_id = None
-                time.sleep(delay)
+                if abort_evt is not None and abort_evt.wait(delay):
+                    break
+                elif abort_evt is None:
+                    time.sleep(delay)
 
         self._set_state(
             ConnectionState.DISCONNECTED,
             reason=f"connect_retry_exhausted:{last_error}",
         )
+        return False
 
     def _drive_disconnecting(self, reason: str) -> None:
+        if self._state == ConnectionState.DISCONNECTED:
+            return
         self._set_state(ConnectionState.DISCONNECTING, reason=reason)
         try:
             if self.uart is not None:
@@ -353,6 +368,16 @@ class MotionSensor(SignalWrapper):
         self._cached_hwid = None
         self.hardware_id = None
         self._set_state(ConnectionState.DISCONNECTED, reason=reason)
+
+    def _shutdown(self) -> None:
+        """Final teardown: stop the worker, then synchronously release USB."""
+        if self._worker is not None:
+            self._worker.stop()
+            self._worker = None
+        try:
+            self._drive_disconnecting("shutdown")
+        except Exception:
+            logger.exception("%s shutdown disconnect failed", self.name)
 
     # ------------------------------------------------------------------
     # Internal helpers
