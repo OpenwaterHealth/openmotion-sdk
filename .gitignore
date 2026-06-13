@@ -170,3 +170,7 @@ histogram.csv
 /reports/*
 .claude/*
 .scratch/
+# Superpowers brainstorming/spec/plan artifacts are local-only process docs
+# (written under docs/superpowers/ by the brainstorming / writing-plans skills).
+# Keep them out of the shared repo.
+docs/superpowers/

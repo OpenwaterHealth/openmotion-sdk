@@ -128,6 +128,7 @@ class CommInterface(USBInterfaceBase):
         data=None,
         timeout=10.0,
         max_retries=0,
+        cancel_evt=None,
     ) -> UartPacket:
         with self._send_lock:
             if id is None:
@@ -168,6 +169,10 @@ class CommInterface(USBInterfaceBase):
                 data = bytearray()
                 with self._io_lock:
                     while time.monotonic() - start < timeout:
+                        if cancel_evt is not None and cancel_evt.is_set():
+                            raise ConnectionError(
+                                f"{self.desc}: send canceled, packet id 0x{id:04X}"
+                            )
                         if self._transport_down_evt.is_set():
                             raise ConnectionError(
                                 f"{self.desc}: transport down, packet id "
@@ -186,6 +191,10 @@ class CommInterface(USBInterfaceBase):
             else:
                 start_time = time.monotonic()
                 while time.monotonic() - start_time < timeout:
+                    if cancel_evt is not None and cancel_evt.is_set():
+                        raise ConnectionError(
+                            f"{self.desc}: send canceled, packet id 0x{id:04X}"
+                        )
                     if self._transport_down_evt.is_set():
                         raise ConnectionError(
                             f"{self.desc}: transport down, packet id "

@@ -82,7 +82,8 @@ Signals are `pyqtSignal` when PyQt is importable, otherwise a fallback `MotionSi
 ## Gotchas
 
 - **`MotionConsole.py` is 2815 lines** — read its module-level docstring + method docstrings before scrolling. The class is the source-of-truth for the low-level console command set. For the consumer-facing public interface (facade, scans, DB read, pipeline sinks) see `docs/API.md`.
-- **Three transport threads can run concurrently:** ConnectionMonitor + per-endpoint stream readers + telemetry poller. Anything touching shared state needs to assume cross-thread emission.
+- **Many threads run concurrently:** the `ConnectionMonitor` (a *pure detector* — diffs USB presence and posts connect/disconnect intents, never blocks) + one `ConnectWorker` daemon per handle (does the blocking connect/teardown, so a slow device can't starve the others) + per-endpoint stream readers + the console telemetry poller. Anything touching shared state must assume cross-thread emission. Connect pings are bounded (2 s) and cancellable; the console force-safes the trigger on every connect.
+- **HIL note — console firmware wedge on abrupt USB cut:** when the console's USB is yanked mid-activity, the firmware command interface can stop responding (`No data received from UART within timeout`) until a **mains power cycle** (Shelly), even though the SDK reconnect logic is healthy (sensors recover fine, the monitor keeps cleanly retrying). This is a firmware bug — tracked in `openmotion-console-fw` issue #26 (host-loss laser watchdog + USB-disconnect command-interface reset).
 - **Histogram packets have two CRCs when `DEBUG_FLAG_HISTO_CMP` is on** — transport CRC + decompressed-payload CRC. See `StreamInterface.py` ~lines 51–100.
 - **Debug flags live in firmware**, set via `MotionSensor.set_debug_flags()`. Bits defined at `config.py:116-125` (`USB_PRINTF`, `HISTO_THROTTLE`, `FAKE_DATA`, `HISTO_CMP`, etc.).
 - **Dark correction (PDC) is an active design area** — the per-frame PDC buffer was added recently; see memory `pdc_correction_design_paused.md` for the latest reasoning (amplitude scaling dropped, existing shot-noise correction is the fix).
@@ -91,6 +92,7 @@ Signals are `pyqtSignal` when PyQt is importable, otherwise a fallback `MotionSi
 ## Branching and releases
 
 - Work on `next`, PR into `next`. Releases require a `next → main` PR **before** tagging (enforced by `docs/Releasing.md`).
+- **`docs/superpowers/` is gitignored — do NOT commit it.** The brainstorming / writing-plans skills write spec & plan artifacts there; they are local-only process notes. The skill steps that say "commit the design doc" do not apply to this repo. Put durable design/decisions in the PR description, a GitHub issue, or a real doc under `docs/` instead.
 - Current branches active in recent log: `feature/122-*`, `feature/calibration`, `feature/contact-quality-rehash`, `feature/compression`.
 - CI: `.github/workflows/hardware-tests.yml` runs on the `testing` branch via self-hosted hardware runner, with `-m "not destructive and not slow"`. Full suite at `hardware-tests-full.yml`. Wheel build + upload via `publish-pypi.yml` / `release-build.yml`.
 

@@ -167,6 +167,7 @@ class MotionConsole(SignalWrapper):
         self._state = ConnectionState.DISCONNECTED
         self._state_cv = threading.Condition()
         self._monitor = None  # set by MotionInterface.start()
+        self._worker = None  # ConnectWorker, created in _attach_monitor
         self._version = "v0.0.0"
 
     # ──────────────────────────────────────────────────────────────────
@@ -202,6 +203,18 @@ class MotionConsole(SignalWrapper):
     def _attach_monitor(self, monitor) -> None:
         """Called by MotionInterface when starting the monitor."""
         self._monitor = monitor
+        self._start_worker()
+
+    def _start_worker(self) -> None:
+        from omotion.connect_worker import ConnectWorker
+
+        if self._worker is None:
+            self._worker = ConnectWorker(
+                name=self.name,
+                do_connect=self._drive_connecting,
+                do_disconnect=self._drive_disconnecting,
+            )
+            self._worker.start()
 
     def _on_uart_io_error(self, errno, message: str) -> None:
         """Forwarded from MotionUart on serial errors. Submits an event so
@@ -238,8 +251,9 @@ class MotionConsole(SignalWrapper):
         )
 
     def _handle_event(self, event) -> None:
-        """Entry point called by ConnectionMonitor on its thread.
-        Dispatches based on (current_state, event_type)."""
+        """Entry point called by ConnectionMonitor on its thread. Decides the
+        target intent from (state, event) and posts it to the per-handle
+        worker — never blocks the monitor thread."""
         from omotion.connection_monitor import (
             IoError,
             PollArrived,
@@ -247,36 +261,36 @@ class MotionConsole(SignalWrapper):
             UserStop,
         )
 
+        if self._worker is None:
+            return
         st = self._state
         if isinstance(event, PollArrived):
             if st == ConnectionState.DISCONNECTED:
-                self._drive_connecting(reason="poll_arrived")
+                self._worker.post("connect", "poll_arrived")
         elif isinstance(event, (PollGone, IoError)):
-            if st == ConnectionState.CONNECTED:
-                ev_name = type(event).__name__.lower()
+            # Post disconnect from CONNECTING too: if the device is pulled
+            # mid-connect, the worker sets its abort so the in-flight
+            # _drive_connecting bails promptly instead of grinding through its
+            # backoff. (Posting from DISCONNECTING/DISCONNECTED is a no-op once
+            # the worker reaches the guarded _drive_disconnecting.)
+            if st in (ConnectionState.CONNECTED, ConnectionState.CONNECTING):
                 reason = (
                     f"usb_io_error:errno={event.errno}"
                     if isinstance(event, IoError)
-                    else f"poll_gone"
+                    else "poll_gone"
                 )
-                self._drive_disconnecting(reason=reason)
-            # else: already DISCONNECTING/DISCONNECTED/CONNECTING — no-op.
-            #       This is the dedup that kills duplicate "release failed"
-            #       warnings: a second IoError after the first one started
-            #       us toward DISCONNECTING is silently absorbed.
+                self._worker.post("disconnect", reason)
         elif isinstance(event, UserStop):
-            if st == ConnectionState.CONNECTED:
-                self._drive_disconnecting(reason="user_stop")
-            elif st == ConnectionState.CONNECTING:
-                # If we're mid-CONNECTING the call below is racing with
-                # _drive_connecting on the same thread, so it can't
-                # actually arrive while we're inside _drive_connecting —
-                # the queue serializes. So this branch only fires when
-                # _drive_connecting has already returned.
-                self._drive_disconnecting(reason="user_stop")
-            # DISCONNECTING/DISCONNECTED: nothing to do.
+            # CONNECTING is included so a stop racing an in-flight connect
+            # aborts it; the worker's serial mailbox orders the two safely.
+            if st in (ConnectionState.CONNECTED, ConnectionState.CONNECTING):
+                self._worker.post("disconnect", "user_stop")
 
-    def _drive_connecting(self, reason: str) -> None:
+    def _drive_connecting(self, reason: str, abort_evt=None) -> bool:
+        """Runs on the connect worker thread. Returns True iff CONNECTED."""
+        if self._state != ConnectionState.DISCONNECTED:
+            return self._state == ConnectionState.CONNECTED
+
         if self.uart.demo_mode:
             self._set_state(ConnectionState.CONNECTING, reason=reason)
             self._set_state(ConnectionState.CONNECTED, reason="demo_mode")
@@ -284,62 +298,59 @@ class MotionConsole(SignalWrapper):
                 self.telemetry.start()
             except Exception:
                 logger.exception("telemetry start (demo) failed")
-            return
+            return True
 
         self._set_state(ConnectionState.CONNECTING, reason=reason)
 
-        # Five-step backoff: 50, 100, 250, 500, 1000 ms. Covers the
-        # empirical Windows post-enumeration window where the device is
-        # visible to libusb/pyserial but `Serial(...)` still raises
-        # "Resource busy" or "Permission denied" for ~200–500 ms.
         backoff = [0.05, 0.1, 0.25, 0.5, 1.0]
         last_error: Optional[Exception] = None
         for delay in backoff:
+            if abort_evt is not None and abort_evt.is_set():
+                break
             try:
                 port = self.uart.find_port()
                 if port is None:
                     raise RuntimeError("console COM port not found")
                 self.uart.open(port)
-                # Ping to confirm the firmware is responsive.
+                # Bounded, cancellable ping (was the unbounded 20 s default).
                 r = self.uart.send_packet(
-                    id=None, packetType=OW_CMD, command=OW_CMD_PING
+                    id=None, packetType=OW_CMD, command=OW_CMD_PING,
+                    timeout=2, cancel_evt=abort_evt,
                 )
                 if r is None or r.packetType == OW_ERROR:
                     raise RuntimeError("console ping failed or returned error")
-                # `self._version` is no longer cached during CONNECTING:
-                # `get_version()` gates on `is_connected()` (which is
-                # state == CONNECTED), so calling it here logged a
-                # spurious "Console Module not connected" ERROR and
-                # returned "v0.0.0" anyway. Callers that want the
-                # version invoke `get_version()` from their own
-                # CONNECTED handler (e.g. `log_console_info`), which
-                # works correctly post-transition.
                 self._set_state(ConnectionState.CONNECTED, reason="ping_ok")
+                # Force-safe: leave the laser/trigger OFF on every connect.
+                try:
+                    self.stop_trigger(timeout=2)
+                    logger.info("console force-safe stop_trigger on connect")
+                except Exception as e:
+                    logger.warning("force-safe stop_trigger failed: %s", e)
                 try:
                     self.telemetry.start()
                 except Exception:
                     logger.exception("telemetry start failed")
-                return
+                return True
             except Exception as e:
                 last_error = e
                 logger.warning(
                     "console connect attempt failed (%s); retrying in %.0f ms",
-                    e,
-                    delay * 1000,
+                    e, delay * 1000,
                 )
-                # Roll back any partial open.
                 try:
                     self.uart.close()
                 except Exception:
                     pass
-                time.sleep(delay)
+                if abort_evt is not None and abort_evt.wait(delay):
+                    break
+                elif abort_evt is None:
+                    time.sleep(delay)
 
-        # All attempts failed — back to DISCONNECTED. Next poll/hotplug
-        # will retry from scratch.
         self._set_state(
             ConnectionState.DISCONNECTED,
             reason=f"connect_retry_exhausted:{last_error}",
         )
+        return False
 
     def _log_command_error(self, method_name: str, e: Exception) -> None:
         """Log a command-method failure with severity that depends on
@@ -361,6 +372,9 @@ class MotionConsole(SignalWrapper):
             logger.error("Unexpected error during %s: %s", method_name, e)
 
     def _drive_disconnecting(self, reason: str) -> None:
+        """Runs on the connect worker thread (or synchronously from _shutdown)."""
+        if self._state == ConnectionState.DISCONNECTED:
+            return
         self._set_state(ConnectionState.DISCONNECTING, reason=reason)
         try:
             self.telemetry.stop()
@@ -371,6 +385,17 @@ class MotionConsole(SignalWrapper):
         except Exception:
             logger.exception("uart close failed")
         self._set_state(ConnectionState.DISCONNECTED, reason=reason)
+
+    def _shutdown(self) -> None:
+        """Final teardown: stop the worker, then synchronously release the
+        transport. Called by ConnectionMonitor._teardown."""
+        if self._worker is not None:
+            self._worker.stop()
+            self._worker = None
+        try:
+            self._drive_disconnecting("shutdown")
+        except Exception:
+            logger.exception("console shutdown disconnect failed")
 
     # ──────────────────────────────────────────────────────────────────
     # Backwards-compat helper used by command bodies further below.
@@ -1185,9 +1210,14 @@ class MotionConsole(SignalWrapper):
             self._log_command_error("start_trigger", e)
             raise  # Re-raise the exception for the caller to handle
 
-    def stop_trigger(self) -> bool:
+    def stop_trigger(self, timeout: int = 20) -> bool:
         """
         Stop the trigger on the Console device.
+
+        Args:
+            timeout: UART response timeout in seconds. The default suits normal
+                use; the connect-time force-safe call passes a short bound so a
+                non-responsive console can't stall the connect worker.
 
         Returns:
             bool: True if the trigger was started successfully, False otherwise.
@@ -1204,7 +1234,8 @@ class MotionConsole(SignalWrapper):
                 raise ValueError("Console controller not connected")
 
             r = self.uart.send_packet(
-                id=None, packetType=OW_CONTROLLER, command=OW_CTRL_STOP_TRIG, data=None
+                id=None, packetType=OW_CONTROLLER, command=OW_CTRL_STOP_TRIG,
+                data=None, timeout=timeout,
             )
             self.uart.clear_buffer()
             # r.print_packet()
