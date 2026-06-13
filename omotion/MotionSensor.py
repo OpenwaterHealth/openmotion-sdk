@@ -5,10 +5,7 @@ import threading
 import time
 from typing import Literal, Optional
 
-import usb.core
-
 from omotion.MotionComposite import MotionComposite
-from omotion.usb_backend import get_libusb1_backend
 from omotion.connection_state import ConnectionState
 from omotion.signal_wrapper import SignalWrapper
 from omotion.config import (
