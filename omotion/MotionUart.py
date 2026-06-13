@@ -137,13 +137,17 @@ class MotionUart:
             self._notify_io_error(errno, str(se))
             raise
 
-    def read_packet(self, timeout: int = 20, cancel_evt=None) -> UartPacket:
+    def read_packet(
+        self, timeout: float = 20, cancel_evt: Optional[threading.Event] = None
+    ) -> UartPacket:
         """Block until a packet arrives or `timeout` seconds elapse.
 
         If `cancel_evt` is provided and becomes set, the read aborts promptly
         with a CommandError instead of waiting out the full timeout — used by
         the connect worker so a superseding disconnect cancels an in-flight
-        connect attempt.
+        connect attempt. (Each handle owns its own MotionUart, so the
+        `_io_lock` held here is never contended by another thread that would
+        delay the cancel check.)
         """
         if self.demo_mode:
             return UartPacket(
@@ -182,8 +186,8 @@ class MotionUart:
         addr: int = 0,
         reserved: int = 0,
         data=None,
-        timeout: int = 20,
-        cancel_evt=None,
+        timeout: float = 20,
+        cancel_evt: Optional[threading.Event] = None,
     ) -> Optional[UartPacket]:
         """Send a command packet and return the matching response.
 
