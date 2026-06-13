@@ -193,35 +193,95 @@ targeted at the `openmotion-console-fw` repo:
 
 ## Test plan (HIL + software)
 
-**Hardware-in-the-loop** — new `tests/test_connection_recovery.py`
-(markers: `console`, `sensor`, `slow`; power-control gated, skips cleanly when
-YKUSH/Shelly absent):
+### Lifecycle × transport disconnect matrix (acceptance requirement)
 
-1. **System USB cut + restore** (YKUSH port 1): all three return to `CONNECTED`
-   within a bounded time (target `< ~8 s`), repeated ≥3× to prove determinism.
-2. **Repeated / rapid cut-restore**: no permanent wedge; always recovers.
-3. **Mains cycle** (Shelly) + restore: all three reconnect.
-4. **Force-safe**: with the trigger armed and a reconnect driven, assert
-   `get_trigger_json()["TriggerStatus"] == 1` after reconnect (where the console
-   is reachable).
+The work is not "done" until **both communication links are cut at every stage
+of the app lifecycle and shown to be handled correctly.** The two links are:
 
-**Software-only** (runs with `-m "not console and not sensor"`):
+- **Console UART** — the CDC virtual COM port (`OW_*` command/telemetry traffic).
+- **Sensor USB-bulk** — the 3-interface composite link (command + histo + IMU),
+  left and/or right.
 
-5. **Connect-worker state machine** with fake transports: connect success,
+Lifecycle stages to exercise:
+
+| # | Stage | What is happening |
+|---|---|---|
+| L0 | Pre-start / discovery | before/while `MotionInterface.start()` enumerates |
+| L1 | Mid-`CONNECTING` | cut during a connect attempt (ping / id-cache window) |
+| L2 | `CONNECTED` idle | connected, no scan |
+| L3 | Scan bring-up | configure: FPGA/camera config, before the laser arms |
+| L4 | Mid-scan | trigger running (laser ON) + histogram/IMU streaming |
+| L5 | Scan teardown | during `stop_trigger` → `disable_camera` → `close` |
+| L6 | Calibration workflow | a `CalibrationWorkflow` run in flight |
+| L7 | Rapid repeated cuts | stress / debounce |
+
+Transport dimension for each stage: **console-only**, **sensor-only**
+(left, right, or both), **both simultaneously**.
+
+**"Handled correctly" — pass criteria for every cell:**
+
+- **Laser safety:** no laser left firing that the SDK *could* have prevented.
+  Where the console is reachable, `TriggerStatus == 1` after handling. Where the
+  console link itself is cut (host cannot command it), this is explicitly the
+  firmware-watchdog case — assert the SDK does the right thing on its side
+  (aborts, force-safes on reconnect) and document the residual firmware gap.
+- **No wedge / no starvation:** the monitor thread never freezes; a drop on one
+  transport must not stall the other handle's connect (verifiable only with
+  independent cuts — see *Cabling*).
+- **No worker hang:** scan worker, configure worker, and calibration worker all
+  unwind within a bounded time (no 60 s / 20 s hangs).
+- **Deterministic recovery:** every still-present device returns to `CONNECTED`
+  within a bounded time (target `< ~8 s`); a subsequent fresh scan starts
+  cleanly (READY checks pass).
+
+### Hardware-in-the-loop tests
+
+New `tests/test_connection_recovery.py` (markers: `console`, `sensor`, `slow`;
+power-control gated, skips cleanly when YKUSH/Shelly absent). Drives the matrix
+above. Concrete anchor cases:
+
+1. **System cut + restore** (YKUSH port 1, = both links): all three return to
+   `CONNECTED` `< ~8 s`, repeated ≥3× for determinism.
+2. **Console-only cut** at L2/L4 (requires re-cabling): sensors stay
+   `CONNECTED`; only console drops and recovers; mid-scan abort fires.
+3. **Sensor-only cut** at L2/L4 (requires re-cabling): console stays
+   `CONNECTED` (and force-safes the trigger); only the cut sensor recovers.
+4. **Mid-scan (L4) both-link cut**: scan aborts, no worker hang, full recovery,
+   fresh scan afterwards succeeds.
+5. **Repeated / rapid cut-restore** (L7): no permanent wedge.
+6. **Mains cycle** (Shelly) + restore: all three reconnect.
+7. **Force-safe**: trigger armed, reconnect driven → `TriggerStatus == 1`.
+
+### Software-only tests (runs with `-m "not console and not sensor"`)
+
+8. **Connect-worker state machine** with fake transports: connect success,
    connect failure → cooldown → retry, disconnect-mid-connect abort.
-6. **Non-blocking monitor**: a fake handle whose connect blocks must not delay
-   another handle's connect — assert the second connects while the first is
-   still blocked (the regression test for failure mode **A**).
+9. **Non-blocking monitor**: a fake handle whose connect blocks must not delay
+   another handle's connect — the regression test for failure mode **A**.
 
-**Cabling.** Under the current single-hub-on-YKUSH-port-1 wiring, only
-system-wide USB cuts are possible. This is documented in the test module.
-**Recommendation:** re-cable each device onto its own YKUSH port to unlock
-per-device-drop tests (e.g., "console drops, sensors stay" → assert sensors
-remain `CONNECTED` and only the console recovers). Listed as a follow-up, not a
-blocker.
+### Cabling
+
+Under the current single-hub-on-YKUSH-port-1 wiring, only **system-wide
+(both-link) cuts** are physically possible — the console-only and sensor-only
+rows of the matrix (cases 2, 3, and the starvation check) **cannot** be tested.
+To cover the full matrix the bench must be **re-cabled** so the console and each
+sensor sit on **separate YKUSH ports**. This is a prerequisite for the
+independent-transport cells, captured as decision **D1** below.
 
 The scratch characterization harnesses (`scratch/char_connection.py`,
 `scratch/char_laser.py`) are the prototypes these tests derive from.
+
+## Decisions
+
+- **D1 — cabling for independent cuts → RESOLVED: combined-only this pass.**
+  Keep the current wiring. The redesign is implemented and **every lifecycle
+  stage (L0–L7) is tested with both links cut at once** via YKUSH (USB) and via
+  the Shelly (mains). The console-only / sensor-only rows of the matrix and the
+  cross-handle starvation *hardware* check are **deferred** until the bench is
+  re-cabled onto separate YKUSH ports. Note: the cross-handle starvation
+  guarantee (failure mode **A**) is still verified in this pass by the
+  **software-only non-blocking-monitor test** (case 9), which does not need
+  independent hardware cuts.
 
 ## Risks / trade-offs
 
