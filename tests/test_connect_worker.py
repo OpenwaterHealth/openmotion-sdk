@@ -95,3 +95,41 @@ def test_cooldown_delays_retry_after_failure():
         assert attempts[1] - attempts[0] >= 0.45
     finally:
         w.stop()
+
+
+def test_disconnect_coalesced_into_connect_still_connects():
+    """Regression: a disconnect that coalescing collapses into a later connect
+    must not leave _abort set such that the connect (after a prior failure's
+    cooldown) is silently skipped — that would leave the device disconnected
+    when the latest intent says connect. This is the exact bug class the
+    hardening effort exists to prevent."""
+    calls = []
+    in_first = threading.Event()
+    release_first = threading.Event()
+    second_done = threading.Event()
+
+    def connect(reason, abort):
+        calls.append(reason)
+        if len(calls) == 1:
+            in_first.set()
+            release_first.wait(2.0)   # hold the worker inside the first attempt
+            return False              # then fail -> arms the cooldown
+        second_done.set()
+        return True
+
+    w = _make_worker(connect, lambda reason: None, cooldown=0.3)
+    try:
+        w.post("connect", "first")
+        assert in_first.wait(2.0)
+        # While the worker is busy in the first attempt, queue a disconnect
+        # (sets _abort) then a connect. They coalesce to "connect" with _abort
+        # still set; the connect must still proceed.
+        w.post("disconnect", "blip")
+        w.post("connect", "second")
+        release_first.set()           # let the first attempt finish (fails)
+        assert second_done.wait(2.0), (
+            "connect was skipped by a stale abort after coalescing"
+        )
+    finally:
+        release_first.set()
+        w.stop()

@@ -44,7 +44,7 @@ class ConnectWorker(threading.Thread):
         self._do_disconnect = do_disconnect
         self._cooldown = cooldown
 
-        self._mailbox: "queue.Queue[tuple[str, str]]" = queue.Queue()
+        self._mailbox: queue.Queue[tuple[str, str]] = queue.Queue()
         self._abort = threading.Event()
         self._stop = threading.Event()
         self._last_fail_t = 0.0
@@ -61,6 +61,15 @@ class ConnectWorker(threading.Thread):
         self._abort.set()
         self._mailbox.put(("stop", "worker_stop"))
         self.join(timeout=5.0)
+        if self.is_alive():
+            # do_connect ignored the abort and outran the join. The thread is
+            # a daemon so the process can still exit, but a caller that
+            # proceeds to tear the handle down may race this still-running
+            # connect — surface it loudly.
+            logger.warning(
+                "%s connect worker still alive 5s after stop(); a connect "
+                "attempt is ignoring the abort signal", self._label,
+            )
 
     # worker thread body
     def run(self) -> None:
@@ -75,7 +84,11 @@ class ConnectWorker(threading.Thread):
             if intent == "connect":
                 self._run_connect(reason)
             elif intent == "disconnect":
-                self._abort.clear()
+                # Don't clear _abort here — _run_connect owns clearing it (so a
+                # disconnect that coalescing collapsed into a later connect is
+                # still consumed correctly). A lingering set abort with no
+                # connect pending is harmless: only _run_connect and stop()
+                # read it.
                 try:
                     self._do_disconnect(reason)
                 except Exception:
@@ -83,20 +96,34 @@ class ConnectWorker(threading.Thread):
 
     def _coalesce(self, intent: str, reason: str):
         """Drain queued intents, keeping only the most recent. Collapses the
-        burst of PollArrived events the monitor emits every 200 ms."""
+        burst of PollArrived events the monitor emits every 200 ms. The kept
+        intent is the latest desired state; any abort set by a superseded
+        disconnect is consumed by _run_connect."""
+        dropped = 0
         while True:
             try:
                 intent, reason = self._mailbox.get_nowait()
+                dropped += 1
             except queue.Empty:
+                if dropped:
+                    logger.debug(
+                        "%s coalesced %d superseded intent(s); latest=%s",
+                        self._label, dropped, intent,
+                    )
                 return intent, reason
 
     def _run_connect(self, reason: str) -> None:
+        # Consume any abort set by a superseded disconnect before doing
+        # anything: coalescing may have collapsed a "disconnect" into this
+        # "connect" without running the disconnect branch, leaving _abort set.
+        # Clearing it here (before the cooldown wait) keeps a stale abort from
+        # silently skipping the connect we're about to attempt.
+        self._abort.clear()
         # Cooldown after a recent failure (interruptible by stop/disconnect).
         if self._cooldown > 0 and self._last_fail_t:
             remaining = self._cooldown - (time.monotonic() - self._last_fail_t)
             if remaining > 0 and self._abort.wait(remaining):
                 return  # superseded by disconnect/stop during cooldown
-        self._abort.clear()
         try:
             ok = self._do_connect(reason, self._abort)
         except Exception:
