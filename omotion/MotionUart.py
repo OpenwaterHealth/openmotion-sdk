@@ -137,8 +137,14 @@ class MotionUart:
             self._notify_io_error(errno, str(se))
             raise
 
-    def read_packet(self, timeout: int = 20) -> UartPacket:
-        """Block until a packet arrives or `timeout` seconds elapse."""
+    def read_packet(self, timeout: int = 20, cancel_evt=None) -> UartPacket:
+        """Block until a packet arrives or `timeout` seconds elapse.
+
+        If `cancel_evt` is provided and becomes set, the read aborts promptly
+        with a CommandError instead of waiting out the full timeout — used by
+        the connect worker so a superseding disconnect cancels an in-flight
+        connect attempt.
+        """
         if self.demo_mode:
             return UartPacket(
                 id=0, packetType=OW_ERROR, command=0, addr=0, reserved=0, data=[]
@@ -151,6 +157,8 @@ class MotionUart:
             count = 0
 
             while timeout == -1 or time.monotonic() - start_time < timeout:
+                if cancel_evt is not None and cancel_evt.is_set():
+                    raise CommandError("UART read canceled")
                 time.sleep(0.05)
                 try:
                     raw_data += self.serial.read_all()
@@ -175,6 +183,7 @@ class MotionUart:
         reserved: int = 0,
         data=None,
         timeout: int = 20,
+        cancel_evt=None,
     ) -> Optional[UartPacket]:
         """Send a command packet and return the matching response.
 
@@ -223,7 +232,7 @@ class MotionUart:
             with self._io_lock:
                 self._tx(packet)
                 time.sleep(0.0005)
-                ret_packet = self.read_packet(timeout=timeout)
+                ret_packet = self.read_packet(timeout=timeout, cancel_evt=cancel_evt)
                 time.sleep(0.0005)
                 return ret_packet
 
