@@ -268,7 +268,12 @@ class MotionConsole(SignalWrapper):
             if st == ConnectionState.DISCONNECTED:
                 self._worker.post("connect", "poll_arrived")
         elif isinstance(event, (PollGone, IoError)):
-            if st == ConnectionState.CONNECTED:
+            # Post disconnect from CONNECTING too: if the device is pulled
+            # mid-connect, the worker sets its abort so the in-flight
+            # _drive_connecting bails promptly instead of grinding through its
+            # backoff. (Posting from DISCONNECTING/DISCONNECTED is a no-op once
+            # the worker reaches the guarded _drive_disconnecting.)
+            if st in (ConnectionState.CONNECTED, ConnectionState.CONNECTING):
                 reason = (
                     f"usb_io_error:errno={event.errno}"
                     if isinstance(event, IoError)
@@ -276,6 +281,8 @@ class MotionConsole(SignalWrapper):
                 )
                 self._worker.post("disconnect", reason)
         elif isinstance(event, UserStop):
+            # CONNECTING is included so a stop racing an in-flight connect
+            # aborts it; the worker's serial mailbox orders the two safely.
             if st in (ConnectionState.CONNECTED, ConnectionState.CONNECTING):
                 self._worker.post("disconnect", "user_stop")
 
