@@ -116,6 +116,7 @@ class _MonitoredHandle(Protocol):
 
     def is_connected(self) -> bool: ...
     def _handle_event(self, event: _Event) -> None: ...
+    def _shutdown(self) -> None: ...
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -219,10 +220,13 @@ class ConnectionMonitor(threading.Thread):
                 logger.warning("Hotplug unsubscribe failed: %s", e)
 
         # Drive each handle to DISCONNECTED so its transport releases cleanly
-        # before MotionInterface (and any owning Qt parent) tears down.
+        # before MotionInterface (and any owning Qt parent) tears down. Each
+        # handle stops its own connect worker first, then releases the
+        # transport synchronously — so stop() does not return until the
+        # devices are actually released.
         for handle in (self._console, self._left, self._right):
             try:
-                handle._handle_event(UserStop(handle_name=handle.name))
+                handle._shutdown()
             except Exception as e:
                 logger.warning("Final disconnect of %s failed: %s", handle.name, e)
 
