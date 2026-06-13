@@ -3,7 +3,19 @@ import os
 import sys
 import platform
 import ctypes
+import threading
 from pathlib import Path
+
+# Process-wide lock serializing ALL USB/serial *enumeration* (libusb device
+# discovery + pyserial COM-port listing). The connection redesign runs the
+# ConnectionMonitor poll sweep and the per-handle ConnectWorker connects on
+# separate threads, so without this they would call usb.core.find /
+# comports() concurrently — concurrent libusb device-list enumeration + the
+# Windows SetupAPI port scan are not reliably thread-safe and were observed to
+# trigger a native access violation during disconnect/reconnect churn. The lock
+# is held only around the (fast) enumeration call itself, never across device
+# I/O, so it cannot deadlock with transfers.
+_ENUM_LOCK = threading.RLock()
 
 
 def _is_win():
@@ -49,3 +61,31 @@ def get_libusb1_backend():
 
     # Non-Windows: use system libusb via the loader
     return libusb1.get_backend()
+
+
+def list_comports():
+    """Thread-safe serial-port enumeration. Returns a fully-materialized list
+    (the lock is released before the caller iterates). Use this instead of
+    calling ``serial.tools.list_ports.comports()`` directly from any thread
+    that can run concurrently with the ConnectionMonitor / ConnectWorkers."""
+    import serial.tools.list_ports
+
+    with _ENUM_LOCK:
+        return list(serial.tools.list_ports.comports())
+
+
+def find_usb(vid, pid):
+    """Thread-safe libusb device enumeration by VID/PID. Returns a
+    fully-materialized list of matching devices. Use this instead of calling
+    ``usb.core.find(find_all=True, ...)`` directly from concurrent threads."""
+    import usb.core
+
+    with _ENUM_LOCK:
+        return list(
+            usb.core.find(
+                find_all=True,
+                idVendor=vid,
+                idProduct=pid,
+                backend=get_libusb1_backend(),
+            )
+        )

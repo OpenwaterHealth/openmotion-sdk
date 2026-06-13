@@ -267,12 +267,12 @@ class ConnectionMonitor(threading.Thread):
 
     def _poll_console(self) -> None:
         try:
-            import serial.tools.list_ports
+            from omotion.usb_backend import list_comports
 
             present = any(
                 getattr(p, "vid", None) == self._console_vid
                 and getattr(p, "pid", None) == self._console_pid
-                for p in serial.tools.list_ports.comports()
+                for p in list_comports()
             )
         except Exception as e:
             logger.debug("Console poll sweep failed: %s", e)
@@ -293,18 +293,9 @@ class ConnectionMonitor(threading.Thread):
 
     def _poll_sensors(self) -> None:
         try:
-            import usb.core
-            from omotion.usb_backend import get_libusb1_backend
+            from omotion.usb_backend import find_usb
 
-            backend = get_libusb1_backend()
-            devices = list(
-                usb.core.find(
-                    find_all=True,
-                    idVendor=self._sensor_vid,
-                    idProduct=self._sensor_pid,
-                    backend=backend,
-                )
-            )
+            devices = find_usb(self._sensor_vid, self._sensor_pid)
         except Exception as e:
             logger.debug("Sensor poll sweep failed: %s", e)
             return

@@ -269,10 +269,9 @@ class MotionSensor(SignalWrapper):
 
     def _find_dev(self):
         """Locate the libusb device matching this sensor's VID/PID + port suffix."""
-        backend = get_libusb1_backend()
-        for dev in usb.core.find(
-            find_all=True, idVendor=self.vid, idProduct=self.pid, backend=backend
-        ):
+        from omotion.usb_backend import find_usb
+
+        for dev in find_usb(self.vid, self.pid):
             try:
                 ports = getattr(dev, "port_numbers", []) or []
                 if ports and ports[-1] == self._port_suffix:

@@ -99,7 +99,9 @@ class MotionUart:
 
     def find_port(self) -> Optional[str]:
         """Return the COM/tty device path that matches our VID/PID, or None."""
-        for p in serial.tools.list_ports.comports():
+        from omotion.usb_backend import list_comports
+
+        for p in list_comports():
             if (
                 getattr(p, "vid", None) == self.vid
                 and getattr(p, "pid", None) == self.pid
