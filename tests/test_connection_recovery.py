@@ -26,6 +26,7 @@ import time
 import pytest
 
 from omotion.connection_state import ConnectionState
+from omotion.ScanWorkflow import ScanRequest
 
 ykush = pytest.importorskip("ykush")  # tests/ is on sys.path under pytest
 
@@ -199,3 +200,173 @@ def test_force_safe_trigger_off_after_reconnect(motion, hub):
             motion.console.stop_trigger(timeout=2)
         except Exception:
             pass
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Full-scan lifecycle disconnects (L3 bring-up, L4 mid-stream, L5 teardown,
+# L6 calibration). These run a real scan through ScanWorkflow and cut the
+# whole-system USB at a chosen phase. All FIRE THE LASER. The whole-system cut
+# is the only physical disconnect (the hub is internal to the console), so a
+# mid-scan cut drops the console too — the host cannot stop_trigger until it
+# reconnects, at which point the SDK force-safes the trigger. Each test ends
+# with the laser confirmed OFF (via USB-recover-or-mains) and the system back
+# to all-connected so a fresh scan could run.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _short_scan_request(subject, duration_sec):
+    """One camera on the left, right sensor disabled, no storage — the
+    minimal real scan for a HIL disconnect."""
+    return ScanRequest(
+        subject_id=subject,
+        duration_sec=duration_sec,
+        left_camera_mask=0x01,
+        right_camera_mask=0x00,
+        skip_default_storage=True,
+    )
+
+
+def _scan_lifecycle_cut(motion, hub, *, subject, cut_after_s, scan_duration_s,
+                        expect_canceled):
+    """Start a scan, cut whole-system USB after `cut_after_s`, wait for the
+    worker to unwind, restore + recover, and assert the laser is OFF. Returns
+    the recovery path ("usb"/"mains")."""
+    assert _wait_all(motion, MAINS_TIMEOUT), (
+        f"preconditions: all connected ({_state_str(motion)})"
+    )
+    sw = motion.scan_workflow
+    started = motion.start_scan(_short_scan_request(subject, scan_duration_s))
+    if not started:
+        pytest.skip(f"scan refused to start: {sw.last_scan_error}")
+
+    time.sleep(cut_after_s)
+    hub.off(SYS_PORT)
+    # The scan worker must unwind without hanging (bounded teardown).
+    sw.await_complete(timeout_sec=30.0)
+    assert not sw.running, "scan worker did not finish after mid-scan disconnect"
+    if expect_canceled:
+        assert sw.last_scan_canceled or sw.last_scan_error, (
+            f"scan should have aborted on disconnect "
+            f"(canceled={sw.last_scan_canceled} err={sw.last_scan_error})"
+        )
+
+    hub.on(SYS_PORT)
+    path = _assert_recovers(motion, hub)
+    time.sleep(0.5)
+    assert motion.console.get_trigger_json()["TriggerStatus"] == 1, (
+        "laser was not OFF after recovering from a mid-scan disconnect"
+    )
+    return path
+
+
+@pytest.mark.timeout(180)
+@pytest.mark.laser
+@pytest.mark.console
+@pytest.mark.sensor
+@pytest.mark.slow
+def test_disconnect_during_scan_bringup(motion, hub):
+    """L3: cut during bring-up (enable_camera / flush window, first ~0.5 s)."""
+    try:
+        _scan_lifecycle_cut(
+            motion, hub, subject="hil_l3_bringup",
+            cut_after_s=0.15, scan_duration_s=8, expect_canceled=True,
+        )
+    finally:
+        try:
+            motion.console.stop_trigger(timeout=2)
+        except Exception:
+            pass
+
+
+@pytest.mark.timeout(180)
+@pytest.mark.laser
+@pytest.mark.console
+@pytest.mark.sensor
+@pytest.mark.slow
+def test_disconnect_during_scan_streaming(motion, hub):
+    """L4: cut mid-stream (laser firing, histograms flowing)."""
+    try:
+        _scan_lifecycle_cut(
+            motion, hub, subject="hil_l4_stream",
+            cut_after_s=1.5, scan_duration_s=8, expect_canceled=True,
+        )
+    finally:
+        try:
+            motion.console.stop_trigger(timeout=2)
+        except Exception:
+            pass
+
+
+@pytest.mark.timeout(180)
+@pytest.mark.laser
+@pytest.mark.console
+@pytest.mark.sensor
+@pytest.mark.slow
+def test_disconnect_during_scan_teardown(motion, hub):
+    """L5: short scan, cut as it enters teardown (stop_trigger→disable→close).
+    The scan may report complete or canceled depending on the exact instant;
+    what matters is no hang, full recovery, and laser OFF."""
+    try:
+        _scan_lifecycle_cut(
+            motion, hub, subject="hil_l5_teardown",
+            cut_after_s=1.6, scan_duration_s=1, expect_canceled=False,
+        )
+    finally:
+        try:
+            motion.console.stop_trigger(timeout=2)
+        except Exception:
+            pass
+
+
+@pytest.mark.timeout(180)
+@pytest.mark.laser
+@pytest.mark.console
+@pytest.mark.sensor
+@pytest.mark.slow
+def test_disconnect_during_calibration(motion, hub, tmp_path):
+    """L6: cut mid-calibration. Calibration drives sub-scans through the same
+    ScanWorkflow abort path, so the contract is identical: the workflow stops,
+    the system recovers, and the laser ends OFF."""
+    from omotion.CalibrationWorkflow import CalibrationRequest, CalibrationThresholds
+
+    assert _wait_all(motion, MAINS_TIMEOUT)
+    z = [0.0] * 8
+    req = CalibrationRequest(
+        operator_id="hil",
+        output_dir=str(tmp_path),
+        left_camera_mask=0x01,
+        right_camera_mask=0x00,
+        thresholds=CalibrationThresholds(
+            min_mean_per_camera=z, min_contrast_per_camera=z,
+            min_bfi_per_camera=z, min_bvi_per_camera=z,
+        ),
+        duration_sec=3,
+    )
+    cw = motion.calibration_workflow
+    try:
+        if not motion.start_calibration(req):
+            pytest.skip("calibration refused to start")
+        # Let it get into a sub-scan, then cut.
+        time.sleep(1.5)
+        hub.off(SYS_PORT)
+        # Wait for the workflow to stop running (bounded).
+        deadline = time.monotonic() + 30
+        while cw.running and time.monotonic() < deadline:
+            time.sleep(0.2)
+        assert not cw.running, "calibration did not stop after mid-scan disconnect"
+        hub.on(SYS_PORT)
+        _assert_recovers(motion, hub)
+        time.sleep(0.5)
+        assert motion.console.get_trigger_json()["TriggerStatus"] == 1, (
+            "laser not OFF after recovering from a mid-calibration disconnect"
+        )
+    finally:
+        try:
+            motion.cancel_calibration()
+        except Exception:
+            pass
+        try:
+            motion.console.stop_trigger(timeout=2)
+        except Exception:
+            pass
+
