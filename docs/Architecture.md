@@ -16,7 +16,8 @@ The Open-Motion SDK is a Python library for controlling optical speckle imaging 
 ┌──────────────────────────────▼──────────────────────────────────────┐
 │                         MotionInterface                              │
 │   console · left · right (stable handles) · scan_workflow            │
-│   ConnectionMonitor (single daemon thread; OS hotplug + 200ms poll)  │
+│   ConnectionMonitor (detector: OS hotplug + 200ms poll) →            │
+│   per-handle ConnectWorker threads (do the blocking connect)         │
 └──────────────┬──────────────────────────────┬───────────────────────┘
                │                              │
                │  Console path                │  Sensor path (×2: left, right)
@@ -347,25 +348,45 @@ USB insert / serial port appears
     OS hotplug (WM_DEVICECHANGE / libusb)  ──or──  200ms ConnectionMonitor poll
          │
          ▼
-    ConnectionMonitor event queue
-         │  HotplugWake / PollArrived
+    ConnectionMonitor event queue          (pure detector — never blocks)
+         │  HotplugWake / PollArrived / PollGone / IoError / UserStop
          ▼
-    Handle state machine transitions  (MotionConsole / MotionSensor)
+    Handle._handle_event posts an intent    ("connect" / "disconnect")
+         │
+         ▼
+    Per-handle ConnectWorker thread         (one per console / left / right)
          │  DISCONNECTED → CONNECTING → CONNECTED
-         │  ├─ open transport (MotionUart / MotionComposite)
+         │  ├─ open transport (MotionUart / MotionComposite)   [bounded + cancellable]
+         │  ├─ ping (2 s timeout, abortable)
          │  ├─ refresh cached IDs (HWID, camera UIDs, version)
+         │  ├─ console only: force-safe stop_trigger (laser OFF on every connect)
          │  └─ start ConsoleTelemetryPoller (console only)
          │
          ▼  signal_state_changed(ConnectionState.CONNECTED)
     Application (QML connector / headless script)
 ```
 
+**The monitor is a pure detector/router.** It only diffs USB presence against
+handle state and posts a `connect` / `disconnect` *intent* to the target
+handle's `ConnectWorker` — it never runs blocking device I/O itself. Each
+handle owns one `ConnectWorker` daemon thread (`omotion/connect_worker.py`)
+that runs the connect/teardown sequence. This is what keeps a slow or
+unresponsive device from stalling the others: the console's connect ping is
+bounded to 2 s and interruptible (`cancel_evt`), and a worker blocked on one
+handle cannot delay another handle's worker. A failed connect applies a short
+cooldown so a present-but-unresponsive device retries on a calm cadence instead
+of spinning every poll tick. On connect the console force-safes the trigger
+(`stop_trigger`) so the laser is never left armed after a reconnect.
+
 The same flow operates in reverse on disconnect — `ConnectionMonitor` sees the
-device leave, the handle transitions back to `DISCONNECTED`, and the
+device leave (a stream-thread `IoError` or a `PollGone`), posts a `disconnect`
+intent (which also trips the worker's abort so an in-flight connect bails
+promptly), the handle transitions back to `DISCONNECTED`, and the
 `signal_state_changed` callback fires once more. Apps subscribe to each
 handle's `signal_state_changed` once and rely on the handle reference being
 stable across reconnects; they never touch `MotionUart` or `MotionComposite`
-directly.
+directly. At shutdown, `ConnectionMonitor._teardown` calls each handle's
+`_shutdown()`, which stops the worker and releases the transport synchronously.
 
 ---
 
