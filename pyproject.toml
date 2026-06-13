@@ -86,6 +86,7 @@ markers = [
     "sequence: multi-step round-trip tests",
     "fpga: requires a loaded FPGA bitstream — temporarily skipped",
     "imu: exercises the IMU subsystem — temporarily skipped",
+    "laser: arms the trigger / fires the laser — run only with a safe beam path",
 ]
 
 [tool.setuptools_scm]
