@@ -86,6 +86,7 @@ markers = [
     "sequence: multi-step round-trip tests",
     "fpga: requires a loaded FPGA bitstream — temporarily skipped",
     "imu: exercises the IMU subsystem — temporarily skipped",
+    "unit: fast tests that require no hardware",
 ]
 
 [tool.setuptools_scm]

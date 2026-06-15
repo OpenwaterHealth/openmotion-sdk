@@ -619,6 +619,7 @@ class ScanDBSink:
         self._meta = meta
         self._closed = False
         self._diag = {}
+        self._rows_written = 0
         label = f"{meta.scan_id}_{meta.subject_id}"
         self._db = ScanDatabase(db_path=self._db_path)
         # data_semantics distinguishes final-branch sessions from legacy
