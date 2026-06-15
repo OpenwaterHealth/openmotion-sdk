@@ -609,6 +609,7 @@ class ScanDBSink:
         self._meta: Optional[ScanMetadata] = None
         self._session_meta: Optional[dict] = None
         self._buffer: list = []
+        self._rows_written = 0
         self._diag: dict[str, dict] = {}
         self._closed = False
 
@@ -657,18 +658,30 @@ class ScanDBSink:
         try:
             self._flush()
             if self._db is not None and self._session_id is not None:
-                if self._diag and self._session_meta is not None:
-                    try:
-                        self._db.update_session(
-                            self._session_id,
-                            session_meta={**self._session_meta,
-                                          "diagnostics": self._diag},
-                        )
-                    except Exception:
-                        logger.exception(
-                            "ScanDBSink: failed to write diagnostics summary"
-                        )
-                self._db.close_session(self._session_id, time.time())
+                if self._rows_written == 0:
+                    # Nothing was persisted (scan interrupted before any dark
+                    # interval closed). Drop the orphan session header so it
+                    # never appears as a viewable scan in History.
+                    scan_id = (self._session_meta or {}).get("scan_id", "?")
+                    logger.warning(
+                        "ScanDBSink: session %d (%s) recorded no corrected "
+                        "rows — deleting empty session row.",
+                        self._session_id, scan_id,
+                    )
+                    self._db.delete_session(self._session_id)
+                else:
+                    if self._diag and self._session_meta is not None:
+                        try:
+                            self._db.update_session(
+                                self._session_id,
+                                session_meta={**self._session_meta,
+                                              "diagnostics": self._diag},
+                            )
+                        except Exception:
+                            logger.exception(
+                                "ScanDBSink: failed to write diagnostics summary"
+                            )
+                    self._db.close_session(self._session_id, time.time())
         except Exception:
             logger.exception("ScanDBSink.on_complete: failed to finalise session")
         finally:
@@ -759,11 +772,12 @@ class ScanDBSink:
     def _flush(self) -> None:
         if not self._buffer or self._db is None:
             return
+        n = len(self._buffer)
         try:
             self._db.insert_session_data_rows(self._buffer)
+            self._rows_written += n
         except Exception:
             logger.exception(
-                "ScanDBSink: failed to insert %d corrected rows",
-                len(self._buffer),
+                "ScanDBSink: failed to insert %d corrected rows", n
             )
         self._buffer = []
