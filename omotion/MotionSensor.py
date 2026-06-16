@@ -22,6 +22,7 @@ from omotion.config import (
     OW_CMD,
     OW_CMD_ECHO,
     OW_CMD_HWID,
+    OW_CMD_I2C_STATUS,
     OW_CMD_PING,
     OW_CMD_RESET,
     OW_CMD_TOGGLE_LED,
@@ -71,7 +72,7 @@ from omotion.config import (
 from omotion.i2c_packet import I2C_Packet
 from omotion.GitHubReleases import GitHubReleases
 from omotion.MotionProcessing import bytes_to_integers
-from omotion.utils import calculate_file_crc
+from omotion.utils import calculate_file_crc, log_i2c_health
 from omotion import _log_root
 
 logger = logging.getLogger(f"{_log_root}.Sensor" if _log_root else "Sensor")
@@ -145,6 +146,10 @@ class MotionSensor(SignalWrapper):
         self._cached_hwid: Optional[str] = None
         self.hardware_id: Optional[str] = None  # alias kept on the handle for clarity
         self._version: str = "v0.0.0"
+
+        # Boot-time I2C health snapshot, populated at connection (None until
+        # then, or if the device firmware predates the I2C-status command).
+        self._i2c_health: Optional[dict] = None
 
         # State machine
         self._state = ConnectionState.DISCONNECTED
@@ -316,6 +321,11 @@ class MotionSensor(SignalWrapper):
                 except Exception as e:
                     logger.debug("get_version during connect failed: %s", e)
 
+                # Assess device health from the firmware's boot-time I2C scan.
+                # Best-effort: never blocks or fails the connection. Done
+                # before the CONNECTED transition so handle.i2c_health is
+                # ready the instant a waiter observes is_connected().
+                self._check_i2c_health()
                 self._set_state(ConnectionState.CONNECTED, reason="ping_ok")
                 return
             except Exception as e:
@@ -334,6 +344,7 @@ class MotionSensor(SignalWrapper):
                 self._cached_camera_uids = None
                 self._cached_hwid = None
                 self.hardware_id = None
+                self._i2c_health = None
                 time.sleep(delay)
 
         self._set_state(
@@ -352,6 +363,7 @@ class MotionSensor(SignalWrapper):
         self._cached_camera_uids = None
         self._cached_hwid = None
         self.hardware_id = None
+        self._i2c_health = None
         self._set_state(ConnectionState.DISCONNECTED, reason=reason)
 
     # ------------------------------------------------------------------
@@ -442,6 +454,91 @@ class MotionSensor(SignalWrapper):
             return bytes.fromhex("deadbeefcafebabe1122334455667788")
         r = self._send(packetType=OW_CMD, command=OW_CMD_HWID)
         return r.data.hex() if r.data_len == 16 else None
+
+    # ------------------------------------------------------------------
+    # I2C health
+    # ------------------------------------------------------------------
+
+    def get_i2c_health(self, rescan: bool = False) -> dict | None:
+        """Return the boot-time I2C health snapshot, or None on error.
+
+        The firmware verifies, at startup, that every expected I2C device is
+        present: the TCA9548A mux, the ICM-20948 IMU, and all 8 cameras
+        (OV2312) + 8 FPGAs (CrossLink) behind the mux. The USB PHY is not on
+        I2C (ULPI) and is excluded.
+
+        Args:
+            rescan: if True, ask the firmware to re-run the scan live (powers
+                each camera one at a time, ~2 s) before returning. If False,
+                returns the cached boot snapshot immediately.
+
+        Returns a dict::
+
+            {
+                "version": int,
+                "mux": bool,             # TCA9548A 0x70
+                "imu": bool,             # ICM-20948 0x68
+                "cameras": [bool] * 8,   # OV2312 0x36 per mux channel
+                "fpgas":   [bool] * 8,   # CrossLink 0x40 per mux channel
+                "cameras_expected": int, # bitmask, 0xFF = all 8
+                "all_present": bool,
+            }
+        """
+        if self.demo_mode:
+            return {
+                "version": 1,
+                "mux": True,
+                "imu": True,
+                "cameras": [True] * 8,
+                "fpgas": [True] * 8,
+                "cameras_expected": 0xFF,
+                "all_present": True,
+            }
+        r = self._send(
+            packetType=OW_CMD,
+            command=OW_CMD_I2C_STATUS,
+            reserved=(1 if rescan else 0),
+        )
+        if r is None or r.packetType in _ERROR_TYPES or r.data_len < 8:
+            return None
+        d = r.data
+        cam_mask = d[3]
+        fpga_mask = d[4]
+        return {
+            "version": d[0],
+            "mux": bool(d[1]),
+            "imu": bool(d[2]),
+            "cameras": [bool(cam_mask & (1 << i)) for i in range(8)],
+            "fpgas": [bool(fpga_mask & (1 << i)) for i in range(8)],
+            "cameras_expected": d[5],
+            "all_present": bool(d[6]),
+        }
+
+    def _check_i2c_health(self) -> None:
+        """Read and cache the boot-time I2C health snapshot (connection step).
+
+        Best-effort: reads the cached firmware snapshot (no disruptive rescan),
+        never raises, and never affects the connection result. Stores the
+        snapshot on the handle and logs the outcome.
+        """
+        try:
+            self._i2c_health = self.get_i2c_health()
+        except Exception as e:
+            logger.debug("%s: I2C health check failed: %s", self.name, e)
+            self._i2c_health = None
+        log_i2c_health(self.name, self._i2c_health, logger)
+
+    @property
+    def i2c_health(self) -> Optional[dict]:
+        """Cached boot-time I2C health snapshot, or None if unavailable.
+
+        Populated at connection. See :meth:`get_i2c_health` for the shape.
+        """
+        return self._i2c_health
+
+    def is_i2c_healthy(self) -> bool:
+        """True iff a health snapshot is present and every expected device responded."""
+        return bool(self._i2c_health and self._i2c_health.get("all_present"))
 
     # ------------------------------------------------------------------
     # Fan control

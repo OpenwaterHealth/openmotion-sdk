@@ -322,3 +322,25 @@ def list_vcp_with_vid_pid(target_vid, target_pid):
             print(f"Device found: {port.device} - {port.description}")
             devices.append(port.device)
     return devices
+
+
+def log_i2c_health(name, snapshot, logger):
+    """Log the outcome of a device's boot-time I2C health snapshot.
+
+    Shared by MotionSensor / MotionConsole connection handling.
+
+    - ``snapshot is None`` → DEBUG. The query failed or the firmware predates
+      the I2C-status command; treated as "unknown", never an error.
+    - ``all_present`` true → INFO.
+    - otherwise → WARNING, including the snapshot so the missing devices show.
+    """
+    if snapshot is None:
+        logger.debug(
+            "%s: I2C health unavailable (query failed or firmware predates "
+            "the I2C-status command)", name,
+        )
+    elif snapshot.get("all_present"):
+        logger.info("%s: I2C health OK - all expected devices present", name)
+    else:
+        logger.warning("%s: I2C health DEGRADED - not all devices present: %s",
+                       name, snapshot)
