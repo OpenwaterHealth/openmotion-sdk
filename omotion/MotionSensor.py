@@ -22,6 +22,7 @@ from omotion.config import (
     OW_CMD,
     OW_CMD_ECHO,
     OW_CMD_HWID,
+    OW_CMD_I2C_STATUS,
     OW_CMD_PING,
     OW_CMD_RESET,
     OW_CMD_TOGGLE_LED,
@@ -442,6 +443,65 @@ class MotionSensor(SignalWrapper):
             return bytes.fromhex("deadbeefcafebabe1122334455667788")
         r = self._send(packetType=OW_CMD, command=OW_CMD_HWID)
         return r.data.hex() if r.data_len == 16 else None
+
+    # ------------------------------------------------------------------
+    # I2C health
+    # ------------------------------------------------------------------
+
+    def get_i2c_health(self, rescan: bool = False) -> dict | None:
+        """Return the boot-time I2C health snapshot, or None on error.
+
+        The firmware verifies, at startup, that every expected I2C device is
+        present: the TCA9548A mux, the ICM-20948 IMU, and all 8 cameras
+        (OV2312) + 8 FPGAs (CrossLink) behind the mux. The USB PHY is not on
+        I2C (ULPI) and is excluded.
+
+        Args:
+            rescan: if True, ask the firmware to re-run the scan live (powers
+                each camera one at a time, ~2 s) before returning. If False,
+                returns the cached boot snapshot immediately.
+
+        Returns a dict::
+
+            {
+                "version": int,
+                "mux": bool,             # TCA9548A 0x70
+                "imu": bool,             # ICM-20948 0x68
+                "cameras": [bool] * 8,   # OV2312 0x36 per mux channel
+                "fpgas":   [bool] * 8,   # CrossLink 0x40 per mux channel
+                "cameras_expected": int, # bitmask, 0xFF = all 8
+                "all_present": bool,
+            }
+        """
+        if self.demo_mode:
+            return {
+                "version": 1,
+                "mux": True,
+                "imu": True,
+                "cameras": [True] * 8,
+                "fpgas": [True] * 8,
+                "cameras_expected": 0xFF,
+                "all_present": True,
+            }
+        r = self._send(
+            packetType=OW_CMD,
+            command=OW_CMD_I2C_STATUS,
+            reserved=(1 if rescan else 0),
+        )
+        if r is None or r.packetType in _ERROR_TYPES or r.data_len < 8:
+            return None
+        d = r.data
+        cam_mask = d[3]
+        fpga_mask = d[4]
+        return {
+            "version": d[0],
+            "mux": bool(d[1]),
+            "imu": bool(d[2]),
+            "cameras": [bool(cam_mask & (1 << i)) for i in range(8)],
+            "fpgas": [bool(fpga_mask & (1 << i)) for i in range(8)],
+            "cameras_expected": d[5],
+            "all_present": bool(d[6]),
+        }
 
     # ------------------------------------------------------------------
     # Fan control
