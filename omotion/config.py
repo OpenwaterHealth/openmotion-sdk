@@ -178,6 +178,9 @@ OW_CTRL_GET_LASER_ODO = 0x27
 # to both.
 OW_CTRL_RESET_ODO = 0x28
 OW_CTRL_I2C_STATUS = 0x29
+# Read the external EEPROM's factory EUI-48 (6 bytes, MSB first) as a unique
+# per-board serial. NAK/OW_ERROR if the console has no EEPROM.
+OW_CTRL_GET_EEPROM_EUI = 0x2A
 OW_CTRL_FAN_CTL = 0x0A
 
 # Page-by-page direct FPGA programming commands (0x30–0x3C)

@@ -46,6 +46,7 @@ from omotion.config import (
     OW_CTRL_GET_FAN,
     OW_CTRL_SET_FAN,
     OW_CTRL_GET_FSYNC,
+    OW_CTRL_GET_EEPROM_EUI,
     OW_CTRL_GET_IND,
     OW_CTRL_GET_LSYNC,
     OW_CTRL_GET_LASER_ODO,
@@ -1473,6 +1474,45 @@ class MotionConsole(SignalWrapper):
             raise
         except Exception as e:
             self._log_command_error(name, e)
+            return None
+
+    def get_board_eui(self) -> Optional[str]:
+        """Return the console's unique board serial as a colon-separated EUI-48
+        string (e.g. ``"FC:0F:E7:16:38:90"``).
+
+        This is the factory-programmed EUI-48 read from the external EEPROM on
+        the console board. Returns None on NAK / unexpected length (e.g.
+        firmware predating the EEPROM odometer feature, or a board with no
+        EEPROM).
+        """
+        try:
+            if self.uart.demo_mode:
+                return None
+            if not self.is_connected():
+                raise ValueError("Console controller not connected")
+            r = self.uart.send_packet(
+                id=None, packetType=OW_CONTROLLER,
+                command=OW_CTRL_GET_EEPROM_EUI, data=None,
+            )
+            self.uart.clear_buffer()
+            if r.packetType == OW_ERROR:
+                logger.info(
+                    "get_board_eui: console NAK'd opcode 0x%02X — firmware "
+                    "likely predates the EEPROM feature, or no EEPROM present",
+                    OW_CTRL_GET_EEPROM_EUI,
+                )
+                return None
+            if r.data_len != 6:
+                logger.warning(
+                    "get_board_eui: expected 6 bytes, got %d — skipped",
+                    r.data_len,
+                )
+                return None
+            return ":".join(f"{b:02X}" for b in r.data)
+        except ValueError:
+            raise
+        except Exception as e:
+            self._log_command_error("get_board_eui", e)
             return None
 
     def reset_odometer(self, target: int = 2) -> bool:
