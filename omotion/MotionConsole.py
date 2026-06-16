@@ -56,6 +56,7 @@ from omotion.config import (
     OW_CTRL_GET_TRIG,
     OW_CTRL_I2C_RD,
     OW_CTRL_I2C_SCAN,
+    OW_CTRL_I2C_STATUS,
     OW_CTRL_I2C_WR,
     OW_CTRL_PDUMON,
     OW_CTRL_READ_ADC,
@@ -742,6 +743,80 @@ class MotionConsole(SignalWrapper):
                 e,
             )
             raise
+
+    def get_i2c_health(self, rescan: bool = False) -> dict | None:
+        """Return the boot-time I2C health snapshot, or None on error.
+
+        At startup the console firmware passively pings every expected I2C
+        device across its two TCA9548 muxes and the fan bus, and caches the
+        result. This reads that snapshot.
+
+        Args:
+            rescan: if True, ask the firmware to re-run the (passive) scan live
+                before returning; if False, returns the cached boot snapshot.
+
+        Returns a dict::
+
+            {
+                "version": int,
+                "mux0": bool,          # TCA9548 #0 @0x70 on I2C1
+                "mux1": bool,          # TCA9548 #1 @0x70 on I2C2
+                "seed_cfg_fpga": bool, # XO2 config @0x40, mux0 ch0
+                "gpio_exp": bool,      # PCA9535 @0x20, mux1 ch0
+                "pdu_adc0": bool,      # ADS7828 @0x48, mux1 ch0
+                "pdu_adc1": bool,      # ADS7828 @0x4B, mux1 ch0
+                "tec_adc": bool,       # ADS7924 @0x49, mux1 ch3
+                "fan": bool,           # MAX6663 @0x2C, I2C4
+                "temps": [bool, bool, bool],  # MAX31875 0x49/0x4A/0x4B, mux1 ch1
+                "fpgas": {"ta": bool, "seed": bool, "ee": bool, "opt": bool},  # 0x41, mux1 ch4-7
+                "all_present": bool,
+            }
+        """
+        if self.uart.demo_mode:
+            return {
+                "version": 1,
+                "mux0": True, "mux1": True, "seed_cfg_fpga": True,
+                "gpio_exp": True, "pdu_adc0": True, "pdu_adc1": True,
+                "tec_adc": True, "fan": True,
+                "temps": [True, True, True],
+                "fpgas": {"ta": True, "seed": True, "ee": True, "opt": True},
+                "all_present": True,
+            }
+        try:
+            r = self.uart.send_packet(
+                id=None,
+                packetType=OW_CONTROLLER,
+                command=OW_CTRL_I2C_STATUS,
+                reserved=(1 if rescan else 0),
+            )
+            self.uart.clear_buffer()
+            if r is None or r.packetType == OW_ERROR or not r.data or r.data_len < 12:
+                return None
+            d = r.data
+            temp_mask = d[9]
+            fpga_mask = d[10]
+            return {
+                "version": d[0],
+                "mux0": bool(d[1]),
+                "mux1": bool(d[2]),
+                "seed_cfg_fpga": bool(d[3]),
+                "gpio_exp": bool(d[4]),
+                "pdu_adc0": bool(d[5]),
+                "pdu_adc1": bool(d[6]),
+                "tec_adc": bool(d[7]),
+                "fan": bool(d[8]),
+                "temps": [bool(temp_mask & (1 << i)) for i in range(3)],
+                "fpgas": {
+                    "ta": bool(fpga_mask & (1 << 4)),
+                    "seed": bool(fpga_mask & (1 << 5)),
+                    "ee": bool(fpga_mask & (1 << 6)),
+                    "opt": bool(fpga_mask & (1 << 7)),
+                },
+                "all_present": bool(d[11]),
+            }
+        except Exception as e:
+            self._log_command_error("get_i2c_health", e)
+            return None
 
     def read_i2c_packet(
         self,

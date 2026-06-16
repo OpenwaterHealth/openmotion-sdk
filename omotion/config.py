@@ -177,6 +177,7 @@ OW_CTRL_GET_LASER_ODO = 0x27
 # Payload: 1 byte target (0=system, 1=laser, 2=both). Missing payload defaults
 # to both.
 OW_CTRL_RESET_ODO = 0x28
+OW_CTRL_I2C_STATUS = 0x29
 OW_CTRL_FAN_CTL = 0x0A
 
 # Page-by-page direct FPGA programming commands (0x30–0x3C)
