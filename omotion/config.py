@@ -132,6 +132,7 @@ OW_CMD_NOP = 0x0E
 OW_CMD_RESET = 0x0F
 OW_CMD_I2C_BROADCAST = 0x06
 OW_CMD_DEBUG_FLAGS = 0x0C
+OW_CMD_I2C_STATUS = 0x0B
 
 # Debug flag bits.
 DEBUG_FLAG_USB_PRINTF = 0x01  # Turn on or off USB printf logging
