@@ -76,6 +76,7 @@ from omotion.config import (
 
 from omotion.GitHubReleases import GitHubReleases
 from omotion.MotionConfig import MotionConfig, MotionConfigHeader
+from omotion.utils import log_i2c_health
 from omotion.Calibration import (
     Calibration,
     parse_calibration,
@@ -169,6 +170,10 @@ class MotionConsole(SignalWrapper):
         self._state_cv = threading.Condition()
         self._monitor = None  # set by MotionInterface.start()
         self._version = "v0.0.0"
+
+        # Boot-time I2C health snapshot, populated at connection (None until
+        # then, or if the device firmware predates the I2C-status command).
+        self._i2c_health: Optional[dict] = None
 
     # ──────────────────────────────────────────────────────────────────
     # State (read-only from outside)
@@ -280,6 +285,7 @@ class MotionConsole(SignalWrapper):
     def _drive_connecting(self, reason: str) -> None:
         if self.uart.demo_mode:
             self._set_state(ConnectionState.CONNECTING, reason=reason)
+            self._check_i2c_health()
             self._set_state(ConnectionState.CONNECTED, reason="demo_mode")
             try:
                 self.telemetry.start()
@@ -315,6 +321,11 @@ class MotionConsole(SignalWrapper):
                 # version invoke `get_version()` from their own
                 # CONNECTED handler (e.g. `log_console_info`), which
                 # works correctly post-transition.
+                # Assess device health from the firmware's boot-time I2C scan.
+                # Best-effort: never blocks or fails the connection. Done
+                # before the CONNECTED transition so handle.i2c_health is
+                # ready the instant a waiter observes is_connected().
+                self._check_i2c_health()
                 self._set_state(ConnectionState.CONNECTED, reason="ping_ok")
                 try:
                     self.telemetry.start()
@@ -371,6 +382,7 @@ class MotionConsole(SignalWrapper):
             self.uart.close()
         except Exception:
             logger.exception("uart close failed")
+        self._i2c_health = None
         self._set_state(ConnectionState.DISCONNECTED, reason=reason)
 
     # ──────────────────────────────────────────────────────────────────
@@ -817,6 +829,32 @@ class MotionConsole(SignalWrapper):
         except Exception as e:
             self._log_command_error("get_i2c_health", e)
             return None
+
+    def _check_i2c_health(self) -> None:
+        """Read and cache the boot-time I2C health snapshot (connection step).
+
+        Best-effort: reads the cached firmware snapshot (no disruptive rescan),
+        never raises, and never affects the connection result. Stores the
+        snapshot on the handle and logs the outcome.
+        """
+        try:
+            self._i2c_health = self.get_i2c_health()
+        except Exception as e:
+            logger.debug("%s: I2C health check failed: %s", self.name, e)
+            self._i2c_health = None
+        log_i2c_health(self.name, self._i2c_health, logger)
+
+    @property
+    def i2c_health(self) -> Optional[dict]:
+        """Cached boot-time I2C health snapshot, or None if unavailable.
+
+        Populated at connection. See :meth:`get_i2c_health` for the shape.
+        """
+        return self._i2c_health
+
+    def is_i2c_healthy(self) -> bool:
+        """True iff a health snapshot is present and every expected device responded."""
+        return bool(self._i2c_health and self._i2c_health.get("all_present"))
 
     def read_i2c_packet(
         self,
