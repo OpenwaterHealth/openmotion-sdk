@@ -141,7 +141,7 @@ class MotionUart:
         """Block until a packet arrives or `timeout` seconds elapse."""
         if self.demo_mode:
             return UartPacket(
-                id=0, packet_type=OW_ERROR, command=0, addr=0, reserved=0, data=[]
+                id=0, packetType=OW_ERROR, command=0, addr=0, reserved=0, data=[]
             )
         if self.serial is None:
             raise CommandError("UART not open")

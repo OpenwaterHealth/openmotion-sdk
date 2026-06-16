@@ -1,9 +1,15 @@
-import argparse
-from omotion.Interface import MOTIONInterface
+#!/usr/bin/env python3
+"""Disable power to selected cameras on all connected sensors.
 
-# Run this script with:
-# set PYTHONPATH=%cd%;%PYTHONPATH%
-# python scripts\disable_camera_power.py --mask 0xFF
+Usage
+-----
+    python scripts/disable_camera_power.py --mask 0xFF
+"""
+
+import argparse
+import sys
+
+from omotion import MotionInterface
 
 
 def parse_args():
@@ -17,41 +23,44 @@ def parse_args():
     return parser.parse_args()
 
 
-def main():
+def main() -> int:
     args = parse_args()
 
-    # Acquire interface + connection state
-    interface, console_connected, left_sensor, right_sensor = MOTIONInterface.acquire_motion_interface()
+    interface = MotionInterface()
+    interface.start()
 
-    if console_connected and left_sensor and right_sensor:
-        print("MOTION System fully connected.")
-    else:
-        print(
-            f"MOTION System NOT Fully Connected. CONSOLE: {console_connected}, SENSOR (LEFT,RIGHT): {left_sensor}, {right_sensor}"
-        )
+    try:
+        console_connected, left_connected, right_connected = interface.is_device_connected()
 
-    if not left_sensor and not right_sensor:
-        print("Sensor Module not connected.")
-        exit(1)
-
-    print(f"Disabling camera power with mask {args.mask:#04x} on all connected sensors...")
-    results = interface.run_on_sensors("disable_camera_power", args.mask)
-
-    any_success = False
-    for side, success in results.items():
-        if success is True:
-            any_success = True
-            print(f"{side.capitalize()}: ✅ Power disabled")
-        elif success is False:
-            print(f"{side.capitalize()}: ❌ Failed to disable power")
+        if console_connected and left_connected and right_connected:
+            print("MOTION System fully connected.")
         else:
-            print(f"{side.capitalize()}: ⚠️ No result (possibly disconnected)")
+            print(
+                f"MOTION System NOT Fully Connected. CONSOLE: {console_connected}, "
+                f"SENSOR (LEFT,RIGHT): {left_connected}, {right_connected}"
+            )
 
-    if not any_success:
-        exit(1)
+        if not left_connected and not right_connected:
+            print("Sensor Module not connected.")
+            return 1
+
+        print(f"Disabling camera power with mask {args.mask:#04x} on all connected sensors...")
+        results = interface.run_on_sensors("disable_camera_power", args.mask)
+
+        any_success = False
+        for side, success in results.items():
+            if success is True:
+                any_success = True
+                print(f"{side.capitalize()}: ✅ Power disabled")
+            elif success is False:
+                print(f"{side.capitalize()}: ❌ Failed to disable power")
+            else:
+                print(f"{side.capitalize()}: ⚠️ No result (possibly disconnected)")
+
+        return 0 if any_success else 1
+    finally:
+        interface.stop()
 
 
 if __name__ == "__main__":
-    main()
-
-
+    sys.exit(main())

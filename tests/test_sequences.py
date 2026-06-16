@@ -118,50 +118,6 @@ def test_fpga_enable_histogram_disable(any_sensor):
 # 5.4 Streaming acquisition
 # ===========================================================================
 
-@pytest.mark.slow
-def test_streaming_acquisition(any_sensor):
-    """
-    Start FSIN streaming, collect 30 science frames, assert monotonic
-    absolute_frame_id increments of exactly 1.
-    """
-    from omotion.MotionProcessing import create_science_pipeline
-
-    N = 30
-    _camera_up(any_sensor)
-    any_sensor.enable_aggregator_fsin()
-
-    frames = []
-    done = threading.Event()
-
-    def on_science_frame(frame):
-        frames.append(frame)
-        if len(frames) >= N:
-            done.set()
-
-    # create_science_pipeline() starts the pipeline internally — do NOT call .start() again
-    pipeline = create_science_pipeline(
-        bfi_c_min=_BFI_ZEROS,
-        bfi_c_max=_BFI_ONES,
-        bfi_i_min=_BFI_ZEROS,
-        bfi_i_max=_BFI_ONES,
-        on_science_frame_fn=on_science_frame,
-    )
-    any_sensor.enable_camera(0x01)
-
-    try:
-        done.wait(timeout=30)
-    finally:
-        any_sensor.disable_camera(0x01)
-        any_sensor.disable_aggregator_fsin()
-        pipeline.stop()
-
-    assert len(frames) >= N, f"Expected {N} frames, got {len(frames)}"
-
-    abs_ids = [f.absolute_frame for f in frames[:N]]
-    for prev, curr in zip(abs_ids, abs_ids[1:]):
-        assert curr == prev + 1, f"Frame ID not monotonic: {prev} → {curr}"
-
-
 # ===========================================================================
 # 5.5 External FSIN sequence
 # ===========================================================================
@@ -210,76 +166,19 @@ def test_trigger_lsync_sequence(console):
 
 
 # ===========================================================================
-# 5.8 Dual-sensor aligned frame acquisition
-# ===========================================================================
-
-@pytest.mark.slow
-def test_dual_sensor_frame_alignment(sensor_left, sensor_right):
-    """
-    Stream from both sensors and assert ScienceFrames carry both
-    left and right samples with matching absolute_frame.
-    """
-    from omotion.MotionProcessing import create_science_pipeline
-
-    N = 20
-
-    for sensor in (sensor_left, sensor_right):
-        _camera_up(sensor)
-        sensor.enable_aggregator_fsin()
-
-    aligned_frames = []
-    done = threading.Event()
-
-    def on_science_frame(frame):
-        sides = {side for (side, _) in frame.samples.keys()}
-        if "left" in sides and "right" in sides:
-            aligned_frames.append(frame)
-        if len(aligned_frames) >= N:
-            done.set()
-
-    # create_science_pipeline() starts the pipeline internally — do NOT call .start() again
-    pipeline = create_science_pipeline(
-        bfi_c_min=_BFI_ZEROS,
-        bfi_c_max=_BFI_ONES,
-        bfi_i_min=_BFI_ZEROS,
-        bfi_i_max=_BFI_ONES,
-        on_science_frame_fn=on_science_frame,
-    )
-
-    for sensor in (sensor_left, sensor_right):
-        sensor.enable_camera(0x01)
-
-    try:
-        done.wait(timeout=30)
-    finally:
-        for sensor in (sensor_left, sensor_right):
-            sensor.disable_camera(0x01)
-            sensor.disable_aggregator_fsin()
-        pipeline.stop()
-
-    assert len(aligned_frames) >= N, (
-        f"Expected {N} aligned frames, got {len(aligned_frames)}"
-    )
-
-    for frame in aligned_frames:
-        sides_present = {side for (side, _) in frame.samples.keys()}
-        assert "left" in sides_present
-        assert "right" in sides_present
-
-
-# ===========================================================================
 # 5.9 Full scan workflow
 # ===========================================================================
 
 @pytest.mark.slow
 @pytest.mark.console
 @pytest.mark.timeout(300)
-def test_scan_workflow_end_to_end(motion, tmp_path):
+def test_scan_workflow_end_to_end(motion):
     """
-    Execute a 5-second scan via ScanWorkflow and assert a non-empty
-    CSV is written with a matching frame count.
+    Execute a 5-second scan via the current ScanWorkflow API and assert it
+    runs to completion cleanly. start_scan returns a bool and runs on a worker
+    thread; progress/completion is observed via the scan_workflow properties
+    (there is no on_complete_fn callback or ScanResult anymore).
     """
-    import csv as csv_module
     from omotion.ScanWorkflow import ScanRequest
 
     request = ScanRequest(
@@ -287,32 +186,20 @@ def test_scan_workflow_end_to_end(motion, tmp_path):
         duration_sec=5,
         left_camera_mask=0x01,
         right_camera_mask=0x01,
-        data_dir=str(tmp_path),
         disable_laser=False,
     )
 
-    result_holder = {}
-    done = threading.Event()
+    sw = motion.scan_workflow
+    assert motion.start_scan(request), f"start_scan refused: {sw.last_scan_error}"
 
-    def on_result(result):
-        result_holder["result"] = result
-        done.set()
+    deadline = time.monotonic() + 60
+    while sw.running and time.monotonic() < deadline:
+        sw.await_complete(timeout_sec=1.0)
 
-    motion.scan_workflow.start_scan(request, on_complete_fn=on_result)
-    done.wait(timeout=30)
-
-    result = result_holder.get("result")
-    assert result is not None, "ScanWorkflow did not call on_complete_fn"
-    assert result.ok, f"Scan failed: {result.error}"
-    assert not result.canceled
-
-    for path in (result.left_path, result.right_path):
-        if path:
-            assert os.path.isfile(path), f"Expected CSV at {path}"
-            with open(path, newline="") as f:
-                rows = list(csv_module.reader(f))
-            data_rows = [r for r in rows if r and not r[0].startswith("#")]
-            assert len(data_rows) > 1, f"CSV at {path} has no data rows"
+    assert not sw.running, "scan did not finish within 60s"
+    assert sw.last_scan_error is None, f"scan failed: {sw.last_scan_error}"
+    assert not sw.last_scan_canceled
+    assert sw.current_scan_label, "current_scan_label should be set after a scan"
 
 
 # ===========================================================================

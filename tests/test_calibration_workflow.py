@@ -1,9 +1,9 @@
 """Integration tests for CalibrationWorkflow with mocked ScanWorkflow.
 
-Patches MotionInterface.scan_workflow.start_scan to immediately invoke
-on_complete_fn with a fake ScanResult pointing at fixture CSVs.
-Patches MotionInterface.write_calibration to record arguments without
-hitting hardware.
+Patches MotionInterface.scan_workflow.start_scan so sub-scans don't hit
+hardware, and MotionInterface.write_calibration to record arguments.
+Sub-scans run via run_collection_scan, which calls start_scan(request) and
+polls scan_workflow.running — there is no on_complete_fn / ScanResult callback.
 """
 import os
 import threading
@@ -20,7 +20,6 @@ from omotion.CalibrationWorkflow import (
     CalibrationResult,
     CalibrationThresholds,
 )
-from omotion.ScanWorkflow import ScanResult
 
 
 _FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
@@ -81,59 +80,73 @@ def interface():
     return iface
 
 
-def _make_fake_scan(left, right):
-    """Return a function that mimics scan_workflow.start_scan.
+def _make_fake_scan_workflow(interface, left, right):
+    """Patch interface.scan_workflow so start_scan synthesises corrected
+    samples through the sink contract used by the new pipeline (Phase E).
 
-    Spawns a thread that:
-      1. Synthesises a corrected CorrectedBatch with one Sample per
-         (side, cam) and emits it via on_corrected_batch_fn (matching
-         the new live-capture flow used by CalibrationWorkflow).
-      2. Calls on_complete_fn with a ScanResult pointing at fixture
-         paths so the workflow has CSV artifacts.
+    Drives the _CalibrationCollectorSink directly: on_scan_start ->
+    consume("final", EnrichedCorrectedInterval) -> on_complete.
+    Sets scan_workflow.running True briefly then False so the polling
+    loop in _run_subscan_capture exits with last_scan_error=None.
     """
-    from omotion.MotionProcessing import CorrectedBatch, Sample
+    from omotion.pipeline.stages.dark import (
+        EnrichedCorrectedFrame, EnrichedCorrectedInterval,
+    )
 
-    def _make_batch():
-        samples = []
+    def _make_interval():
+        frames = []
         for side in ("left", "right"):
             for cam_id in range(8):
-                # Multiple samples per camera so per-frame averaging
-                # has something to average.
                 for fid in range(50, 100):
-                    samples.append(Sample(
-                        side=side, cam_id=cam_id, frame_id=fid,
-                        absolute_frame_id=fid, timestamp_s=fid / 40.0,
-                        row_sum=1000, temperature_c=25.0,
-                        mean=200.0, std_dev=80.0, contrast=0.4,
-                        bfi=5.0, bvi=5.0,
-                        is_corrected=True, is_dark=False,
+                    frames.append(EnrichedCorrectedFrame(
+                        abs_frame_id=fid, t=fid / 40.0, side=side, cam_id=cam_id,
+                        mean=200.0, std=80.0, contrast=0.4, bfi=5.0, bvi=5.0,
                     ))
-        return CorrectedBatch(
-            dark_frame_start=10, dark_frame_end=240, samples=samples,
-        )
+        return EnrichedCorrectedInterval(left_abs=10, right_abs=240, frames=frames)
 
-    def _fake(req, *, on_complete_fn=None, on_log_fn=None,
-              on_corrected_batch_fn=None, **kw):
+    sw = interface.scan_workflow
+    done_evt = threading.Event()
+
+    def _fake_start_scan(req):
+        sw._running = True
+        sw._last_scan_error = None
+        sw._last_scan_canceled = False
+
         def _run():
             time.sleep(0.05)
-            if on_corrected_batch_fn:
-                on_corrected_batch_fn(_make_batch())
-            res = ScanResult(
-                ok=True, error="", left_path=left, right_path=right,
-                canceled=False, scan_timestamp="20260501_000000",
-            )
-            if on_complete_fn:
-                on_complete_fn(res)
+            for sink in req.sinks:
+                try:
+                    sink.on_scan_start(None)
+                except Exception:
+                    pass
+                try:
+                    sink.consume("final", _make_interval())
+                except Exception:
+                    pass
+                try:
+                    sink.on_complete()
+                except Exception:
+                    pass
+            sw._running = False
+            done_evt.set()
+
         threading.Thread(target=_run, daemon=True).start()
         return True
-    return _fake
+
+    def _fake_await(*, timeout_sec=None):
+        done_evt.wait(timeout=timeout_sec)
+
+    sw.start_scan = _fake_start_scan
+    sw.await_complete = _fake_await
+    # last_scan_error / last_scan_canceled / running come straight from
+    # the real ScanWorkflow attrs we just twiddled above.
 
 
 def test_happy_path_produces_csv_and_passes(interface, request_obj):
     if not _have_fixtures():
         pytest.skip("fixture CSVs missing")
 
-    interface.scan_workflow.start_scan = _make_fake_scan(_LEFT, _RIGHT)
+    _make_fake_scan_workflow(interface, _LEFT, _RIGHT)
     interface.write_calibration = MagicMock(
         return_value=Calibration(
             c_min=np.zeros((2, 8)), c_max=np.full((2, 8), 0.5),
@@ -162,25 +175,29 @@ def test_cancel_during_phase_1(interface, request_obj):
     if not _have_fixtures():
         pytest.skip("fixture CSVs missing")
 
+    sw = interface.scan_workflow
     started = threading.Event()
     cancel_called = threading.Event()
 
-    def _slow_scan(req, *, on_complete_fn=None, **kw):
+    def _slow_scan(req):
+        sw._running = True
+        sw._last_scan_error = None
+        sw._last_scan_canceled = False
+
         def _run():
             started.set()
             cancel_called.wait(timeout=5.0)
-            if on_complete_fn:
-                on_complete_fn(ScanResult(
-                    ok=False, error="canceled", left_path="", right_path="",
-                    canceled=True, scan_timestamp="x",
-                ))
+            sw._last_scan_canceled = True
+            sw._running = False
+
         threading.Thread(target=_run, daemon=True).start()
         return True
 
-    interface.scan_workflow.start_scan = _slow_scan
-    interface.scan_workflow.cancel_scan = MagicMock(
-        side_effect=lambda **kw: cancel_called.set()
+    sw.start_scan = _slow_scan
+    sw.await_complete = lambda *, timeout_sec=None: (
+        time.sleep(min(0.1, timeout_sec)) if timeout_sec else None
     )
+    sw.cancel_scan = MagicMock(side_effect=lambda **kw: cancel_called.set())
     interface.write_calibration = MagicMock()
 
     done = threading.Event()
@@ -200,17 +217,28 @@ def test_cancel_during_phase_1(interface, request_obj):
 
 
 def test_phase1_scan_failure_aborts_before_write(interface, request_obj):
-    def _fail_scan(req, *, on_complete_fn=None, **kw):
-        threading.Thread(
-            target=lambda: on_complete_fn(ScanResult(
-                ok=False, error="USB lost", left_path="", right_path="",
-                canceled=False, scan_timestamp="x",
-            )),
-            daemon=True,
-        ).start()
+    """When the underlying scan worker raises, _run_subscan_capture should
+    surface the error message via scan_workflow.last_scan_error so the
+    workflow aborts before write_calibration is touched."""
+    sw = interface.scan_workflow
+
+    def _fail_scan(req):
+        sw._running = True
+        sw._last_scan_error = None
+        sw._last_scan_canceled = False
+
+        def _run():
+            time.sleep(0.02)
+            sw._last_scan_error = "USB lost"
+            sw._running = False
+
+        threading.Thread(target=_run, daemon=True).start()
         return True
 
-    interface.scan_workflow.start_scan = _fail_scan
+    done_join = threading.Event()
+    sw.start_scan = _fail_scan
+    sw.await_complete = lambda *, timeout_sec=None: done_join.wait(timeout=timeout_sec)
+
     interface.write_calibration = MagicMock()
 
     done = threading.Event()
@@ -219,8 +247,109 @@ def test_phase1_scan_failure_aborts_before_write(interface, request_obj):
         request_obj,
         on_complete_fn=lambda r: (box.append(r), done.set()),
     )
+    # Let the fake scan thread finish before the polling loop awaits.
+    time.sleep(0.05)
+    done_join.set()
     assert done.wait(timeout=10.0)
     r = box[0]
     assert r.ok is False
     assert "USB lost" in r.error
     interface.write_calibration.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Task 13: _run_subscan_capture passes collector sink + skip_default_storage
+# ---------------------------------------------------------------------------
+
+def test_subscan_uses_collector_sink_and_skip_default_storage(interface, request_obj):
+    """_run_subscan_capture (called by start_calibration) must attach a
+    _CalibrationCollectorSink to each ScanRequest and set
+    skip_default_storage=True.  Verifies the new sink-based API shape
+    added in Phase D of the pipeline cutover (Task 13).
+    """
+    from omotion.CalibrationWorkflow import _CalibrationCollectorSink
+
+    captured_requests: list = []
+
+    def _capture_and_complete(req, **kw):
+        # run_collection_scan calls start_scan(request) then polls
+        # scan_workflow.running (False here — no worker is started), so just
+        # capture the request and report a successful launch.
+        captured_requests.append(req)
+        return True
+
+    interface.scan_workflow.start_scan = _capture_and_complete
+    interface.write_calibration = MagicMock(
+        return_value=Calibration(
+            c_min=np.zeros((2, 8)), c_max=np.full((2, 8), 0.5),
+            i_min=np.zeros((2, 8)), i_max=np.full((2, 8), 200.0),
+            source="console",
+        )
+    )
+
+    done = threading.Event()
+    box: list[CalibrationResult] = []
+
+    interface.start_calibration(
+        request_obj,
+        on_complete_fn=lambda r: (box.append(r), done.set()),
+    )
+    assert done.wait(timeout=15.0), "calibration did not complete"
+
+    # The calibration workflow makes at least 2 sub-scans (phase 1 + phase 4).
+    assert len(captured_requests) >= 1, "No ScanRequests were captured"
+
+    for req in captured_requests:
+        assert req.skip_default_storage is True, (
+            f"ScanRequest.skip_default_storage should be True; got {req.skip_default_storage}"
+        )
+        collector_sinks = [
+            s for s in req.sinks
+            if isinstance(s, _CalibrationCollectorSink)
+        ]
+        assert len(collector_sinks) >= 1, (
+            f"Expected a _CalibrationCollectorSink in req.sinks; got {req.sinks}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Task 16: start_test_scan also uses collector sink + skip_default_storage
+# ---------------------------------------------------------------------------
+
+def test_start_test_scan_uses_collector_sink_and_skip_default_storage(
+    interface, request_obj
+):
+    """start_test_scan's sub-scan must also carry the collector sink and
+    skip_default_storage=True.  Same shape as the calibration sub-scan
+    (Task 16 of the pipeline cutover)."""
+    from omotion.CalibrationWorkflow import _CalibrationCollectorSink, TestScanResult
+
+    captured_requests: list = []
+
+    def _capture_and_complete(req, **kw):
+        captured_requests.append(req)
+        return True
+
+    interface.scan_workflow.start_scan = _capture_and_complete
+
+    done = threading.Event()
+    box: list[TestScanResult] = []
+    interface.start_test_scan(
+        request_obj,
+        on_complete_fn=lambda r: (box.append(r), done.set()),
+    )
+    assert done.wait(timeout=15.0), "test scan did not complete"
+
+    assert len(captured_requests) >= 1, "No ScanRequests were captured"
+
+    for req in captured_requests:
+        assert req.skip_default_storage is True, (
+            f"ScanRequest.skip_default_storage should be True; got {req.skip_default_storage}"
+        )
+        collector_sinks = [
+            s for s in req.sinks
+            if isinstance(s, _CalibrationCollectorSink)
+        ]
+        assert len(collector_sinks) >= 1, (
+            f"Expected a _CalibrationCollectorSink in req.sinks; got {req.sinks}"
+        )

@@ -143,7 +143,7 @@ class CommInterface(USBInterfaceBase):
 
             uart_packet = UartPacket(
                 id=id,
-                packet_type=packetType,
+                packetType=packetType,
                 command=command,
                 addr=addr,
                 reserved=reserved,
@@ -364,7 +364,7 @@ class CommInterface(USBInterfaceBase):
                 continue
             if (
                 uart_packet.id == 0
-                and uart_packet.packet_type == OW_DATA
+                and uart_packet.packetType == OW_DATA
                 and uart_packet.command == OW_CMD_ECHO
             ):
                 _raw = bytes(uart_packet.data[:uart_packet.data_len]) if uart_packet.data_len > 0 else b""

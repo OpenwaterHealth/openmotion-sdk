@@ -17,7 +17,7 @@ def test_value_error_on_crc_mismatch():
     """Corrupt CRC bytes in a serialised packet; re-parsing must raise ValueError."""
     pkt = UartPacket(
         id=1,
-        packet_type=OW_CMD,
+        packetType=OW_CMD,
         command=OW_CMD_PING,
         addr=0,
         reserved=0,
@@ -35,8 +35,8 @@ def test_mutable_default_arg_isolation():
     Two UartPackets constructed with no explicit data must not share the
     same list object (regression for the mutable default `data=[]` bug).
     """
-    a = UartPacket(id=1, packet_type=OW_CMD, command=OW_CMD_PING, addr=0, reserved=0)
-    b = UartPacket(id=2, packet_type=OW_CMD, command=OW_CMD_PING, addr=0, reserved=0)
+    a = UartPacket(id=1, packetType=OW_CMD, command=OW_CMD_PING, addr=0, reserved=0)
+    b = UartPacket(id=2, packetType=OW_CMD, command=OW_CMD_PING, addr=0, reserved=0)
     assert a.data is not b.data, (
         "UartPacket instances share the same default data list — mutable default bug"
     )
@@ -60,7 +60,7 @@ def test_command_error_or_timeout_on_bad_subtype(console):
         pytest.skip("Console not connected (may have entered DFU in an earlier test)")
     with pytest.raises((CommandError, TimeoutError, Exception)):
         console._uart.send_packet(
-            packet_type=0xE2,
+            packetType=0xE2,
             command=0xFE,
             addr=0,
             reserved=0,

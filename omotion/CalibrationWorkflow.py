@@ -166,10 +166,7 @@ class TestScanResult:
 # tests/test_calibration_workflow_compute.py.
 # ---------------------------------------------------------------------------
 
-from omotion.MotionProcessing import (
-    CorrectedBatch,
-    Sample,
-)
+from omotion.MotionProcessing import Sample
 
 
 class DegenerateCalibrationError(RuntimeError):
@@ -753,10 +750,119 @@ def _format_result_rows_table(
 
 
 # ---------------------------------------------------------------------------
+# Calibration collector sink
+# ---------------------------------------------------------------------------
+
+
+class _CalibrationCollectorSink:
+    """Internal: collects corrected light samples + dark samples for the
+    calibration math.
+
+    Subscribes to two channels:
+
+    * ``"final"``  — each payload is an ``EnrichedCorrectedInterval`` of
+      light frames produced by DarkCorrectionStage after a dark interval
+      closes. The sink slices each frame down to a legacy ``Sample``-shaped
+      object (mean, std_dev, contrast, BFI, BVI) so the existing math
+      functions (``_compute_calibration_from_samples``, ``_build_result_rows_from_samples``)
+      keep working unchanged.
+
+    * ``"live"``   — each payload is a per-frame ``FrameBatch``. The sink
+      picks out rows where ``frame_type == "dark"`` and emits a Sample
+      whose ``mean`` is the pedestal-subtracted ``subtracted_mean`` (matching
+      the legacy "u1 - PEDESTAL_HEIGHT" semantics used by the FT
+      ambient-light gate).
+
+    After the scan completes, the workflow drains ``corrected_samples`` and
+    ``dark_samples`` and applies the existing frame-id windowing on the
+    light samples (skip leading + frame_window_count cap).
+    """
+
+    channels: set = frozenset({"final", "live"})
+
+    def __init__(self) -> None:
+        self.corrected_samples: list[Sample] = []
+        self.dark_samples: list[Sample] = []
+        # Keep raw EnrichedCorrectedInterval payloads around for any future
+        # consumer that wants more than the legacy Sample fields.
+        self.batches: list = []
+
+    def on_scan_start(self, meta) -> None:  # noqa: D401
+        self.corrected_samples.clear()
+        self.dark_samples.clear()
+        self.batches.clear()
+
+    def consume(self, channel: str, payload) -> None:
+        if channel == "final":
+            self.batches.append(payload)
+            for f in payload.frames:
+                self.corrected_samples.append(Sample(
+                    side=f.side,
+                    cam_id=f.cam_id,
+                    frame_id=int(f.abs_frame_id) & 0xFF,
+                    absolute_frame_id=int(f.abs_frame_id),
+                    timestamp_s=float(f.t),
+                    row_sum=0,
+                    temperature_c=float("nan"),
+                    mean=float(f.mean),
+                    std_dev=float(f.std),
+                    contrast=float(f.contrast),
+                    bfi=float(f.bfi),
+                    bvi=float(f.bvi),
+                    is_corrected=True,
+                    is_dark=False,
+                ))
+        elif channel == "live":
+            # payload is a FrameBatch — pick out dark frames and emit Samples
+            # with pedestal-subtracted mean (subtracted_mean).
+            if payload.frame_type is None or payload.subtracted_mean is None:
+                return
+            n = payload.subtracted_mean.shape[0]
+            for i in range(n):
+                if str(payload.frame_type[i]) != "dark":
+                    continue
+                abs_id = (
+                    int(payload.abs_frame_ids[i])
+                    if payload.abs_frame_ids is not None
+                    else int(payload.frame_ids[i])
+                )
+                ts = float(payload.timestamp_s[i])
+                for side_idx, side in enumerate(("left", "right")):
+                    for cam_id in range(8):
+                        m = float(payload.subtracted_mean[i, side_idx, cam_id])
+                        if not np.isfinite(m):
+                            continue
+                        temp = (
+                            float(payload.temperature_c[i, side_idx, cam_id])
+                            if payload.temperature_c is not None
+                            else float("nan")
+                        )
+                        self.dark_samples.append(Sample(
+                            side=side,
+                            cam_id=cam_id,
+                            frame_id=int(payload.frame_ids[i]),
+                            absolute_frame_id=abs_id,
+                            timestamp_s=ts,
+                            row_sum=0,
+                            temperature_c=temp,
+                            mean=m,
+                            std_dev=0.0,
+                            contrast=0.0,
+                            bfi=0.0,
+                            bvi=0.0,
+                            is_corrected=False,
+                            is_dark=True,
+                        ))
+
+    def on_complete(self) -> None:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Orchestration class
 # ---------------------------------------------------------------------------
 
-from omotion.ScanWorkflow import ScanRequest, ScanResult
+from omotion.ScanWorkflow import run_collection_scan
 
 
 def _run_subscan_capture(
@@ -790,73 +896,44 @@ def _run_subscan_capture(
     on scan failure. Honors ``stop_evt`` by calling ``cancel_scan``
     and returning empty paths + empty lists.
     """
-    scan_req = ScanRequest(
+    collector = _CalibrationCollectorSink()
+
+    # Shared short-scan engine (ScanWorkflow.run_collection_scan), the same one
+    # the contact-quality check uses. Cancellable via stop_evt; raises on a
+    # scan-level failure so the caller aborts calibration cleanly rather than
+    # running the math on empty data.
+    completed = run_collection_scan(
+        interface.scan_workflow,
+        collector,
         subject_id=subject_id,
         duration_sec=duration_sec,
         left_camera_mask=request.left_camera_mask,
         right_camera_mask=request.right_camera_mask,
-        data_dir=request.output_dir,
-        disable_laser=False,
-        write_raw_csv=True,         # keep the raw artifact for audit
-        write_corrected_csv=False,
-        write_telemetry_csv=False,
-        reduced_mode=False,
+        stop_evt=stop_evt,
+        raise_on_error=True,
     )
-
-    upper_bound = skip_leading_frames + int(frame_window_count)
-    captured: list[Sample] = []
-    dark: list[Sample] = []
-
-    def _on_corrected_batch(batch: CorrectedBatch) -> None:
-        for s in batch.samples:
-            if s.absolute_frame_id < skip_leading_frames:
-                continue
-            if s.absolute_frame_id >= upper_bound:
-                continue
-            captured.append(s)
-
-    def _on_dark_frame(s: Sample) -> None:
-        # Dark frames don't reach on_corrected_batch — the science
-        # pipeline routes them here with mean already pedestal-
-        # subtracted. Every dark frame in the schedule is a valid
-        # ambient reading; no frame-id windowing applies.
-        dark.append(s)
-
-    evt = threading.Event()
-    holder: dict[str, ScanResult] = {}
-
-    def _on_complete(r: ScanResult) -> None:
-        holder["r"] = r
-        evt.set()
-
-    started = interface.scan_workflow.start_scan(
-        scan_req,
-        on_corrected_batch_fn=_on_corrected_batch,
-        on_dark_frame_fn=_on_dark_frame,
-        on_complete_fn=_on_complete,
-        log_dark_endpoints=True,
-    )
-    if not started:
-        raise RuntimeError("ScanWorkflow refused start_scan.")
-
-    while not evt.wait(timeout=0.1):
-        if stop_evt.is_set():
-            try:
-                interface.scan_workflow.cancel_scan()
-            except Exception:
-                pass
-            evt.wait(timeout=5.0)
-            return "", "", [], []
-    res = holder.get("r")
-    if res is None or not res.ok:
-        raise RuntimeError(
-            f"sub-scan failed: {(res.error if res else 'no result')}"
-        )
-    if res.canceled:
+    if not completed:  # canceled (mid-scan stop_evt or last_scan_canceled)
         return "", "", [], []
+
+    # Apply the legacy windowing on light samples here so the sink's
+    # collection logic stays uncoupled from the calibration-specific frame
+    # window. Dark samples bypass windowing — every dark frame in the
+    # schedule is a valid ambient reading (#122).
+    upper_bound = skip_leading_frames + int(frame_window_count)
+    captured: list[Sample] = [
+        s for s in collector.corrected_samples
+        if skip_leading_frames <= s.absolute_frame_id < upper_bound
+    ]
+    dark = list(collector.dark_samples)
     captured.sort(key=lambda s: (s.side, s.cam_id, s.absolute_frame_id))
     dark.sort(key=lambda s: (s.side, s.cam_id, s.absolute_frame_id))
-    return res.left_path or "", res.right_path or "", captured, dark
+
+    # Raw CSV paths are written by the SDK's default CsvSink (skip_default_storage=False
+    # would attach it automatically; here we set skip_default_storage=True so we
+    # don't double-write). The legacy contract returned scan paths for the
+    # CalibrationResult; pass empty strings — calibration JSON is the
+    # authoritative artifact, and CSVs aren't produced by this scan path.
+    return "", "", captured, dark
 
 
 class CalibrationWorkflow:

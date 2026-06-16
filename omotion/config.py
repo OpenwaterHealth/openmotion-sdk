@@ -1,5 +1,7 @@
 from enum import IntEnum
 
+import numpy as np
+
 SERIAL_PORT = "COM24"  # Change this to your serial port
 BAUD_RATE = 921600
 
@@ -14,6 +16,25 @@ ID_COUNTER = 0  # Initializing the ID counter
 # Histo Packet structure constants
 HISTO_SIZE_WORDS = 1024
 HISTO_BLOCK_SIZE = 1 + (HISTO_SIZE_WORDS * 4) + 1  # HID + HISTO + EOH
+
+# Bin-index arrays used by moment computations and CSV column naming.
+# HISTO_BINS[i] = i; HISTO_BINS_SQ[i] = i*i. Float64 so downstream Σ b·n(b)
+# and Σ b²·n(b) keep precision for ~2.4M-count histograms.
+HISTO_BINS: np.ndarray = np.arange(HISTO_SIZE_WORDS, dtype=np.float64)
+HISTO_BINS_SQ: np.ndarray = HISTO_BINS * HISTO_BINS
+
+# Full-well capacity of the OV2312 sensor in electrons. Used to compute
+# ADC gain (DN per electron) for shot-noise correction:
+#   ADC_GAIN = (HISTO_SIZE_WORDS - pedestal) / ELECTRON_WELL_CAPACITY
+ELECTRON_WELL_CAPACITY: int = 11_000
+
+# Per-camera analog gain for the 8 cameras in a sensor module, indexed by
+# cam_id % 8. Outer positions (0, 7) use higher gain to compensate for the
+# reduced illumination at the array periphery. Used by ShotNoiseCorrectionStage
+# and DarkCorrectionStage's enrichment path; see SciencePipeline.md §8.3.
+CAMERA_GAIN_MAP: np.ndarray = np.array(
+    [16, 4, 2, 1, 1, 2, 4, 16], dtype=np.float32
+)
 
 
 # Packet Types
@@ -146,6 +167,15 @@ OW_CTRL_TECADC = 0x21
 OW_CTRL_TEC_STATUS = 0x22
 OW_CTRL_BOARDID = 0x23
 OW_CTRL_PDUMON = 0x24
+OW_CTRL_GET_PDC_BUFFER = 0x25
+# Lifetime usage counters persisted to console flash. System counter is minutes
+# of uptime (uint32, ~8000 yr range); laser counter is cumulative LSYNC pulses
+# across all scans (uint32, ~3.4 yr at 40 Hz continuous).
+OW_CTRL_GET_SYSTEM_ODO = 0x26
+OW_CTRL_GET_LASER_ODO = 0x27
+# Payload: 1 byte target (0=system, 1=laser, 2=both). Missing payload defaults
+# to both.
+OW_CTRL_RESET_ODO = 0x28
 OW_CTRL_FAN_CTL = 0x0A
 
 # Page-by-page direct FPGA programming commands (0x30–0x3C)
@@ -166,6 +196,12 @@ FPGA_PROG_CFG_WRITE_PAGES = 0x3D  # Write N 16-byte CFG pages (N*16 bytes payloa
 FPGA_PROG_UFM_WRITE_PAGES = 0x3E  # Write N 16-byte UFM pages (N*16 bytes payload)
 FPGA_PROG_READ_STATUS = 0x3F  # Read 32-bit Status Register (no cfgEn required)
 
+OW_FACTORY_I2C_SCAN = 0x60
+OW_FACTORY_CRESET = 0x68
+OW_FACTORY_I2C_RD = 0x69
+OW_FACTORY_I2C_WR = 0x6A
+OW_FACTORY_I2C_WRRD = 0x6B
+OW_FACTORY_NVCM_CHECK = 0x6C
 
 TEST_PATTERN_BARS = 0x00
 TEST_PATTERN_SOLID = 0x01

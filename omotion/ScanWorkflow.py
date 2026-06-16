@@ -2,20 +2,19 @@ import concurrent.futures
 import datetime
 import csv
 import logging
+import math
 import os
 import queue
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable, TYPE_CHECKING
+from typing import Callable, Optional, TYPE_CHECKING
 
 from omotion import _log_root
 from omotion.connection_state import ConnectionState
 from omotion.MotionProcessing import (
     CorrectedBatch,
     HISTO_SIZE_WORDS,
-    create_science_pipeline,
-    parse_histogram_stream,
 )
 from omotion.Calibration import Calibration
 
@@ -67,54 +66,79 @@ def _snap_to_row(snap) -> list:
     return row
 
 
+class _TelemetryCsvWriter:
+    """Listener registered on ConsoleTelemetryPoller that writes each snapshot
+    to ``{scan_id}_{subject_id}_telemetry.csv`` for the duration of one scan.
+
+    Constructed and started by ``start_scan``; ``close()`` is called from the
+    worker's ``finally`` block. The listener runs on the poller thread, so
+    ``__call__`` must stay non-blocking.
+    """
+
+    def __init__(self, path: str, poller) -> None:
+        self._poller = poller
+        self._file = open(path, "w", newline="", encoding="utf-8")
+        self._writer = csv.writer(self._file)
+        self._writer.writerow(_TELEMETRY_HEADERS)
+        self._file.flush()
+        self.path = path
+        poller.add_listener(self)
+
+    def __call__(self, snap) -> None:
+        try:
+            self._writer.writerow(_snap_to_row(snap))
+            self._file.flush()
+        except Exception:
+            logger.exception("telemetry CSV write failed")
+
+    def close(self) -> None:
+        try:
+            self._poller.remove_listener(self)
+        except Exception:
+            pass
+        try:
+            self._file.close()
+        except Exception:
+            pass
+
+
 @dataclass
 class ScanRequest:
     subject_id: str
     duration_sec: int
     left_camera_mask: int
     right_camera_mask: int
-    data_dir: str
-    disable_laser: bool
+    disable_laser: bool = False
     expected_size: int = 32837
     # CSV output flags — all enabled by default.  Flip to False once the
     # corresponding downstream consumer no longer needs the file, so the
     # pipeline avoids unnecessary disk I/O.
-    write_raw_csv: bool = True
     write_corrected_csv: bool = True
     write_telemetry_csv: bool = True
-    # Maximum number of seconds for which raw histogram CSVs are written.
-    # None (default) means write for the full scan duration.
-    # Has no effect when write_raw_csv is False.
-    raw_csv_duration_sec: float | None = None
     # When True, the pipeline averages all active cameras per side into
     # single left/right BFI/BVI values.  The corrected CSV contains only
     # bfi_left, bfi_right, bvi_left, bvi_right columns.  Uncorrected
     # samples emitted to the UI are also averaged per-side per-frame.
     reduced_mode: bool = False
-    # When True, the pipeline emits a rolling-mean Sample (mean + contrast
-    # only) via on_rolling_avg_fn once per uncorrected light frame per
-    # camera.  Window size is rolling_avg_window.  Dark frames are
-    # excluded from the window.
-    rolling_avg_enabled: bool = False
-    rolling_avg_window: int = 10
-
-
-@dataclass
-class ScanResult:
-    ok: bool
-    error: str
-    left_path: str
-    right_path: str
-    canceled: bool
-    scan_timestamp: str
-    corrected_path: str = ""
-    telemetry_path: str = ""
-    # Populated when the science pipeline detected schedule/measurement
-    # disagreement on dark frames (firmware off-by-one, unwrapper
-    # alignment quirk, or significant ambient light in a dark slot).
-    # Empty on a clean scan. Diagnostic only — calibration no longer
-    # aborts on this; the per-camera FT dark mean-max check gates that.
-    dark_integrity_warnings: list[str] = field(default_factory=list)
+    # Pipeline sinks list — will be injected by the runner at start_scan time.
+    # Normally managed by the SDK at MotionInterface construction (data_dir, scan_db_path).
+    sinks: list = field(default_factory=list)
+    # Skip injecting default storage sinks (CSV, DB). Set to True when
+    # a caller supplies all sinks via the sinks list.
+    skip_default_storage: bool = False
+    # Duration cap for raw histogram output. If set and > 0, includes Tee("raw")
+    # with max_duration_s. If 0 or negative, omits raw output.
+    raw_save_max_duration_s: float | None = None
+    # Number of histogram frames to batch before pushing to the pipeline.
+    batch_size_frames: int = 10
+    # Trigger-config override sent to the console before the scan starts.
+    # start_scan always (re)sends a resolved trigger config so the firmware
+    # fsync/dark schedule is reset and aligned to the pipeline's dark-frame
+    # classification — without this the boundary dark frame can land on a
+    # laser-on frame and corrupt dark correction. None -> the interface's
+    # resolved default (DEFAULT_TRIGGER_CONFIG ⊕ constructor override). A dict
+    # here is shallow-merged on top (e.g. {"TriggerFrequencyHz": 20}).
+    trigger_config: dict | None = None
 
 
 @dataclass
@@ -130,6 +154,71 @@ class ConfigureResult:
     error: str
 
 
+def run_collection_scan(
+    scan_workflow,
+    collector,
+    *,
+    subject_id: str,
+    duration_sec,
+    left_camera_mask: int,
+    right_camera_mask: int,
+    disable_laser: bool = False,
+    reduced_mode: bool = False,
+    stop_evt: "threading.Event | None" = None,
+    poll_interval_s: float = 0.1,
+    timeout_pad_s: float = 2.0,
+    raise_on_error: bool = False,
+) -> bool:
+    """Run one short scan whose only sink is ``collector``, blocking until it
+    finishes. This is the shared "threshold scan" engine behind both the
+    contact-quality check and the calibration/test sub-scans: build a
+    ``ScanRequest`` with default storage skipped and just the collector
+    attached, start it, and wait. The collector's own per-camera accumulation
+    and verdict logic stays specialized to each caller.
+
+    ``stop_evt`` (calibration): poll in ``poll_interval_s`` slices and
+    ``cancel_scan()`` if the event is set, returning ``False`` (canceled).
+    Without it (CQ): a single ``await_complete(duration_sec + timeout_pad_s)``.
+    ``raise_on_error``: a refused start or a scan-level error raises
+    ``RuntimeError``. Returns ``False`` when the scan was canceled, else ``True``.
+
+    Operates only on ``scan_workflow``'s public surface (``start_scan`` /
+    ``await_complete`` / ``running`` / ``cancel_scan`` / ``last_scan_error`` /
+    ``last_scan_canceled``) so callers can pass a real ``ScanWorkflow`` or a
+    compatible mock.
+    """
+    request = ScanRequest(
+        subject_id=subject_id,
+        duration_sec=int(math.ceil(duration_sec)),
+        left_camera_mask=left_camera_mask,
+        right_camera_mask=right_camera_mask,
+        disable_laser=disable_laser,
+        reduced_mode=reduced_mode,
+        sinks=[collector],
+        skip_default_storage=True,
+    )
+    started = scan_workflow.start_scan(request)
+    if raise_on_error and not started:
+        raise RuntimeError("ScanWorkflow refused start_scan.")
+
+    if stop_evt is None:
+        scan_workflow.await_complete(timeout_sec=duration_sec + timeout_pad_s)
+    else:
+        while scan_workflow.running:
+            scan_workflow.await_complete(timeout_sec=poll_interval_s)
+            if stop_evt.is_set() and scan_workflow.running:
+                try:
+                    scan_workflow.cancel_scan()
+                except Exception:
+                    pass
+                scan_workflow.await_complete(timeout_sec=5.0)
+                return False
+
+    if raise_on_error and scan_workflow.last_scan_error:
+        raise RuntimeError(f"sub-scan failed: {scan_workflow.last_scan_error}")
+    return not scan_workflow.last_scan_canceled
+
+
 class ScanWorkflow:
     def __init__(self, interface: "MotionInterface"):
         self._interface = interface
@@ -143,11 +232,40 @@ class ScanWorkflow:
 
         self._calibration: Calibration = Calibration.default()
 
+        # Phase E: new-pipeline runner + scan thread (set synchronously
+        # in start_scan before the worker thread spawns so test assertions
+        # on _runner are valid immediately after start_scan returns).
+        self._runner = None
+        self._scan_thread: threading.Thread | None = None
+
         # Per-scan state for the disconnect-abort subscription. Reset at
         # each scan start by _scan_subscribe_state.
         self._scan_subs: list[tuple] = []  # (signal, handler) pairs
         self._scan_active_handles: list = []
         self._scan_abort_reason: str | None = None
+
+        # Per-scan active (side, mask, sensor) tuples, snapshotted by the
+        # worker once it resolves the request. cancel_scan reads this to
+        # tear down cameras BEFORE source.close() — without it, drain_final
+        # fights the still-capturing firmware for several seconds.
+        self._scan_active_sides: list = []
+
+        # Set by the worker thread's finally block. Callers (notably
+        # CalibrationWorkflow) check this after await_complete to decide
+        # whether the scan succeeded.
+        self._last_scan_error: str | None = None
+        self._last_scan_canceled: bool = False
+        # Label of the scan-DB session for the most recent start_scan, set
+        # synchronously when the scan's metadata is built. Lets callers bind
+        # to THIS scan's session row (e.g. the app's live plot DB tail) by
+        # exact label instead of guessing the newest session.
+        self._current_scan_label: str | None = None
+        # Cancel signal flag. Distinct from _stop_evt (which is also pulsed
+        # by the worker's inner finally to wake the duration guard on a
+        # clean exit). Set ONLY by the user-cancel paths — cancel() and
+        # cancel_scan() — so _last_scan_canceled isn't tripped by normal
+        # scan completion.
+        self._cancel_requested: bool = False
 
     @property
     def running(self) -> bool:
@@ -225,824 +343,549 @@ class ScanWorkflow:
     def start_scan(
         self,
         request: ScanRequest,
-        *,
-        extra_cols_fn: Callable[[], list] | None = None,
-        on_log_fn: Callable[[str], None] | None = None,
-        on_progress_fn: Callable[[int], None] | None = None,
-        on_trigger_state_fn: Callable[[str], None] | None = None,
-        on_uncorrected_fn: Callable[[object], None] | None = None,
-        on_corrected_batch_fn: Callable[[object], None] | None = None,
-        on_dark_frame_fn: Callable[[object], None] | None = None,
-        on_rolling_avg_fn: Callable[[object], None] | None = None,
-        on_error_fn: Callable[[Exception], None] | None = None,
-        on_side_stream_fn: Callable[[str, str], None] | None = None,
-        on_complete_fn: Callable[[ScanResult], None] | None = None,
-        log_dark_endpoints: bool = False,
+        **_legacy_kwargs,
     ) -> bool:
+        """Drive a scan through the new pipeline.
+
+        Constructs ScanMetadata, default_pipeline, LiveUsbSource,
+        auto-injects default storage sinks (unless request.skip_default_storage),
+        and spawns a worker thread that runs the ScanRunner.
+
+        Sets ``self._runner`` synchronously before the thread starts so
+        callers can inspect runner attributes immediately after this method
+        returns True.
+
+        ``_legacy_kwargs`` silently discards callback arguments from pre-Phase-E
+        callers (on_complete_fn, on_corrected_batch_fn, etc.) so they don't
+        hard-crash before Phase G migrates those callers to the sink API.
+        """
+        if _legacy_kwargs:
+            logger.warning(
+                "start_scan: ignoring legacy callback kwargs %s — "
+                "migrate callers to the sink API (Phase G).",
+                sorted(_legacy_kwargs.keys()),
+            )
+        from omotion.pipeline.factory import default_pipeline
+        from omotion.pipeline.runner import ScanRunner
+        from omotion.pipeline.sources import LiveUsbSource
+        from omotion.pipeline.sinks import (
+            CsvSink as PipelineCsvSink, DiagnosticsLogSink, ScanDBSink, ScanMetadata,
+        )
+        from omotion.pipeline.pedestal import SensorPedestals, pedestal_for_fw
+
+        # Clear the prior scan's outcome up front so a refusal below (busy, or
+        # a pre-flight failure) never reports a stale error from an earlier run.
+        self._last_scan_error = None
+
         with self._lock:
             if self._running or (self._thread and self._thread.is_alive()):
                 logger.warning(
                     "start_scan refused: previous scan is still active "
-                    "(_running=%s, thread alive=%s, thread=%s). The previous "
-                    "worker has not reached its finally cleanup yet — most "
-                    "likely a writer or science-pipeline thread didn't exit "
-                    "within its join timeout.",
+                    "(_running=%s, thread alive=%s, thread=%s).",
                     self._running,
                     self._thread.is_alive() if self._thread else None,
                     self._thread,
                 )
                 return False
             self._running = True
-        logger.info("start_scan: spawning worker thread for new scan")
 
+        logger.info("start_scan: building pipeline for new scan")
         self._stop_evt = threading.Event()
 
-        def _emit_log(msg: str) -> None:
-            logger.info(msg)
-            if on_log_fn:
-                on_log_fn(msg)
+        # ── Build ScanMetadata ────────────────────────────────────────────
+        _now = datetime.datetime.now(datetime.timezone.utc)
+        scan_id = _now.strftime("%Y%m%d_%H%M%S")
+        meta = ScanMetadata(
+            scan_id=scan_id,
+            subject_id=request.subject_id,
+            operator=getattr(self._interface, "operator_id", None) or "unknown",
+            started_at_iso=_now.isoformat(),
+            duration_sec=request.duration_sec,
+            left_camera_mask=request.left_camera_mask,
+            right_camera_mask=request.right_camera_mask,
+            reduced_mode=request.reduced_mode,
+        )
+        # Mirror ScanDBSink.on_scan_start's label so callers can bind to this
+        # exact session row (must match f"{scan_id}_{subject_id}" there).
+        self._current_scan_label = f"{scan_id}_{request.subject_id}"
 
-        def _worker():
-            ok = False
-            err = ""
-            left_path = ""
-            right_path = ""
-            corrected_path = ""
-            telemetry_path = ""
-            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            active_sides = []
-            writer_threads: dict[str, threading.Thread] = {}
-            writer_stops: dict[str, threading.Event] = {}
-            writer_row_counts: dict[str, int] = {}
-            writer_queues: dict[str, queue.Queue] = {}
-            science_pipeline = None
-            # Issue #44: dropped the ``_corrected`` suffix from the
-            # canonical output. The corrected stream is the default,
-            # so naming it doesn't add information; the raw histo CSVs
-            # below now carry ``_raw`` to disambiguate. Old scans
-            # written before this change still use ``_corrected.csv``;
-            # downstream consumers (bloodflow-app's get_scan_list /
-            # get_scan_details) accept both.
-            corrected_path = os.path.join(
-                request.data_dir, f"{ts}_{request.subject_id}.csv"
-            )
-            telemetry_path = os.path.join(
-                request.data_dir, f"{ts}_{request.subject_id}_telemetry.csv"
-            )
-            # Telemetry CSV state (populated in try block if console is available)
-            _telem_poller = None
-            _telem_listener = None
-            _telem_fh = None
-            _telem_lock = threading.Lock()
-            _telem_stop = threading.Event()
-
-            # Corrected CSV streaming state
-            corrected_by_frame: dict[int, dict] = {}
-            _corr_fh = None
-            _corr_csv = None
-            _corr_lock = threading.Lock()
-            _corr_base_ts: float | None = None
-            if request.reduced_mode:
-                corrected_columns = [
-                    "bfi_left", "bfi_right",
-                    "bvi_left", "bvi_right",
-                ]
-            else:
-                corrected_columns = (
-                    [f"bfi_l{i}" for i in range(1, 9)]
-                    + [f"bfi_r{i}" for i in range(1, 9)]
-                    + [f"bvi_l{i}" for i in range(1, 9)]
-                    + [f"bvi_r{i}" for i in range(1, 9)]
-                    + [f"mean_l{i}" for i in range(1, 9)]
-                    + [f"mean_r{i}" for i in range(1, 9)]
-                    + [f"contrast_l{i}" for i in range(1, 9)]
-                    + [f"contrast_r{i}" for i in range(1, 9)]
-                    + [f"temp_l{i}" for i in range(1, 9)]
-                    + [f"temp_r{i}" for i in range(1, 9)]
-                )
-            expected_col_suffixes: set[str] = set()
-
-            # Reduced-mode uncorrected sample accumulator: buffers per-camera
-            # samples and emits a single averaged sample per side per frame.
-            _reduced_uncorr_buf: dict[tuple[str, int], dict] = {}
-            # Number of active cameras per side (computed after active_sides
-            # is resolved; filled in below).
-            _reduced_cam_counts: dict[str, int] = {}
-
+        # ── Build pedestals (safe: fall back to 64.0 if version unreadable) ─
+        def _safe_pedestal(sensor) -> float:
             try:
-                os.makedirs(request.data_dir, exist_ok=True)
+                version_str = getattr(sensor, "_version", "v0.0.0")
+                from omotion.MotionSensor import _parse_firmware_version
+                return pedestal_for_fw(_parse_firmware_version(version_str))
+            except Exception:
+                return 64.0
 
-                # Open the telemetry CSV and register a listener on the poller.
-                # The guard handles headless configs where there is no console module.
-                _telem_poller = getattr(
-                    getattr(self._interface, "console", None), "telemetry", None
+        pedestals = SensorPedestals(
+            left=_safe_pedestal(self._interface.left),
+            right=_safe_pedestal(self._interface.right),
+        )
+
+        # ── Per-frame telemetry stamping ──────────────────────────────────
+        # When the console's telemetry poller is running, feed its snapshots
+        # into a per-scan aggregator and insert TelemetryIngestStage so every
+        # frame (including the raw CSV record) carries pdc/tcm/tcl context.
+        # The feeder is a poller listener (same pattern as the telemetry CSV
+        # writer below) — no extra thread; unregistered in _worker's finally.
+        telemetry_feeder = None
+        telemetry_aggregator = None
+        _poller = getattr(getattr(self._interface, "console", None), "telemetry", None)
+        if _poller is not None:
+            try:
+                from omotion.pipeline.telemetry import TelemetryAggregator, TelemetryFeeder
+                telemetry_aggregator = TelemetryAggregator()
+                telemetry_feeder = TelemetryFeeder(telemetry_aggregator, _poller)
+            except Exception:
+                logger.exception("failed to wire per-frame telemetry; continuing without")
+                telemetry_aggregator = None
+                telemetry_feeder = None
+
+        # ── Build pipeline ────────────────────────────────────────────────
+        calibration = self._calibration
+        pipeline = default_pipeline(
+            metadata=meta,
+            calibration=calibration,
+            pedestals=pedestals,
+            raw_save_max_duration_s=request.raw_save_max_duration_s,
+            telemetry=telemetry_aggregator,
+        )
+
+        # ── Auto-inject default sinks ──────────────────────────────────────
+        # DiagnosticsLogSink is unconditional (not storage — it logs
+        # correction-integrity events that would otherwise vanish; the DB
+        # sink persists the matching summary when a DB is configured).
+        default_sinks: list = [DiagnosticsLogSink()]
+        telemetry_writer: Optional[_TelemetryCsvWriter] = None
+        if not request.skip_default_storage:
+            data_dir = getattr(self._interface, "data_dir", None)
+            scan_db_path = getattr(self._interface, "scan_db_path", None)
+            if data_dir is not None:
+                # Corrected CSV: honor request.write_corrected_csv when a
+                # scan DB is configured (DB is the system of record, so
+                # the CSV is opt-in). When NO DB is configured the CSV is
+                # the only persisted record of corrected data — force it
+                # on regardless of the request flag so a scan is never
+                # silently unrecorded.
+                write_corrected = (
+                    True if scan_db_path is None
+                    else bool(request.write_corrected_csv)
                 )
-                if _telem_poller is not None and request.write_telemetry_csv:
-                    try:
-                        _telem_fh = open(  # noqa: WPS515
-                            telemetry_path, "w", newline="", encoding="utf-8"
-                        )
-                        _telem_csv = csv.writer(_telem_fh)
-                        _telem_csv.writerow(_TELEMETRY_HEADERS)
-                        _telem_fh.flush()
+                default_sinks.append(
+                    PipelineCsvSink(output_dir=data_dir, write_corrected=write_corrected)
+                )
+            if scan_db_path is not None:
+                # Pre-flight the scan DB before the laser fires. The DB is the
+                # system of record for live per-camera BFI/BVI (and, when the
+                # corrected CSV is opt-in and off, the ONLY record). If it
+                # can't be opened there is nowhere to persist the scan, so
+                # refuse now — failing fast, with the laser still off — rather
+                # than run a scan whose data is silently lost. (ScanDBSink is
+                # also marked ``critical`` so the runner aborts as a backstop
+                # if the DB dies between this check and the worker start.)
+                try:
+                    from omotion.ScanDatabase import ScanDatabase
+                    ScanDatabase(db_path=scan_db_path).close()
+                except Exception as exc:
+                    logger.exception(
+                        "start_scan: scan database pre-flight failed (%s) — "
+                        "aborting before laser start", scan_db_path,
+                    )
+                    self._last_scan_error = f"Scan database unavailable: {exc}"
+                    with self._lock:
+                        self._running = False
+                    return False
+                default_sinks.append(ScanDBSink(db_path=scan_db_path))
+            # Telemetry CSV: per-scan snapshots from ConsoleTelemetryPoller.
+            # Not a pipeline sink — the poller is its own daemon thread that
+            # predates the sink-based architecture, so we register a listener
+            # for the duration of the scan and unregister in _worker's finally.
+            poller = getattr(getattr(self._interface, "console", None), "telemetry", None)
+            if (
+                request.write_telemetry_csv
+                and data_dir is not None
+                and poller is not None
+            ):
+                telemetry_path = os.path.join(
+                    data_dir, f"{scan_id}_{request.subject_id}_telemetry.csv"
+                )
+                try:
+                    telemetry_writer = _TelemetryCsvWriter(telemetry_path, poller)
+                except Exception:
+                    logger.exception("failed to open telemetry CSV %s", telemetry_path)
+                    telemetry_writer = None
+        all_sinks = default_sinks + list(request.sinks)
 
-                        def _on_telemetry(snap):
-                            if _telem_stop.is_set():
-                                return
-                            with _telem_lock:
-                                if _telem_stop.is_set():
-                                    return
-                                try:
-                                    _telem_csv.writerow(_snap_to_row(snap))
-                                    _telem_fh.flush()
-                                except Exception as _te:
-                                    logger.debug("Telemetry CSV write error: %s", _te)
+        # ── Build source + runner (set self._runner synchronously) ─────────
+        source = LiveUsbSource(
+            console=self._interface.console,
+            left=self._interface.left,
+            right=self._interface.right,
+            batch_size_frames=request.batch_size_frames or 10,
+            metadata=meta,
+        )
+        self._runner = ScanRunner(
+            source=source,
+            pipeline=pipeline,
+            sinks=all_sinks,
+        )
 
-                        _telem_listener = _on_telemetry
-                        _telem_poller.add_listener(_telem_listener)
-                    except Exception as _telem_err:
-                        _emit_log(f"Failed to open telemetry CSV: {_telem_err}")
-                        telemetry_path = ""
-                else:
-                    telemetry_path = ""
+        # Anchor for TriggerStateEvent timestamps. Set before the worker
+        # starts so the very first start_trigger emits at ~0.
+        self._scan_t0_monotonic = time.monotonic()
 
+        # ── Spawn worker thread ────────────────────────────────────────────
+        def _worker():
+            try:
+                # ── Pre-flight hardware setup ─────────────────────────────
                 active_sides = self._resolve_active_sides(
                     request.left_camera_mask, request.right_camera_mask
                 )
+                # Expose for cancel_scan's teardown.
+                self._scan_active_sides = active_sides
                 if not active_sides:
-                    raise RuntimeError(
-                        "No active sensors to capture (both masks 0x00 or disconnected)."
+                    logger.warning(
+                        "start_scan: no active sensors (demo mode or masks 0x00); "
+                        "runner will iterate over empty source."
                     )
-
-                # Compute expected column suffixes from the active camera masks.
-                for _s, _m, _ in active_sides:
-                    _letter = _s[0]
-                    _cam_count = 0
-                    for _i in range(8):
-                        if _m & (1 << _i):
-                            expected_col_suffixes.add(f"{_letter}{_i + 1}")
-                            _cam_count += 1
-                    _reduced_cam_counts[_s] = _cam_count
-
-                # Open corrected CSV immediately and write the header so data is
-                # on disk continuously rather than all-at-once after the scan.
-                if request.write_corrected_csv:
-                    try:
-                        _corr_fh = open(  # noqa: WPS515
-                            corrected_path, "w", newline="", encoding="utf-8"
-                        )
-                        _corr_csv = csv.writer(_corr_fh)
-                        _corr_csv.writerow(["frame_id", "timestamp_s", *corrected_columns])
-                        _corr_fh.flush()
-                    except Exception as _corr_open_err:
-                        _emit_log(f"Failed to open corrected CSV: {_corr_open_err}")
-                        corrected_path = ""
                 else:
-                    corrected_path = ""
+                    if not request.disable_laser:
+                        for side, _, _ in active_sides:
+                            res = self._interface.run_on_sensors(
+                                "enable_camera_fsin_ext", target=side
+                            )
+                            if not self._ok_from_result(res, side):
+                                logger.error(
+                                    "Failed to enable external frame sync on %s.", side
+                                )
 
-                _emit_log("Preparing capture...")
+                    time.sleep(0.1)
 
-                if not request.disable_laser:
-                    _emit_log("Enabling external frame sync...")
-                    for side, _, _ in active_sides:
+                    for side, mask, sensor in active_sides:
+                        try:
+                            q_side: queue.Queue = source._packet_queues.get(side)
+                            if q_side is not None:
+                                flushed = sensor.uart.histo.flush_stale_data(
+                                    expected_size=request.expected_size
+                                )
+                                if flushed:
+                                    logger.info(
+                                        "Flushed %d stale bytes from %s USB endpoint "
+                                        "before scan start.", flushed, side
+                                    )
+                        except Exception:
+                            logger.warning(
+                                "Could not flush stale USB data for %s.", side,
+                                exc_info=True,
+                            )
+
+                    _scan_handles = (
+                        [self._interface.console] + [s for _, _, s in active_sides]
+                    )
+                    self._scan_subscribe_state(handles=_scan_handles)
+
+                    for side, mask, _ in active_sides:
                         res = self._interface.run_on_sensors(
-                            "enable_camera_fsin_ext", target=side
+                            "enable_camera", mask, target=side
                         )
                         if not self._ok_from_result(res, side):
-                            raise RuntimeError(
-                                f"Failed to enable external frame sync on {side}."
+                            logger.error(
+                                "Failed to enable camera on %s (mask 0x%02X).", side, mask
                             )
 
-                time.sleep(0.1)
-
-                _emit_log("Setting up streaming...")
-
-                # Build one unified SciencePipeline that handles both sides
-                # before starting any per-side writer threads.
-                if self._calibration is not None:
-                    left_mask_active = next(
-                        (m for s, m, _ in active_sides if s == "left"), 0x00
+                    # (Re)send the trigger config before starting the trigger.
+                    # This resets the firmware fsync counter so its laser-skip
+                    # (dark-frame) schedule starts fresh and aligns with the
+                    # pipeline's dark-frame classification (boundary dark at
+                    # abs_id == discard_count+1, then every dark_interval). The
+                    # bloodflow app does this via QML; doing it here makes any
+                    # direct SDK caller (contact-quality, examples) correct too.
+                    # Idempotent for the app: its trigger ≈ this resolved config.
+                    trigger_cfg = self._interface.resolve_trigger_config(
+                        request.trigger_config
                     )
-                    right_mask_active = next(
-                        (m for s, m, _ in active_sides if s == "right"), 0x00
-                    )
+                    self._interface.console.set_trigger_json(data=trigger_cfg)
+                    self._interface.console.start_trigger()
+                    self._emit_trigger_event("ON")
 
-                    def _on_uncorrected_sample(sample):
-                        # Per-sample real-time callback (fires immediately for
-                        # GUI with uncorrected BFI/BVI).
-                        if request.reduced_mode:
-                            # Buffer samples per (side, frame_id), emit averaged
-                            # result once all active cameras for that side report.
-                            key = (sample.side, int(sample.absolute_frame_id))
-                            entry = _reduced_uncorr_buf.get(key)
-                            if entry is None:
-                                entry = {
-                                    "bfi_sum": 0.0, "bvi_sum": 0.0,
-                                    "count": 0,
-                                    "timestamp_s": float(sample.timestamp_s),
-                                    "frame_id": int(sample.frame_id),
-                                    "abs_frame_id": int(sample.absolute_frame_id),
-                                    "side": sample.side,
-                                }
-                                _reduced_uncorr_buf[key] = entry
-                            entry["bfi_sum"] += float(sample.bfi)
-                            entry["bvi_sum"] += float(sample.bvi)
-                            entry["count"] += 1
+                # ── Duration gate: stop the source when time is up ────────
+                stop_after = float(request.duration_sec)
 
-                            expected = _reduced_cam_counts.get(sample.side, 1)
-                            if entry["count"] >= expected:
-                                from omotion.MotionProcessing import Sample
-                                avg_sample = Sample(
-                                    side=entry["side"],
-                                    cam_id=0,
-                                    frame_id=entry["frame_id"],
-                                    absolute_frame_id=entry["abs_frame_id"],
-                                    timestamp_s=entry["timestamp_s"],
-                                    row_sum=0,
-                                    temperature_c=0.0,
-                                    mean=0.0,
-                                    std_dev=0.0,
-                                    contrast=0.0,
-                                    bfi=entry["bfi_sum"] / entry["count"],
-                                    bvi=entry["bvi_sum"] / entry["count"],
-                                    is_corrected=False,
-                                )
-                                del _reduced_uncorr_buf[key]
-                                # Evict stale entries (>5 frames behind)
-                                stale = [
-                                    k for k in _reduced_uncorr_buf
-                                    if k[0] == sample.side
-                                    and k[1] < entry["abs_frame_id"] - 5
-                                ]
-                                for sk in stale:
-                                    del _reduced_uncorr_buf[sk]
-                                if on_uncorrected_fn:
-                                    on_uncorrected_fn(avg_sample)
-                            return
-                        if on_uncorrected_fn:
-                            on_uncorrected_fn(sample)
-
-                    def _on_corrected_batch(batch: CorrectedBatch):
-                        # Fires once per (side, cam_id) per dark-frame interval
-                        # with properly corrected BFI/BVI for that interval.
-                        nonlocal _corr_base_ts
-
-                        if request.reduced_mode:
-                            # In reduced mode, average all cameras per side per
-                            # frame and write only bfi_left/right, bvi_left/right.
-                            try:
-                                with _corr_lock:
-                                    for sample in batch.samples:
-                                        frame_key = int(sample.absolute_frame_id)
-                                        side = sample.side
-                                        frame_entry = corrected_by_frame.get(frame_key)
-                                        if frame_entry is None:
-                                            frame_entry = {
-                                                "timestamp_s": float(sample.timestamp_s),
-                                                "values": {},
-                                                "_accum": {},
-                                            }
-                                            corrected_by_frame[frame_key] = frame_entry
-                                        else:
-                                            frame_entry["timestamp_s"] = min(
-                                                float(frame_entry["timestamp_s"]),
-                                                float(sample.timestamp_s),
-                                            )
-                                        accum = frame_entry.setdefault("_accum", {})
-                                        side_acc = accum.get(side)
-                                        if side_acc is None:
-                                            side_acc = {"bfi_sum": 0.0, "bvi_sum": 0.0, "count": 0}
-                                            accum[side] = side_acc
-                                        side_acc["bfi_sum"] += float(sample.bfi)
-                                        side_acc["bvi_sum"] += float(sample.bvi)
-                                        side_acc["count"] += 1
-
-                                    # Flush frames where all expected sides are complete.
-                                    expected_sides = set(
-                                        _s for _s, _m, _ in active_sides
-                                    )
-                                    complete = []
-                                    for fid, entry in corrected_by_frame.items():
-                                        accum = entry.get("_accum", {})
-                                        if all(
-                                            accum.get(sd, {}).get("count", 0)
-                                            >= _reduced_cam_counts.get(sd, 1)
-                                            for sd in expected_sides
-                                        ):
-                                            complete.append(fid)
-
-                                    if complete and _corr_csv is not None:
-                                        if _corr_base_ts is None:
-                                            _corr_base_ts = min(
-                                                float(corrected_by_frame[fid]["timestamp_s"])
-                                                for fid in complete
-                                            )
-                                        for fid in sorted(complete):
-                                            entry = corrected_by_frame.pop(fid)
-                                            rel_ts = float(entry["timestamp_s"]) - _corr_base_ts
-                                            accum = entry.get("_accum", {})
-                                            left_acc = accum.get("left", {"bfi_sum": 0, "bvi_sum": 0, "count": 1})
-                                            right_acc = accum.get("right", {"bfi_sum": 0, "bvi_sum": 0, "count": 1})
-                                            vals = {
-                                                "bfi_left": round(left_acc["bfi_sum"] / max(1, left_acc["count"]), 6),
-                                                "bfi_right": round(right_acc["bfi_sum"] / max(1, right_acc["count"]), 6),
-                                                "bvi_left": round(left_acc["bvi_sum"] / max(1, left_acc["count"]), 6),
-                                                "bvi_right": round(right_acc["bvi_sum"] / max(1, right_acc["count"]), 6),
-                                            }
-                                            row = [fid, rel_ts]
-                                            row.extend(vals.get(col, "") for col in corrected_columns)
-                                            _corr_csv.writerow(row)
-                                        _corr_fh.flush()
-                            except Exception as agg_err:
-                                _emit_log(f"Corrected batch aggregation error: {agg_err}")
-
-                            # Emit averaged batch to UI
-                            if on_corrected_batch_fn:
-                                from omotion.MotionProcessing import Sample
-                                # Group samples by (side, frame_id) and average
-                                _batch_buf: dict[tuple[str, int], dict] = {}
-                                for s in batch.samples:
-                                    bk = (s.side, int(s.absolute_frame_id))
-                                    be = _batch_buf.get(bk)
-                                    if be is None:
-                                        be = {"bfi_sum": 0.0, "bvi_sum": 0.0, "count": 0,
-                                              "ts": float(s.timestamp_s),
-                                              "frame_id": int(s.frame_id),
-                                              "abs_frame_id": int(s.absolute_frame_id),
-                                              "side": s.side}
-                                        _batch_buf[bk] = be
-                                    be["bfi_sum"] += float(s.bfi)
-                                    be["bvi_sum"] += float(s.bvi)
-                                    be["count"] += 1
-                                avg_samples = []
-                                for be in _batch_buf.values():
-                                    cnt = max(1, be["count"])
-                                    avg_samples.append(Sample(
-                                        side=be["side"], cam_id=0,
-                                        frame_id=be["frame_id"],
-                                        absolute_frame_id=be["abs_frame_id"],
-                                        timestamp_s=be["ts"],
-                                        row_sum=0, temperature_c=0.0,
-                                        mean=0.0, std_dev=0.0, contrast=0.0,
-                                        bfi=be["bfi_sum"] / cnt,
-                                        bvi=be["bvi_sum"] / cnt,
-                                        is_corrected=True,
-                                    ))
-                                on_corrected_batch_fn(CorrectedBatch(
-                                    dark_frame_start=batch.dark_frame_start,
-                                    dark_frame_end=batch.dark_frame_end,
-                                    samples=avg_samples,
-                                ))
-                            return
-
-                        try:
-                            with _corr_lock:
-                                for sample in batch.samples:
-                                    frame_key = int(sample.absolute_frame_id)
-                                    col_suffix = f"{sample.side[0]}{int(sample.cam_id) + 1}"
-                                    frame_entry = corrected_by_frame.get(frame_key)
-                                    if frame_entry is None:
-                                        frame_entry = {
-                                            "timestamp_s": float(sample.timestamp_s),
-                                            "values": {},
-                                        }
-                                        corrected_by_frame[frame_key] = frame_entry
-                                    else:
-                                        frame_entry["timestamp_s"] = min(
-                                            float(frame_entry["timestamp_s"]),
-                                            float(sample.timestamp_s),
-                                        )
-                                    frame_entry["values"][f"bfi_{col_suffix}"] = round(
-                                        float(sample.bfi), 6
-                                    )
-                                    frame_entry["values"][f"bvi_{col_suffix}"] = round(
-                                        float(sample.bvi), 6
-                                    )
-                                    frame_entry["values"][f"mean_{col_suffix}"] = round(
-                                        float(sample.mean), 6
-                                    )
-                                    frame_entry["values"][f"contrast_{col_suffix}"] = round(
-                                        float(sample.contrast), 6
-                                    )
-                                    frame_entry["values"][f"temp_{col_suffix}"] = float(
-                                        sample.temperature_c
-                                    )
-
-                                # Flush frame rows that are complete (all cameras contributed).
-                                if _corr_csv is not None and expected_col_suffixes:
-                                    complete = [
-                                        fid
-                                        for fid, entry in corrected_by_frame.items()
-                                        if all(
-                                            f"bfi_{s}" in entry["values"]
-                                            for s in expected_col_suffixes
-                                        )
-                                    ]
-                                    if complete:
-                                        if _corr_base_ts is None:
-                                            _corr_base_ts = min(
-                                                float(corrected_by_frame[fid]["timestamp_s"])
-                                                for fid in complete
-                                            )
-                                        for fid in sorted(complete):
-                                            entry = corrected_by_frame.pop(fid)
-                                            rel_ts = (
-                                                float(entry["timestamp_s"]) - _corr_base_ts
-                                            )
-                                            row = [fid, rel_ts]
-                                            row.extend(
-                                                entry["values"].get(col, "")
-                                                for col in corrected_columns
-                                            )
-                                            _corr_csv.writerow(row)
-                                        _corr_fh.flush()
-                        except Exception as agg_err:
-                            _emit_log(f"Corrected batch aggregation error: {agg_err}")
-                        if on_corrected_batch_fn:
-                            on_corrected_batch_fn(batch)
-
-                    science_pipeline = create_science_pipeline(
-                        left_camera_mask=left_mask_active,
-                        right_camera_mask=right_mask_active,
-                        bfi_c_min=self._calibration.c_min,
-                        bfi_c_max=self._calibration.c_max,
-                        bfi_i_min=self._calibration.i_min,
-                        bfi_i_max=self._calibration.i_max,
-                        on_uncorrected_fn=_on_uncorrected_sample,
-                        on_corrected_batch_fn=_on_corrected_batch,
-                        on_dark_frame_fn=on_dark_frame_fn,
-                        on_rolling_avg_fn=on_rolling_avg_fn,
-                        rolling_avg_enabled=request.rolling_avg_enabled,
-                        rolling_avg_window=request.rolling_avg_window,
-                        log_dark_endpoints=log_dark_endpoints,
-                    )
-
-                def _make_row_handler(current_side: str, p):
-                    """Close over side so each writer thread feeds the right key."""
-                    def _on_row(cam_id, frame_id, ts_val, hist, row_sum, temp):
-                        if p is not None:
-                            p.enqueue(
-                                current_side,
-                                cam_id,
-                                frame_id,
-                                ts_val,
-                                hist,
-                                row_sum,
-                                temp,
-                            )
-                    return _on_row
-
-                _RAW_CSV_HEADERS = [
-                    "cam_id", "frame_id", "timestamp_s",
-                    *range(HISTO_SIZE_WORDS),
-                    "temperature", "sum",
-                    "tcm", "tcl", "pdc",
-                ]
-
-                # _trigger_armed_evt fires the moment start_trigger() succeeds
-                # so each writer computes its CSV deadline from real scan-start
-                # rather than from thread-spawn time (which is several seconds
-                # earlier, before cameras are enabled).  It is also set in the
-                # finally block so threads never hang if the trigger fails.
-                # _csv_stop_evt is broadcast by whichever thread hits its
-                # deadline first so every side stops writing at the same
-                # wall-clock instant, giving equal row counts across CSVs.
-                _trigger_armed_evt = threading.Event()
-                _csv_stop_evt = (
-                    threading.Event()
-                    if request.raw_csv_duration_sec is not None
-                    else None
-                )
-
-                for side, mask, sensor in active_sides:
-                    q = queue.Queue()
-                    writer_queues[side] = q
-                    stop_evt = threading.Event()
-
-                    # Drain any USB data left over from the previous scan before
-                    # arming the new writer thread.  This runs while the MCU
-                    # trigger is still off, so only stale prior-scan frames can
-                    # be in the endpoint buffer — no real data is discarded.
-                    flushed = sensor.uart.histo.flush_stale_data(
-                        expected_size=request.expected_size
-                    )
-                    if flushed:
-                        _emit_log(
-                            f"Flushed {flushed} stale bytes from {side} USB endpoint "
-                            f"({flushed // request.expected_size} frame(s)) before scan start."
+                def _duration_guard():
+                    deadline = time.monotonic() + stop_after
+                    while time.monotonic() < deadline:
+                        if self._stop_evt.is_set():
+                            break
+                        time.sleep(0.2)
+                    # Cancel race: cancel_scan() already closed the source
+                    # (and likely called stop_trigger) before we got here.
+                    # Don't re-run stop_trigger/close on a closed source —
+                    # it can blow up on torn-down USB endpoints and would
+                    # block on the already-drained _batch_queue's sentinel
+                    # slot. Just exit.
+                    source_already_closing = getattr(source, "_stop", None) is not None \
+                        and source._stop.is_set()
+                    if source_already_closing:
+                        logger.debug(
+                            "duration_guard: source already closing (cancel path); "
+                            "skipping stop_trigger + close"
                         )
+                        return
 
-                    sensor.uart.histo.start_streaming(q, expected_size=request.expected_size)
-
-                    _row_handler = _make_row_handler(side, science_pipeline)
-
-                    # Resolve CSV file path for this side. Issue #44:
-                    # raw histo CSVs now carry a ``_raw`` suffix so
-                    # they're visually distinct from the canonical
-                    # corrected output (which dropped ``_corrected``).
-                    if request.write_raw_csv:
-                        filename = f"{ts}_{request.subject_id}_{side}_mask{mask:02X}_raw.csv"
-                        filepath = os.path.join(request.data_dir, filename)
-                    else:
-                        filepath = ""
-
-                    def _writer(
-                        q=q,
-                        stop_evt=stop_evt,
-                        on_row_fn=_row_handler,
-                        fp=filepath,
-                        ecfn=extra_cols_fn,
-                        s=side,
-                        dur=request.raw_csv_duration_sec,
-                        trigger_armed_evt=_trigger_armed_evt,
-                        csv_stop_evt=_csv_stop_evt,
-                    ):
-                        # Wait for the hardware trigger to fire before starting
-                        # the CSV deadline countdown.  The data queue is empty
-                        # until FSYNC begins (cameras are enabled but not yet
-                        # clocked) so nothing is lost during the wait.
-                        # _trigger_armed_evt is also set in the finally block so
-                        # this wait never hangs on an error path.
-                        if dur is not None:
-                            trigger_armed_evt.wait()
-                            csv_deadline = time.monotonic() + float(dur)
-                        else:
-                            csv_deadline = None
-
-                        rows_written = 0
-                        fh = None
-                        try:
-                            if fp:
-                                fh = open(fp, "w", newline="", encoding="utf-8")  # noqa: WPS515
-                                real_writer = csv.writer(fh)
-                                real_writer.writerow(_RAW_CSV_HEADERS)
-                            else:
-                                real_writer = None
-
-                            def _on_csv_closed():
-                                _emit_log(
-                                    f"{s.capitalize()} histogram CSV closed after "
-                                    f"{dur:.0f}s limit"
-                                )
-
-                            rows_written = parse_histogram_stream(
-                                q=q,
-                                stop_evt=stop_evt,
-                                csv_writer=real_writer,
-                                buffer_accumulator=bytearray(),
-                                extra_cols_fn=ecfn,
-                                on_row_fn=on_row_fn,
-                                csv_deadline=csv_deadline,
-                                csv_stop_event=csv_stop_evt,
-                                on_csv_closed_fn=_on_csv_closed if csv_deadline is not None else None,
-                            )
-                        except Exception as e:
-                            _emit_log(f"Writer error ({os.path.basename(fp) if fp else s}): {e}")
-                        finally:
-                            if fh is not None:
-                                try:
-                                    fh.close()
-                                except Exception:
-                                    pass
-                            writer_row_counts[s] = rows_written
-
-                    t = threading.Thread(target=_writer, daemon=True)
-
-                    t.start()
-                    writer_threads[side] = t
-                    writer_stops[side] = stop_evt
-
-                    if side == "left":
-                        left_path = filepath
-                    elif side == "right":
-                        right_path = filepath
-                    if filepath:
-                        _emit_log(f"{side.capitalize()} raw CSV: {os.path.basename(filepath)}")
-                    if on_side_stream_fn:
-                        on_side_stream_fn(side, filepath)
-
-                # Subscribe to state changes on the participating handles so
-                # any mid-scan disconnect aborts the scan immediately.
-                # Subscribed handles include the console (whose loss stops
-                # the FSYNC trigger) and every active sensor.
-                _scan_handles = [self._interface.console] + [s for _, _, s in active_sides]
-                self._scan_subscribe_state(handles=_scan_handles)
-
-                # Arm host-side streaming before enabling cameras so the first
-                # frame packet is not missed at scan start.
-                _emit_log("Enabling cameras...")
-                for side, mask, _ in active_sides:
-                    res = self._interface.run_on_sensors("enable_camera", mask, target=side)
-                    if not self._ok_from_result(res, side):
-                        raise RuntimeError(
-                            f"Failed to enable camera on {side} (mask 0x{mask:02X})."
-                        )
-
-                _emit_log("Starting trigger...")
-                if not self._interface.console.start_trigger():
-                    raise RuntimeError("Failed to start trigger.")
-                if on_trigger_state_fn:
-                    on_trigger_state_fn("ON")
-                # Signal writer threads: trigger is live, start CSV countdowns now.
-                _trigger_armed_evt.set()
-
-                start_t = time.time()
-                last_emit = -1
-                while not self._stop_evt.is_set():
-                    elapsed = time.time() - start_t
-                    pct = int(min(100, max(0, (elapsed / max(1, request.duration_sec)) * 100)))
-                    if pct != last_emit:
-                        if on_progress_fn:
-                            on_progress_fn(pct if pct >= 1 else 1)
-                        last_emit = pct
-                    if elapsed >= request.duration_sec:
-                        break
-                    time.sleep(0.2)
-
-                ok = not self._stop_evt.is_set()
-                if not ok:
-                    # If the stop was triggered by a mid-scan disconnect,
-                    # prefer that specific reason over "Capture canceled".
-                    err = self._scan_abort_reason or "Capture canceled"
-            except Exception as e:
-                ok = False
-                err = str(e)
-                if on_error_fn:
-                    on_error_fn(e)
-            finally:
-                try:
-                    self._interface.console.stop_trigger()
-                except Exception:
-                    pass
-                if on_trigger_state_fn:
-                    on_trigger_state_fn("OFF")
-
-                # Stop reacting to handle state changes — the scan is
-                # done, so any further disconnects shouldn't influence
-                # this run.
-                self._scan_unsubscribe_state()
-
-                time.sleep(0.5)
-
-                try:
+                    # Teardown order matches the legacy SciencePipeline path:
+                    #
+                    #   stop_trigger -> 0.5s -> disable_camera -> 0.35s -> close
+                    #
+                    # Why disable_camera BEFORE source.close (stop_streaming):
+                    # After stop_trigger the laser is off but the camera FSIN
+                    # scheduler keeps capturing frames (now darks) into the
+                    # firmware DMA buffer. If we stop_streaming first, the
+                    # camera continues filling DMA with no host reader, and
+                    # by the time disable_camera fires (in the worker's
+                    # `finally`) the firmware ends up in a half-state that
+                    # fails the next scan's READY check at flash time —
+                    # "left camera N not READY for FPGA/config." Calling
+                    # disable_camera first stops the DMA being filled at the
+                    # source so close() drains cleanly and the camera lands
+                    # in standby ready for the next flash.
+                    try:
+                        self._interface.console.stop_trigger()
+                        self._emit_trigger_event("OFF")
+                    except Exception:
+                        logger.warning("stop_trigger raised in duration guard", exc_info=True)
+                    time.sleep(0.5)
+                    # The deferred final FSYNC pulse (the terminal dark) has
+                    # fired by now — report its index for positive terminal-
+                    # dark identification in the flush.
+                    self._report_terminal_fsync()
                     for side, mask, _ in active_sides:
                         try:
-                            self._interface.run_on_sensors("disable_camera", mask, target=side)
+                            self._interface.run_on_sensors(
+                                "disable_camera", mask, target=side
+                            )
                         except Exception:
-                            pass
-                except Exception:
-                    pass
-
-                # After disabling cameras the MCU still needs up to ~250 ms to
-                # flush its DMA buffer and complete the final USB bulk transfer.
-                # Waiting here while _stream_loop is still running ensures that
-                # transfer is received and queued BEFORE stop_streaming() signals
-                # the loop to exit.
-                time.sleep(0.35)
-
-                for side, _, sensor in active_sides:
-                    try:
-                        sensor.uart.histo.stop_streaming()
-                    except Exception:
-                        pass
-                    # Post-stop drain: _stream_loop exits when it gets a timeout
-                    # while stop_event is set.  If the MCU's final USB transfer
-                    # arrives after that timeout window (which can happen >350 ms
-                    # after trigger-off), the frame lands in the host endpoint
-                    # buffer with no reader.  drain_final() recovers it here,
-                    # before the writer thread is told to stop.
-                    q = writer_queues.get(side)
-                    if q is not None:
-                        try:
-                            final_chunks = sensor.uart.histo.drain_final(
-                                expected_size=request.expected_size
+                            logger.warning(
+                                "disable_camera(%s) raised in duration guard",
+                                side, exc_info=True,
                             )
-                            for chunk in final_chunks:
-                                q.put(chunk)
-                            if final_chunks:
-                                _emit_log(
-                                    f"{side.capitalize()}: post-stop drain recovered "
-                                    f"{len(final_chunks)} late USB transfer(s) "
-                                    f"({sum(len(c) for c in final_chunks)} bytes)"
-                                )
-                        except Exception as _drain_err:
-                            logger.warning("%s: post-stop drain error: %s", side, _drain_err)
-
-                # Unblock any writer thread still waiting on the trigger event
-                # (e.g. if an error occurred before start_trigger ran).
-                _trigger_armed_evt.set()
-
-                for stop_evt in writer_stops.values():
-                    stop_evt.set()
-                for t in writer_threads.values():
-                    t.join(timeout=5.0)
-
-                # Per-side summary: USB read chunks received vs rows written to CSV.
-                # Compare against the MCU's own frame-sent printout to locate
-                # exactly where any frame loss is occurring. The sensor.uart
-                # may be None here if the sensor disconnected mid-scan and
-                # never recovered — in that case we can only report the
-                # writer-side row count.
-                for side, _, sensor in active_sides:
-                    if sensor.uart is not None:
-                        usb_pkts = sensor.uart.histo.packets_received
-                    else:
-                        usb_pkts = "n/a (disconnected)"
-                    rows = writer_row_counts.get(side, 0)
-                    side_path = left_path if side == "left" else right_path
-                    _emit_log(
-                        f"{side.capitalize()} — USB read chunks received: {usb_pkts} | "
-                        f"CSV rows written: {rows}"
-                        + (f" | {os.path.basename(side_path)}" if side_path else "")
-                    )
-
-                if science_pipeline is not None:
-                    science_pipeline.stop()
-
-                # Flush any remaining corrected rows (partial — not all cameras
-                # contributed before the scan ended).
-                with _corr_lock:
-                    if _corr_csv is not None and corrected_by_frame:
-                        if _corr_base_ts is None:
-                            _corr_base_ts = min(
-                                float(e["timestamp_s"])
-                                for e in corrected_by_frame.values()
-                            )
-                        for fid in sorted(corrected_by_frame.keys()):
-                            entry = corrected_by_frame[fid]
-                            rel_ts = float(entry["timestamp_s"]) - _corr_base_ts
-                            row = [fid, rel_ts]
-                            row.extend(
-                                entry["values"].get(col, "") for col in corrected_columns
-                            )
-                            _corr_csv.writerow(row)
-                        corrected_by_frame.clear()
-                if _corr_fh is not None:
+                    time.sleep(0.35)
                     try:
-                        _corr_fh.flush()
-                        _corr_fh.close()
+                        source.close()
                     except Exception:
-                        pass
-                if corrected_path:
-                    _emit_log(
-                        f"Corrected CSV created: {os.path.basename(corrected_path)}"
-                    )
+                        logger.warning("source.close raised in duration guard", exc_info=True)
 
-                # Telemetry CSV teardown — signal the listener to stop writing,
-                # wait for any in-flight write to drain, then close the file.
-                _telem_stop.set()
-                with _telem_lock:
-                    pass  # acquire+release: ensures any in-flight write has exited
-                if _telem_poller is not None and _telem_listener is not None:
-                    try:
-                        _telem_poller.remove_listener(_telem_listener)
-                    except Exception:
-                        pass
-                if _telem_fh is not None:
-                    try:
-                        _telem_fh.close()
-                    except Exception:
-                        pass
-                if telemetry_path:
-                    _emit_log(f"Telemetry CSV created: {os.path.basename(telemetry_path)}")
-
-                # Surface any dark-integrity warnings the science
-                # pipeline collected so calibration callers can fail.
-                integrity_warnings: list[str] = []
-                if science_pipeline is not None:
-                    try:
-                        integrity_warnings = science_pipeline.dark_integrity_warnings
-                    except Exception:
-                        pass
-
-                result = ScanResult(
-                    ok=ok,
-                    error=err,
-                    left_path=left_path,
-                    right_path=right_path,
-                    corrected_path=corrected_path,
-                    telemetry_path=telemetry_path,
-                    canceled=self._stop_evt.is_set(),
-                    scan_timestamp=ts,
-                    dark_integrity_warnings=integrity_warnings,
+                guard_thread = threading.Thread(
+                    target=_duration_guard, daemon=True, name="ScanWorkflow-guard"
                 )
-                if on_complete_fn:
-                    on_complete_fn(result)
+                guard_thread.start()
+
+                # ── Run the pipeline ──────────────────────────────────────
+                try:
+                    self._runner.run()
+                finally:
+                    # Ensure guard exits promptly if runner returned early.
+                    self._stop_evt.set()
+                    guard_thread.join(timeout=2.0)
+
+                    # stop_trigger + disable_camera are normally done by
+                    # _duration_guard above; the calls here are idempotent
+                    # safety nets for the cancel-from-cancel_scan path where
+                    # the guard short-circuits on the source_already_closing
+                    # check and never runs them.
+                    try:
+                        self._interface.console.stop_trigger()
+                    except Exception:
+                        pass
+
+                    if active_sides:
+                        self._scan_unsubscribe_state()
+                        for side, mask, _ in active_sides:
+                            try:
+                                self._interface.run_on_sensors(
+                                    "disable_camera", mask, target=side
+                                )
+                            except Exception:
+                                pass
+            except Exception as e:
+                logger.exception("ScanWorkflow worker raised")
+                self._last_scan_error = str(e) or type(e).__name__
+            finally:
+                if telemetry_writer is not None:
+                    telemetry_writer.close()
+                if telemetry_feeder is not None:
+                    telemetry_feeder.close()
                 with self._lock:
                     self._running = False
                     self._thread = None
+                # _stop_evt is also set by the inner finally to wake the
+                # duration guard on a clean exit, so checking it here would
+                # mark every scan as canceled. Use the dedicated flag set
+                # only by the user-cancel paths.
+                self._last_scan_canceled = self._cancel_requested
 
-        self._thread = threading.Thread(target=_worker, daemon=True)
+        # Reset per-scan outcome before spawning the worker so callers
+        # don't see stale state from a prior run. (_last_scan_error is cleared
+        # at the top of start_scan so refusals report no stale error.)
+        self._last_scan_canceled = False
+        self._cancel_requested = False
+
+        self._thread = threading.Thread(
+            target=_worker, daemon=True, name="ScanWorkflow-scan"
+        )
         self._thread.start()
         return True
 
-    def cancel_scan(self, *, join_timeout: float = 5.0) -> None:
+    def _emit_trigger_event(self, state: str) -> None:
+        """Push a TriggerStateEvent to the current runner's diagnostics channel.
+
+        Wrapped in try/except because failure to emit a diagnostic event
+        must never abort a scan.
+        """
+        try:
+            from omotion.pipeline.batch import TriggerStateEvent
+            runner = self._runner
+            if runner is None:
+                return
+            t0 = getattr(self, "_scan_t0_monotonic", None)
+            ts = (time.monotonic() - t0) if t0 is not None else 0.0
+            runner.dispatch_event(TriggerStateEvent(state=state, timestamp_s=ts))
+        except Exception:
+            logger.warning("_emit_trigger_event raised", exc_info=True)
+
+    def _report_terminal_fsync(self) -> None:
+        """Read the console's final fsync pulse count and deliver it to the
+        dark stage + diagnostics channel.
+
+        Trigger_Stop hard-disables the laser timer before the FSYNC timer's
+        deferred final pulse fires, so the frame captured on the last pulse
+        is laser-off by construction — the count positively identifies the
+        terminal dark frame (content checking demotes to verification).
+
+        Must be called >= ~150 ms after stop_trigger (the deferred final
+        pulse's worst-case latency) so the firmware counter includes it;
+        both call sites sit after the teardown's 0.5 s settle sleep.
+        Best-effort: failure must never break scan teardown.
+        """
+        try:
+            from omotion.pipeline.batch import TerminalFsyncCount
+            runner = self._runner
+            if runner is None:
+                return
+            count = self._interface.console.get_fsync_pulsecount()
+            if not isinstance(count, int) or count <= 0:
+                logger.warning(
+                    "get_fsync_pulsecount returned %r — terminal dark will "
+                    "be identified content-based", count,
+                )
+                return
+            for stage in runner.pipeline.stages:
+                if getattr(stage, "name", "") == "dark_correction":
+                    stage.set_terminal_fsync_count(count)
+                    break
+            t0 = getattr(self, "_scan_t0_monotonic", None)
+            ts = (time.monotonic() - t0) if t0 is not None else 0.0
+            runner.dispatch_event(TerminalFsyncCount(count=count, timestamp_s=ts))
+            logger.info("terminal fsync count reported: %d", count)
+        except Exception:
+            logger.warning("_report_terminal_fsync raised", exc_info=True)
+
+    @property
+    def last_scan_error(self) -> str | None:
+        """Error message from the most recent scan worker, or None on
+        success. Cleared at the start of each new scan."""
+        return self._last_scan_error
+
+    @property
+    def last_scan_canceled(self) -> bool:
+        """True if the most recent scan was canceled (stop_evt was set
+        before the worker finished). Cleared at the start of each new scan."""
+        return self._last_scan_canceled
+
+    @property
+    def current_scan_label(self) -> str | None:
+        """Scan-DB session label (``f"{scan_id}_{subject_id}"``) for the most
+        recent start_scan, or None if no scan has started. Set synchronously
+        while building scan metadata, so it's valid as soon as start_scan
+        returns. Callers use it to bind to this scan's exact session row."""
+        return self._current_scan_label
+
+    def await_complete(self, *, timeout_sec: float | None = None) -> None:
+        """Block until the current scan worker thread finishes (or the
+        optional timeout elapses).  Useful for callers that start a scan
+        and want synchronous completion — notably the sink-based workflow
+        helpers added in Phase D of the pipeline cutover.
+
+        Does nothing if no scan is running.
+        """
+        t = self._thread
+        if t is not None and t.is_alive():
+            t.join(timeout=timeout_sec)
+
+    def cancel(self) -> None:
+        """Signal the running scan to stop.
+
+        Closes the source (stopping the USB reader loops). The worker thread's
+        duration guard exits on the next poll and the runner's finally block fires.
+        """
+        self._cancel_requested = True
         self._stop_evt.set()
+        if self._runner is not None:
+            try:
+                self._runner.source.close()
+            except Exception:
+                pass
+
+    def cancel_scan(self, *, join_timeout: float = 5.0) -> None:
+        """User-facing cancel. Mirrors the normal end-of-scan teardown order
+        so a manual Stop returns in ~1s instead of ~3s.
+
+        Order (matches _duration_guard above):
+          stop_trigger -> 0.5s -> disable_camera -> 0.35s -> source.close()
+
+        Without disable_camera before close(), drain_final fights the
+        still-capturing firmware DMA and blocks for 2-3s while the host
+        endpoint buffer drains. With it, drain_final finds almost nothing
+        and close() returns quickly. cancel_scan then sets _stop_evt and
+        joins the worker thread.
+        """
+        # Stop the laser FIRST (laser-safety: fastest response).
         try:
             if self._interface and self._interface.console:
                 self._interface.console.stop_trigger()
+                self._emit_trigger_event("OFF")
         except Exception:
-            pass
+            logger.warning("stop_trigger raised in cancel_scan", exc_info=True)
+
+        # Stop cameras capturing so the firmware DMA stops being filled.
+        # Use the snapshotted active_sides from the running worker. If the
+        # worker hasn't snapshotted yet (very early cancel), this is empty
+        # and we just fall through to the close() — the worker will hit
+        # its own cancel paths.
+        active = list(self._scan_active_sides)
+        if active:
+            time.sleep(0.5)
+            # Deferred final FSYNC pulse has fired — report the terminal
+            # frame index before the source drains it (same as the
+            # duration-guard path).
+            self._report_terminal_fsync()
+            for side, mask, _ in active:
+                try:
+                    self._interface.run_on_sensors(
+                        "disable_camera", mask, target=side
+                    )
+                except Exception:
+                    logger.warning(
+                        "disable_camera(%s) raised in cancel_scan",
+                        side, exc_info=True,
+                    )
+            time.sleep(0.35)
+
+        # Signal worker + tear down source. cancel() sets _stop_evt and
+        # calls source.close(); the duration_guard sees source._stop set
+        # and short-circuits its own teardown.
+        self.cancel()
+
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=join_timeout)
 
@@ -1082,40 +925,47 @@ class ScanWorkflow:
                 if not active:
                     raise RuntimeError("No active sensors to configure.")
 
-                if request.power_off_unused_cameras:
-                    _emit_log("Powering on cameras before programming FPGAs...")
-                    for side, mask, sensor in active:
-                        try:
+                # Always power on the cameras we're about to program. FPGA SRAM
+                # programming requires the camera module powered — a READY status
+                # bit alone is not sufficient (program_fpga is rejected otherwise).
+                # The bloodflow app powers cameras on at connect; doing it here makes
+                # the SDK configure self-sufficient for any caller. The
+                # power_off_unused_cameras flag must NOT gate this power-on — it only
+                # controls whether the OTHER (unused) cameras get powered down.
+                _emit_log("Powering on cameras before programming FPGAs...")
+                for side, mask, sensor in active:
+                    try:
+                        on_mask = mask & 0xFF
+                        off_mask = 0
+                        if request.power_off_unused_cameras:
                             power_status = sensor.get_camera_power_status()
-                            if not power_status or len(power_status) != 8:
+                            if power_status and len(power_status) == 8:
+                                off_mask = sum(
+                                    1 << i
+                                    for i in range(8)
+                                    if power_status[i] and not (mask & (1 << i))
+                                )
+                            else:
                                 _emit_log(f"{side}: could not get camera power status")
-                                continue
-                            off_mask = sum(
-                                1 << i
-                                for i in range(8)
-                                if power_status[i] and not (mask & (1 << i))
+                        if off_mask:
+                            if sensor.disable_camera_power(off_mask):
+                                _emit_log(
+                                    f"{side}: powered off cameras not in mask (0x{off_mask:02X})"
+                                )
+                            time.sleep(0.05)
+                        if on_mask:
+                            if not sensor.enable_camera_power(on_mask):
+                                raise RuntimeError(
+                                    f"Failed to power on cameras on {side} (mask 0x{on_mask:02X})."
+                                )
+                            _emit_log(
+                                f"{side}: powered on cameras (mask 0x{on_mask:02X})"
                             )
-                            on_mask = mask & 0xFF
-                            if off_mask:
-                                if sensor.disable_camera_power(off_mask):
-                                    _emit_log(
-                                        f"{side}: powered off cameras not in mask (0x{off_mask:02X})"
-                                    )
-                                time.sleep(0.05)
-                            if on_mask:
-                                if sensor.enable_camera_power(on_mask):
-                                    _emit_log(
-                                        f"{side}: powered on cameras (mask 0x{on_mask:02X})"
-                                    )
-                                else:
-                                    raise RuntimeError(
-                                        f"Failed to power on cameras on {side} (mask 0x{on_mask:02X})."
-                                    )
-                                time.sleep(0.5)
-                        except Exception as e:
-                            raise RuntimeError(
-                                f"Error setting camera power for {side}: {e}"
-                            ) from e
+                            time.sleep(0.5)
+                    except Exception as e:
+                        raise RuntimeError(
+                            f"Error setting camera power for {side}: {e}"
+                        ) from e
 
                 side_positions: dict[str, list[int]] = {}
                 side_sensors: dict = {}
@@ -1326,4 +1176,7 @@ class ScanWorkflow:
             self._scan_abort_reason = (
                 f"{handle.name} disconnected mid-scan ({reason})"
             )
+            # Treat mid-scan disconnect the same as user-cancel for
+            # downstream "is partial data trustworthy" decisions.
+            self._cancel_requested = True
             self._stop_evt.set()

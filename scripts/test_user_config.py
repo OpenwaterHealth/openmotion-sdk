@@ -6,32 +6,32 @@ Read and modify user configuration on the Motion Console device.
 
 Usage:
     # Read and display current configuration
-    python scripts/user_config.py --read
+    python scripts/test_user_config.py --read
 
     # Get a specific value
-    python scripts/user_config.py --get <key>
+    python scripts/test_user_config.py --get <key>
 
     # Set values (types auto-detected: int, float, bool, string)
-    python scripts/user_config.py --set key1 value1 [--set key2 value2]
+    python scripts/test_user_config.py --set key1 value1 [--set key2 value2]
 
     # Remove keys from configuration
-    python scripts/user_config.py --remove key1 [--remove key2]
+    python scripts/test_user_config.py --remove key1 [--remove key2]
 
     # Write JSON file to device
-    python scripts/user_config.py --write-file <file.json>
+    python scripts/test_user_config.py --write-file <file.json>
 
     # Read and save to file
-    python scripts/user_config.py --read --output <file.json>
+    python scripts/test_user_config.py --read --output <file.json>
 """
 
 import sys
 import json
 import argparse
-from omotion.Interface import MOTIONInterface
-from omotion.config import CONSOLE_MODULE_PID
+
+from omotion import MotionInterface
 
 
-def parse_value(value_str: str) -> any:
+def parse_value(value_str: str):
     """
     Parse a string value and auto-detect its Python/JSON type.
 
@@ -39,7 +39,7 @@ def parse_value(value_str: str) -> any:
         value_str: String to parse
 
     Returns:
-        Parsed value as int, float, bool, or str
+        Parsed value as int, float, bool, None, or str
     """
     # Check for boolean literals (case-insensitive)
     if value_str.lower() == 'true':
@@ -67,7 +67,7 @@ def parse_value(value_str: str) -> any:
     return value_str
 
 
-def parse_json_value(value_str: str) -> any:
+def parse_json_value(value_str: str):
     """
     Parse a string as JSON. If it's not valid JSON, fall back to auto-detect.
 
@@ -84,10 +84,10 @@ def parse_json_value(value_str: str) -> any:
         return parse_value(value_str)
 
 
-def read_config_action(interface, output_file: str = None) -> bool:
+def read_config_action(console, output_file: str = None) -> bool:
     """Read configuration from device and display or save it."""
     print("Reading configuration from device...")
-    config = interface.console_module.read_config()
+    config = console.read_config()
 
     if config is None:
         print("Error: Failed to read configuration")
@@ -114,10 +114,10 @@ def read_config_action(interface, output_file: str = None) -> bool:
     return True
 
 
-def get_value_action(interface, key: str) -> bool:
+def get_value_action(console, key: str) -> bool:
     """Get a specific value from the configuration."""
     print("Reading configuration from device...")
-    config = interface.console_module.read_config()
+    config = console.read_config()
 
     if config is None:
         print("Error: Failed to read configuration")
@@ -134,10 +134,10 @@ def get_value_action(interface, key: str) -> bool:
     return True
 
 
-def set_values_action(interface, key_value_pairs: list) -> bool:
+def set_values_action(console, key_value_pairs: list) -> bool:
     """Set one or more values in the configuration."""
     print("Reading current configuration...")
-    config = interface.console_module.read_config()
+    config = console.read_config()
 
     if config is None:
         print("Error: Failed to read configuration")
@@ -158,23 +158,23 @@ def set_values_action(interface, key_value_pairs: list) -> bool:
 
     # Write to device
     print("\nWriting configuration to device...")
-    updated_config = interface.console_module.write_config(config)
+    updated_config = console.write_config(config)
 
     if updated_config is None:
         print("Error: Failed to write configuration")
         return False
 
-    print(f"\nConfiguration written successfully!")
+    print("\nConfiguration written successfully!")
     print(f"  New sequence: {updated_config.header.seq}")
     print(f"  New CRC: 0x{updated_config.header.crc:04X}")
 
     return True
 
 
-def remove_keys_action(interface, keys: list) -> bool:
+def remove_keys_action(console, keys: list) -> bool:
     """Remove one or more keys from the configuration."""
     print("Reading current configuration...")
-    config = interface.console_module.read_config()
+    config = console.read_config()
 
     if config is None:
         print("Error: Failed to read configuration")
@@ -201,20 +201,20 @@ def remove_keys_action(interface, keys: list) -> bool:
 
     # Write to device
     print("\nWriting configuration to device...")
-    updated_config = interface.console_module.write_config(config)
+    updated_config = console.write_config(config)
 
     if updated_config is None:
         print("Error: Failed to write configuration")
         return False
 
-    print(f"\nConfiguration written successfully!")
+    print("\nConfiguration written successfully!")
     print(f"  New sequence: {updated_config.header.seq}")
     print(f"  New CRC: 0x{updated_config.header.crc:04X}")
 
     return True
 
 
-def write_file_action(interface, json_file: str) -> bool:
+def write_file_action(console, json_file: str) -> bool:
     """Write configuration from a JSON file to the device."""
     try:
         with open(json_file, 'r') as f:
@@ -235,54 +235,52 @@ def write_file_action(interface, json_file: str) -> bool:
         return False
 
     print("\nWriting configuration to device...")
-    config = interface.console_module.read_config()
+    config = console.read_config()
 
     if config is None:
         print("Error: Failed to read current configuration")
         return False
 
-    # Update with new values while preserving header
-    old_seq = config.header.seq
+    # Update with new values while preserving header; the device assigns
+    # its own sequence on write.
     config.json_data = data
-    # Keep the same sequence number or increment it
-    # The device will assign its own sequence on write
 
-    updated_config = interface.console_module.write_config(config)
+    updated_config = console.write_config(config)
 
     if updated_config is None:
         print("Error: Failed to write configuration")
         return False
 
-    print(f"\nConfiguration written successfully!")
+    print("\nConfiguration written successfully!")
     print(f"  New sequence: {updated_config.header.seq}")
     print(f"  New CRC: 0x{updated_config.header.crc:04X}")
 
     return True
 
 
-def main():
+def main() -> int:
     parser = argparse.ArgumentParser(
         description='Read and modify user configuration on the Motion Console device.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   # Read and display current configuration
-  python scripts/user_config.py --read
+  python scripts/test_user_config.py --read
 
   # Get a specific value
-  python scripts/user_config.py --get device_name
+  python scripts/test_user_config.py --get device_name
 
   # Set values (types auto-detected: int, float, bool, string)
-  python scripts/user_config.py --set device_name "My Device" --set enabled true --set count 42
+  python scripts/test_user_config.py --set device_name "My Device" --set enabled true --set count 42
 
   # Remove keys from configuration
-  python scripts/user_config.py --remove old_key --remove another_key
+  python scripts/test_user_config.py --remove old_key --remove another_key
 
   # Write JSON file to device
-  python scripts/user_config.py --write-file my_config.json
+  python scripts/test_user_config.py --write-file my_config.json
 
   # Read and save to file
-  python scripts/user_config.py --read --output backup.json
+  python scripts/test_user_config.py --read --output backup.json
 """
     )
 
@@ -306,39 +304,49 @@ Examples:
         parser.print_help()
         return 1
 
-    # Acquire interface + connection state
-    interface, console_connected, left_sensor, right_sensor = MOTIONInterface.acquire_motion_interface()
+    interface = MotionInterface()
+    interface.start()
 
-    if console_connected and left_sensor and right_sensor:
-        print("MOTION System fully connected.")
-    else:
-        print(f'MOTION System NOT Fully Connected. CONSOLE: {console_connected}, SENSOR (LEFT,RIGHT): {left_sensor}, {right_sensor}')
+    try:
+        console_connected, left_connected, right_connected = interface.is_device_connected()
 
-    if not console_connected:
-        print("Console Module not connected.")
-        return 1
+        if console_connected and left_connected and right_connected:
+            print("MOTION System fully connected.")
+        else:
+            print(
+                f"MOTION System NOT Fully Connected. CONSOLE: {console_connected}, "
+                f"SENSOR (LEFT,RIGHT): {left_connected}, {right_connected}"
+            )
 
-    # Execute requested actions
-    success = True
+        if not console_connected:
+            print("Console Module not connected.")
+            return 1
 
-    if args.read:
-        success = read_config_action(interface, args.output) and success
+        console = interface.console
 
-    if args.get:
-        success = get_value_action(interface, args.get) and success
+        # Execute requested actions
+        success = True
 
-    if args.set:
-        success = set_values_action(interface, args.set) and success
+        if args.read:
+            success = read_config_action(console, args.output) and success
 
-    if args.remove:
-        # Flatten nested lists from action='append'
-        all_keys = [key for sublist in args.remove for key in sublist]
-        success = remove_keys_action(interface, all_keys) and success
+        if args.get:
+            success = get_value_action(console, args.get) and success
 
-    if args.write_file:
-        success = write_file_action(interface, args.write_file) and success
+        if args.set:
+            success = set_values_action(console, args.set) and success
 
-    return 0 if success else 1
+        if args.remove:
+            # Flatten nested lists from action='append'
+            all_keys = [key for sublist in args.remove for key in sublist]
+            success = remove_keys_action(console, all_keys) and success
+
+        if args.write_file:
+            success = write_file_action(console, args.write_file) and success
+
+        return 0 if success else 1
+    finally:
+        interface.stop()
 
 
 if __name__ == "__main__":

@@ -1,0 +1,74 @@
+[
+  {
+    "friendlyName": "TA_PULSE_WIDTH",
+    "dataToSend": [27, 6, 0]
+  },
+  {
+    "friendlyName": "TA_CURRENT_DRV",
+    "dataToSend": [23, 122]
+  },
+  {
+    "friendlyName": "SEED_DDS_GAIN",
+    "dataToSend": [0, 0]
+  },
+  {
+    "friendlyName": "SEED_CW_GAIN",
+    "dataToSend": [14, 8]
+  },
+  {
+    "friendlyName": "SEED_DDS_CL",
+    "dataToSend": [96, 3]
+  },
+  {
+    "friendlyName": "SEED_CW_CL",
+    "dataToSend": [165, 9]
+  },
+  {
+    "friendlyName": "EE_PULSE_WIDTH_LL",
+    "dataToSend": [0, 0, 0, 0]
+  },
+  {
+    "friendlyName": "EE_PULSE_WIDTH_UL",
+    "dataToSend": [53, 12, 0, 0]
+  },
+  {
+    "friendlyName": "EE_RATE_LL",
+    "dataToSend": [169, 18, 1, 0]
+  },
+  {
+    "friendlyName": "EE_DRIVE_CL",
+    "dataToSend": [136, 19]
+  },
+  {
+    "friendlyName": "EE_CW_CURRENT",
+    "dataToSend": [138, 3]
+  },
+  {
+    "friendlyName": "EE_PWM_CURRENT",
+    "dataToSend": [138, 3]
+  },
+  {
+    "friendlyName": "OPT_PULSE_WIDTH_LL",
+    "dataToSend": [0, 0, 0, 0]
+  },
+  {
+    "friendlyName": "OPT_PULSE_WIDTH_UL",
+    "dataToSend": [53, 12, 0, 0]
+  },
+  {
+    "friendlyName": "OPT_RATE_LL",
+    "dataToSend": [169, 18, 1, 0]
+  },
+  {
+    "friendlyName": "OPT_DRIVE_CL",
+    "dataToSend": [231, 27]
+  },
+  {
+    "friendlyName": "OPT_PWM_CURRENT",
+    "dataToSend": [138, 3]
+  },
+  {
+    "friendlyName": "OPT_CW_CURRENT",
+    "dataToSend": [138, 3]
+  }
+]

@@ -1,10 +1,16 @@
-# OpenMotion SDK — Test Plan
+# Open-Motion SDK — Test Plan
 
 ## Overview
 
-This document defines the hardware-in-the-loop test suite for the OpenMotion SDK. Tests are grouped by system (console / sensor), then by subsystem, and finally by individual function. The plan also covers common command sequences, communication-path verification, and the recommended pytest infrastructure for a GitHub Actions CI workflow backed by physical hardware runners.
+This document defines the **hardware-in-the-loop (HIL) test suite** for the Open-Motion SDK. Tests are grouped by system (console / sensor), then by subsystem, and finally by individual function. The plan also covers common command sequences, communication-path verification, and the recommended pytest infrastructure for a GitHub Actions CI workflow backed by physical hardware runners.
 
-All tests are written against the public SDK API (`MOTIONConsole`, `MOTIONSensor`, `MOTIONInterface`). Lower-level transport classes (`MOTIONUart`, `CommInterface`, `StreamInterface`) are exercised indirectly; dedicated transport tests are called out where the transport behaviour itself is the thing under test.
+**Scope.** This plan covers HIL tests only — the ones gated behind the `console` / `sensor` / `sensor_left` / `sensor_right` / `sequence` / `destructive` markers and run on the self-hosted hardware runners. The pure-software tier (the stage-based pipeline tests under `tests/test_pipeline/`, the calibration-compute tests, contact-quality, scan-DB, and unit tests) runs anywhere without hardware and is intentionally **out of scope here** — those tests are their own authoritative spec. There is, by design, no software-only PR CI job; everything runs on the rig.
+
+All tests are written against the public SDK API (`MotionConsole`, `MotionSensor`, `MotionInterface`). Lower-level transport classes (`MotionUart`, `CommInterface`, `StreamInterface`) are exercised indirectly; dedicated transport tests are called out where the transport behaviour itself is the thing under test.
+
+**How to read this plan.** This document describes HIL coverage **by subsystem** — what each subsystem's hardware tests are meant to verify. It is **not** a line-by-line registry of every test function: the executable tests under `tests/test_*.py` are the authoritative, live registry. Individual test names below are illustrative of intent and may have drifted (renames, splits); when in doubt, the code wins. Coverage we intend but have not yet built is collected in **§8 Known coverage gaps / backlog**.
+
+For the **whole-suite view** (all 504 tests grouped by SDK architecture layer, the software-vs-hardware split, and per-layer coverage ratings), see [`TestSuite.md`](TestSuite.md). This plan covers only the HIL tier.
 
 ---
 
@@ -23,11 +29,11 @@ All tests are written against the public SDK API (`MOTIONConsole`, `MOTIONSensor
 ```python
 # tests/conftest.py
 import pytest
-from omotion.Interface import MOTIONInterface
+from omotion.MotionInterface import MotionInterface
 
 @pytest.fixture(scope="session")
 def motion():
-    iface = MOTIONInterface()
+    iface = MotionInterface()
     iface.connect()
     yield iface
     iface.disconnect()
@@ -58,17 +64,21 @@ Session-scoped fixtures keep the USB connection open for the entire test run. In
 
 ### 1.3 Markers
 
-```ini
-# pytest.ini
-[pytest]
-markers =
-    console:      tests that require a connected console module
-    sensor:       tests that require at least one connected sensor module
-    sensor_left:  tests specific to the left sensor
-    sensor_right: tests specific to the right sensor
-    slow:         tests that take more than 10 s (e.g. full scans, DFU)
-    destructive:  tests that modify flash or firmware
-    sequence:     multi-step round-trip tests
+Markers are declared in `pyproject.toml` under `[tool.pytest.ini_options]` (there
+is no `pytest.ini`). The full set:
+
+```toml
+markers = [
+    "console:      requires a connected console module",
+    "sensor:       requires at least one connected sensor module",
+    "sensor_left:  tests specific to the left sensor",
+    "sensor_right: tests specific to the right sensor",
+    "slow:         takes more than 10 s (e.g. full scans, DFU)",
+    "destructive:  modifies flash or firmware",
+    "sequence:     multi-step round-trip tests",
+    "fpga:         requires a loaded FPGA bitstream — excluded by default",
+    "imu:          exercises the IMU subsystem — excluded by default",
+]
 ```
 
 Run only fast, non-destructive tests:
@@ -380,10 +390,10 @@ These tests verify that bytes take the correct path through the transport stack 
 Constructs a `UartPacket`, flips one byte in the CRC field, sends raw bytes over the serial port. Asserts the response is a `CommandError` with `BAD_CRC` (not a silent discard).
 
 **`test_uart_response_arrives_on_correct_queue`**
-Sends two commands with different packet IDs concurrently (two threads). Asserts each thread receives the response matching its own ID. (Tests the per-ID `queue.Queue` routing in `MOTIONUart` async mode.)
+Sends two commands with different packet IDs concurrently (two threads). Asserts each thread receives the response matching its own ID. (Tests the per-ID `queue.Queue` routing in `MotionUart` async mode.)
 
 **`test_uart_sync_mode_blocking`**
-Forces `MOTIONUart` into sync mode (if exposed). Sends a `ping`. Asserts the response arrives within the timeout and is correct.
+Forces `MotionUart` into sync mode (if exposed). Sends a `ping`. Asserts the response arrives within the timeout and is correct.
 
 **`test_uart_timeout_raises`**
 Sends a command to a known-nonexistent address with a very short timeout. Asserts `TimeoutError` is raised.
@@ -403,7 +413,7 @@ Sends a known-unresponsive command pattern. Asserts `TimeoutError` within the ex
 Starts histogram streaming on the sensor. After 500 ms, stops it. Inspects the raw bytes queued on `StreamInterface` for interface 1 (histogram). Asserts all packet headers indicate they arrived on the histogram bulk endpoint (interface index 1, not 0 or 2). Asserts no data appeared on the IMU interface during this test.
 
 **`test_stream_interface_no_data_loss`**
-Streams histograms for 2 s. Counts frames received via `SciencePipeline.on_science_frame_fn`. Queries the sensor for its internal frame counter. Asserts the two counts match (zero frame loss).
+Streams histograms for 2 s. Counts frames drained from the `StreamInterface` IF1 packet queue (or the `LiveUsbSource` per-side reader). Queries the sensor for its internal frame counter. Asserts the two counts match (zero frame loss).
 
 ### 4.3 Dual-sensor USB topology
 
@@ -473,23 +483,11 @@ Steps:
 
 ### 5.4 Streaming acquisition
 
-```
-test_streaming_acquisition
-```
-
-Steps:
-1. Power on camera.
-2. Enable FPGA.
-3. Configure registers.
-4. Enable FSIN (`enable_aggregator_fsin`).
-5. Start histogram streaming.
-6. Collect `N = 30` science frames via `SciencePipeline`.
-7. Disable FSIN.
-8. Stop streaming.
-9. Assert `len(frames) == N`.
-10. Assert each frame has `absolute_frame_id` monotonically increasing by 1.
-11. Assert each frame's BFI is in a physically plausible range (0.0–1.0).
-12. Disable FPGA. Power off.
+> **Not yet implemented — see §8 backlog (HIGH).** The original spec here drove
+> the now-removed `SciencePipeline` callback API; a real streaming-acquisition
+> HIL test must instead run a short scan through `omotion/pipeline/` (the
+> `LiveUsbSource` → stage chain → a collector sink) and assert on the corrected
+> frames it emits. Re-spec'd in §8.
 
 ### 5.5 External FSIN enable → scan → disable
 
@@ -535,87 +533,92 @@ Steps:
 
 ### 5.8 Dual-sensor aligned frame acquisition
 
-```
-test_dual_sensor_frame_alignment
-```
-
-Steps:
-1. Bring up left and right cameras.
-2. Start streaming on both.
-3. Collect 20 `ScienceFrame` objects (both left and right samples present).
-4. Assert each `ScienceFrame` has matching `absolute_frame_id` for both sides.
-5. Tear down both.
+> **Not yet implemented — see §8 backlog (HIGH).** Original spec referenced the
+> removed `ScienceFrame` type. Re-spec'd against the pipeline `FrameBatch` /
+> per-side reader threads in §8.
 
 ### 5.9 Full scan workflow
 
 ```
-test_scan_workflow_end_to_end
+test_scan_workflow_end_to_end   →   tests/test_sequences.py::test_scan_workflow_end_to_end
 ```
 
-Steps:
-1. Build a `ScanRequest` with a 5-second duration.
-2. Call `ScanWorkflow.start_scan()`.
-3. Collect progress callbacks.
-4. Assert `ScanResult.success is True`.
-5. Assert at least one CSV file was written with a non-zero row count.
-6. Assert the `ScanResult.frame_count` matches the row count in the CSV.
+Verifies a short scan runs to completion through the current API (there is no
+`ScanResult` or `on_complete` callback anymore — both were removed):
+
+1. Build a `ScanRequest` with a ~5-second duration.
+2. `motion.start_scan(request)` (returns a bool; the scan runs on a worker thread).
+3. Poll `scan_workflow.running` / `await_complete()` until done.
+4. Assert `scan_workflow.last_scan_error is None` and `not last_scan_canceled`.
+5. Assert `scan_workflow.current_scan_label` is set, and the persisted output
+   (CSV under `data_dir`, or `session_data` rows when a DB is configured) is
+   non-empty.
+
+> Robustness note: this test currently assumes a sensor is present and will error
+> rather than skip if run with a console but no sensor — see §8.
 
 ---
 
 ## 6. Error and Edge Case Tests
 
-**`test_command_error_on_nak`**
-Sends a command byte that the firmware returns NAK for (use `echo` against the sensor with a deliberately overlong payload if that triggers NAK in the protocol). Asserts `CommandError` is raised.
+Error-path coverage lives in `tests/test_errors.py`. The pure-code cases (CRC,
+mutable-default isolation, `CommandError` API) run anywhere; the device cases are
+hardware-gated. What's actually verified today:
 
-**`test_value_error_on_crc_mismatch`**
-Manually corrupts an incoming packet buffer and attempts to parse it with `UartPacket(buffer=...)`. Asserts `ValueError` is raised.
+- **Packet framing** — `test_value_error_on_crc_mismatch`: corrupt an incoming
+  buffer, `UartPacket(buffer=...)` raises `ValueError`. `test_mutable_default_arg_isolation`:
+  two packets built without explicit data don't share one list.
+- **Bad command** — `test_command_error_or_timeout_on_bad_subtype`: a bad
+  opcode raises `CommandError`/`TimeoutError`.
+- **`CommandError` contract** — optional vs populated `response`, and that it
+  subclasses `RuntimeError`.
+- **Idempotent ping / connectivity** — `test_double_ping_after_connect`,
+  `test_sensor_double_ping`, `test_sensor_ping_after_is_connected`.
 
-**`test_timeout_error_no_device`**
-Attempts a `ping` on a `MOTIONUart` instance backed by a serial port that has been closed. Asserts `TimeoutError` or `serial.SerialException`.
-
-**`test_usb_error_propagates`**
-With the sensor connected, calls `release()` on the `CommInterface` to simulate a disconnect, then attempts `ping()`. Asserts `usb.core.USBError` or `ValueError("not connected")`.
-
-**`test_double_connect_is_idempotent`**
-Calls `connect()` on an already-connected transport. Asserts no exception and device remains functional.
-
-**`test_double_disconnect_is_idempotent`**
-Calls `disconnect()` twice. Asserts no exception.
+**Intentionally NOT covered** (decided 2026-05-29): connection-robustness edge
+tests — device-absent timeout, idempotent connect/disconnect, USB-error
+propagation on `release()`, and any USB power-cycle / hotplug-reconnect path.
+These are deliberately out of the current HIL scope (the transport-down
+cancellation path *is* covered by the pure-software
+`tests/test_comm_transport_down.py`).
 
 ---
 
-## 7. Pytest Infrastructure Recommendations
+## 7. HIL CI — how it runs today
 
-### 7.1 Repository layout
+> This section *describes the deployed setup*, not a proposal. The YAML and
+> runner notes below (§7.2) are illustrative of the real workflows.
 
-```
-openmotion-sdk/
-├── omotion/
-├── tests/
-│   ├── conftest.py              # session fixtures, markers
-│   ├── test_console.py          # Section 2 tests
-│   ├── test_sensor.py           # Section 3 tests
-│   ├── test_comm_paths.py       # Section 4 tests
-│   ├── test_sequences.py        # Section 5 tests
-│   ├── test_errors.py           # Section 6 tests
-│   └── hardware/
-│       └── README.md            # instructions for runner setup
-├── pytest.ini
-└── pyproject.toml
-```
+### 7.1 Layout and config (as built)
 
-Add to `pyproject.toml`:
+Tests live flat under `tests/` (HIL tests) with the pure-software pipeline tier
+under `tests/test_pipeline/`. There is **no** `tests/hardware/` subfolder and
+**no** `pytest.ini` — pytest is configured entirely in `pyproject.toml`:
 
 ```toml
 [tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short -m 'not fpga and not imu'"   # fpga/imu excluded by default
+timeout = 30
 markers = [
     "console", "sensor", "sensor_left", "sensor_right",
-    "slow", "destructive", "sequence"
+    "slow", "destructive", "sequence", "fpga", "imu",
 ]
-addopts = "-v --tb=short"
 ```
 
+Note `fpga` and `imu` are **excluded by default** (temporarily skipped); opt in
+explicitly with `-m fpga` / `-m imu`. Hardware tests gate on
+`console` / `sensor` markers and skip gracefully when the device is absent
+(§7.5).
+
 ### 7.2 GitHub Actions hardware runner
+
+Two workflows are deployed: **`hardware-tests.yml`** runs the fast,
+non-destructive subset (`-m "not destructive and not slow"`) on push/PR to
+`testing`; **`hardware-tests-full.yml`** runs the full suite (including
+destructive tests) on `release`. Both target `runs-on: [self-hosted, hardware,
+openmotion]`. There is, by design, **no software-only `ubuntu-latest` job** — the
+pure-software tier runs locally or when the rig picks it up.
 
 Self-hosted runners are required for hardware-in-the-loop tests. Each runner machine must have a console module and at least one sensor module permanently attached. The runner must have `libusb` installed and the appropriate udev rules (Linux) or WinUSB driver (Windows) configured.
 
@@ -718,3 +721,67 @@ Mark any test that modifies persistent device state (fan speed, TEC setpoint, tr
 The session-scoped fixtures (Section 1.2) call `pytest.skip()` when the targeted device is not present. This allows the same test suite to run in CI with only partial hardware attached — for example, a console-only runner will run all console tests and skip sensor tests without failing the build.
 
 Set the environment variable `OPENMOTION_DEMO=1` to substitute `demo_mode=True` in the fixtures, enabling a fully offline dry-run of the test scaffolding without any physical hardware.
+
+---
+
+## 8. Known coverage gaps / backlog
+
+HIL coverage we intend to build but have not yet. Reviewed and prioritised
+2026-05-29. (Connection-robustness / USB power-cycle / hotplug-reconnect coverage
+is intentionally **excluded** from this backlog — see §6.)
+
+### HIGH
+
+- **Streaming acquisition** (replaces the dead §5.4). Run a short scan through
+  `omotion/pipeline/` end-to-end — `LiveUsbSource` → default stage chain → a
+  collector sink — and assert: N corrected frames emitted, `abs_frame_id`
+  monotonic per side, BFI/BVI in a physically plausible range. This is the actual
+  product acquisition path and has no HIL test today.
+- **EFT timestamp-repair: clean-scan false-positive + stim detection check.**
+  Two-part verification of `TimestampRepairStage` against live hardware
+  (background: the recorded "clean" fixture `owYWB8TN` turned out to have been
+  captured with the stimulator running at 300 ms cadence, whose signature —
+  one packet per ~12 frames stamped ~10 ms early, dt pattern `25,…,15,35,…,25`
+  per camera — the detector correctly caught; we have never verified the
+  no-stim baseline on hardware).
+  - **(a) Clean baseline — no alerts for no reason.** Stimulator OFF, run a
+    ≥5-minute scan with the scan DB enabled. Assert: zero `"ts_corrected"` /
+    `"nan_filled"` rows in `session_data`, **zero WARNINGs** from
+    `timestamp_repair` (the terminal stop frame — the firmware's laser-off
+    frame fires ~151 ms off-grid at every scan stop — is reclassified at
+    INFO and must not warn), and `session_meta` has **no** `"diagnostics"`
+    key. Repeat across both sensor modules and with IMU streaming on/off,
+    since periodic firmware tasks are the suspected jitter source if this
+    ever trips.
+  - **(b) Stim — detector and corrector behave.** Stimulator ON at 300 ms,
+    same scan. Assert: misalignment windows are detected at the stim cadence
+    (~3.3 Hz), `session_meta["diagnostics"]` records them, and the corrected
+    timestamps land back on the 25 ms frame grid — per camera,
+    `|t(fid) − t(anchor) − (fid − anchor)·25.02 ms| < tolerance` for the
+    re-timestamped rows, against the raw CSV as the pre-repair reference.
+- **Dual-sensor aligned-frame acquisition** (replaces the dead §5.8). Bring up
+  left + right, run a short streamed scan, assert both sides produce frames with
+  matching `abs_frame_id` within each `FrameBatch` (frame alignment across
+  sensors). Core to any 2-sensor system.
+
+### MEDIUM
+
+- **I2C write→read roundtrip** (§2.4). Today only the bad-address path is tested;
+  add a write-then-read on a safe scratch register via the console I2C
+  pass-through.
+- **UART CRC-corruption + timeout** (§4.1). Today only sync-mode blocking is
+  tested; add: a corrupted response is rejected, and a command to a silent device
+  raises `TimeoutError` within the configured window.
+- **IMU streaming** (§3.10). Exercise the `StreamInterface` IF2 path: enable IMU
+  streaming, receive N samples, assert plausible accel/gyro magnitudes.
+
+### Hardware-safety fix (then re-enable)
+
+- **DFU enter (console §2.11 + sensor §3.11)** — both are currently
+  `@pytest.mark.skip(reason="DFU temporarily disabled")` because the test left
+  the hardware in a bad state. Fix the test so it enters DFU and **returns the
+  device cleanly to application mode** (or is safe to leave in DFU for the rest of
+  the destructive run), then remove the skip. Belongs in the `destructive` lane.
+
+> Maintenance: when a backlog item ships as a real test, delete it here — the
+> tests are the registry (§Overview, "How to read this plan").

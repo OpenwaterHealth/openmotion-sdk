@@ -12,7 +12,7 @@ class UartPacket:
     def __init__(
         self,
         id=None,
-        packet_type=None,
+        packetType=None,
         command=None,
         addr=None,
         reserved=None,
@@ -23,7 +23,7 @@ class UartPacket:
             self.from_buffer(buffer)
         else:
             self.id = id
-            self.packet_type = packet_type
+            self.packetType = packetType
             self.command = command
             self.addr = addr
             self.reserved = reserved
@@ -36,7 +36,7 @@ class UartPacket:
         packet = bytearray()
         packet.append(OW_START_BYTE)
         packet.extend(self.id.to_bytes(2, "big"))
-        packet.append(self.packet_type)
+        packet.append(self.packetType)
         packet.append(self.command)
         packet.append(self.addr)
         packet.append(self.reserved)
@@ -50,7 +50,7 @@ class UartPacket:
         buffer = bytearray()
         buffer.append(OW_START_BYTE)
         buffer.extend(self.id.to_bytes(2, "big"))
-        buffer.append(self.packet_type)
+        buffer.append(self.packetType)
         buffer.append(self.command)
         buffer.append(self.addr)
         buffer.append(self.reserved)
@@ -69,7 +69,7 @@ class UartPacket:
             raise ValueError("Invalid buffer format")
 
         self.id = int.from_bytes(buffer[1:3], "big")
-        self.packet_type = buffer[3]
+        self.packetType = buffer[3]
         self.command = buffer[4]
         self.addr = buffer[5]
         self.reserved = buffer[6]
@@ -84,21 +84,23 @@ class UartPacket:
             raise ValueError("CRC mismatch")
 
     def print_packet(self, full=False):
-        logger.debug("UartPacket:")
-        logger.debug("  Packet ID:", self.id)
-        logger.debug("  Packet Type:", hex(self.packet_type))
-        logger.debug("  Command:", hex(self.command))
-        logger.debug("  Data Length:", self.data_len)
-        if full:
-            logger.debug("  Address:", hex(self.addr))
-            logger.debug("  Reserved:", hex(self.reserved))
-            logger.debug("  Data:", self.data.hex())
-            logger.debug("  CRC:", hex(self.crc))
+        logger.debug(
+            "UartPacket: id=%s type=0x%02X cmd=0x%02X addr=0x%02X reserved=0x%02X "
+            "data_len=%s data=%s crc=0x%04X",
+            self.id,
+            self.packetType,
+            self.command,
+            self.addr,
+            self.reserved,
+            self.data_len,
+            self.data.hex() if self.data else "",
+            self.crc,
+        )
 
     def __str__(self):
         return (
             f"UartPacket(id={self.id}, "
-            f"type=0x{self.packet_type:02X}, "
+            f"type=0x{self.packetType:02X}, "
             f"cmd=0x{self.command:02X}, "
             f"addr=0x{self.addr:02X}, "
             f"reserved=0x{self.reserved:02X}, "

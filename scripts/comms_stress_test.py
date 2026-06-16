@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Comms stress test for the MOTION Console module.
 
-This script is intentionally built on the same connection path as
-`scripts/test_console_comms.py` (via `MOTIONInterface.acquire_motion_interface()`),
-but runs a tight loop of command/response transactions to quantify:
+Runs a tight loop of command/response transactions over the standard
+`MotionInterface` connection path to quantify:
 
 - success/failure rate
 - round-trip latency distribution
@@ -34,7 +33,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from omotion.Interface import MOTIONInterface
+from omotion import MotionInterface
 
 
 logger = logging.getLogger("comms_stress_test")
@@ -229,12 +228,14 @@ def run() -> int:
     if args.sleep_ms < 0:
         raise SystemExit("--sleep-ms must be >= 0")
 
-    interface, console_connected, _left_sensor, _right_sensor = MOTIONInterface.acquire_motion_interface()
-    if not console_connected:
+    interface = MotionInterface()
+    interface.start()
+    if not interface.console.is_connected():
         print("Console Module not connected.")
+        interface.stop()
         return 2
 
-    console = interface.console_module
+    console = interface.console
     # Ensure console API calls respect the requested timeout.
     # The Console methods call `self.uart.send_packet(...)` without passing timeout,
     # so we wrap the instance method to inject `timeout=args.timeout`.
@@ -435,6 +436,7 @@ def run() -> int:
         if csv_file is not None:
             csv_file.flush()
             csv_file.close()
+        interface.stop()
 
     end_time = time.perf_counter()
     elapsed = end_time - start_time

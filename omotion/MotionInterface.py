@@ -48,10 +48,18 @@ class MotionInterface:
         timeout: int = 30,
         demo_mode: bool = False,
         default_trigger_config: Optional[dict] = None,
+        data_dir: Optional[str] = None,
+        scan_db_path: Optional[str] = None,
+        operator_id: Optional[str] = None,
     ):
         self.vid = vid
         self.sensor_pid = sensor_pid
         self.console_pid = console_pid
+
+        # SDK-level output config
+        self.data_dir = data_dir
+        self.scan_db_path = scan_db_path
+        self.operator_id = operator_id
 
         # Resolved default trigger config used by every workflow whose
         # request doesn't carry a ``trigger_config`` override. Stored
@@ -78,6 +86,7 @@ class MotionInterface:
         # dependencies at import time for users who only want device control.
         self._scan_workflow = None
         self._calibration_workflow = None
+        self._cq_workflow = None
         self._monitor: Optional[ConnectionMonitor] = None
         self._started = False
 
@@ -293,6 +302,22 @@ class MotionInterface:
         return self._calibration_workflow
 
     @property
+    def contact_quality_workflow(self):
+        """Lazy-loaded :class:`~omotion.ContactQualityWorkflow.ContactQualityWorkflow`.
+
+        Backed by the same :attr:`scan_workflow` instance so the CQ check
+        and normal scans share the scan-running lock — only one can be active
+        at a time.
+        """
+        if self._cq_workflow is None:
+            from omotion.ContactQualityWorkflow import ContactQualityWorkflow
+
+            self._cq_workflow = ContactQualityWorkflow(
+                scan_workflow=self.scan_workflow
+            )
+        return self._cq_workflow
+
+    @property
     def calibration_running(self) -> bool:
         return (
             self._calibration_workflow is not None
@@ -300,7 +325,11 @@ class MotionInterface:
         )
 
     def start_scan(self, request, **kwargs) -> bool:
-        return self.scan_workflow.start_scan(request, **kwargs)
+        # Storage routing is handled by the pipeline's auto-injected sinks
+        # (data_dir → CsvSink, scan_db_path → ScanDBSink). Unknown kwargs are
+        # silently dropped so legacy callers that still pass the old
+        # callback arguments don't hard-crash.
+        return self.scan_workflow.start_scan(request)
 
     def cancel_scan(self, **kwargs) -> None:
         self.scan_workflow.cancel_scan(**kwargs)
@@ -345,6 +374,22 @@ class MotionInterface:
 
     def cancel_configure_camera_sensors(self, **kwargs) -> None:
         self.scan_workflow.cancel_configure_camera_sensors(**kwargs)
+
+    def apply_laser_power(self, *, force_fault: bool = False, lock=None) -> bool:
+        """Write the laser-driver configuration to the console over I2C.
+
+        Required as a cold-start step: after a power-cycle the driver
+        registers are cleared, so the laser pulses produce no light until this
+        is applied. Call once after connecting and before any laser scan
+        (scan / contact-quality / calibration / test). Uses the SDK's bundled
+        laser params (see :mod:`omotion.laser`); ``force_fault=True`` loads the
+        safety-trip set for exercising the interlock. ``lock`` (anything with
+        ``lock()``/``unlock()``) is held for the duration of the writes — pass
+        a console mutex when calling from a multithreaded context. Returns True
+        on success.
+        """
+        from omotion.laser import apply_laser_power as _apply
+        return _apply(self.console, force_fault=force_fault, lock=lock)
 
     # ──────────────────────────────────────────────────────────────────
     # Logging helpers
