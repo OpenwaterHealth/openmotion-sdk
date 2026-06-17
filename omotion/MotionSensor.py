@@ -68,6 +68,8 @@ from omotion.config import (
     OW_CAMERA_POWER_STATUS,
     OW_CAMERA_READ_SECURITY_UID,
     OW_CMD_DFU,
+    OW_CMD_SERIAL,
+    is_valid_serial,
 )
 from omotion.i2c_packet import I2C_Packet
 from omotion.GitHubReleases import GitHubReleases
@@ -416,6 +418,57 @@ class MotionSensor(SignalWrapper):
             )
             return ver_str or "v0.0.0"
         return "v0.0.0"
+
+    def read_serial_number(self) -> str | None:
+        """Read the sensor module hardware serial number (None if unprogrammed/error)."""
+        try:
+            if self.demo_mode:
+                return "QWW04Q10003"
+            if not self.is_connected():
+                logger.error("Sensor Module not connected")
+                return None
+            r = self._send(packetType=OW_CMD, command=OW_CMD_SERIAL, reserved=0)
+            if r is None or r.packetType in _ERROR_TYPES:
+                logger.error("Error reading sensor serial number")
+                return None
+            if r.data_len == 0:
+                return None  # unprogrammed
+            return bytes(r.data[: r.data_len]).decode("ascii", errors="replace")
+        except Exception as e:
+            logger.error("read_serial_number failed: %s", e)
+            return None
+
+    def write_serial_number(self, serial: str, force: bool = False) -> bool:
+        """Write the sensor module hardware serial number.
+
+        Args:
+            serial: 1-24 uppercase-alphanumeric characters.
+            force: if False, refuses to overwrite an already-programmed serial.
+        Returns:
+            bool: True on ACK, False on NAK/error/invalid input.
+        """
+        if not is_valid_serial(serial):
+            logger.error("Invalid sensor serial %r (need 1-24 of [A-Z0-9])", serial)
+            return False
+        try:
+            if self.demo_mode:
+                return True
+            if not self.is_connected():
+                logger.error("Sensor Module not connected")
+                return False
+            r = self._send(
+                packetType=OW_CMD,
+                command=OW_CMD_SERIAL,
+                reserved=(2 if force else 1),
+                data=serial.encode("ascii"),
+            )
+            if r is None or r.packetType in _ERROR_TYPES:
+                logger.error("Sensor rejected serial write (already programmed? use force)")
+                return False
+            return True
+        except Exception as e:
+            logger.error("write_serial_number failed: %s", e)
+            return False
 
     def echo(self, echo_data=None) -> tuple[bytes, int]:
         """Send echo_data and return (echoed_bytes, length), or (None, None)."""
