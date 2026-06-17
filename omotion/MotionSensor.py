@@ -465,6 +465,18 @@ class MotionSensor(SignalWrapper):
             if r is None or r.packetType in _ERROR_TYPES:
                 logger.error("Sensor rejected serial write (already programmed? use force)")
                 return False
+
+            # Read-back verify. Guards against firmware that ACKs the command but
+            # doesn't persist it, so a write only reports success once the value
+            # is actually readable back.
+            readback = self.read_serial_number()
+            if readback != serial:
+                logger.error(
+                    "Sensor serial write not persisted (read back %r, expected %r); "
+                    "firmware may not support OW_CMD_SERIAL",
+                    readback, serial,
+                )
+                return False
             return True
         except Exception as e:
             logger.error("write_serial_number failed: %s", e)

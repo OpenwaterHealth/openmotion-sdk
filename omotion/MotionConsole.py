@@ -663,6 +663,19 @@ class MotionConsole(SignalWrapper):
             if r is None or r.packetType == OW_ERROR:
                 logger.error("Console rejected serial write (already programmed? use force)")
                 return False
+
+            # Read-back verify. Guards against firmware that ACKs the command but
+            # doesn't persist it — e.g. older builds without OW_CMD_SERIAL, which
+            # reply with a generic (non-error) packet. Without this check the write
+            # would look successful while nothing was stored.
+            readback = self.read_serial_number()
+            if readback != serial:
+                logger.error(
+                    "Console serial write not persisted (read back %r, expected %r); "
+                    "firmware may not support OW_CMD_SERIAL",
+                    readback, serial,
+                )
+                return False
             return True
         except Exception as e:
             self._log_command_error("write_serial_number", e)
