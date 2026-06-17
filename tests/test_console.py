@@ -412,19 +412,6 @@ def test_safety_interlock_clear(console):
     )
 
 
-# ===========================================================================
-# 2.11 DFU  — runs last (name sorts after all other tests)
-# ===========================================================================
-
-@pytest.mark.skip(reason="DFU temporarily disabled")
-@pytest.mark.destructive
-@pytest.mark.slow
-def test_z_enter_dfu(console):
-    """Enter DFU mode. Must run LAST — device re-enumerates after this."""
-    result = console.enter_dfu()
-    assert result is True
-
-
 def test_console_serial_roundtrip(console):
     original = console.read_serial_number()  # may be None on a fresh board
     try:
@@ -448,3 +435,16 @@ def test_console_serial_rejects_bad_input(console):
     before = console.read_serial_number()
     assert console.write_serial_number("bad-serial!", force=True) is False
     assert console.read_serial_number() == before
+
+
+# ===========================================================================
+# 2.11 DFU  — runs last (name sorts after all other tests)
+# ===========================================================================
+
+@pytest.mark.skip(reason="DFU temporarily disabled")
+@pytest.mark.destructive
+@pytest.mark.slow
+def test_z_enter_dfu(console):
+    """Enter DFU mode. Must run LAST — device re-enumerates after this."""
+    result = console.enter_dfu()
+    assert result is True

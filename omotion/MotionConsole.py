@@ -89,7 +89,7 @@ from omotion.CommandError import CommandError
 
 logger = logging.getLogger(f"{_log_root}.Console" if _log_root else "Console")
 
-_SERIAL_RE = re.compile(r"^[A-Z0-9]{1,24}$")
+_SERIAL_RE = re.compile(r"^[A-Z0-9]{1,24}\Z")
 
 
 def is_valid_console_serial(serial: str) -> bool:

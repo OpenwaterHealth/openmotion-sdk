@@ -7,6 +7,6 @@ pytestmark = pytest.mark.unit
 def test_valid_serials(s):
     assert is_valid_console_serial(s) is True
 
-@pytest.mark.parametrize("s", ["", "a" * 5, "AB-12", "ABC 12", "A" * 25, "ÀBC"])
+@pytest.mark.parametrize("s", ["", "a" * 5, "AB-12", "ABC 12", "A" * 25, "ÀBC", "ABC\n", "ABC\t"])
 def test_invalid_serials(s):
     assert is_valid_console_serial(s) is False
