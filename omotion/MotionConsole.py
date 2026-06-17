@@ -2,7 +2,6 @@ import logging
 import struct
 import json
 import os
-import re
 import threading
 import time
 from dataclasses import dataclass
@@ -34,6 +33,7 @@ from omotion.config import (
     OW_CMD,
     OW_CMD_SERIAL,
     OW_CMD_DFU,
+    is_valid_serial,
     OW_FPGA_PROG,
     OW_CMD_ECHO,
     OW_CMD_HWID,
@@ -89,12 +89,9 @@ from omotion.CommandError import CommandError
 
 logger = logging.getLogger(f"{_log_root}.Console" if _log_root else "Console")
 
-_SERIAL_RE = re.compile(r"^[A-Z0-9]{1,24}\Z")
-
-
-def is_valid_console_serial(serial: str) -> bool:
-    """True if serial is 1-24 uppercase-alphanumeric characters."""
-    return isinstance(serial, str) and bool(_SERIAL_RE.match(serial))
+# Backwards-compatible alias; the canonical validator now lives in
+# omotion.config.is_valid_serial (shared by console + sensor).
+is_valid_console_serial = is_valid_serial
 
 
 # --------------------------------------------------------------------------- #
