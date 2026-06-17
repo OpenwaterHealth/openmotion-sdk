@@ -444,6 +444,31 @@ def test_safety_interlock_clear(console):
     )
 
 
+def test_console_serial_roundtrip(console):
+    original = console.read_serial_number()  # may be None on a fresh board
+    try:
+        assert console.write_serial_number("QWW04Q10003", force=True) is True
+        assert console.read_serial_number() == "QWW04Q10003"
+
+        # Guarded write must be refused now that a serial exists.
+        assert console.write_serial_number("ZZZ99Z99999", force=False) is False
+        assert console.read_serial_number() == "QWW04Q10003"
+
+        # Force overwrite succeeds.
+        assert console.write_serial_number("ZZZ99Z99999", force=True) is True
+        assert console.read_serial_number() == "ZZZ99Z99999"
+    finally:
+        if original:
+            console.write_serial_number(original, force=True)
+
+
+def test_console_serial_rejects_bad_input(console):
+    # Invalid input is rejected client-side; stored serial is unchanged.
+    before = console.read_serial_number()
+    assert console.write_serial_number("bad-serial!", force=True) is False
+    assert console.read_serial_number() == before
+
+
 # ===========================================================================
 # 2.11 DFU  — runs last (name sorts after all other tests)
 # ===========================================================================

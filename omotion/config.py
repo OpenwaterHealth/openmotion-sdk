@@ -1,6 +1,15 @@
+import re
 from enum import IntEnum
 
 import numpy as np
+
+_SERIAL_RE = re.compile(r"^[A-Z0-9]{1,24}\Z")
+
+
+def is_valid_serial(serial: str) -> bool:
+    """True if serial is 1-24 uppercase-alphanumeric chars (console or sensor)."""
+    return isinstance(serial, str) and bool(_SERIAL_RE.match(serial))
+
 
 SERIAL_PORT = "COM24"  # Change this to your serial port
 BAUD_RATE = 921600
@@ -125,6 +134,7 @@ OW_CMD_VERSION = 0x02
 OW_CMD_ECHO = 0x03
 OW_CMD_TOGGLE_LED = 0x04
 OW_CMD_HWID = 0x05
+OW_CMD_SERIAL = 0x07
 OW_CMD_MESSAGES = 0x09
 OW_CMD_USR_CFG = 0x0A
 OW_CMD_DFU = 0x0D

@@ -31,7 +31,9 @@ from omotion.config import (
     FPGA_PROG_UFM_WRITE_PAGE,
     FPGA_PROG_UFM_WRITE_PAGES,
     OW_CMD,
+    OW_CMD_SERIAL,
     OW_CMD_DFU,
+    is_valid_serial,
     OW_FPGA_PROG,
     OW_CMD_ECHO,
     OW_CMD_HWID,
@@ -86,6 +88,11 @@ from omotion.Calibration import (
 from omotion.CommandError import CommandError
 
 logger = logging.getLogger(f"{_log_root}.Console" if _log_root else "Console")
+
+# Backwards-compatible alias; the canonical validator now lives in
+# omotion.config.is_valid_serial (shared by console + sensor).
+is_valid_console_serial = is_valid_serial
+
 
 # --------------------------------------------------------------------------- #
 # Dataclasses
@@ -586,6 +593,80 @@ class MotionConsole(SignalWrapper):
         except Exception as e:
             self._log_command_error("get_hardware_id", e)
             raise  # Re-raise the exception for the caller to handle
+
+    def read_serial_number(self) -> str | None:
+        """
+        Read the console hardware serial number from the external EEPROM.
+
+        Returns:
+            str: the serial (uppercase alphanumeric) if programmed,
+            None if unprogrammed or on error.
+        """
+        try:
+            if self.uart.demo_mode:
+                return "QWW04Q10003"
+
+            if not self.is_connected():
+                logger.error("Console Module not connected")
+                return None
+
+            r = self.uart.send_packet(
+                id=None, packetType=OW_CMD, command=OW_CMD_SERIAL, reserved=0
+            )
+            self.uart.clear_buffer()
+
+            if r is None or r.packetType == OW_ERROR:
+                logger.error("Error reading console serial number")
+                return None
+            if r.data_len == 0:
+                return None  # unprogrammed
+            return bytes(r.data[: r.data_len]).decode("ascii", errors="replace")
+        except ValueError as v:
+            logger.error("ValueError: %s", v)
+            raise
+        except Exception as e:
+            self._log_command_error("read_serial_number", e)
+            raise
+
+    def write_serial_number(self, serial: str, force: bool = False) -> bool:
+        """
+        Write the console hardware serial number to the external EEPROM.
+
+        Args:
+            serial: 1-24 uppercase-alphanumeric characters.
+            force: if False, the console refuses to overwrite an already-programmed
+                   serial (returns False). If True, it overwrites.
+
+        Returns:
+            bool: True on ACK, False on NAK/error/invalid input.
+        """
+        if not is_valid_console_serial(serial):
+            logger.error("Invalid console serial %r (need 1-24 of [A-Z0-9])", serial)
+            return False
+        try:
+            if self.uart.demo_mode:
+                return True
+
+            if not self.is_connected():
+                logger.error("Console Module not connected")
+                return False
+
+            r = self.uart.send_packet(
+                id=None,
+                packetType=OW_CMD,
+                command=OW_CMD_SERIAL,
+                reserved=(2 if force else 1),
+                data=serial.encode("ascii"),
+            )
+            self.uart.clear_buffer()
+
+            if r is None or r.packetType == OW_ERROR:
+                logger.error("Console rejected serial write (already programmed? use force)")
+                return False
+            return True
+        except Exception as e:
+            self._log_command_error("write_serial_number", e)
+            return False
 
     def enter_dfu(self) -> bool:
         """
@@ -3013,7 +3094,8 @@ class MotionConsole(SignalWrapper):
         try:
             fw_version = self.get_version()
             hw_id      = self.get_hardware_id()
-            logger.info("Console: firmware=%s  hw_id=%s", fw_version, hw_id)
+            serial = self.read_serial_number() or "unprogrammed"
+            logger.info("Console: firmware=%s  hw_id=%s  serial=%s", fw_version, hw_id, serial)
         except Exception as e:
             logger.warning("Console: failed to read device info: %s", e)
             return
