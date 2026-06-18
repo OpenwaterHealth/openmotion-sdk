@@ -22,6 +22,7 @@ from omotion.config import (
     OW_CMD,
     OW_CMD_ECHO,
     OW_CMD_HWID,
+    OW_CMD_I2C_REG_READ,
     OW_CMD_I2C_STATUS,
     OW_CMD_PING,
     OW_CMD_RESET,
