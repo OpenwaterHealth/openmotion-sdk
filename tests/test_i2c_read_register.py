@@ -44,7 +44,17 @@ def test_mux_channel_encoded_in_byte2():
     sensor = _make_sensor(_resp(b"\x00"))
     sensor.i2c_read_register(0x50, 0x05, mux_channel=3)
     data = bytes(sensor._send.call_args.kwargs["data"])
-    assert data[2] == 0x03
+    # Full-payload assertion: mux byte plus all other fields, so a byte
+    # transpose elsewhere is also caught.
+    assert data == bytes([0x50, 0x01, 0x03, 0x00, 0x05, 0x00, 0x01])
+
+
+def test_read_len_256_high_byte():
+    """The boundary value 256 must encode big-endian as [0x01, 0x00]."""
+    sensor = _make_sensor(_resp(b"\x00" * 256))
+    sensor.i2c_read_register(0x40, 0x00, read_len=256)
+    data = bytes(sensor._send.call_args.kwargs["data"])
+    assert data[5] == 0x01 and data[6] == 0x00
 
 
 def test_error_response_returns_false():
