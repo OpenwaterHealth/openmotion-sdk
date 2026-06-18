@@ -775,6 +775,66 @@ class MotionSensor(SignalWrapper):
                      [f"0x{b:02X}" for b in result])
         return result
 
+    def i2c_read_register(self, dev_addr: int, reg_addr: int, read_len: int = 1,
+                          reg_addr_size: int = 1,
+                          mux_channel: Optional[int] = None) -> bytes:
+        """Read register bytes from an arbitrary I2C device on the sensor bus.
+
+        Payload (7 bytes, big-endian):
+            [dev_addr, reg_addr_size, mux_channel,
+             reg_addr_hi, reg_addr_lo, read_len_hi, read_len_lo]
+        where ``mux_channel == 0xFF`` means "do not touch the TCA9548A mux".
+
+        Args:
+            dev_addr: 7-bit I2C device address (0x00-0x7F).
+            reg_addr: Register / memory address to read from.
+            read_len: Number of bytes to read (1-256).
+            reg_addr_size: Register address width in bytes: 1 (8-bit) or 2 (16-bit).
+            mux_channel: TCA9548A (0x70) channel 0-7 to select before reading,
+                or None to read a device directly on the bus.
+
+        Returns:
+            Bytes read from the device, or False on an error response.
+
+        Raises:
+            ValueError: On out-of-range arguments.
+            OWNotConnectedError, OWCommunicationError, OWDeviceError.
+        """
+        if not (0x00 <= dev_addr <= 0x7F):
+            raise ValueError(f"dev_addr must be 0x00-0x7F, got {dev_addr:#04x}")
+        if reg_addr_size not in (1, 2):
+            raise ValueError(f"reg_addr_size must be 1 or 2, got {reg_addr_size}")
+        max_reg = 0xFF if reg_addr_size == 1 else 0xFFFF
+        if not (0 <= reg_addr <= max_reg):
+            raise ValueError(
+                f"reg_addr 0x{reg_addr:X} does not fit in "
+                f"{reg_addr_size * 8}-bit address")
+        if not (1 <= read_len <= 256):
+            raise ValueError(f"read_len must be 1-256, got {read_len}")
+        if mux_channel is not None and not (0 <= mux_channel <= 7):
+            raise ValueError(f"mux_channel must be 0-7 or None, got {mux_channel}")
+
+        mux_byte = 0xFF if mux_channel is None else mux_channel
+        payload = bytearray([
+            dev_addr      & 0xFF,
+            reg_addr_size & 0xFF,
+            mux_byte      & 0xFF,
+            (reg_addr >> 8) & 0xFF,
+            reg_addr        & 0xFF,
+            (read_len >> 8) & 0xFF,
+            read_len        & 0xFF,
+        ])
+
+        r = self._send(packetType=OW_CMD, command=OW_CMD_I2C_REG_READ, data=payload)
+        if r.packetType in _ERROR_TYPES:
+            return False
+
+        result = bytes(r.data[:r.data_len]) if r.data and r.data_len else b""
+        logger.debug("i2c_read_register: addr=0x%02X reg=0x%X size=%d len=%d data=%s",
+                     dev_addr, reg_addr, reg_addr_size, len(result),
+                     [f"0x{b:02X}" for b in result])
+        return result
+
     def nvcm_check(self, isc_operand: int = 0x08, num_rows: int = 1,
                    boot_test: bool = True) -> bytes:
         """Probe the active camera's CrossLink NVCM state.
