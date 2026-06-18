@@ -485,7 +485,7 @@ class MotionInterface:
     def log_sensor_info(self, side: str) -> None:
         sensor = self.left if side == "left" else self.right if side == "right" else None
         if sensor and sensor.is_connected():
-            sensor.log_device_info()
+            sensor.log_device_info(label=side)
 
     @staticmethod
     def get_sdk_version() -> str:

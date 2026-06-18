@@ -1681,24 +1681,39 @@ class MotionSensor(SignalWrapper):
     # Lifecycle
     # ------------------------------------------------------------------
 
-    def log_device_info(self) -> None:
-        """Log sensor firmware version, hardware ID, and cached camera UIDs to the SDK logger."""
+    def log_device_info(self, label: str | None = None) -> None:
+        """Log a ``====``-guarded, side-labeled block with everything we need
+        to identify this sensor: firmware version, hardware ID, serial number,
+        and all 8 camera UIDs.
+
+        ``label`` is the side ("left"/"right") supplied by
+        :meth:`omotion.MotionInterface.log_sensor_info`; it tags the block so
+        the two sensors are distinguishable in the log. The whole block is
+        emitted as a single log record so it stays intact even when both
+        sensors log concurrently (camera UIDs that failed to read are shown
+        as ``<none>`` rather than dropped, so a dead camera stays visible).
+        """
+        title = (label or "sensor").upper()
         try:
             fw_version = self.get_version()
             hw_id      = self.get_cached_hardware_id() or self.get_hardware_id()
-            if self._cached_camera_uids:
-                uid_summary = ", ".join(
-                    f"cam{k}={v}" for k, v in sorted(self._cached_camera_uids.items()) if v
-                )
-            else:
-                uid_summary = "none cached"
-            serial = self.read_serial_number() or "unprogrammed"
-            logger.info(
-                "Sensor: firmware=%s  hw_id=%s  serial=%s  camera_uids=[%s]",
-                fw_version, hw_id, serial, uid_summary,
-            )
+            serial     = self.read_serial_number() or "unprogrammed"
+            uids       = self._cached_camera_uids or {}
+            rule = "=" * 60
+            lines = [
+                rule,
+                f"{title} SENSOR",
+                f"  firmware = {fw_version}",
+                f"  hw_id    = {hw_id}",
+                f"  serial   = {serial}",
+                "  camera UIDs:",
+            ]
+            for cam in range(8):
+                lines.append(f"    cam{cam} = {uids.get(cam) or '<none>'}")
+            lines.append(rule)
+            logger.info("\n".join(lines))
         except Exception as e:
-            logger.warning("Sensor: failed to read device info: %s", e)
+            logger.warning("%s sensor: failed to read device info: %s", title, e)
 
 # Note: graceful disconnect is now driven by ConnectionMonitor via
 # `request_disconnect()` (which submits an EVT_USER_STOP). The old
