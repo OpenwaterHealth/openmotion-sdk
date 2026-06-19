@@ -139,6 +139,13 @@ class ScanRequest:
     # resolved default (DEFAULT_TRIGGER_CONFIG ⊕ constructor override). A dict
     # here is shallow-merged on top (e.g. {"TriggerFrequencyHz": 20}).
     trigger_config: dict | None = None
+    # Called (with the exception) when the scan worker thread aborts AFTER
+    # start_scan returned True — e.g. a critical sink failing in on_scan_start
+    # because the scan DB became unwritable in the race window past the
+    # synchronous preflight. Lets the caller surface a failure that a return
+    # value can no longer carry. Fires on the worker thread, so the handler
+    # must be thread-safe. See bloodflow-app issue #213.
+    on_error: Callable[[BaseException], None] | None = None
 
 
 @dataclass
@@ -486,7 +493,17 @@ class ScanWorkflow:
                 # if the DB dies between this check and the worker start.)
                 try:
                     from omotion.ScanDatabase import ScanDatabase
-                    ScanDatabase(db_path=scan_db_path).close()
+                    _preflight_db = ScanDatabase(db_path=scan_db_path)
+                    try:
+                        # Opening a read-only DB succeeds (open never writes),
+                        # so probe a real write here — otherwise a read-only
+                        # file/dir slips through and the failure only surfaces
+                        # asynchronously on the first INSERT in the worker
+                        # thread, after the laser has fired. See bloodflow-app
+                        # issue #213.
+                        _preflight_db.assert_writable()
+                    finally:
+                        _preflight_db.close()
                 except Exception as exc:
                     logger.exception(
                         "start_scan: scan database pre-flight failed (%s) — "
@@ -710,6 +727,14 @@ class ScanWorkflow:
             except Exception as e:
                 logger.exception("ScanWorkflow worker raised")
                 self._last_scan_error = str(e) or type(e).__name__
+                # Notify the caller of an async start failure (start_scan
+                # already returned True, so the failure can't ride the return
+                # value). Guarded so a faulty handler can't break teardown.
+                if request.on_error is not None:
+                    try:
+                        request.on_error(e)
+                    except Exception:
+                        logger.exception("ScanRequest.on_error handler raised")
             finally:
                 if telemetry_writer is not None:
                     telemetry_writer.close()
