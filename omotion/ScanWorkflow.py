@@ -378,6 +378,7 @@ class ScanWorkflow:
         from omotion.pipeline.sinks import (
             CsvSink as PipelineCsvSink, DiagnosticsLogSink, ScanDBSink, ScanMetadata,
         )
+        from omotion.pipeline.async_sink import AsyncSink
         from omotion.pipeline.pedestal import SensorPedestals, pedestal_for_fw
 
         # Clear the prior scan's outcome up front so a refusal below (busy, or
@@ -479,8 +480,12 @@ class ScanWorkflow:
                     True if scan_db_path is None
                     else bool(request.write_corrected_csv)
                 )
+                # AsyncSink: run the CSV writes on a worker thread so a disk
+                # flush can't stall the runner's USB-drain loop and overflow
+                # the firmware histo queue (2026-06 soak root-cause).
                 default_sinks.append(
-                    PipelineCsvSink(output_dir=data_dir, write_corrected=write_corrected)
+                    AsyncSink(PipelineCsvSink(output_dir=data_dir,
+                                              write_corrected=write_corrected))
                 )
             if scan_db_path is not None:
                 # Pre-flight the scan DB before the laser fires. The DB is the
@@ -513,7 +518,11 @@ class ScanWorkflow:
                     with self._lock:
                         self._running = False
                     return False
-                default_sinks.append(ScanDBSink(db_path=scan_db_path))
+                # AsyncSink: keep the SQLite commit/fsync off the USB-drain
+                # thread. AsyncSink mirrors `critical`, so a DB on_scan_start
+                # failure still aborts the scan (and the pre-flight above
+                # already caught the common case with the laser off).
+                default_sinks.append(AsyncSink(ScanDBSink(db_path=scan_db_path)))
             # Telemetry CSV: per-scan snapshots from ConsoleTelemetryPoller.
             # Not a pipeline sink — the poller is its own daemon thread that
             # predates the sink-based architecture, so we register a listener

@@ -134,6 +134,27 @@ def test_live_usb_source_close_stops_event():
     assert src._stop.is_set()
 
 
+def test_batch_queue_depth_is_configurable():
+    """The parsed-batch buffer between the reader threads and the runner is
+    sized via batch_queue_size so a slow runner can't backpressure dev.read
+    too quickly (see the 2026-06 histo-drop soak)."""
+    src = LiveUsbSource(
+        console=None, left=None, right=None,
+        metadata=_meta(), batch_queue_size=32,
+    )
+    assert src._batch_queue.maxsize == 32
+
+
+def test_batch_queue_default_depth_is_deeper_than_legacy_four():
+    """Default buffer was 4 batches (~1 s); deepened so transient runner
+    stalls are absorbed instead of stalling the USB drain."""
+    src = LiveUsbSource(
+        console=None, left=None, right=None,
+        metadata=_meta(),
+    )
+    assert src._batch_queue.maxsize >= 16
+
+
 def test_live_usb_source_reader_loop_builds_batches_from_packet_queue(monkeypatch):
     """Mock parse_histogram_stream to feed fake samples; verify _reader_loop
     accumulates them into FrameBatches and pushes to the batch queue."""

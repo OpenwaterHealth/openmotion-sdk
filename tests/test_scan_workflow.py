@@ -125,7 +125,10 @@ def test_start_scan_auto_injects_csv_sink_when_data_dir_set(tmp_path):
         left_camera_mask=0xFF, right_camera_mask=0, reduced_mode=False,
     )
     motion.scan_workflow.start_scan(request)
-    csv_sinks = [s for s in motion.scan_workflow._runner.sinks if isinstance(s, CsvSink)]
+    # Storage sinks are AsyncSink-wrapped (decoupled from the USB-drain
+    # thread); unwrap to assert on the concrete sink type.
+    csv_sinks = [s for s in motion.scan_workflow._runner.sinks
+                 if isinstance(getattr(s, "wrapped", s), CsvSink)]
     assert len(csv_sinks) == 1
 
 
@@ -137,7 +140,8 @@ def test_start_scan_skips_csv_sink_when_data_dir_none():
         left_camera_mask=0xFF, right_camera_mask=0, reduced_mode=False,
     )
     motion.scan_workflow.start_scan(request)
-    csv_sinks = [s for s in motion.scan_workflow._runner.sinks if isinstance(s, CsvSink)]
+    csv_sinks = [s for s in motion.scan_workflow._runner.sinks
+                 if isinstance(getattr(s, "wrapped", s), CsvSink)]
     assert csv_sinks == []
 
 
@@ -150,7 +154,8 @@ def test_start_scan_skips_default_storage_when_request_opts_out(tmp_path):
         skip_default_storage=True,
     )
     motion.scan_workflow.start_scan(request)
-    assert all(not isinstance(s, CsvSink) for s in motion.scan_workflow._runner.sinks)
+    assert all(not isinstance(getattr(s, "wrapped", s), CsvSink)
+               for s in motion.scan_workflow._runner.sinks)
 
 
 def test_start_scan_does_not_auto_wire_pipeline_telemetry_source():

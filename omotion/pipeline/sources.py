@@ -195,6 +195,7 @@ class LiveUsbSource(_BaseSource):
                  batch_size_frames: int = 10,
                  flush_interval_s: float = 0.25,
                  packet_queue_size: int = 64,
+                 batch_queue_size: int = 16,
                  metadata: ScanMetadata):
         super().__init__(metadata=metadata)
         self._console = console
@@ -205,7 +206,14 @@ class LiveUsbSource(_BaseSource):
             side: queue.Queue(maxsize=packet_queue_size)
             for side, sensor in self._sensors.items() if sensor is not None
         }
-        self._batch_queue: queue.Queue = queue.Queue(maxsize=4)
+        # Parsed-batch buffer between the per-side reader threads and the
+        # runner. Was a hardcoded 4 (~1 s at the 0.25 s flush cadence); a
+        # transient runner stall (sink fsync, GC) then filled it in ~1 s and
+        # backpressured the parser -> dev.read -> the firmware's 4-deep histo
+        # queue overflowed and dropped frames. Deepened (and made tunable) so
+        # brief stalls are absorbed here instead of on the USB path. See the
+        # 2026-06 long-scan soak root-cause + AsyncSink.
+        self._batch_queue: queue.Queue = queue.Queue(maxsize=max(1, int(batch_queue_size)))
         self._stop = threading.Event()
         self._reader_threads: list[threading.Thread] = []
 
