@@ -14,10 +14,14 @@ See docs/SciencePipeline.md §3 (unwrapping) and §4 (classification).
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 
 from ..batch import FrameBatch
 
+
+logger = logging.getLogger("openmotion.sdk.pipeline.stages.frame_classification")
 
 _FRAME_ID_MODULUS = 256
 _FRAME_ROLLOVER_THRESHOLD = 128
@@ -85,6 +89,13 @@ class FrameClassificationStage:
         self.discard_count = int(discard_count)
         self.dark_interval = int(dark_interval)
         self._unwrappers: dict[tuple[int, int], _FrameUnwrapper] = {}
+        # Per-(side, cam) count of stale/non-monotonic frames dropped this
+        # scan. A non-zero count is a hardware-health signal — the sensor
+        # shipped a leftover/garbage frame (e.g. unflushed histogram buffer)
+        # that we excluded. First occurrence per camera is logged live; the
+        # totals are summarised at on_scan_stop.
+        self._stale_counts: dict[tuple[int, int], int] = {}
+        self._stale_logged: set[tuple[int, int]] = set()
 
     def process(self, batch: FrameBatch) -> FrameBatch:
         n = batch.frame_ids.shape[0]
@@ -113,8 +124,12 @@ class FrameClassificationStage:
                 # histogram buffer at scan start or a mid-scan counter blip).
                 # Excluded downstream so it can't poison dark/timestamp align.
                 types[i] = "stale"
+                self._note_stale(side_idx, cam_id, raw_id,
+                                 "non-monotonic frame id (backward/duplicate)")
             elif unwrapper.first_was_stale and abs_id == raw_id:
                 types[i] = "stale"
+                self._note_stale(side_idx, cam_id, raw_id,
+                                 "leading stale frame (stream did not start at 1)")
             elif abs_id <= self.discard_count:
                 types[i] = "warmup"
             elif self._is_dark(abs_id):
@@ -125,6 +140,37 @@ class FrameClassificationStage:
         batch.abs_frame_ids = abs_ids
         batch.frame_type = types
         return batch
+
+    def _note_stale(self, side_idx: int, cam_id: int, raw_id: int,
+                    reason: str) -> None:
+        """Count a dropped stale frame and log the first one per camera."""
+        key = (side_idx, cam_id)
+        self._stale_counts[key] = self._stale_counts.get(key, 0) + 1
+        if key not in self._stale_logged:
+            self._stale_logged.add(key)
+            logger.warning(
+                "dropping stale frame: side=%d cam=%d raw_frame_id=%d — %s; "
+                "excluded so it can't desync the dark/timestamp schedule. "
+                "Likely an unflushed sensor histogram buffer "
+                "(leftover/duplicate frame); per-camera totals at scan stop.",
+                side_idx, cam_id, raw_id, reason,
+            )
+
+    def on_scan_stop(self, batch: FrameBatch) -> None:
+        """End-of-scan summary of stale/non-monotonic frames dropped.
+
+        A non-zero count means the sensor shipped leftover/garbage frames
+        (e.g. an unflushed histogram buffer) that were excluded to protect
+        the dark/timestamp alignment — a hardware-health signal worth
+        surfacing even when the per-scan damage was contained."""
+        total = sum(self._stale_counts.values())
+        if total:
+            per_cam = {f"s{s}c{c}": n
+                       for (s, c), n in sorted(self._stale_counts.items())}
+            logger.warning(
+                "Scan summary: dropped %d stale/non-monotonic frame(s) across "
+                "%d camera(s): %s", total, len(self._stale_counts), per_cam,
+            )
 
     def _is_dark(self, abs_id: int) -> bool:
         """Per SciencePipeline.md §4.2:
@@ -138,3 +184,5 @@ class FrameClassificationStage:
 
     def reset(self) -> None:
         self._unwrappers.clear()
+        self._stale_counts.clear()
+        self._stale_logged.clear()
