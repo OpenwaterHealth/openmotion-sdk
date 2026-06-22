@@ -1,17 +1,18 @@
+"""Sensor command/response transport — USB-bulk interface 0.
+
+The threading, framing and dispatch live in :class:`omotion.packet_transport.PacketTransport`;
+this class only supplies the USB-specific raw I/O (bulk read/write with libusb
+error handling), interface claim, and a synchronous send path used by tests.
+"""
 import logging
-import omotion.config as config
-from omotion.UartPacket import UartPacket
-from omotion.config import (
-    OW_ACK,
-    OW_CMD_NOP,
-    OW_END_BYTE,
-)
-from omotion.framing import emit_log_packet, extract_frame, is_log_packet
+import time
+
 import usb.core
 import usb.util
-import time
-import threading
-import queue
+
+from omotion.UartPacket import UartPacket
+from omotion.config import OW_ACK, OW_CMD_NOP, OW_END_BYTE
+from omotion.packet_transport import PacketTransport
 from omotion.USBInterfaceBase import USBInterfaceBase
 from omotion import _log_root
 
@@ -19,87 +20,19 @@ logger = logging.getLogger(
     f"{_log_root}.CommInterface" if _log_root else "CommInterface"
 )
 
-_PACKET_TYPE_NAMES = {
-    value: name
-    for name, value in vars(config).items()
-    if name.startswith("OW_") and name.isupper() and isinstance(value, int)
-}
-_CMD_NAMES = {
-    "OW_CMD": {
-        value: name
-        for name, value in vars(config).items()
-        if name.startswith("OW_CMD_")
-    },
-    "OW_CONTROLLER": {
-        value: name
-        for name, value in vars(config).items()
-        if name.startswith("OW_CTRL_")
-    },
-    "OW_FPGA": {
-        value: name
-        for name, value in vars(config).items()
-        if name.startswith("OW_FPGA_")
-    },
-    "OW_CAMERA": {
-        value: name
-        for name, value in vars(config).items()
-        if name.startswith("OW_CAMERA_")
-    },
-    "OW_IMU": {
-        value: name
-        for name, value in vars(config).items()
-        if name.startswith("OW_IMU_")
-    },
-}
-
-
-def _format_named(value: int, name_map: dict[int, str], width: int = 2) -> str:
-    name = name_map.get(value)
-    if name:
-        return f"{name}(0x{value:0{width}X})"
-    return f"0x{value:0{width}X}"
-
 
 # =========================================
 # Comm Interface (IN + OUT + threads)
 # =========================================
-class CommInterface(USBInterfaceBase):
+class CommInterface(PacketTransport, USBInterfaceBase):
     def __init__(self, dev, interface_index, desc="Comm", async_mode=False):
-        super().__init__(dev, interface_index, desc)
-        self.read_thread = None
-        self.stop_event = threading.Event()
-        # Set by the read loop when it exits on a fatal USB error
-        # (ENODEV / EIO / EPIPE / other non-timeout failures). send_packet
-        # polls it inside the wait loops so an in-flight command unblocks
-        # the moment the transport drops, instead of spinning for the full
-        # caller-supplied timeout (60 s for program_fpga, etc.). See
-        # bloodflow-app#130: power-cycle mid-configure left the SDK's
-        # configure worker hung for 60 s, blocking the next scan attempt.
-        self._transport_down_evt = threading.Event()
-        # Contiguous byte buffer: USB reader extends the end, packet parser chops from the front
-        self._read_buffer = bytearray()
-        self._buffer_lock = threading.Lock()
-        self._buffer_condition = threading.Condition(self._buffer_lock)
-        self.packet_count = 0
-        self.async_mode = async_mode
-        # Callback invoked once when the read loop sees a fatal USB error
-        # (e.g. ENODEV, EIO, EPIPE). The owning MotionSensor wires this to
-        # submit an EVT_IO_ERROR to the ConnectionMonitor, which then drives
-        # the handle's state machine. The single-event-queue design means we
-        # don't need the previous _disconnect_notified flag or the daemon-
-        # thread dispatch hack that worked around join-self deadlocks.
-        self.on_io_error = None
-        self._io_lock = threading.RLock()
-        self._send_lock = threading.Lock()
-        if self.async_mode:
-            self.response_queue = queue.Queue()
-            self.response_thread = threading.Thread(
-                target=self._process_responses, daemon=True
-            )
-            self.response_thread.start()
+        USBInterfaceBase.__init__(self, dev, interface_index, desc)
+        PacketTransport.__init__(
+            self, desc=desc, async_mode=async_mode, default_timeout=10.0
+        )
 
     def claim(self):
-        super().claim()
+        USBInterfaceBase.claim(self)
         intf = self.dev.get_active_configuration()[(self.interface_index, 0)]
         self.ep_out = usb.util.find_descriptor(
             intf,
@@ -110,96 +43,23 @@ class CommInterface(USBInterfaceBase):
         if not self.ep_out:
             raise RuntimeError(f"{self.desc}: No OUT endpoint found")
 
-    def send_packet(
-        self,
-        id=None,
-        packetType=OW_ACK,
-        command=OW_CMD_NOP,
-        addr=0,
-        reserved=0,
-        data=None,
-        timeout=10.0,
-        max_retries=0,
-    ) -> UartPacket:
-        with self._send_lock:
-            if id is None:
-                self.packet_count = (self.packet_count + 1) & 0xFFFF or 1
-                id = self.packet_count
+    # ────────────────────────────────────────────────────────────────────
+    # Raw byte I/O for the shared transport engine
+    # ────────────────────────────────────────────────────────────────────
 
-            if data:
-                if not isinstance(data, (bytes, bytearray)):
-                    raise ValueError("Data must be bytes or bytearray")
-                payload = data
-            else:
-                payload = b""
-
-            uart_packet = UartPacket(
-                id=id,
-                packetType=packetType,
-                command=command,
-                addr=addr,
-                reserved=reserved,
-                data=payload,
+    def _raw_read(self) -> bytes:
+        try:
+            data = self.dev.read(
+                self.ep_in.bEndpointAddress, self.ep_in.wMaxPacketSize, timeout=100
             )
+        except usb.core.USBError as e:
+            if e.errno in (110, 10060):  # ETIMEDOUT / WSAETIMEDOUT — idle window
+                return b""
+            raise  # ENODEV / EIO / EPIPE / etc. — fatal, reader loop handles it
+        return bytes(data) if data else b""
 
-            tx_bytes = uart_packet.to_bytes()
-            packet_type_name = _PACKET_TYPE_NAMES.get(packetType)
-            cmd_names = _CMD_NAMES.get(packet_type_name, {})
-            logger.debug(
-                f"{self.desc}: TX id=0x{id:04X} "
-                f"type={_format_named(packetType, _PACKET_TYPE_NAMES)} "
-                f"cmd={_format_named(command, cmd_names)} "
-                f"addr=0x{addr:02X} reserved=0x{reserved:02X} len={len(payload)} data={tx_bytes.hex()}"
-            )
-
-            self.write(tx_bytes)
-            time.sleep(0.0005)
-
-            if not self.async_mode:
-                start = time.monotonic()
-                data = bytearray()
-                with self._io_lock:
-                    while time.monotonic() - start < timeout:
-                        if self._transport_down_evt.is_set():
-                            raise ConnectionError(
-                                f"{self.desc}: transport down, packet id "
-                                f"0x{id:04X} not deliverable"
-                            )
-                        try:
-                            resp = self.receive()
-                            time.sleep(0.005)
-                            if resp:
-                                data.extend(resp)
-                                if data and data[-1] == OW_END_BYTE:
-                                    return UartPacket(buffer=data)
-                        except usb.core.USBError:
-                            continue
-                last_error = TimeoutError("No response")
-            else:
-                start_time = time.monotonic()
-                while time.monotonic() - start_time < timeout:
-                    if self._transport_down_evt.is_set():
-                        raise ConnectionError(
-                            f"{self.desc}: transport down, packet id "
-                            f"0x{id:04X} not deliverable"
-                        )
-                    if self.response_queue.empty():
-                        time.sleep(0.0005)
-                    else:
-                        time.sleep(0.001)
-                        pkt = self.response_queue.get()
-                        if pkt.id != id:
-                            logger.warning(
-                                "%s: discarding stale response id=0x%04X (expected 0x%04X)",
-                                self.desc, pkt.id, id,
-                            )
-                            continue
-                        return pkt
-                raise TimeoutError(f"No response in async mode, packet id 0x{id:04X}")
-
-    def clear_buffer(self):
-        with self._buffer_lock:
-            self._read_buffer.clear()
+    def _raw_write(self, data) -> None:
+        self.write(data)
 
     def write(self, data, timeout=100, _retries=5):
         with self._io_lock:
@@ -224,7 +84,7 @@ class CommInterface(USBInterfaceBase):
                     # A stalled endpoint (EPIPE / broken-pipe) can be recovered by
                     # issuing a CLEAR_HALT control transfer.  Try once; if it works
                     # re-send the original data.  Any other USB error is re-raised
-                    # so callers and _read_loop disconnect logic see it normally.
+                    # so callers and the reader loop disconnect logic see it normally.
                     if e.errno in (32, -9):  # EPIPE on Linux; LIBUSB_ERROR_PIPE cross-platform
                         logger.warning("%s: OUT endpoint stalled, attempting clear_halt", self.desc)
                         try:
@@ -240,101 +100,51 @@ class CommInterface(USBInterfaceBase):
             logger.debug(f"Received {len(data)} bytes.")
             return data
 
-    def start_read_thread(self):
-        if self.read_thread and self.read_thread.is_alive():
-            logger.info(f"{self.desc}: Read thread already running")
-            return
-        self.stop_event.clear()
-        # Fresh read thread implies transport is up again; any prior
-        # transport-down latch from a previous USB error must clear or
-        # subsequent sends would short-circuit on the stale flag.
-        self._transport_down_evt.clear()
-        self.read_thread = threading.Thread(target=self._read_loop, daemon=True)
-        self.read_thread.start()
-        logger.info(f"{self.desc}: Read thread started")
+    # ────────────────────────────────────────────────────────────────────
+    # Send: async path is inherited; sync path (legacy / tested) lives here
+    # because it reads raw USB chunks until the end byte.
+    # ────────────────────────────────────────────────────────────────────
 
-    def stop_read_thread(self):
-        """Signal the read loop to exit and join it (unless we're being
-        called from the read thread itself, in which case the caller is
-        already on its way out)."""
-        self.stop_event.set()
-        rt = self.read_thread
-        if rt is not None and threading.current_thread() is not rt:
-            rt.join(timeout=2.0)
-        logger.info(f"{self.desc}: Read thread stopped")
-
-    def _notify_io_error(self, error):
-        """Invoke the io-error callback exactly once per read-loop exit.
-
-        The state-machine on the owning handle dedups further events that
-        arrive while the handle is already in DISCONNECTING, so we don't
-        need a flag here — the queue serializes everything."""
-        cb = self.on_io_error
-        if cb is None:
-            return
-        errno = getattr(error, "errno", None)
-        try:
-            cb(errno, str(error))
-        except Exception as e:
-            logger.warning("on_io_error callback raised: %s", e)
-
-    def _read_loop(self):
-        while not self.stop_event.is_set():
-            try:
-                data = self.dev.read(
-                    self.ep_in.bEndpointAddress, self.ep_in.wMaxPacketSize, timeout=100
-                )
-                if data:
-                    data_bytes = bytes(data)
-                    with self._buffer_condition:
-                        self._read_buffer.extend(data_bytes)
-                        self._buffer_condition.notify()
-                    logger.debug(f"Read {len(data)} bytes.")
-                time.sleep(0.001)
-            except usb.core.USBError as e:
-                # During an intentional shutdown the read loop will see USB
-                # errors as the transport is closed; suppress them silently.
-                if self.stop_event.is_set():
-                    break
-                if e.errno in (110, 10060):
-                    # Read timeout — no data this window. Keep looping.
-                    continue
-                # errno 32 = EPIPE (stalled/disconnected endpoint)
-                # errno 19 = ENODEV (device unplugged)
-                # errno  5 = EIO (device I/O error)
-                # Any other USB error we treat the same way: notify the
-                # owning handle and exit. The handle's state machine
-                # decides how to react (transition to DISCONNECTING,
-                # release resources). Logging the disconnect once at the
-                # state-machine level avoids the historical duplicate-log
-                # spam from multiple disconnect paths racing.
-                logger.warning(
-                    f"{self.desc}: USB read error (errno={e.errno}); exiting read loop: {e}"
-                )
-                # Latch transport-down BEFORE the io-error callback so any
-                # send_packet that is currently spinning in its wait loop
-                # observes the dead transport on its next tick.
-                self._transport_down_evt.set()
-                self._notify_io_error(e)
-                break
-
-    def _process_responses(self):
-        while not self.stop_event.is_set():
-            with self._buffer_condition:
-                if not self._read_buffer:
-                    self._buffer_condition.wait(timeout=0.1)
-                    continue
-                # Carve one complete frame off the front (resyncs past garbage).
-                frame = extract_frame(self._read_buffer)
-            if frame is None:
-                continue  # partial frame — wait for the reader to add more
-            try:
-                uart_packet = UartPacket(buffer=frame)
-            except ValueError:
-                continue  # bad CRC / malformed — drop it
-            # Unsolicited firmware log packets are surfaced and dropped; only
-            # real command responses go to the queue for send_packet to match.
-            if is_log_packet(uart_packet):
-                emit_log_packet(uart_packet, self.desc)
-            else:
-                self.response_queue.put(uart_packet)
+    def send_packet(
+        self,
+        id=None,
+        packetType=OW_ACK,
+        command=OW_CMD_NOP,
+        addr=0,
+        reserved=0,
+        data=None,
+        timeout=10.0,
+        max_retries=0,
+    ) -> UartPacket:
+        if self.async_mode:
+            return super().send_packet(
+                id=id, packetType=packetType, command=command, addr=addr,
+                reserved=reserved, data=data, timeout=timeout, max_retries=max_retries,
+            )
+        # Synchronous path: accumulate raw reads until the END byte. Polls
+        # _transport_down_evt so an in-flight send unblocks if the link drops.
+        with self._send_lock:
+            id, tx = self._build_packet(id, packetType, command, addr, reserved, data)
+            self.write(tx)
+            time.sleep(0.0005)
+            start = time.monotonic()
+            buf = bytearray()
+            with self._io_lock:
+                while time.monotonic() - start < timeout:
+                    if self._transport_down_evt.is_set():
+                        raise ConnectionError(
+                            f"{self.desc}: transport down, packet id 0x{id:04X} "
+                            "not deliverable"
+                        )
+                    try:
+                        resp = self.receive()
+                        time.sleep(0.005)
+                        if resp:
+                            buf.extend(resp)
+                            if buf and buf[-1] == OW_END_BYTE:
+                                return UartPacket(buffer=buf)
+                    except usb.core.USBError:
+                        continue
+            raise TimeoutError(
+                f"{self.desc}: no response (sync) for packet id 0x{id:04X}"
+            )
