@@ -24,7 +24,25 @@ _FRAME_ROLLOVER_THRESHOLD = 128
 
 
 class _FrameUnwrapper:
-    """8-bit rolling → monotonic. One instance per (side, cam_id)."""
+    """8-bit rolling → monotonic. One instance per (side, cam_id).
+
+    Robust against a non-monotonic frame stream. The sensor occasionally
+    emits stale/garbage frames — leftover buffer contents at scan start
+    (e.g. raw 1, 255, 173, 4, 5 …) or a mid-scan counter blip — when its
+    histogram DMA buffer isn't flushed. The old unwrapper trusted every
+    frame after the first, so a backward-looking value (255 after 1) was
+    read as a huge forward jump and the next real frame (4) tripped the
+    rollover test, injecting a permanent +256 epoch offset that shifted the
+    whole positional dark/warmup schedule for the rest of the scan.
+
+    Now each frame is gated by its *signed* 8-bit step from the last
+    accepted frame: only forward steps (1..127) advance state; a backward
+    or duplicate step (<= 0) is rejected as stale and does NOT advance the
+    counter, so isolated garbage frames can't corrupt the epoch. The 8-bit
+    counter can't disambiguate a genuine forward gap > 127 frames (a >3.2 s
+    intra-scan dropout) from a backward step; such ambiguous frames are
+    rejected — that data is already lost in a gap that large.
+    """
 
     __slots__ = ("epoch", "last_raw", "seen_first", "first_was_stale")
 
@@ -34,18 +52,30 @@ class _FrameUnwrapper:
         self.seen_first = False
         self.first_was_stale = False
 
-    def unwrap(self, raw_frame_id: int) -> int:
+    def unwrap(self, raw_frame_id: int) -> tuple[int, bool]:
+        """Return (abs_frame_id, accepted).
+
+        accepted=False marks a stale/non-monotonic frame: the abs_id is
+        advisory only and the unwrapper state is left untouched so the
+        next genuine frame resumes the sequence cleanly.
+        """
         if not self.seen_first:
             self.seen_first = True
             self.first_was_stale = (raw_frame_id != 1)
             self.last_raw = raw_frame_id
-            return raw_frame_id
+            return raw_frame_id, True
 
-        delta = (raw_frame_id - self.last_raw) & 0xFF
-        if delta <= _FRAME_ROLLOVER_THRESHOLD and raw_frame_id < self.last_raw:
+        # Signed step in [-128, 127]: positive = forward, <= 0 = backward
+        # (stale leftover) or duplicate.
+        step = ((raw_frame_id - self.last_raw + 128) & 0xFF) - 128
+        if step <= 0:
+            return self.epoch * _FRAME_ID_MODULUS + raw_frame_id, False
+
+        # Forward step (1..127). A wrap shows up as raw <= last_raw.
+        if raw_frame_id <= self.last_raw:
             self.epoch += 1
         self.last_raw = raw_frame_id
-        return self.epoch * _FRAME_ID_MODULUS + raw_frame_id
+        return self.epoch * _FRAME_ID_MODULUS + raw_frame_id, True
 
 
 class FrameClassificationStage:
@@ -75,10 +105,15 @@ class FrameClassificationStage:
                 unwrapper = _FrameUnwrapper()
                 self._unwrappers[key] = unwrapper
 
-            abs_id = unwrapper.unwrap(raw_id)
+            abs_id, accepted = unwrapper.unwrap(raw_id)
             abs_ids[i] = abs_id
 
-            if unwrapper.first_was_stale and abs_id == raw_id:
+            if not accepted:
+                # Non-monotonic / stale leftover frame (e.g. unflushed
+                # histogram buffer at scan start or a mid-scan counter blip).
+                # Excluded downstream so it can't poison dark/timestamp align.
+                types[i] = "stale"
+            elif unwrapper.first_was_stale and abs_id == raw_id:
                 types[i] = "stale"
             elif abs_id <= self.discard_count:
                 types[i] = "warmup"
