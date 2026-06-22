@@ -18,7 +18,7 @@ channel without colliding with responses — the reason the sensor tolerated
 firmware printf long before the console did.
 
 Subclasses implement ``_raw_read()`` / ``_raw_write()`` plus their own
-open/close, and may override the throttle hooks to pace commands.
+open/close.
 """
 from __future__ import annotations
 
@@ -225,42 +225,30 @@ class PacketTransport:
         """
         timeout = self.default_timeout if timeout is None else timeout
         with self._send_lock:
-            self._pace_before_send()
-            try:
-                id, tx = self._build_packet(id, packetType, command, addr, reserved, data)
-                self._raw_write(tx)
-                time.sleep(0.0005)
-                start = time.monotonic()
-                while time.monotonic() - start < timeout:
-                    if self._transport_down_evt.is_set():
-                        raise ConnectionError(
-                            f"{self.desc}: transport down, packet id 0x{id:04X} "
-                            "not deliverable"
-                        )
-                    try:
-                        resp = self.response_queue.get(timeout=0.02)
-                    except queue.Empty:
-                        continue
-                    if resp.id != id:
-                        logger.warning(
-                            "%s: discarding stale response id=0x%04X (expected 0x%04X)",
-                            self.desc, resp.id, id,
-                        )
-                        continue
-                    return resp
-                raise TimeoutError(
-                    f"{self.desc}: no response for packet id 0x{id:04X}"
-                )
-            finally:
-                self._mark_send_done()
-
-    def _pace_before_send(self) -> None:
-        """Hook (called holding the send lock): subclasses may throttle the
-        command rate. Default: no throttling."""
-
-    def _mark_send_done(self) -> None:
-        """Hook (called holding the send lock): subclasses may record the
-        send-completion time for rate throttling. Default: no-op."""
+            id, tx = self._build_packet(id, packetType, command, addr, reserved, data)
+            self._raw_write(tx)
+            time.sleep(0.0005)
+            start = time.monotonic()
+            while time.monotonic() - start < timeout:
+                if self._transport_down_evt.is_set():
+                    raise ConnectionError(
+                        f"{self.desc}: transport down, packet id 0x{id:04X} "
+                        "not deliverable"
+                    )
+                try:
+                    resp = self.response_queue.get(timeout=0.02)
+                except queue.Empty:
+                    continue
+                if resp.id != id:
+                    logger.warning(
+                        "%s: discarding stale response id=0x%04X (expected 0x%04X)",
+                        self.desc, resp.id, id,
+                    )
+                    continue
+                return resp
+            raise TimeoutError(
+                f"{self.desc}: no response for packet id 0x{id:04X}"
+            )
 
     def clear_buffer(self) -> None:
         """Drop any partially-received frame. Safe to call from any thread —

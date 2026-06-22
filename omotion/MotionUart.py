@@ -14,7 +14,6 @@ machine can transition out of CONNECTED.
 from __future__ import annotations
 
 import logging
-import time
 from typing import Callable, Optional
 
 import serial
@@ -34,12 +33,6 @@ logger = logging.getLogger(f"{_log_root}.UART" if _log_root else "UART")
 _READER_TIMEOUT_S = 0.1
 # Default per-command response timeout for the console (preserves prior behavior).
 _CONSOLE_CMD_TIMEOUT_S = 20.0
-# Minimum gap between the previous response and the next command. The console
-# firmware re-arms its CDC OUT reception only after sending each response, so a
-# command that arrives in the ~10 ms window before that is silently dropped.
-# Pacing here (rather than retrying) avoids re-applying non-idempotent commands.
-# The old synchronous reader paced this implicitly via its ~100 ms read loop.
-_MIN_CMD_INTERVAL_S = 0.015
 
 
 class MotionUart(PacketTransport):
@@ -67,7 +60,6 @@ class MotionUart(PacketTransport):
         self.demo_mode = demo_mode
         self.descriptor = desc
         self.serial: Optional[serial.Serial] = None
-        self._last_cmd_ts = 0.0
 
     # ────────────────────────────────────────────────────────────────────
     # Lifecycle (driven by MotionConsole state machine)
@@ -158,17 +150,6 @@ class MotionUart(PacketTransport):
                 id=0, packetType=OW_ERROR, command=0, addr=0, reserved=0, data=[]
             )
         return super().send_packet(*args, **kwargs)
-
-    # Throttle hooks (called by PacketTransport.send_packet holding the send
-    # lock) — keep at least _MIN_CMD_INTERVAL_S between the previous response
-    # and the next command so the firmware's CDC RX has re-armed.
-    def _pace_before_send(self) -> None:
-        wait = self._last_cmd_ts + _MIN_CMD_INTERVAL_S - time.monotonic()
-        if wait > 0:
-            time.sleep(wait)
-
-    def _mark_send_done(self) -> None:
-        self._last_cmd_ts = time.monotonic()
 
     def print(self) -> None:
         logger.info("    Serial Port: %s", self.port)
