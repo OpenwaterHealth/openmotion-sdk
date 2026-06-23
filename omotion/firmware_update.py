@@ -3,9 +3,21 @@ download, and a thin DFU flash orchestrator. UI-agnostic (no Qt)."""
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
+from typing import Callable
+
+from omotion.GitHubReleases import GitHubReleases
+from omotion.DFUProgrammer import DFUProgrammer, DFUProgress, DFUResult
+
+# ---------------------------------------------------------------------------
+# Version parsing
+# ---------------------------------------------------------------------------
 
 # Matches a leading MAJOR.MINOR.PATCH, tolerating a leading "v" and any
-# pre-release/build/git-describe suffix. Mirrors MotionSensor._VERSION_RE.
+# pre-release/build/git-describe suffix. Shared with MotionSensor (which
+# re-imports parse_version).
 _VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)")
 
 
@@ -35,14 +47,8 @@ def is_update_available(installed: str, latest: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Task 3: FirmwareKind, LatestInfo, check_latest
+# FirmwareKind, LatestInfo, check_latest
 # ---------------------------------------------------------------------------
-from dataclasses import dataclass
-from enum import Enum
-from typing import Optional
-
-from omotion.GitHubReleases import GitHubReleases
-
 
 class FirmwareKind(Enum):
     CONSOLE = "console"
@@ -64,7 +70,7 @@ class LatestInfo:
     kind: FirmwareKind
     tag: str
     asset_name: str
-    published_at: Optional[str] = None
+    published_at: str | None = None
 
 
 def check_latest(
@@ -72,7 +78,7 @@ def check_latest(
     *,
     include_prerelease: bool = False,
     releases: GitHubReleases | None = None,
-) -> Optional[LatestInfo]:
+) -> LatestInfo | None:
     """Newest release of ``kind``'s firmware repo, or ``None`` on any
     network/parse failure or if no matching ``.bin`` asset exists. Never raises:
     callers treat ``None`` as "couldn't determine, show nothing"."""
@@ -97,12 +103,8 @@ def check_latest(
 
 
 # ---------------------------------------------------------------------------
-# Task 4: download_firmware + FirmwareUpdater
+# download_firmware + FirmwareUpdater
 # ---------------------------------------------------------------------------
-from pathlib import Path
-from typing import Callable
-
-from omotion.DFUProgrammer import DFUProgrammer, DFUProgress, DFUResult
 
 _STM32_DFU_VIDPID = "0483:df11"
 
