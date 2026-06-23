@@ -27,8 +27,13 @@ jobs:
 
       - name: Install WiX 5.0.2
         run: |
-          dotnet tool install --global wix --version 5.0.2
+          # 'update' is idempotent: installs if missing, pins to 5.0.2 if present
+          dotnet tool update --global wix --version 5.0.2
+          if ($LASTEXITCODE -ne 0) { throw "dotnet tool update wix failed" }
           "$env:USERPROFILE\.dotnet\tools" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding ascii
+
+      - name: Show WiX version
+        run: wix --version
 
       - name: Decode signing PFX from secret
         env:
