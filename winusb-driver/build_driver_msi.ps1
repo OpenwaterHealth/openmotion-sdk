@@ -3,13 +3,14 @@
 # Steps:
 #   1. Mint a fresh self-signed "CN=Openwater WinUSB" code-signing cert if the
 #      PFX is absent (20-yr validity; the old cert expires 2026-08-11).
-#   2. Trust our cert on THIS machine (CurrentUser Root + TrustedPublisher) so
-#      catalog signatures verify as Valid and the dev box can use the driver.
-#   3. Derive the public .cer from the key; generate the DFU catalog (in-box
-#      New-FileCatalog; no WDK needed) and sign it; re-sign sensor catalogs only
-#      on key change. All signatures timestamped. Signed artifacts (.cer/.cat/
-#      .msi/.cab/.zip) are build outputs, not committed -- the key is the single
-#      source of truth.
+#   2. Load the signing key from the PFX and derive the public .cer from it (so
+#      the shipped cert always matches the key). We do NOT trust the cert on the
+#      build machine -- signing needs only the key; trust is the MSI's job.
+#   3. Ensure the catalogs exist (regenerate the DFU cat from its INF only when
+#      missing or -RegenCats) and (re)sign any catalog not already signed by the
+#      current key -- all timestamped. The .cer/.msi/.cab/.zip are build outputs
+#      (gitignored); the .cat files and INFs are committed content. The key is
+#      the single source of truth for what ships.
 #   4. wix build the MSI (Util ext supplies the QuietExec custom actions).
 #   5. Zip the MSI + external cab.
 #   6. Refresh the bloodflow-app vendored zip.
@@ -19,9 +20,11 @@
 param(
     [string]$AppResourcesZip = "C:\Users\ethan\Projects\openmotion-bloodflow-app\resources\OpenMotionDriver-x64.zip",
     [string]$TimeStampServer = "http://timestamp.digicert.com",
-    [switch]$Fresh
+    [switch]$Fresh,
+    [switch]$RegenCats
 )
 $ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"   # avoid New-FileCatalog progress-bar stalls in CI
 Set-Location (Split-Path -Parent $MyInvocation.MyCommand.Definition)
 
 $pfx = "OpenMotion_signing_cert.pfx"
@@ -69,19 +72,24 @@ try {
 # can never disagree with the key that signs the catalogs. The .cer is a build
 # output (gitignored), not committed source.
 Export-Certificate -Cert $signCert -FilePath $cer | Out-Null
-Import-Certificate -FilePath $cer -CertStoreLocation Cert:\CurrentUser\Root            | Out-Null
-Import-Certificate -FilePath $cer -CertStoreLocation Cert:\CurrentUser\TrustedPublisher | Out-Null
+# NOTE: we deliberately do NOT import the cert into this machine's trust stores.
+# The build only needs the private key to SIGN; trust is the end user's MSI's job
+# (certutil -addstore at install). Skipping the import keeps the build/dev box's
+# trust store clean and removes an interactive-prompt hang risk in CI.
 
-# -- 3. generate DFU catalog, then sign all catalogs (timestamped) --
+# -- 3. ensure catalogs exist, then (re)sign any not already signed by this key --
+# All four catalogs are committed content. The DFU cat is regenerated from its
+# INF only when missing or -RegenCats (i.e. after an INF change); sensor cats are
+# inherited libwdi/inf2cat content and are not regenerated. Signing matches on
+# the signer THUMBPRINT (not chain-validation Status), since the build box does
+# not trust the cert -- so a steady-state build (key unchanged) signs nothing and
+# a key rotation re-signs all four.
 $dfuCat = "openmotion-dfu.cat"
-Remove-Item $dfuCat -ErrorAction SilentlyContinue
-New-FileCatalog -Path "openmotion-dfu.inf" -CatalogFilePath $dfuCat -CatalogVersion 2 | Out-Null
+if ($RegenCats -or -not (Test-Path $dfuCat)) {
+    Remove-Item $dfuCat -ErrorAction SilentlyContinue
+    New-FileCatalog -Path "openmotion-dfu.inf" -CatalogFilePath $dfuCat -CatalogVersion 2 | Out-Null
+}
 
-# Sensor catalogs are committed (proven libwdi/inf2cat content); the DFU catalog
-# is freshly generated above. Always sign the DFU cat; (re)sign a sensor cat
-# only if it is not already validly signed by THIS key -- so a steady-state
-# build (key unchanged) leaves the committed sensor cats untouched and only a
-# key rotation re-signs them.
 $cats = @(
     $dfuCat,
     "comms_histo_imu(hs)_(interface_0).cat",
@@ -89,17 +97,17 @@ $cats = @(
     "comms_histo_imu(hs)_(interface_2).cat"
 )
 foreach ($c in $cats) {
-    if ($c -ne $dfuCat) {
-        $sig = Get-AuthenticodeSignature $c
-        if ($sig.Status -eq "Valid" -and $sig.SignerCertificate.Thumbprint -eq $signCert.Thumbprint) {
-            Write-Host "  $c already signed by current key, skipping" -ForegroundColor DarkGray
-            continue
-        }
+    $sig = Get-AuthenticodeSignature $c
+    if ($sig.SignerCertificate -and $sig.SignerCertificate.Thumbprint -eq $signCert.Thumbprint) {
+        Write-Host "  $c already signed by current key, skipping" -ForegroundColor DarkGray
+        continue
     }
     $r = Set-AuthenticodeSignature -FilePath $c -Certificate $signCert `
             -HashAlgorithm SHA256 -TimeStampServer $TimeStampServer
-    if ($r.Status -ne "Valid") { throw "signing $c failed: $($r.Status) - $($r.StatusMessage)" }
-    Write-Host "  signed $c -> $($r.Status)" -ForegroundColor Green
+    if (-not $r.SignerCertificate -or $r.SignerCertificate.Thumbprint -ne $signCert.Thumbprint) {
+        throw "signing $c failed: $($r.Status) - $($r.StatusMessage)"
+    }
+    Write-Host "  signed $c -> $($r.SignerCertificate.Thumbprint)" -ForegroundColor Green
 }
 
 # -- 4. wix build (ensure Util ext present, pinned to the wix CLI version;

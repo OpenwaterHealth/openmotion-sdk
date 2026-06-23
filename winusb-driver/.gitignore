@@ -5,11 +5,11 @@ OpenMotion_signing_cert.cer
 
 # Build outputs produced by build_driver_msi.ps1 / CI (the signing key is the
 # single source of truth). The distributable zip is vendored in bloodflow-app.
-# NOTE: the 3 sensor comms_histo_imu(hs)_(interface_*).cat files ARE committed
-# (proven libwdi/inf2cat content; re-signed only on key change); the DFU cat is
-# generated each build, so it is ignored.
+# NOTE: all four .cat files ARE committed content -- the 3 sensor cats are proven
+# libwdi/inf2cat content, and openmotion-dfu.cat is regenerated only on INF
+# change (build_driver_msi.ps1 -RegenCats). The build re-signs catalogs only
+# when the signing key changes.
 OpenMotionDriver-x64.zip
 OpenMotionDriver-x64.msi
 cab1.cab
-openmotion-dfu.cat
 *.wixpdb

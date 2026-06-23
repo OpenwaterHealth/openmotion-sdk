@@ -20,30 +20,33 @@ $env:OW_DRIVER_PFX_PASSWORD = "<pfx password>"
 
 The script mints `OpenMotion_signing_cert.pfx` when no PFX is present
 (self-signed, 20-yr). Use `-Fresh` to mint a **replacement** (deletes any
-existing key first). It then derives the public `.cer` from the key, generates
-the DFU catalog, signs it (re-signing the sensor catalogs only on key change),
-runs `wix build`, zips, and copies the zip into the bloodflow-app `resources/`.
-The MSI installs the public cert into TrustedPublisher + Root, removes the old
-retired cert (`certutil -delstore`, by thumbprint), then `pnputil
-/add-driver /install`s each INF. (`driver_install.cmd` performs the certutil +
-pnputil steps for a manual, no-MSI install.)
+existing key first). It then derives the public `.cer` from the key and
+(re)signs any catalog not already signed by that key (so a steady-state build
+signs nothing; a key rotation re-signs all four). It then runs `wix build`,
+zips, and copies the zip into the bloodflow-app `resources/`. The MSI installs
+the public cert into TrustedPublisher + Root, removes the old retired cert
+(`certutil -delstore`, by thumbprint), then `pnputil /add-driver /install`s each
+INF. (`driver_install.cmd` performs the certutil + pnputil steps for a manual,
+no-MSI install.) Pass `-RegenCats` after changing an INF to rebuild
+`openmotion-dfu.cat` from it.
 
 Signing uses in-box `New-FileCatalog` / `Set-AuthenticodeSignature` — no WDK
 required.
 
 ## Source vs. build outputs
 
-The **signing key is the single source of truth**; signed material is never
-committed:
+The **signing key is the single source of truth** for what ships; the private
+key and the derived/built outputs are never committed:
 
-- **Committed source:** the INFs, `Product.wxs`, `build_driver_msi.ps1`,
-  `driver_install.cmd`, this README, the CI workflow, and the 3 sensor
-  `comms_histo_imu(hs)_(interface_*).cat` files (proven libwdi/inf2cat content,
-  re-signed only when the key changes).
-- **Not committed (gitignored), produced each build:** `OpenMotion_signing_cert.pfx`
+- **Committed content:** the INFs, all four `.cat` files (the 3 sensor cats are
+  proven libwdi/inf2cat content; `openmotion-dfu.cat` is regenerated only on INF
+  change via `-RegenCats`), `Product.wxs`, `build_driver_msi.ps1`,
+  `driver_install.cmd`, this README, and the CI workflow. The build re-signs the
+  catalogs only when the signing key changes.
+- **Not committed (gitignored), produced at build time:** `OpenMotion_signing_cert.pfx`
   (the private key — CI injects it from the `OW_DRIVER_PFX_BASE64` secret),
-  `OpenMotion_signing_cert.cer` (derived from the key), `openmotion-dfu.cat`,
-  `OpenMotionDriver-x64.msi`, `cab1.cab`, and `OpenMotionDriver-x64.zip`.
+  `OpenMotion_signing_cert.cer` (derived from the key), `OpenMotionDriver-x64.msi`,
+  `cab1.cab`, and `OpenMotionDriver-x64.zip`.
 
 The PFX password is read from `$env:OW_DRIVER_PFX_PASSWORD` (or prompted) and is
 never written to the repo or logs. CI (`.github/workflows/driver-msi.yml`)
