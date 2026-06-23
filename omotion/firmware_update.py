@@ -32,3 +32,65 @@ def is_update_available(installed: str, latest: str) -> bool:
         return parse_version(latest) > parse_version(installed)
     except (ValueError, TypeError):
         return False
+
+
+# ---------------------------------------------------------------------------
+# Task 3: FirmwareKind, LatestInfo, check_latest
+# ---------------------------------------------------------------------------
+from dataclasses import dataclass
+from enum import Enum
+from typing import Optional
+
+from omotion.GitHubReleases import GitHubReleases
+
+
+class FirmwareKind(Enum):
+    CONSOLE = "console"
+    SENSOR = "sensor"
+
+
+_REPO = {
+    FirmwareKind.CONSOLE: ("OpenwaterHealth", "openmotion-console-fw"),
+    FirmwareKind.SENSOR: ("OpenwaterHealth", "openmotion-sensor-fw"),
+}
+_ASSET = {
+    FirmwareKind.CONSOLE: "motion-console-fw.bin",
+    FirmwareKind.SENSOR: "motion-sensor-fw.bin",
+}
+
+
+@dataclass(frozen=True)
+class LatestInfo:
+    kind: FirmwareKind
+    tag: str
+    asset_name: str
+    published_at: Optional[str] = None
+
+
+def check_latest(
+    kind: FirmwareKind,
+    *,
+    include_prerelease: bool = False,
+    releases: GitHubReleases | None = None,
+) -> Optional[LatestInfo]:
+    """Newest release of ``kind``'s firmware repo, or ``None`` on any
+    network/parse failure or if no matching ``.bin`` asset exists. Never raises:
+    callers treat ``None`` as "couldn't determine, show nothing"."""
+    owner, repo = _REPO[kind]
+    gh = releases or GitHubReleases(owner, repo)
+    try:
+        rel = gh.get_latest_release(include_prerelease=include_prerelease)
+        tag = rel.get("tag_name")
+        if not tag:
+            return None
+        names = [a.get("name", "") for a in gh.get_asset_list(release=rel, extension=".bin")]
+        if _ASSET[kind] in names:
+            asset_name = _ASSET[kind]
+        elif names:
+            asset_name = names[0]
+        else:
+            return None
+        return LatestInfo(kind=kind, tag=tag, asset_name=asset_name,
+                          published_at=rel.get("published_at"))
+    except Exception:
+        return None
