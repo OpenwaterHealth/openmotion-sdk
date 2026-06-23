@@ -15,7 +15,8 @@
 # never written to the repo or logs.
 param(
     [string]$AppResourcesZip = "C:\Users\ethan\Projects\openmotion-bloodflow-app\resources\OpenMotionDriver-x64.zip",
-    [string]$TimeStampServer = "http://timestamp.digicert.com"
+    [string]$TimeStampServer = "http://timestamp.digicert.com",
+    [switch]$Fresh
 )
 $ErrorActionPreference = "Stop"
 Set-Location (Split-Path -Parent $MyInvocation.MyCommand.Definition)
@@ -23,12 +24,19 @@ Set-Location (Split-Path -Parent $MyInvocation.MyCommand.Definition)
 $pfx = "OpenMotion_signing_cert.pfx"
 $cer = "OpenMotion_signing_cert.cer"
 
+# -- 0. -Fresh: drop any existing cert so a brand-new one is minted below --
+if ($Fresh) {
+    Remove-Item $pfx,$cer -ErrorAction SilentlyContinue
+    Write-Host "Fresh mode: removed any existing signing cert." -ForegroundColor Cyan
+}
+
 # -- password --
 $pw = $env:OW_DRIVER_PFX_PASSWORD
 if (-not $pw) {
     $sec = Read-Host "PFX password" -AsSecureString
     $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
-    $pw  = [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
+    try   { $pw = [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr) }
+    finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
 }
 
 # -- 1. mint cert if absent --
@@ -47,9 +55,14 @@ if (-not (Test-Path $pfx)) {
 }
 
 # -- 2. load signing cert (with private key) + trust it on this machine --
-$signCert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(
-    (Resolve-Path $pfx).Path, $pw,
-    [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable)
+try {
+    $signCert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(
+        (Resolve-Path $pfx).Path, $pw,
+        [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable)
+} catch {
+    throw "Could not open $pfx with the supplied password. To mint a NEW signing cert, " +
+          "re-run with -Fresh (deletes $pfx/$cer) and provide a new password."
+}
 Import-Certificate -FilePath $cer -CertStoreLocation Cert:\CurrentUser\Root            | Out-Null
 Import-Certificate -FilePath $cer -CertStoreLocation Cert:\CurrentUser\TrustedPublisher | Out-Null
 
@@ -73,6 +86,7 @@ foreach ($c in $cats) {
 
 # -- 4. wix build --
 wix extension add -g WixToolset.Util.wixext | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "wix extension add (WixToolset.Util.wixext) failed" }
 $msi = "OpenMotionDriver-x64.msi"
 Remove-Item $msi,"cab1.cab" -ErrorAction SilentlyContinue
 wix build Product.wxs -arch x64 -ext WixToolset.Util.wixext -o $msi

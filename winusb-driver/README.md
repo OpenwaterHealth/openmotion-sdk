@@ -14,14 +14,19 @@ in-box Windows VCP driver, so it needs no INF here.
 
 ```powershell
 $env:OW_DRIVER_PFX_PASSWORD = "<pfx password>"
-.\build_driver_msi.ps1 -AppResourcesZip <path to bloodflow-app resources\OpenMotionDriver-x64.zip>
+# first time / replacing the old cert: add -Fresh to mint a new signing cert
+.\build_driver_msi.ps1 -Fresh -AppResourcesZip <path to bloodflow-app resources\OpenMotionDriver-x64.zip>
 ```
 
-The script mints `OpenMotion_signing_cert.pfx/.cer` on first run (self-signed,
-20-yr), generates + signs all catalogs (timestamped), runs `wix build`, zips,
-and copies the zip into the bloodflow-app `resources/`. The MSI installs the
-public cert into TrustedPublisher + Root, then `pnputil /add-driver /install`s
-each INF.
+The script mints `OpenMotion_signing_cert.pfx/.cer` when no PFX is present
+(self-signed, 20-yr). The repo currently ships an older cert (expires
+2026-08-11) whose password is not on hand — to mint a **replacement**, run with
+`-Fresh`, which deletes the existing `.pfx`/`.cer` first so a new one is minted
+with the password you supply. It then generates + signs all catalogs
+(timestamped), runs `wix build`, zips, and copies the zip into the bloodflow-app
+`resources/`. The MSI installs the public cert into TrustedPublisher + Root,
+then `pnputil /add-driver /install`s each INF. (`driver_install.cmd` performs
+the same certutil + pnputil steps for a manual, no-MSI install.)
 
 Signing uses in-box `New-FileCatalog` / `Set-AuthenticodeSignature` — no WDK
 required. The PFX password is read from `$env:OW_DRIVER_PFX_PASSWORD` (or
