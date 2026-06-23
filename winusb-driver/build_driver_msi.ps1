@@ -5,8 +5,11 @@
 #      PFX is absent (20-yr validity; the old cert expires 2026-08-11).
 #   2. Trust our cert on THIS machine (CurrentUser Root + TrustedPublisher) so
 #      catalog signatures verify as Valid and the dev box can use the driver.
-#   3. Generate the DFU catalog (in-box New-FileCatalog; no WDK needed) and
-#      re-sign it + the three sensor catalogs with our cert, all timestamped.
+#   3. Derive the public .cer from the key; generate the DFU catalog (in-box
+#      New-FileCatalog; no WDK needed) and sign it; re-sign sensor catalogs only
+#      on key change. All signatures timestamped. Signed artifacts (.cer/.cat/
+#      .msi/.cab/.zip) are build outputs, not committed -- the key is the single
+#      source of truth.
 #   4. wix build the MSI (Util ext supplies the QuietExec custom actions).
 #   5. Zip the MSI + external cab.
 #   6. Refresh the bloodflow-app vendored zip.
@@ -49,9 +52,8 @@ if (-not (Test-Path $pfx)) {
         -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3")
     $sp = ConvertTo-SecureString $pw -AsPlainText -Force
     Export-PfxCertificate -Cert $cert -FilePath $pfx -Password $sp | Out-Null
-    Export-Certificate    -Cert $cert -FilePath $cer | Out-Null
     Remove-Item ("Cert:\CurrentUser\My\" + $cert.Thumbprint) -Force
-    Write-Host "  wrote $pfx and $cer" -ForegroundColor Green
+    Write-Host "  wrote $pfx" -ForegroundColor Green
 }
 
 # -- 2. load signing cert (with private key) + trust it on this machine --
@@ -63,6 +65,10 @@ try {
     throw "Could not open $pfx with the supplied password. To mint a NEW signing cert, " +
           "re-run with -Fresh (deletes $pfx/$cer) and provide a new password."
 }
+# Always (re)derive the public .cer from the signing key, so the cert that ships
+# can never disagree with the key that signs the catalogs. The .cer is a build
+# output (gitignored), not committed source.
+Export-Certificate -Cert $signCert -FilePath $cer | Out-Null
 Import-Certificate -FilePath $cer -CertStoreLocation Cert:\CurrentUser\Root            | Out-Null
 Import-Certificate -FilePath $cer -CertStoreLocation Cert:\CurrentUser\TrustedPublisher | Out-Null
 
@@ -71,6 +77,11 @@ $dfuCat = "openmotion-dfu.cat"
 Remove-Item $dfuCat -ErrorAction SilentlyContinue
 New-FileCatalog -Path "openmotion-dfu.inf" -CatalogFilePath $dfuCat -CatalogVersion 2 | Out-Null
 
+# Sensor catalogs are committed (proven libwdi/inf2cat content); the DFU catalog
+# is freshly generated above. Always sign the DFU cat; (re)sign a sensor cat
+# only if it is not already validly signed by THIS key -- so a steady-state
+# build (key unchanged) leaves the committed sensor cats untouched and only a
+# key rotation re-signs them.
 $cats = @(
     $dfuCat,
     "comms_histo_imu(hs)_(interface_0).cat",
@@ -78,6 +89,13 @@ $cats = @(
     "comms_histo_imu(hs)_(interface_2).cat"
 )
 foreach ($c in $cats) {
+    if ($c -ne $dfuCat) {
+        $sig = Get-AuthenticodeSignature $c
+        if ($sig.Status -eq "Valid" -and $sig.SignerCertificate.Thumbprint -eq $signCert.Thumbprint) {
+            Write-Host "  $c already signed by current key, skipping" -ForegroundColor DarkGray
+            continue
+        }
+    }
     $r = Set-AuthenticodeSignature -FilePath $c -Certificate $signCert `
             -HashAlgorithm SHA256 -TimeStampServer $TimeStampServer
     if ($r.Status -ne "Valid") { throw "signing $c failed: $($r.Status) - $($r.StatusMessage)" }

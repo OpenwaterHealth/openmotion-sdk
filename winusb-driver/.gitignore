@@ -1,7 +1,15 @@
-# Code-signing private key — must never be committed (CI injects it from a secret)
+# Code-signing material — never committed. CI injects the .pfx from a secret;
+# the public .cer is derived from the key by build_driver_msi.ps1 at build time.
 OpenMotion_signing_cert.pfx
+OpenMotion_signing_cert.cer
 
-# Transient build byproducts (the distributable zip is vendored in bloodflow-app;
-# the wixpdb is debug symbols). The .msi/.cab/.cat are tracked snapshots.
+# Build outputs produced by build_driver_msi.ps1 / CI (the signing key is the
+# single source of truth). The distributable zip is vendored in bloodflow-app.
+# NOTE: the 3 sensor comms_histo_imu(hs)_(interface_*).cat files ARE committed
+# (proven libwdi/inf2cat content; re-signed only on key change); the DFU cat is
+# generated each build, so it is ignored.
 OpenMotionDriver-x64.zip
+OpenMotionDriver-x64.msi
+cab1.cab
+openmotion-dfu.cat
 *.wixpdb
