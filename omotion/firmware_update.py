@@ -94,3 +94,61 @@ def check_latest(
                           published_at=rel.get("published_at"))
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Task 4: download_firmware + FirmwareUpdater
+# ---------------------------------------------------------------------------
+from pathlib import Path
+from typing import Callable
+
+from omotion.DFUProgrammer import DFUProgrammer, DFUProgress, DFUResult
+
+_STM32_DFU_VIDPID = "0483:df11"
+
+
+class FirmwareUpdateError(RuntimeError):
+    """Raised when a firmware flash cannot proceed (DFU entry/enumeration)."""
+
+
+def download_firmware(
+    info: LatestInfo,
+    dest_dir: Path,
+    *,
+    releases: GitHubReleases | None = None,
+) -> Path:
+    """Download ``info``'s ``.bin`` asset into ``dest_dir``; returns the path."""
+    owner, repo = _REPO[info.kind]
+    gh = releases or GitHubReleases(owner, repo)
+    rel = gh.get_release_by_tag(info.tag)
+    return gh.download_asset(rel, info.asset_name, output_dir=Path(dest_dir))
+
+
+class FirmwareUpdater:
+    """Flash one STM32 firmware ``.bin`` onto a handle that supports ``enter_dfu``.
+
+    Pure SDK: enters DFU, waits for the ROM bootloader (PID df11) to
+    re-enumerate, and flashes with the bundled dfu-util. Does NOT manage any
+    connection monitor — the caller pauses reconnection logic around this call.
+    """
+
+    def __init__(
+        self,
+        *,
+        programmer: DFUProgrammer | None = None,
+        dfu_wait_timeout_s: float = 30.0,
+    ):
+        self._dfu = programmer or DFUProgrammer(vidpid=_STM32_DFU_VIDPID)
+        self._wait_timeout_s = dfu_wait_timeout_s
+
+    def update(
+        self,
+        handle,
+        bin_path: Path,
+        progress_cb: Callable[[DFUProgress], None] | None = None,
+    ) -> DFUResult:
+        if not handle.enter_dfu():
+            raise FirmwareUpdateError("device did not accept enter_dfu()")
+        if not self._dfu.wait_for_dfu_device(timeout_s=self._wait_timeout_s):
+            raise FirmwareUpdateError("DFU device did not appear after enter_dfu()")
+        return self._dfu.flash_bin(Path(bin_path), progress=progress_cb)
