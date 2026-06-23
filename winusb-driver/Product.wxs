@@ -81,6 +81,26 @@
                   BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)" DllEntry="WixQuietExec"
                   Execute="deferred" Impersonate="no" Return="check"/>
 
+    <!-- Remove the retired/compromised old signing cert. The old self-signed
+         private key was exposed in public git history, so the cert it signs is
+         treated as burned. Keyed by THUMBPRINT (not subject) so only the old
+         cert is removed; the new cert shares the same subject and is kept.
+         Best-effort: Return="ignore" so a clean machine that never had the old
+         cert still installs cleanly. -->
+    <SetProperty Id="RemoveOldCertTrustedPublisher"
+                 Value="&quot;[System32Folder]certutil.exe&quot; -delstore &quot;TrustedPublisher&quot; D3A6A27AA018DF07164D551D9B83AE6F27D1D453"
+                 Before="RemoveOldCertTrustedPublisher" Sequence="execute"/>
+    <CustomAction Id="RemoveOldCertTrustedPublisher"
+                  BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)" DllEntry="WixQuietExec"
+                  Execute="deferred" Impersonate="no" Return="ignore"/>
+
+    <SetProperty Id="RemoveOldCertRoot"
+                 Value="&quot;[System32Folder]certutil.exe&quot; -delstore &quot;Root&quot; D3A6A27AA018DF07164D551D9B83AE6F27D1D453"
+                 Before="RemoveOldCertRoot" Sequence="execute"/>
+    <CustomAction Id="RemoveOldCertRoot"
+                  BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)" DllEntry="WixQuietExec"
+                  Execute="deferred" Impersonate="no" Return="ignore"/>
+
     <SetProperty Id="AddDriverIf0"
                  Value="&quot;[System32Folder]pnputil.exe&quot; /add-driver &quot;[#filInf0]&quot; /install"
                  Before="AddDriverIf0" Sequence="execute"/>
@@ -112,7 +132,9 @@
     <InstallExecuteSequence>
       <Custom Action="InstallCertTrustedPublisher" After="InstallFiles" Condition="NOT Installed OR REINSTALL"/>
       <Custom Action="InstallCertRoot"             After="InstallCertTrustedPublisher" Condition="NOT Installed OR REINSTALL"/>
-      <Custom Action="AddDriverIf0"                After="InstallCertRoot" Condition="NOT Installed OR REINSTALL"/>
+      <Custom Action="RemoveOldCertTrustedPublisher" After="InstallCertRoot" Condition="NOT Installed OR REINSTALL"/>
+      <Custom Action="RemoveOldCertRoot"           After="RemoveOldCertTrustedPublisher" Condition="NOT Installed OR REINSTALL"/>
+      <Custom Action="AddDriverIf0"                After="RemoveOldCertRoot" Condition="NOT Installed OR REINSTALL"/>
       <Custom Action="AddDriverIf1"                After="AddDriverIf0" Condition="NOT Installed OR REINSTALL"/>
       <Custom Action="AddDriverIf2"                After="AddDriverIf1" Condition="NOT Installed OR REINSTALL"/>
       <Custom Action="AddDriverIf3" After="AddDriverIf2" Condition="NOT Installed OR REINSTALL"/>
