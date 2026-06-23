@@ -1,0 +1,53 @@
+name: Build WinUSB driver MSI
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: powershell
+        working-directory: winusb-driver
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify signing secrets are present
+        env:
+          PFX_B64: ${{ secrets.OW_DRIVER_PFX_BASE64 }}
+          PFX_PW: ${{ secrets.OW_DRIVER_PFX_PASSWORD }}
+        run: |
+          if (-not $env:PFX_B64) { throw "Secret OW_DRIVER_PFX_BASE64 is not set" }
+          if (-not $env:PFX_PW)  { throw "Secret OW_DRIVER_PFX_PASSWORD is not set" }
+
+      - name: Install WiX 5.0.2
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          "$env:USERPROFILE\.dotnet\tools" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding ascii
+
+      - name: Decode signing PFX from secret
+        env:
+          PFX_B64: ${{ secrets.OW_DRIVER_PFX_BASE64 }}
+        run: |
+          [IO.File]::WriteAllBytes("$PWD\OpenMotion_signing_cert.pfx", [Convert]::FromBase64String($env:PFX_B64))
+
+      - name: Build and sign driver MSI
+        env:
+          OW_DRIVER_PFX_PASSWORD: ${{ secrets.OW_DRIVER_PFX_PASSWORD }}
+        run: .\build_driver_msi.ps1 -AppResourcesZip ""
+
+      - name: Scrub PFX from workspace
+        if: always()
+        run: Remove-Item .\OpenMotion_signing_cert.pfx -Force -ErrorAction SilentlyContinue
+
+      - name: Upload signed driver zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenMotionDriver-x64
+          path: winusb-driver/OpenMotionDriver-x64.zip
+          if-no-files-found: error

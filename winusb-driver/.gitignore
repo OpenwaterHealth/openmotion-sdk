@@ -1,0 +1,2 @@
+# Code-signing private key — must never be committed (CI injects it from a secret)
+OpenMotion_signing_cert.pfx
