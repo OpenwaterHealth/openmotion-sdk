@@ -81,3 +81,60 @@ def test_check_latest_none_when_no_bin_asset():
 def test_check_latest_none_when_no_tag():
     gh = _fake_gh({"published_at": "x"})  # no tag_name
     assert check_latest(FirmwareKind.CONSOLE, releases=gh) is None
+
+
+# ---------------------------------------------------------------------------
+# Task 4: download_firmware + FirmwareUpdater
+# ---------------------------------------------------------------------------
+from pathlib import Path
+
+from omotion.firmware_update import (
+    FirmwareUpdateError, FirmwareUpdater, download_firmware,
+)
+
+
+def test_download_firmware_uses_release_by_tag(tmp_path):
+    gh = MagicMock()
+    gh.get_release_by_tag.return_value = {"tag_name": "1.4.0"}
+    gh.download_asset.return_value = tmp_path / "motion-sensor-fw.bin"
+    info = LatestInfo(FirmwareKind.SENSOR, "1.4.0", "motion-sensor-fw.bin")
+
+    out = download_firmware(info, tmp_path, releases=gh)
+
+    gh.get_release_by_tag.assert_called_once_with("1.4.0")
+    gh.download_asset.assert_called_once_with(
+        {"tag_name": "1.4.0"}, "motion-sensor-fw.bin", output_dir=tmp_path)
+    assert out == tmp_path / "motion-sensor-fw.bin"
+
+
+def test_updater_happy_path(tmp_path):
+    handle = MagicMock()
+    handle.enter_dfu.return_value = True
+    dfu = MagicMock()
+    dfu.wait_for_dfu_device.return_value = True
+    dfu.flash_bin.return_value = MagicMock(success=True)
+
+    updater = FirmwareUpdater(programmer=dfu)
+    result = updater.update(handle, tmp_path / "fw.bin")
+
+    assert result.success is True
+    handle.enter_dfu.assert_called_once()
+    dfu.flash_bin.assert_called_once()
+
+
+def test_updater_raises_if_enter_dfu_rejected(tmp_path):
+    handle = MagicMock()
+    handle.enter_dfu.return_value = False
+    updater = FirmwareUpdater(programmer=MagicMock())
+    with pytest.raises(FirmwareUpdateError):
+        updater.update(handle, tmp_path / "fw.bin")
+
+
+def test_updater_raises_if_dfu_never_appears(tmp_path):
+    handle = MagicMock()
+    handle.enter_dfu.return_value = True
+    dfu = MagicMock()
+    dfu.wait_for_dfu_device.return_value = False
+    updater = FirmwareUpdater(programmer=dfu)
+    with pytest.raises(FirmwareUpdateError):
+        updater.update(handle, tmp_path / "fw.bin")
