@@ -84,9 +84,13 @@ foreach ($c in $cats) {
     Write-Host "  signed $c -> $($r.Status)" -ForegroundColor Green
 }
 
-# -- 4. wix build --
-wix extension add -g WixToolset.Util.wixext | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "wix extension add (WixToolset.Util.wixext) failed" }
+# -- 4. wix build (ensure Util ext present, pinned to the wix CLI version;
+#       an unpinned 'add' grabs a newer major that is incompatible with v5) --
+$wixVer = ((wix --version) -split '\+')[0].Trim()
+if (-not ((wix extension list -g) -match 'WixToolset\.Util\.wixext')) {
+    wix extension add -g "WixToolset.Util.wixext/$wixVer" | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "wix extension add (WixToolset.Util.wixext/$wixVer) failed" }
+}
 $msi = "OpenMotionDriver-x64.msi"
 Remove-Item $msi,"cab1.cab" -ErrorAction SilentlyContinue
 wix build Product.wxs -arch x64 -ext WixToolset.Util.wixext -o $msi

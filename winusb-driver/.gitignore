@@ -1,2 +1,7 @@
 # Code-signing private key — must never be committed (CI injects it from a secret)
 OpenMotion_signing_cert.pfx
+
+# Transient build byproducts (the distributable zip is vendored in bloodflow-app;
+# the wixpdb is debug symbols). The .msi/.cab/.cat are tracked snapshots.
+OpenMotionDriver-x64.zip
+*.wixpdb
