@@ -1,0 +1,66 @@
+; openmotion-dfu.inf
+; WinUSB binding for the STM32 system (DFU) bootloader presented by the
+; OpenMotion console and sensor in firmware-update mode (VID_0483&PID_DF11).
+; Modeled on the libwdi-generated sensor INFs: same WinUSB / USBDevice class,
+; single interface, no legacy coinstaller sections (Win10/11 installs WinUSB
+; INFs without them).
+
+[Strings]
+DeviceName = "OpenMotion DFU Bootloader (WinUSB)"
+VendorName = "Openwater"
+DeviceID   = "VID_0483&PID_DF11"
+DeviceGUID = "{7E3B1A2C-5D4F-4A6B-9C8D-0E1F2A3B4C5D}"
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = "USBDevice"
+ClassGuid   = {88bae032-5a81-49f0-bc3d-a4ff138216d6}
+Provider    = "Openwater"
+CatalogFile = openmotion-dfu.cat
+DriverVer   = 06/22/2026,2.0.0.0
+
+[ClassInstall32]
+Addreg = WinUSBDeviceClassReg
+
+[WinUSBDeviceClassReg]
+HKR,,,0,"Universal Serial Bus devices"
+HKR,,Icon,,-20
+
+[Manufacturer]
+%VendorName% = libusbDevice_WinUSB,NTx86,NTamd64,NTarm64
+
+[libusbDevice_WinUSB.NTx86]
+%DeviceName% = USB_Install, USB\%DeviceID%
+
+[libusbDevice_WinUSB.NTamd64]
+%DeviceName% = USB_Install, USB\%DeviceID%
+
+[libusbDevice_WinUSB.NTarm64]
+%DeviceName% = USB_Install, USB\%DeviceID%
+
+[USB_Install]
+Include = winusb.inf
+Needs   = WINUSB.NT
+
+[USB_Install.Services]
+Include    = winusb.inf
+AddService = WinUSB,0x00000002,WinUSB_ServiceInstall
+
+[WinUSB_ServiceInstall]
+DisplayName   = "WinUSB - Kernel Driver"
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %12%\WinUSB.sys
+
+[USB_Install.Wdf]
+KmdfService = WINUSB, WinUsb_Install
+
+[WinUSB_Install]
+KmdfLibraryVersion = 1.11
+
+[USB_Install.HW]
+AddReg = AddDeviceInterfaceGUID
+
+[AddDeviceInterfaceGUID]
+HKR,,DeviceInterfaceGUIDs,0x10000,%DeviceGUID%
