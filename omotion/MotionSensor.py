@@ -83,11 +83,7 @@ logger = logging.getLogger(f"{_log_root}.Sensor" if _log_root else "Sensor")
 _ERROR_TYPES = frozenset({OW_ERROR, OW_BAD_CRC, OW_BAD_PARSE, OW_UNKNOWN})
 
 
-# Re-exported from the shared module so there is a single source of truth.
-from omotion.firmware_update import (
-    _VERSION_RE,           # noqa: F401  (kept for backward references)
-    parse_version as _parse_firmware_version,
-)
+from omotion.firmware_update import parse_version as _parse_firmware_version
 
 
 class MotionSensor(SignalWrapper):

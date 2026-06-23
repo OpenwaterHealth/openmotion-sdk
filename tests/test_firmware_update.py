@@ -83,6 +83,14 @@ def test_check_latest_none_when_no_tag():
     assert check_latest(FirmwareKind.CONSOLE, releases=gh) is None
 
 
+def test_check_latest_falls_back_to_first_bin_when_canonical_missing():
+    gh = _fake_gh({"tag_name": "1.4.0", "published_at": "2026-01-01"})
+    gh.get_asset_list.return_value = [{"name": "motion-sensor-fw-v1.4.0.bin"}]
+    info = check_latest(FirmwareKind.SENSOR, releases=gh)
+    assert info is not None
+    assert info.asset_name == "motion-sensor-fw-v1.4.0.bin"
+
+
 # ---------------------------------------------------------------------------
 # Task 4: download_firmware + FirmwareUpdater
 # ---------------------------------------------------------------------------
