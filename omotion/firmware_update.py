@@ -113,7 +113,17 @@ def check_latest(
     owner, repo = _REPO[kind]
     gh = releases or GitHubReleases(owner, repo)
     try:
-        rel = gh.get_latest_release(include_prerelease=include_prerelease)
+        if include_prerelease:
+            rels = gh.get_all_releases(include_prerelease=True)
+            if not rels:
+                return None
+            # Most recently PUBLISHED wins (timestamp), even if its version is
+            # "lower" semver — a dev released after an rc is the one to flash.
+            # published_at is ISO-8601, so lexicographic max == chronological;
+            # a missing value sorts oldest, falling back to API newest-first.
+            rel = max(rels, key=lambda r: (r.get("published_at") or ""))
+        else:
+            rel = gh.get_latest_release(include_prerelease=False)
         tag = rel.get("tag_name")
         if not tag:
             return None

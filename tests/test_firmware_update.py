@@ -184,3 +184,36 @@ def test_is_update_available_stable_unchanged():
     assert is_update_available("1.8.0", "1.8.1") is True
     assert is_update_available("1.8.1-rc.0", "1.8.1") is False   # same M.M.P
     assert is_update_available("1.8.0", "1.8.0") is False
+
+
+# ---------------------------------------------------------------------------
+# Task 2: check_latest real prerelease path (max published_at)
+# ---------------------------------------------------------------------------
+
+def test_check_latest_beta_picks_max_published_at():
+    gh = MagicMock()
+    gh.get_all_releases.return_value = [
+        {"tag_name": "1.8.1-dev.5", "published_at": "2026-02-10T00:00:00Z"},
+        {"tag_name": "1.8.1-rc.0", "published_at": "2026-02-01T00:00:00Z"},
+        {"tag_name": "1.8.0", "published_at": "2026-01-15T00:00:00Z"},
+    ]
+    gh.get_asset_list.return_value = [{"name": "motion-sensor-fw.bin"}]
+    info = check_latest(FirmwareKind.SENSOR, include_prerelease=True, releases=gh)
+    assert info is not None
+    assert info.tag == "1.8.1-dev.5"            # newest published, though "lower" semver
+    gh.get_all_releases.assert_called_once_with(include_prerelease=True)
+
+
+def test_check_latest_beta_none_when_empty():
+    gh = MagicMock()
+    gh.get_all_releases.return_value = []
+    assert check_latest(FirmwareKind.SENSOR, include_prerelease=True, releases=gh) is None
+
+
+def test_check_latest_stable_uses_get_latest_release():
+    gh = MagicMock()
+    gh.get_latest_release.return_value = {"tag_name": "1.8.0", "published_at": "2026-01-15T00:00:00Z"}
+    gh.get_asset_list.return_value = [{"name": "motion-sensor-fw.bin"}]
+    info = check_latest(FirmwareKind.SENSOR, include_prerelease=False, releases=gh)
+    assert info.tag == "1.8.0"
+    gh.get_latest_release.assert_called_once_with(include_prerelease=False)
