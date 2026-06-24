@@ -36,10 +36,41 @@ def parse_version(version_str: str) -> tuple[int, int, int]:
     return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
 
 
-def is_update_available(installed: str, latest: str) -> bool:
-    """True iff ``latest`` parses to a strictly greater (maj, min, patch) than
-    ``installed``. Pre-release suffixes are ignored. Returns ``False`` if either
-    string is empty/unparseable (fail-safe: never offer an unreasoned update)."""
+_GIT_DESCRIBE_TAIL = re.compile(r"-\d+-g[0-9a-f]+$", re.IGNORECASE)
+
+
+def _release_tag(version: str) -> str:
+    """Reduce a version/tag to its base release tag: strip a leading 'v', a
+    trailing '-dirty', and a git-describe tail ('-<N>-g<sha>'). Used by the
+    beta (most-recently-published) update check, which compares release
+    identity rather than semver precedence."""
+    if not version:
+        return ""
+    v = version.strip()
+    if v[:1] in ("v", "V"):
+        v = v[1:]
+    if v.endswith("-dirty"):
+        v = v[: -len("-dirty")]
+    # Assumes real release tags never end in the git-describe pattern
+    # '-<N>-g<sha>'; that suffix only appears in describe output for commits
+    # AFTER a tag, so stripping it here recovers the base release tag.
+    return _GIT_DESCRIBE_TAIL.sub("", v)
+
+
+def is_update_available(installed: str, latest: str, *, prerelease: bool = False) -> bool:
+    """Whether ``latest`` should be offered over ``installed``.
+
+    prerelease=False (stable): True iff ``latest``'s (major, minor, patch) is
+    strictly greater than ``installed``'s. prerelease=True (beta): True iff the
+    device's base release tag differs from ``latest``'s — i.e. the device is
+    not already on the most-recently-published release. Fail-safe ``False`` on
+    empty/unparseable input."""
+    if prerelease:
+        inst = _release_tag(installed)
+        lat = _release_tag(latest)
+        if not inst or not lat:
+            return False
+        return inst != lat
     try:
         return parse_version(latest) > parse_version(installed)
     except (ValueError, TypeError):
@@ -85,7 +116,19 @@ def check_latest(
     owner, repo = _REPO[kind]
     gh = releases or GitHubReleases(owner, repo)
     try:
-        rel = gh.get_latest_release(include_prerelease=include_prerelease)
+        if include_prerelease:
+            rels = gh.get_all_releases(include_prerelease=True)
+            if not rels:
+                return None
+            # Most recently PUBLISHED wins (timestamp), even if its version is
+            # "lower" semver — a dev released after an rc is the one to flash.
+            # published_at is ISO-8601, so lexicographic max == chronological.
+            # On a tie / missing published_at, Python's max keeps the FIRST
+            # maximal element and GitHub returns releases newest-first, so the
+            # API-newest release wins.
+            rel = max(rels, key=lambda r: (r.get("published_at") or ""))
+        else:
+            rel = gh.get_latest_release(include_prerelease=False)
         tag = rel.get("tag_name")
         if not tag:
             return None

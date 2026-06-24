@@ -146,3 +146,85 @@ def test_updater_raises_if_dfu_never_appears(tmp_path):
     updater = FirmwareUpdater(programmer=dfu)
     with pytest.raises(FirmwareUpdateError):
         updater.update(handle, tmp_path / "fw.bin")
+
+
+# ---------------------------------------------------------------------------
+# Task 1: _release_tag + prerelease-aware is_update_available
+# ---------------------------------------------------------------------------
+from omotion.firmware_update import _release_tag
+
+
+@pytest.mark.parametrize("v,expected", [
+    ("1.8.0", "1.8.0"),
+    ("v1.8.0", "1.8.0"),
+    ("1.8.1-rc.0", "1.8.1-rc.0"),
+    ("1.8.1-dev.5", "1.8.1-dev.5"),
+    ("1.8.1-rc.0-2-gf09e8dc", "1.8.1-rc.0"),
+    ("1.8.1-rc.0-2-gf09e8dc-dirty", "1.8.1-rc.0"),
+    ("1.8.0-dirty", "1.8.0"),
+    ("", ""),
+])
+def test_release_tag(v, expected):
+    assert _release_tag(v) == expected
+
+
+@pytest.mark.parametrize("installed,latest,expected", [
+    ("1.8.1-rc.0-2-gf09e8dc-dirty", "1.8.1-rc.0", False),  # device on/ahead of latest
+    ("1.8.1-rc.0", "1.8.1-dev.5", True),                   # newer-published dev wins
+    ("1.8.0", "1.8.1-dev.0", True),
+    ("1.8.1-dev.5", "1.8.1-dev.5", False),                 # already on it
+    ("v1.8.0", "1.8.0", False),                            # equal after normalize
+    ("", "1.8.1-rc.0", False),                             # empty installed -> no update
+])
+def test_is_update_available_prerelease(installed, latest, expected):
+    assert is_update_available(installed, latest, prerelease=True) is expected
+
+
+def test_is_update_available_stable():
+    assert is_update_available("1.8.0", "1.8.1") is True
+    assert is_update_available("1.8.1-rc.0", "1.8.1") is False   # same M.M.P
+    assert is_update_available("1.8.0", "1.8.0") is False
+
+
+# ---------------------------------------------------------------------------
+# Task 2: check_latest real prerelease path (max published_at)
+# ---------------------------------------------------------------------------
+
+def test_check_latest_beta_picks_max_published_at():
+    gh = MagicMock()
+    gh.get_all_releases.return_value = [
+        {"tag_name": "1.8.1-dev.5", "published_at": "2026-02-10T00:00:00Z"},
+        {"tag_name": "1.8.1-rc.0", "published_at": "2026-02-01T00:00:00Z"},
+        {"tag_name": "1.8.0", "published_at": "2026-01-15T00:00:00Z"},
+    ]
+    gh.get_asset_list.return_value = [{"name": "motion-sensor-fw.bin"}]
+    info = check_latest(FirmwareKind.SENSOR, include_prerelease=True, releases=gh)
+    assert info is not None
+    assert info.tag == "1.8.1-dev.5"            # newest published, though "lower" semver
+    gh.get_all_releases.assert_called_once_with(include_prerelease=True)
+
+
+def test_check_latest_beta_timestamped_beats_missing():
+    gh = MagicMock()
+    gh.get_all_releases.return_value = [
+        {"tag_name": "1.8.1-rc.0", "published_at": "2026-02-01T00:00:00Z"},
+        {"tag_name": "1.8.1-dev.5", "published_at": None},  # no timestamp
+    ]
+    gh.get_asset_list.return_value = [{"name": "motion-sensor-fw.bin"}]
+    info = check_latest(FirmwareKind.SENSOR, include_prerelease=True, releases=gh)
+    assert info.tag == "1.8.1-rc.0"  # a real timestamp beats a missing one
+
+
+def test_check_latest_beta_none_when_empty():
+    gh = MagicMock()
+    gh.get_all_releases.return_value = []
+    assert check_latest(FirmwareKind.SENSOR, include_prerelease=True, releases=gh) is None
+
+
+def test_check_latest_stable_uses_get_latest_release():
+    gh = MagicMock()
+    gh.get_latest_release.return_value = {"tag_name": "1.8.0", "published_at": "2026-01-15T00:00:00Z"}
+    gh.get_asset_list.return_value = [{"name": "motion-sensor-fw.bin"}]
+    info = check_latest(FirmwareKind.SENSOR, include_prerelease=False, releases=gh)
+    assert info.tag == "1.8.0"
+    gh.get_latest_release.assert_called_once_with(include_prerelease=False)
