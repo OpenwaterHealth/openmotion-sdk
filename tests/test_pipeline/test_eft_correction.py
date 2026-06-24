@@ -4,7 +4,8 @@ Replays scans affected by EMI stimulation through the pipeline and verifies:
 - Gap-free abs_frame_id grid in corrected CSV
 - NaN where data was absent
 - Monotonic non-decreasing timestamp_s
-- Quality column populated correctly
+- Quality flags populated correctly on the "final"-channel frames
+  (the corrected CSV itself no longer carries a quality column)
 - Coalesced logging (warnings present, no per-frame spam)
 """
 
@@ -94,7 +95,28 @@ class _NullCalibration:
     i_max = np.zeros((2, 8))
 
 
-def _replay_degraded(scan_info, output_dir):
+class _QualityCollectorSink:
+    """Collects per-frame quality flags from the "final" channel.
+
+    The corrected CSV no longer carries a quality column, so quality
+    assertions read the flags straight off the corrected frames.
+    """
+
+    channels = {"final"}
+
+    def __init__(self) -> None:
+        self.qualities: list[str] = []
+
+    def on_scan_start(self, meta) -> None: ...
+
+    def consume(self, channel, interval) -> None:
+        for f in interval.frames:
+            self.qualities.append(str(getattr(f, "quality", "ok") or "ok"))
+
+    def on_complete(self) -> None: ...
+
+
+def _replay_degraded(scan_info, output_dir, extra_sinks=()):
     meta = ScanMetadata(
         scan_id=scan_info["name"], subject_id="test", operator="eft",
         started_at_iso="2026-01-01T00:00:00", duration_sec=600,
@@ -113,7 +135,8 @@ def _replay_degraded(scan_info, output_dir):
         pedestals=SensorPedestals(left=pedestal, right=pedestal),
     )
     sink = CsvSink(output_dir=str(output_dir))
-    runner = ScanRunner(source=source, pipeline=pipeline, sinks=[sink])
+    runner = ScanRunner(source=source, pipeline=pipeline,
+                        sinks=[sink, *extra_sinks])
     runner.run()
     csvs = list(Path(output_dir).glob("*.csv"))
     corrected = [c for c in csvs if "_raw" not in c.name]
@@ -191,18 +214,16 @@ def test_degraded_monotonic_timestamps(scan_info, tmp_path):
 
 @pytest.mark.slow
 @pytest.mark.parametrize("scan_info", DEGRADED_SCANS, ids=[s["name"] for s in DEGRADED_SCANS])
-def test_degraded_has_quality_column(scan_info, tmp_path):
-    """Corrected CSV must have quality column with at least some non-ok values."""
+def test_degraded_has_quality_flags(scan_info, tmp_path):
+    """Corrected frames must carry quality flags with at least some non-ok values."""
     if not scan_info["left_raw"].exists():
         pytest.skip(f"Test data not found: {scan_info['left_raw']}")
-    csv_path = _replay_degraded(scan_info, tmp_path)
-    with open(csv_path) as f:
-        reader = csv.DictReader(f)
-        qualities = [row["quality"] for row in reader]
-    assert "quality" in reader.fieldnames
-    non_ok = [q for q in qualities if q != "ok"]
+    collector = _QualityCollectorSink()
+    _replay_degraded(scan_info, tmp_path, extra_sinks=(collector,))
+    assert len(collector.qualities) > 0, "No corrected frames produced"
+    non_ok = [q for q in collector.qualities if q != "ok"]
     assert len(non_ok) > 0, "Degraded scan should have at least some corrected/NaN-filled frames"
-    for q in qualities:
+    for q in collector.qualities:
         assert q in ("ok", "ts_corrected", "nan_filled"), f"Unexpected quality value: {q!r}"
 
 
@@ -220,9 +241,10 @@ def test_stim_corrected_timestamps_return_to_grid(scan_info, tmp_path):
     """
     if not scan_info["left_raw"].exists():
         pytest.skip(f"Test data not found: {scan_info['left_raw']}")
-    csv_path = _replay_degraded(scan_info, tmp_path)
+    collector = _QualityCollectorSink()
+    csv_path = _replay_degraded(scan_info, tmp_path, extra_sinks=(collector,))
     with open(csv_path) as f:
-        rows = [(int(r["frame_id"]), float(r["timestamp_s"]), r["quality"])
+        rows = [(int(r["frame_id"]), float(r["timestamp_s"]))
                 for r in csv.DictReader(f)]
 
     fids = np.array([r[0] for r in rows])
@@ -239,8 +261,8 @@ def test_stim_corrected_timestamps_return_to_grid(scan_info, tmp_path):
         "the corrector failed to restore the frame grid"
     )
     # And the repair must actually have fired — this is a stim recording.
-    assert any(q == "ts_corrected" for _, _, q in rows), (
-        "no ts_corrected rows — detector missed the stim signature entirely"
+    assert any(q == "ts_corrected" for q in collector.qualities), (
+        "no ts_corrected frames — detector missed the stim signature entirely"
     )
 
 

@@ -49,7 +49,30 @@ class _NullCalibration:
     i_max = np.zeros((2, 8))
 
 
-def _replay_scan(scan_info, output_dir):
+class _QualityCollectorSink:
+    """Collects per-frame quality flags from the "final" channel.
+
+    The corrected CSV no longer carries a quality column, so the clean-scan
+    quality assertion reads the flags straight off the corrected frames.
+    """
+
+    channels = {"final"}
+
+    def __init__(self) -> None:
+        self.qualities: list[tuple[int, str]] = []
+
+    def on_scan_start(self, meta) -> None: ...
+
+    def consume(self, channel, interval) -> None:
+        for f in interval.frames:
+            self.qualities.append(
+                (int(f.abs_frame_id), str(getattr(f, "quality", "ok") or "ok"))
+            )
+
+    def on_complete(self) -> None: ...
+
+
+def _replay_scan(scan_info, output_dir, extra_sinks=()):
     meta = ScanMetadata(
         scan_id=scan_info["name"],
         subject_id="test",
@@ -72,7 +95,8 @@ def _replay_scan(scan_info, output_dir):
         pedestals=SensorPedestals(left=128.0, right=128.0),
     )
     sink = CsvSink(output_dir=str(output_dir))
-    runner = ScanRunner(source=source, pipeline=pipeline, sinks=[sink])
+    runner = ScanRunner(source=source, pipeline=pipeline,
+                        sinks=[sink, *extra_sinks])
     runner.run()
     csvs = list(Path(output_dir).glob("*.csv"))
     corrected = [c for c in csvs if "_raw" not in c.name]
@@ -86,15 +110,12 @@ def test_clean_scan_quality_all_ok(scan_info, tmp_path):
     """All quality flags must be 'ok' — the repair stage is a no-op on clean scans."""
     if not scan_info["left_raw"].exists():
         pytest.skip(f"Test data not found: {scan_info['left_raw']}")
-    csv_path = _replay_scan(scan_info, tmp_path)
-    with open(csv_path) as f:
-        reader = csv.DictReader(f)
-        rows = list(reader)
-    assert len(rows) > 0, "Corrected CSV is empty"
-    assert "quality" in reader.fieldnames
-    non_ok = [(i, r["quality"]) for i, r in enumerate(rows) if r["quality"] != "ok"]
+    collector = _QualityCollectorSink()
+    _replay_scan(scan_info, tmp_path, extra_sinks=(collector,))
+    assert len(collector.qualities) > 0, "No corrected frames produced"
+    non_ok = [(fid, q) for fid, q in collector.qualities if q != "ok"]
     assert len(non_ok) == 0, (
-        f"{len(non_ok)} rows with non-ok quality (first 5: {non_ok[:5]})"
+        f"{len(non_ok)} frames with non-ok quality (first 5: {non_ok[:5]})"
     )
 
 

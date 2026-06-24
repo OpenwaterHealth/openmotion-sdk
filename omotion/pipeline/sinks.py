@@ -80,19 +80,18 @@ _RAW_PIPELINE_HEADERS: list = [
 
 
 def _corrected_headers_normal() -> list[str]:
-    """83-column corrected CSV header (82 metric columns + quality)."""
+    """82-column corrected CSV header."""
     cols = ["frame_id", "timestamp_s"]
     for metric in ("bfi", "bvi", "mean", "contrast", "temp"):
         for side in ("l", "r"):
             for cam in range(1, 9):
                 cols.append(f"{metric}_{side}{cam}")
-    cols.append("quality")
     return cols
 
 
 def _corrected_headers_reduced() -> list[str]:
-    """7-column reduced corrected CSV header."""
-    return ["frame_id", "timestamp_s", "bfi_left", "bfi_right", "bvi_left", "bvi_right", "quality"]
+    """6-column reduced corrected CSV header."""
+    return ["frame_id", "timestamp_s", "bfi_left", "bfi_right", "bvi_left", "bvi_right"]
 
 
 # Build the column-index lookup once at module load time.
@@ -151,11 +150,6 @@ _NORMAL_COL_IDX: dict[tuple[str, str, int], int] = {
     for side in ("l", "r")
     for cam in range(1, 9)
 }
-
-# Quality ranking: higher rank means worse quality; used to keep the worst
-# quality value seen across all cameras contributing to one output row.
-_QUALITY_RANK: dict[str, int] = {"ok": 0, "ts_corrected": 1, "nan_filled": 2}
-
 
 class CsvSink:
     """Channel-based CSV sink for the pipeline.
@@ -244,7 +238,6 @@ class CsvSink:
                 row = entry["row"]
                 row[0] = abs_id
                 row[1] = round(entry["t"], 9)
-                row[-1] = entry.get("quality", "ok")
                 self._write_corrected_row(row)
         self._corrected_acc.clear()
         for side, fh in list(self._raw_fhs.items()):
@@ -339,14 +332,9 @@ class CsvSink:
             acc = self._corrected_acc
             if abs_id not in acc:
                 row = [""] * self._corrected_n_cols
-                acc[abs_id] = {"t": float(frame.t), "row": row, "quality": "ok"}
+                acc[abs_id] = {"t": float(frame.t), "row": row}
             entry = acc[abs_id]
             row = entry["row"]
-
-            # Track worst quality across all cameras contributing to this row.
-            frame_quality = getattr(frame, "quality", "ok")
-            if _QUALITY_RANK.get(frame_quality, 0) > _QUALITY_RANK.get(entry["quality"], 0):
-                entry["quality"] = frame_quality
 
             if self._corrected_reduced:
                 # Reduced mode: one cam_id=-1 frame per side per capture.
@@ -426,7 +414,6 @@ class CsvSink:
         row = entry["row"]
         row[0] = abs_id
         row[1] = round(entry["t"], 9)
-        row[-1] = entry.get("quality", "ok")
         self._write_corrected_row(row)
 
     # Flush the corrected CSV every N rows rather than per row — a per-row
