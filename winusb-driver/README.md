@@ -4,7 +4,7 @@ Builds `OpenMotionDriver-x64.msi` (+ `cab1.cab`, zipped) which binds WinUSB to:
 
 - the sensor run-mode device — `VID_0483&PID_5A5A` interfaces `MI_00/01/02`
   (`COMMS_HISTO_IMU(HS)_(Interface_*).inf`), and
-- the STM32 DFU bootloader — `VID_0483&PID_DF11` (`openmotion-dfu.inf`),
+- the STM32 DFU bootloader — `VID_0483&PID_DF11` (`DFU_in_FS_Mode.inf`),
   used by both the console and the sensor in firmware-update mode.
 
 The console in run-mode is a CDC virtual COM port (`PID_A53E`) served by the
@@ -27,22 +27,25 @@ zips, and copies the zip into the bloodflow-app `resources/`. The MSI installs
 the public cert into TrustedPublisher + Root, removes the old retired cert
 (`certutil -delstore`, by thumbprint), then `pnputil /add-driver /install`s each
 INF. (`driver_install.cmd` performs the certutil + pnputil steps for a manual,
-no-MSI install.) Pass `-RegenCats` after changing an INF to rebuild
-`openmotion-dfu.cat` from it.
+no-MSI install.)
 
-Signing uses in-box `New-FileCatalog` / `Set-AuthenticodeSignature` — no WDK
-required.
+Catalog signing uses in-box `Set-AuthenticodeSignature` (no WDK). The catalog
+*content* is NOT generated here — the `.cat` files are libwdi/Zadig output,
+committed as content (see below); the build only re-signs them with the current
+key. **Do not** generate driver catalogs with `New-FileCatalog` — it produces
+file-integrity catalogs, not driver catalogs, and `pnputil` rejects them
+("hash for the file is not present in the specified catalog file").
 
 ## Source vs. build outputs
 
 The **signing key is the single source of truth** for what ships; the private
 key and the derived/built outputs are never committed:
 
-- **Committed content:** the INFs, all four `.cat` files (the 3 sensor cats are
-  proven libwdi/inf2cat content; `openmotion-dfu.cat` is regenerated only on INF
-  change via `-RegenCats`), `Product.wxs`, `build_driver_msi.ps1`,
-  `driver_install.cmd`, this README, and the CI workflow. The build re-signs the
-  catalogs only when the signing key changes.
+- **Committed content:** the INFs, all four `.cat` files (libwdi/Zadig-generated
+  driver catalogs — 3 sensor + `DFU_in_FS_Mode.cat`), `Product.wxs`,
+  `build_driver_msi.ps1`, `driver_install.cmd`, this README, and the CI workflow.
+  The build re-signs the catalogs only when the signing key changes; to add or
+  change a device, regenerate its INF + `.cat` with libwdi/Zadig and commit them.
 - **Not committed (gitignored), produced at build time:** `OpenMotion_signing_cert.pfx`
   (the private key — CI injects it from the `OW_DRIVER_PFX_BASE64` secret),
   `OpenMotion_signing_cert.cer` (derived from the key), `OpenMotionDriver-x64.msi`,

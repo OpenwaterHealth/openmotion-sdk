@@ -6,11 +6,10 @@
 #   2. Load the signing key from the PFX and derive the public .cer from it (so
 #      the shipped cert always matches the key). We do NOT trust the cert on the
 #      build machine -- signing needs only the key; trust is the MSI's job.
-#   3. Ensure the catalogs exist (regenerate the DFU cat from its INF only when
-#      missing or -RegenCats) and (re)sign any catalog not already signed by the
-#      current key -- all timestamped. The .cer/.msi/.cab/.zip are build outputs
-#      (gitignored); the .cat files and INFs are committed content. The key is
-#      the single source of truth for what ships.
+#   3. (re)sign any catalog not already signed by the current key -- all
+#      timestamped. The .cer/.msi/.cab/.zip are build outputs (gitignored); the
+#      .cat files and INFs are committed, libwdi/Zadig-generated content. The key
+#      is the single source of truth for what ships.
 #   4. wix build the MSI (Util ext supplies the QuietExec custom actions).
 #   5. Zip the MSI + external cab.
 #   6. Refresh the bloodflow-app vendored zip.
@@ -20,11 +19,9 @@
 param(
     [string]$AppResourcesZip = "C:\Users\ethan\Projects\openmotion-bloodflow-app\resources\OpenMotionDriver-x64.zip",
     [string]$TimeStampServer = "http://timestamp.digicert.com",
-    [switch]$Fresh,
-    [switch]$RegenCats
+    [switch]$Fresh
 )
 $ErrorActionPreference = "Stop"
-$ProgressPreference = "SilentlyContinue"   # avoid New-FileCatalog progress-bar stalls in CI
 Set-Location (Split-Path -Parent $MyInvocation.MyCommand.Definition)
 
 $pfx = "OpenMotion_signing_cert.pfx"
@@ -77,21 +74,16 @@ Export-Certificate -Cert $signCert -FilePath $cer | Out-Null
 # (certutil -addstore at install). Skipping the import keeps the build/dev box's
 # trust store clean and removes an interactive-prompt hang risk in CI.
 
-# -- 3. ensure catalogs exist, then (re)sign any not already signed by this key --
-# All four catalogs are committed content. The DFU cat is regenerated from its
-# INF only when missing or -RegenCats (i.e. after an INF change); sensor cats are
-# inherited libwdi/inf2cat content and are not regenerated. Signing matches on
-# the signer THUMBPRINT (not chain-validation Status), since the build box does
-# not trust the cert -- so a steady-state build (key unchanged) signs nothing and
-# a key rotation re-signs all four.
-$dfuCat = "openmotion-dfu.cat"
-if ($RegenCats -or -not (Test-Path $dfuCat)) {
-    Remove-Item $dfuCat -ErrorAction SilentlyContinue
-    New-FileCatalog -Path "openmotion-dfu.inf" -CatalogFilePath $dfuCat -CatalogVersion 2 | Out-Null
-}
-
+# -- 3. (re)sign any catalog not already signed by this key --
+# All four catalogs are committed, libwdi/Zadig-generated content -- the proven
+# way driver catalogs are made for this project. (New-FileCatalog does NOT make
+# valid driver catalogs: pnputil rejects them with "hash ... not present in the
+# catalog".) The build only re-signs a catalog when the key changes; regenerating
+# one (after an INF change) is a manual libwdi/Zadig step. Matching is by signer
+# THUMBPRINT (not chain-validation Status), since the build box doesn't trust the
+# cert -- so a steady-state build (key unchanged) signs nothing.
 $cats = @(
-    $dfuCat,
+    "DFU_in_FS_Mode.cat",
     "comms_histo_imu(hs)_(interface_0).cat",
     "comms_histo_imu(hs)_(interface_1).cat",
     "comms_histo_imu(hs)_(interface_2).cat"

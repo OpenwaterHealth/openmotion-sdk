@@ -47,10 +47,10 @@
       </Component>
 
       <Component Id="cmpInf3" Guid="*">
-        <File Id="filInf3" Source="openmotion-dfu.inf" KeyPath="yes"/>
+        <File Id="filInf3" Source="DFU_in_FS_Mode.inf" KeyPath="yes"/>
       </Component>
       <Component Id="cmpCat3" Guid="*">
-        <File Id="filCat3" Source="openmotion-dfu.cat" KeyPath="yes"/>
+        <File Id="filCat3" Source="DFU_in_FS_Mode.cat" KeyPath="yes"/>
       </Component>
     </DirectoryRef>
 
