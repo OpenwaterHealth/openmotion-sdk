@@ -2,7 +2,7 @@
 
 The threading, framing and dispatch live in :class:`omotion.packet_transport.PacketTransport`;
 this class only supplies the USB-specific raw I/O (bulk read/write with libusb
-error handling) and the interface claim.
+error handling), interface claim, and a synchronous send path used by tests.
 """
 import logging
 import time
@@ -10,6 +10,8 @@ import time
 import usb.core
 import usb.util
 
+from omotion.UartPacket import UartPacket
+from omotion.config import OW_ACK, OW_CMD_NOP, OW_END_BYTE
 from omotion.packet_transport import PacketTransport
 from omotion.USBInterfaceBase import USBInterfaceBase
 from omotion import _log_root
@@ -23,9 +25,11 @@ logger = logging.getLogger(
 # Comm Interface (IN + OUT + threads)
 # =========================================
 class CommInterface(PacketTransport, USBInterfaceBase):
-    def __init__(self, dev, interface_index, desc="Comm"):
+    def __init__(self, dev, interface_index, desc="Comm", async_mode=False):
         USBInterfaceBase.__init__(self, dev, interface_index, desc)
-        PacketTransport.__init__(self, desc=desc, default_timeout=10.0)
+        PacketTransport.__init__(
+            self, desc=desc, async_mode=async_mode, default_timeout=10.0
+        )
 
     def claim(self):
         USBInterfaceBase.claim(self)
@@ -89,3 +93,58 @@ class CommInterface(PacketTransport, USBInterfaceBase):
                         except Exception as recovery_err:
                             logger.error("%s: clear_halt recovery failed: %s", self.desc, recovery_err)
                     raise
+
+    def receive(self, length=512, timeout=100):
+        with self._io_lock:
+            data = self.dev.read(self.ep_in.bEndpointAddress, length, timeout=timeout)
+            logger.debug(f"Received {len(data)} bytes.")
+            return data
+
+    # ────────────────────────────────────────────────────────────────────
+    # Send: async path is inherited; sync path (legacy / tested) lives here
+    # because it reads raw USB chunks until the end byte.
+    # ────────────────────────────────────────────────────────────────────
+
+    def send_packet(
+        self,
+        id=None,
+        packetType=OW_ACK,
+        command=OW_CMD_NOP,
+        addr=0,
+        reserved=0,
+        data=None,
+        timeout=10.0,
+        max_retries=0,
+    ) -> UartPacket:
+        if self.async_mode:
+            return super().send_packet(
+                id=id, packetType=packetType, command=command, addr=addr,
+                reserved=reserved, data=data, timeout=timeout, max_retries=max_retries,
+            )
+        # Synchronous path: accumulate raw reads until the END byte. Polls
+        # _transport_down_evt so an in-flight send unblocks if the link drops.
+        with self._send_lock:
+            id, tx = self._build_packet(id, packetType, command, addr, reserved, data)
+            self.write(tx)
+            time.sleep(0.0005)
+            start = time.monotonic()
+            buf = bytearray()
+            with self._io_lock:
+                while time.monotonic() - start < timeout:
+                    if self._transport_down_evt.is_set():
+                        raise ConnectionError(
+                            f"{self.desc}: transport down, packet id 0x{id:04X} "
+                            "not deliverable"
+                        )
+                    try:
+                        resp = self.receive()
+                        time.sleep(0.005)
+                        if resp:
+                            buf.extend(resp)
+                            if buf and buf[-1] == OW_END_BYTE:
+                                return UartPacket(buffer=buf)
+                    except usb.core.USBError:
+                        continue
+            raise TimeoutError(
+                f"{self.desc}: no response (sync) for packet id 0x{id:04X}"
+            )

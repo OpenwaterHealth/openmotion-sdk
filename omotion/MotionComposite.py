@@ -40,7 +40,9 @@ class MotionComposite:
         self.demo_mode = False
         self.on_io_error = on_io_error
 
-        self.comm = CommInterface(dev, 0, desc=f"{desc}-COMM")
+        self.comm = CommInterface(
+            dev, 0, desc=f"{desc}-COMM", async_mode=True
+        )
         self.histo = StreamInterface(dev, 1, desc=f"{desc}-HISTO")
         self.imu = StreamInterface(dev, 2, desc=f"{desc}-IMU")
         self.comm.on_io_error = self._forward_io_error
@@ -58,15 +60,18 @@ class MotionComposite:
         self.comm.claim()
         self.histo.claim()
         self.imu.claim()
-        self.comm.start_read_thread()
+        if self.comm.async_mode:
+            self.comm.start_read_thread()
         logger.info(f"{self.desc}: opened")
 
     def close(self) -> None:
         """Release all three interfaces and free USB resources. Idempotent.
         Each step runs regardless of whether earlier steps fail — failures
         are logged with enough context to diagnose without aborting cleanup."""
-        steps = [
-            ("stop comm read thread", self.comm.stop_read_thread),
+        steps = []
+        if getattr(self.comm, "async_mode", False):
+            steps.append(("stop comm read thread", self.comm.stop_read_thread))
+        steps += [
             ("stop histo streaming", self.histo.stop_streaming),
             ("stop imu streaming", self.imu.stop_streaming),
             ("release comm", self.comm.release),
