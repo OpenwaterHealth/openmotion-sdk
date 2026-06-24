@@ -5,8 +5,10 @@ from omotion.config import (
     OW_ACK,
     OW_CMD_NOP,
     OW_END_BYTE,
+    OW_START_BYTE,
+    OW_DATA,
+    OW_CMD_ECHO,
 )
-from omotion.framing import emit_log_packet, extract_frame, is_log_packet
 import usb.core
 import usb.util
 import time
@@ -15,9 +17,15 @@ import queue
 from omotion.USBInterfaceBase import USBInterfaceBase
 from omotion import _log_root
 
+# Max data_len we accept (sanity check to avoid runaway buffer)
+OW_MAX_PACKET_DATA_LEN = 4096 * 2
+
 logger = logging.getLogger(
     f"{_log_root}.CommInterface" if _log_root else "CommInterface"
 )
+
+# Max data_len we accept (sanity check to avoid runaway buffer)
+OW_MAX_PACKET_DATA_LEN = 4096 * 2
 
 _PACKET_TYPE_NAMES = {
     value: name
@@ -324,17 +332,49 @@ class CommInterface(USBInterfaceBase):
                 if not self._read_buffer:
                     self._buffer_condition.wait(timeout=0.1)
                     continue
-                # Carve one complete frame off the front (resyncs past garbage).
-                frame = extract_frame(self._read_buffer)
-            if frame is None:
-                continue  # partial frame — wait for the reader to add more
+                buf = self._read_buffer
+                # Align to start of packet: discard leading bytes until OW_START_BYTE
+                if buf[0] != OW_START_BYTE:
+                    try:
+                        start_idx = buf.index(OW_START_BYTE)
+                    except ValueError:
+                        start_idx = len(buf)
+                    del self._read_buffer[:start_idx]
+                    if start_idx == len(buf):
+                        continue
+                    buf = self._read_buffer
+                # Need at least 9 bytes to read data_len (bytes 7:9)
+                if len(buf) < 9:
+                    continue
+                data_len = int.from_bytes(buf[7:9], "big")
+                if data_len > OW_MAX_PACKET_DATA_LEN:
+                    del self._read_buffer[:1]
+                    continue
+                packet_len = 12 + data_len  # header(11) + data + crc(2) + end(1)
+                if len(buf) < packet_len:
+                    continue
+                if buf[packet_len - 1] != OW_END_BYTE:
+                    del self._read_buffer[:1]
+                    continue
+                packet_bytes = bytes(buf[:packet_len])
+                del self._read_buffer[:packet_len]
             try:
-                uart_packet = UartPacket(buffer=frame)
+                uart_packet = UartPacket(buffer=packet_bytes)
             except ValueError:
-                continue  # bad CRC / malformed — drop it
-            # Unsolicited firmware log packets are surfaced and dropped; only
-            # real command responses go to the queue for send_packet to match.
-            if is_log_packet(uart_packet):
-                emit_log_packet(uart_packet, self.desc)
+                continue
+            if (
+                uart_packet.id == 0
+                and uart_packet.packetType == OW_DATA
+                and uart_packet.command == OW_CMD_ECHO
+            ):
+                _raw = bytes(uart_packet.data[:uart_packet.data_len]) if uart_packet.data_len > 0 else b""
+                try:
+                    _text = _raw.decode("utf-8", errors="replace").rstrip("\x00").strip()
+                except Exception:
+                    _text = ""
+                if _text:
+                    logger.warning("[%s PRINTF] %s", self.desc, _text)
+                else:
+                    logger.warning("[%s] MCU echo: data=%s", self.desc, _raw.hex() if _raw else "")
             else:
                 self.response_queue.put(uart_packet)
