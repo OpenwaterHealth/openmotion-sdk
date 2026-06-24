@@ -71,6 +71,9 @@ def test_scan_db_sink_stamps_session_meta(tmp_path):
     db_path = str(tmp_path / "scan.db")
     sink = ScanDBSink(db_path=db_path)
     sink.on_scan_start(_meta_reduced())
+    # One side-average row so the session persists (empty scans are deleted —
+    # see test_scan_db_sink_empty.py). Reduced mode keeps only cam_id=-1 rows.
+    sink.consume("final", _interval([_frame(42, side="right", cam_id=-1)]))
     sink.on_complete()
 
     conn = sqlite3.connect(db_path)

@@ -10,6 +10,7 @@ TerminalDarkResult) are excluded from the integrity record.
 import json
 import logging
 import sqlite3
+from types import SimpleNamespace
 
 from omotion.pipeline.batch import (
     DarkIntegrityWarning,
@@ -33,6 +34,18 @@ def _dark_warning(abs_id=42):
         side="left", cam_id=0, abs_frame_id=abs_id,
         u1=90.0, pedestal=64.0, threshold=5.0,
     )
+
+
+def _final_interval():
+    """One corrected frame so the session persists as a real scan. Empty scans
+    (no corrected rows) are deleted by ScanDBSink — that path is covered by
+    test_scan_db_sink_empty.py; these tests exercise the session_meta /
+    diagnostics summary on a scan that actually produced rows."""
+    frame = SimpleNamespace(
+        cam_id=0, side="left", abs_frame_id=1, t=0.1,
+        bfi=1.0, bvi=2.0, mean=3.0, contrast=0.4, quality="ok",
+    )
+    return SimpleNamespace(frames=[frame])
 
 
 def test_log_sink_warns_on_integrity_events(caplog):
@@ -66,6 +79,7 @@ def test_scan_db_sink_writes_diagnostics_summary_to_session_meta(tmp_path):
     db_path = str(tmp_path / "scan.db")
     sink = ScanDBSink(db_path=db_path)
     sink.on_scan_start(_meta())
+    sink.consume("final", _final_interval())
     sink.consume("diagnostics", _dark_warning(abs_id=10))
     sink.consume("diagnostics", _dark_warning(abs_id=610))
     sink.consume("diagnostics", TerminalDarkResult(
@@ -92,6 +106,7 @@ def test_scan_db_sink_meta_has_no_diagnostics_key_when_clean(tmp_path):
     db_path = str(tmp_path / "scan.db")
     sink = ScanDBSink(db_path=db_path)
     sink.on_scan_start(_meta())
+    sink.consume("final", _final_interval())
     sink.on_complete()
 
     conn = sqlite3.connect(db_path)
