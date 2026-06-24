@@ -18,7 +18,7 @@ channel without colliding with responses — the reason the sensor tolerated
 firmware printf long before the console did.
 
 Subclasses implement ``_raw_read()`` / ``_raw_write()`` plus their own
-open/close, and may override the throttle hooks to pace commands.
+open/close, and may override :meth:`send_packet` to add a synchronous path.
 """
 from __future__ import annotations
 
@@ -63,10 +63,12 @@ class PacketTransport:
     def __init__(
         self,
         desc: str = "XPORT",
+        async_mode: bool = True,
         default_timeout: float = 10.0,
         on_io_error: Optional[Callable[[Optional[int], str], None]] = None,
     ):
         self.desc = desc
+        self.async_mode = async_mode
         self.default_timeout = default_timeout
         self.on_io_error = on_io_error
         self.packet_count = 0
@@ -87,7 +89,9 @@ class PacketTransport:
 
         self.read_thread: Optional[threading.Thread] = None
         self.response_thread: Optional[threading.Thread] = None
-        self.response_queue: queue.Queue = queue.Queue()
+        self.response_queue: Optional[queue.Queue] = (
+            queue.Queue() if async_mode else None
+        )
 
     # ────────────────────────────────────────────────────────────────────
     # Raw byte I/O — subclass provides
@@ -111,11 +115,14 @@ class PacketTransport:
         # transport-down latch so subsequent sends aren't poisoned.
         self.stop_event.clear()
         self._transport_down_evt.clear()
-        if self.response_thread is None or not self.response_thread.is_alive():
-            self.response_thread = threading.Thread(
-                target=self._process_responses, daemon=True
-            )
-            self.response_thread.start()
+        if self.async_mode:
+            if self.response_queue is None:
+                self.response_queue = queue.Queue()
+            if self.response_thread is None or not self.response_thread.is_alive():
+                self.response_thread = threading.Thread(
+                    target=self._process_responses, daemon=True
+                )
+                self.response_thread.start()
         if self.read_thread is not None and self.read_thread.is_alive():
             logger.info("%s: read thread already running", self.desc)
             return
@@ -174,7 +181,7 @@ class PacketTransport:
             # real command responses go to the queue for send_packet to match.
             if is_log_packet(pkt):
                 emit_log_packet(pkt, self.desc)
-            else:
+            elif self.response_queue is not None:
                 self.response_queue.put(pkt)
 
     # ────────────────────────────────────────────────────────────────────

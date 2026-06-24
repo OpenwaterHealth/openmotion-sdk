@@ -55,7 +55,7 @@ class MotionUart(PacketTransport):
         on_io_error: Optional[Callable[[Optional[int], str], None]] = None,
     ):
         PacketTransport.__init__(
-            self, desc=desc,
+            self, desc=desc, async_mode=True,
             default_timeout=_CONSOLE_CMD_TIMEOUT_S, on_io_error=on_io_error,
         )
         self.vid = vid
