@@ -4,7 +4,7 @@
 
   <Package Name="OpenMotion WinUSB Driver"
            Manufacturer="Openwater"
-           Version="1.0.0"
+           Version="1.1.0"
            UpgradeCode="{F6F5B7B5-98B8-4E6D-9E68-4C7A8A0A1234}"
            Language="1033"
            Scope="perMachine"
@@ -45,6 +45,13 @@
       <Component Id="cmpCat2" Guid="*">
         <File Id="filCat2" Source="comms_histo_imu(hs)_(interface_2).cat" KeyPath="yes"/>
       </Component>
+
+      <Component Id="cmpInf3" Guid="*">
+        <File Id="filInf3" Source="DFU_in_FS_Mode.inf" KeyPath="yes"/>
+      </Component>
+      <Component Id="cmpCat3" Guid="*">
+        <File Id="filCat3" Source="DFU_in_FS_Mode.cat" KeyPath="yes"/>
+      </Component>
     </DirectoryRef>
 
     <Feature Id="MainFeature" Title="OpenMotion Driver" Level="1">
@@ -55,6 +62,8 @@
       <ComponentRef Id="cmpCat1"/>
       <ComponentRef Id="cmpInf2"/>
       <ComponentRef Id="cmpCat2"/>
+      <ComponentRef Id="cmpInf3"/>
+      <ComponentRef Id="cmpCat3"/>
     </Feature>
 
     <!-- QuietExec custom actions (WiX v4) -->
@@ -71,6 +80,26 @@
     <CustomAction Id="InstallCertRoot"
                   BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)" DllEntry="WixQuietExec"
                   Execute="deferred" Impersonate="no" Return="check"/>
+
+    <!-- Remove the retired/compromised old signing cert. The old self-signed
+         private key was exposed in public git history, so the cert it signs is
+         treated as burned. Keyed by THUMBPRINT (not subject) so only the old
+         cert is removed; the new cert shares the same subject and is kept.
+         Best-effort: Return="ignore" so a clean machine that never had the old
+         cert still installs cleanly. -->
+    <SetProperty Id="RemoveOldCertTrustedPublisher"
+                 Value="&quot;[System32Folder]certutil.exe&quot; -delstore &quot;TrustedPublisher&quot; D3A6A27AA018DF07164D551D9B83AE6F27D1D453"
+                 Before="RemoveOldCertTrustedPublisher" Sequence="execute"/>
+    <CustomAction Id="RemoveOldCertTrustedPublisher"
+                  BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)" DllEntry="WixQuietExec"
+                  Execute="deferred" Impersonate="no" Return="ignore"/>
+
+    <SetProperty Id="RemoveOldCertRoot"
+                 Value="&quot;[System32Folder]certutil.exe&quot; -delstore &quot;Root&quot; D3A6A27AA018DF07164D551D9B83AE6F27D1D453"
+                 Before="RemoveOldCertRoot" Sequence="execute"/>
+    <CustomAction Id="RemoveOldCertRoot"
+                  BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)" DllEntry="WixQuietExec"
+                  Execute="deferred" Impersonate="no" Return="ignore"/>
 
     <SetProperty Id="AddDriverIf0"
                  Value="&quot;[System32Folder]pnputil.exe&quot; /add-driver &quot;[#filInf0]&quot; /install"
@@ -93,12 +122,22 @@
                   BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)" DllEntry="WixQuietExec"
                   Execute="deferred" Impersonate="no" Return="check"/>
 
+    <SetProperty Id="AddDriverIf3"
+                 Value="&quot;[System32Folder]pnputil.exe&quot; /add-driver &quot;[#filInf3]&quot; /install"
+                 Before="AddDriverIf3" Sequence="execute"/>
+    <CustomAction Id="AddDriverIf3"
+                  BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)" DllEntry="WixQuietExec"
+                  Execute="deferred" Impersonate="no" Return="check"/>
+
     <InstallExecuteSequence>
       <Custom Action="InstallCertTrustedPublisher" After="InstallFiles" Condition="NOT Installed OR REINSTALL"/>
       <Custom Action="InstallCertRoot"             After="InstallCertTrustedPublisher" Condition="NOT Installed OR REINSTALL"/>
-      <Custom Action="AddDriverIf0"                After="InstallCertRoot" Condition="NOT Installed OR REINSTALL"/>
+      <Custom Action="RemoveOldCertTrustedPublisher" After="InstallCertRoot" Condition="NOT Installed OR REINSTALL"/>
+      <Custom Action="RemoveOldCertRoot"           After="RemoveOldCertTrustedPublisher" Condition="NOT Installed OR REINSTALL"/>
+      <Custom Action="AddDriverIf0"                After="RemoveOldCertRoot" Condition="NOT Installed OR REINSTALL"/>
       <Custom Action="AddDriverIf1"                After="AddDriverIf0" Condition="NOT Installed OR REINSTALL"/>
       <Custom Action="AddDriverIf2"                After="AddDriverIf1" Condition="NOT Installed OR REINSTALL"/>
+      <Custom Action="AddDriverIf3" After="AddDriverIf2" Condition="NOT Installed OR REINSTALL"/>
     </InstallExecuteSequence>
 
   </Package>
