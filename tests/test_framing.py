@@ -1,10 +1,8 @@
-"""Pure-software tests for omotion.framing and the unified async transport
-(MotionUart over a fake serial). No hardware: runs under
-``pytest -m "not console and not sensor and not destructive"``.
+"""Pure-software tests for omotion.framing and the MotionUart printf demux.
+
+No hardware: runs under ``pytest -m "not console and not sensor and not destructive"``.
 """
 import logging
-import threading
-import time
 
 import pytest
 
@@ -17,7 +15,6 @@ from omotion.framing import (
     is_log_packet,
 )
 from omotion.config import (
-    OW_CMD,
     OW_CMD_ECHO,
     OW_CMD_PING,
     OW_DATA,
@@ -44,7 +41,8 @@ def make_log_frame(text=b"hello\n"):
 def test_extract_single_frame():
     frame = make_frame(b"abc")
     buf = bytearray(frame)
-    assert extract_frame(buf) == frame
+    out = extract_frame(buf)
+    assert out == frame
     assert len(buf) == 0
 
 
@@ -61,8 +59,8 @@ def test_extract_multiple_frames_back_to_back():
 def test_extract_partial_frame_returns_none_then_completes():
     frame = make_frame(b"payload")
     buf = bytearray(frame[:6])
-    assert extract_frame(buf) is None
-    assert bytes(buf) == frame[:6]
+    assert extract_frame(buf) is None       # not enough bytes yet
+    assert bytes(buf) == frame[:6]          # held intact for next read
     buf.extend(frame[6:])
     assert extract_frame(buf) == frame
 
@@ -75,6 +73,8 @@ def test_extract_skips_leading_garbage():
 
 
 def test_extract_resyncs_past_false_start():
+    # A 0xAA whose declared length is implausible (0xFFFF > MAX) must be
+    # discarded so the real frame that follows is still found.
     false_start = bytes([OW_START_BYTE, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF])
     frame = make_frame(b"real")
     buf = bytearray(false_start + frame)
@@ -83,16 +83,19 @@ def test_extract_resyncs_past_false_start():
 
 
 def test_extract_empty_buffer():
-    assert extract_frame(bytearray()) is None
+    buf = bytearray()
+    assert extract_frame(buf) is None
 
 
 def test_extract_all_garbage_is_dropped():
     buf = bytearray(b"\x01\x02\x03\x04")
     assert extract_frame(buf) is None
-    assert len(buf) == 0
+    assert len(buf) == 0  # nothing salvageable — buffer cleared
 
 
 def test_max_frame_data_len_is_generous():
+    # Must cover both firmwares (sensor up to 8192) so the shared extractor is
+    # safe for the async path too.
     assert MAX_FRAME_DATA_LEN >= 8192
 
 
@@ -101,15 +104,16 @@ def test_max_frame_data_len_is_generous():
 # --------------------------------------------------------------------------- #
 
 def test_is_log_packet_true_for_printf():
-    assert is_log_packet(UartPacket(buffer=make_log_frame(b"hi"))) is True
+    pkt = UartPacket(buffer=make_log_frame(b"hi"))
+    assert is_log_packet(pkt) is True
 
 
 @pytest.mark.parametrize(
     "frame",
     [
-        make_frame(b"hi", id=1, ptype=OW_DATA, cmd=OW_CMD_ECHO),
-        make_frame(b"hi", id=0, ptype=OW_RESP, cmd=OW_CMD_ECHO),
-        make_frame(b"hi", id=0, ptype=OW_DATA, cmd=OW_CMD_PING),
+        make_frame(b"hi", id=1, ptype=OW_DATA, cmd=OW_CMD_ECHO),   # id != 0
+        make_frame(b"hi", id=0, ptype=OW_RESP, cmd=OW_CMD_ECHO),   # wrong type
+        make_frame(b"hi", id=0, ptype=OW_DATA, cmd=OW_CMD_PING),   # wrong cmd
     ],
 )
 def test_is_log_packet_false_for_responses(frame):
@@ -120,129 +124,64 @@ def test_emit_log_packet_logs_text(caplog):
     pkt = UartPacket(buffer=make_log_frame(b"boot complete\r\n"))
     with caplog.at_level(logging.WARNING):
         emit_log_packet(pkt, "console")
-    assert any(
-        "PRINTF" in r.getMessage() and "boot complete" in r.getMessage()
-        for r in caplog.records
-    )
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("PRINTF" in m and "boot complete" in m for m in msgs)
 
 
 # --------------------------------------------------------------------------- #
-# Unified async transport (MotionUart) over a fake serial
+# MotionUart.read_packet — demuxes log packets out of the response stream
 # --------------------------------------------------------------------------- #
 
 class FakeSerial:
-    """Threadsafe serial stand-in: read(1)/read_all() drain queued chunks."""
+    """Minimal serial stand-in: read_all() drains queued chunks."""
 
-    def __init__(self, chunks=()):
-        self._chunks = [bytes(c) for c in chunks]
-        self._lock = threading.Lock()
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
         self.is_open = True
 
-    def feed(self, data):
-        with self._lock:
-            self._chunks.append(bytes(data))
-
-    def read(self, n=1):
-        with self._lock:
-            if self._chunks:
-                return self._chunks.pop(0)
-        time.sleep(0.005)
-        return b""
-
     def read_all(self):
-        with self._lock:
-            if not self._chunks:
-                return b""
-            data = b"".join(self._chunks)
-            self._chunks.clear()
-            return data
-
-    def write(self, data):
-        return len(data)
+        return self._chunks.pop(0) if self._chunks else b""
 
     def reset_input_buffer(self):
-        with self._lock:
-            self._chunks.clear()
-
-    def close(self):
-        self.is_open = False
+        pass
 
 
-def make_async_uart(chunks=()):
+def make_uart(chunks):
     u = MotionUart(vid=0, pid=0, demo_mode=False)
     u.serial = FakeSerial(chunks)
-    u.port = "FAKE"
-    u.start_read_thread()
     return u
 
 
-def test_transport_demuxes_log_and_returns_response(caplog):
-    resp = make_frame(b"OK", id=42, cmd=OW_CMD_PING)
-    log = make_log_frame(b"hello from fw\n")
-    u = make_async_uart([log + resp])
-    try:
-        with caplog.at_level(logging.WARNING):
-            r = u.send_packet(id=42, packetType=OW_CMD, command=OW_CMD_PING, timeout=2)
-        assert r.id == 42
-        assert bytes(r.data) == b"OK"
-        assert any("PRINTF" in rec.getMessage() for rec in caplog.records)
-    finally:
-        u.stop_read_thread()
+def test_read_packet_skips_log_and_returns_response(caplog):
+    log = make_log_frame(b"some printf\n")
+    resp = make_frame(b"OK", id=7, cmd=OW_CMD_PING)
+    uart = make_uart([log + resp])
+    with caplog.at_level(logging.WARNING):
+        pkt = uart.read_packet(timeout=2)
+    assert pkt.id == 7
+    assert bytes(pkt.data) == b"OK"
+    assert any("PRINTF" in r.getMessage() for r in caplog.records)
 
 
-def test_transport_reassembles_fragments():
-    resp = make_frame(b"payload-across-reads", id=7)
-    u = make_async_uart([resp[:5]])
-    try:
-        u.serial.feed(resp[5:])
-        r = u.send_packet(id=7, packetType=OW_CMD, command=OW_CMD_PING, timeout=2)
-        assert r.id == 7
-        assert bytes(r.data) == b"payload-across-reads"
-    finally:
-        u.stop_read_thread()
+def test_read_packet_reassembles_fragments():
+    resp = make_frame(b"payload-across-reads", id=3)
+    uart = make_uart([resp[:5], resp[5:]])
+    pkt = uart.read_packet(timeout=2)
+    assert pkt.id == 3
+    assert bytes(pkt.data) == b"payload-across-reads"
 
 
-def test_transport_drops_bad_crc_then_returns_good():
+def test_read_packet_times_out_with_no_data():
+    uart = make_uart([])  # read_all always returns b""
+    with pytest.raises(ValueError):
+        uart.read_packet(timeout=0.2)
+
+
+def test_read_packet_drops_bad_crc_then_returns_good():
     bad = bytearray(make_frame(b"bad", id=1))
-    bad[10] ^= 0xFF  # corrupt the payload so CRC fails
+    bad[10] ^= 0xFF  # corrupt a CRC byte
     good = make_frame(b"good", id=2)
-    u = make_async_uart([bytes(bad) + good])
-    try:
-        r = u.send_packet(id=2, packetType=OW_CMD, command=OW_CMD_PING, timeout=2)
-        assert r.id == 2
-        assert bytes(r.data) == b"good"
-    finally:
-        u.stop_read_thread()
-
-
-def test_transport_ignores_stale_id_and_times_out():
-    # A response with the wrong id must not satisfy a different request.
-    other = make_frame(b"x", id=99)
-    u = make_async_uart([other])
-    try:
-        with pytest.raises(TimeoutError):
-            u.send_packet(id=1, packetType=OW_CMD, command=OW_CMD_PING, timeout=0.4)
-    finally:
-        u.stop_read_thread()
-
-
-def test_transport_send_unblocks_on_transport_down():
-    u = make_async_uart([])
-    try:
-        def trip():
-            time.sleep(0.05)
-            u._transport_down_evt.set()
-
-        threading.Thread(target=trip, daemon=True).start()
-        t0 = time.monotonic()
-        with pytest.raises(ConnectionError):
-            u.send_packet(id=1, packetType=OW_CMD, command=OW_CMD_PING, timeout=5)
-        assert time.monotonic() - t0 < 1.0
-    finally:
-        u.stop_read_thread()
-
-
-def test_demo_mode_send_returns_without_serial():
-    u = MotionUart(vid=0, pid=0, demo_mode=True)
-    r = u.send_packet(packetType=OW_CMD, command=OW_CMD_PING)
-    assert r is not None  # demo short-circuit, never touches a port
+    uart = make_uart([bytes(bad) + good])
+    pkt = uart.read_packet(timeout=2)
+    assert pkt.id == 2
+    assert bytes(pkt.data) == b"good"

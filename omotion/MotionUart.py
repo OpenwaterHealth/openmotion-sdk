@@ -1,19 +1,15 @@
-"""Console command/response transport — serial VCP.
+"""Pure UART transport (synchronous request/response).
 
-Same async engine as the sensor's USB link: :class:`omotion.packet_transport.PacketTransport`
-runs the reader/dispatch threads and matches responses by id; this class only
-supplies serial-specific raw I/O and lifecycle (open/close/discovery). A
-continuous reader is what lets unsolicited firmware printf packets share the
-command channel without colliding with responses.
-
-`MotionUart` does not own connection lifecycle — the owning `MotionConsole`
-drives `open(port)` / `close()` from its state machine. On a fatal serial error
-the transport invokes the `on_io_error(errno, message)` callback so the state
-machine can transition out of CONNECTED.
+`MotionUart` no longer owns connection lifecycle — the owning handle
+(`MotionConsole`) drives `open(port)` / `close()` from its state machine.
+On a fatal serial error during reads or writes, the transport invokes the
+`on_io_error(errno, message)` callback; the handle's state machine is
+expected to react by transitioning out of CONNECTED.
 """
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from typing import Callable, Optional
 
@@ -21,28 +17,22 @@ import serial
 import serial.tools.list_ports
 
 from omotion.UartPacket import UartPacket
-from omotion.config import OW_END_BYTE, OW_ERROR
-from omotion.packet_transport import PacketTransport
-from omotion.CommandError import CommandError
+from omotion.config import (
+    OW_ACK,
+    OW_CMD_NOP,
+    OW_END_BYTE,
+    OW_ERROR,
+    OW_START_BYTE,
+)
+from omotion.framing import emit_log_packet, extract_frame, is_log_packet
+from omotion.utils import util_crc16
 from omotion import _log_root
+from omotion.CommandError import CommandError
 
 logger = logging.getLogger(f"{_log_root}.UART" if _log_root else "UART")
 
-# Short blocking read timeout for the reader thread — keeps it responsive to
-# incoming bytes and to shutdown without a busy-spin. The per-command timeout is
-# separate (PacketTransport.send_packet / default_timeout).
-_READER_TIMEOUT_S = 0.1
-# Default per-command response timeout for the console (preserves prior behavior).
-_CONSOLE_CMD_TIMEOUT_S = 20.0
-# Minimum gap between the previous response and the next command. The console
-# firmware re-arms its CDC OUT reception only after sending each response, so a
-# command that arrives in the ~10 ms window before that is silently dropped.
-# Pacing here (rather than retrying) avoids re-applying non-idempotent commands.
-# The old synchronous reader paced this implicitly via its ~100 ms read loop.
-_MIN_CMD_INTERVAL_S = 0.015
 
-
-class MotionUart(PacketTransport):
+class MotionUart:
     def __init__(
         self,
         vid: int,
@@ -54,44 +44,43 @@ class MotionUart(PacketTransport):
         desc: str = "VCP",
         on_io_error: Optional[Callable[[Optional[int], str], None]] = None,
     ):
-        PacketTransport.__init__(
-            self, desc=desc, async_mode=True,
-            default_timeout=_CONSOLE_CMD_TIMEOUT_S, on_io_error=on_io_error,
-        )
         self.vid = vid
         self.pid = pid
         self.port: Optional[str] = None
         self.baudrate = baudrate
-        self.timeout = timeout  # retained for API compat; reader uses _READER_TIMEOUT_S
+        self.timeout = timeout
         self.align = align
+        self.packet_count = 0
         self.demo_mode = demo_mode
         self.descriptor = desc
         self.serial: Optional[serial.Serial] = None
-        self._last_cmd_ts = 0.0
+        self._io_lock = threading.RLock()
+        # Bytes read from the port but not yet consumed as a complete frame.
+        # Lets read_packet reassemble fragmented frames and skip interleaved
+        # firmware log packets without losing trailing response bytes.
+        self._rx_buf = bytearray()
+        self.on_io_error = on_io_error
 
     # ────────────────────────────────────────────────────────────────────
     # Lifecycle (driven by MotionConsole state machine)
     # ────────────────────────────────────────────────────────────────────
 
     def open(self, port: str) -> None:
-        """Open the serial port and start the reader. Raises serial.SerialException
-        on failure."""
+        """Open the serial port. Raises serial.SerialException on failure."""
         if self.demo_mode:
             self.port = port or "DEMO"
             return
         self.serial = serial.Serial(
-            port=port, baudrate=self.baudrate, timeout=_READER_TIMEOUT_S
+            port=port, baudrate=self.baudrate, timeout=self.timeout
         )
         self.port = port
-        self.start_read_thread()
         logger.info("UART %s opened on %s", self.descriptor, port)
 
     def close(self) -> None:
-        """Stop the reader and close the serial port. Idempotent."""
+        """Close the serial port. Idempotent."""
         if self.demo_mode:
             self.port = None
             return
-        self.stop_read_thread()
         s = self.serial
         self.serial = None
         if s is not None:
@@ -109,6 +98,10 @@ class MotionUart(PacketTransport):
             return self.port is not None
         return self.serial is not None and self.serial.is_open
 
+    # ────────────────────────────────────────────────────────────────────
+    # VID/PID discovery
+    # ────────────────────────────────────────────────────────────────────
+
     def find_port(self) -> Optional[str]:
         """Return the COM/tty device path that matches our VID/PID, or None."""
         for p in serial.tools.list_ports.comports():
@@ -120,55 +113,161 @@ class MotionUart(PacketTransport):
         return None
 
     # ────────────────────────────────────────────────────────────────────
-    # Raw byte I/O for the shared transport engine
+    # I/O
     # ────────────────────────────────────────────────────────────────────
 
-    def _raw_read(self) -> bytes:
-        s = self.serial
-        if s is None:
-            raise CommandError("UART not open")
-        # read(1) blocks up to the (short) serial timeout, then drain whatever
-        # else arrived. Returns b"" on an idle window. SerialException → fatal.
-        first = s.read(1)
-        if not first:
-            return b""
-        rest = s.read_all()
-        return first + (rest or b"")
-
-    def _raw_write(self, data: bytes) -> None:
-        if self.demo_mode:
-            logger.debug("Demo mode TX: %s", bytes(data).hex())
+    def _notify_io_error(self, errno: Optional[int], message: str) -> None:
+        cb = self.on_io_error
+        if cb is None:
             return
-        s = self.serial
-        if s is None or not s.is_open:
-            raise CommandError("UART not open")
-        if self.align > 0:
-            data = bytes(data)
-            while len(data) % self.align != 0:
-                data += bytes([OW_END_BYTE])
         try:
-            s.write(data)
+            cb(errno, message)
+        except Exception as e:
+            logger.warning("on_io_error callback raised: %s", e)
+
+    def _tx(self, data: bytes) -> None:
+        if self.demo_mode:
+            logger.debug("Demo mode TX: %s", data.hex())
+            return
+        if self.serial is None or not self.serial.is_open:
+            raise CommandError("UART not open")
+        try:
+            with self._io_lock:
+                if self.align > 0:
+                    while len(data) % self.align != 0:
+                        data += bytes([OW_END_BYTE])
+                self.serial.write(data)
         except serial.SerialException as se:
-            self._notify_io_error(se)
+            errno = getattr(se, "errno", None)
+            self._notify_io_error(errno, str(se))
             raise
 
-    def send_packet(self, *args, **kwargs):
+    def read_packet(self, timeout: int = 20) -> UartPacket:
+        """Block until a command response arrives or `timeout` seconds elapse.
+
+        Unsolicited firmware log packets (printf mirrored over the link when
+        DEBUG_FLAG_USB_PRINTF is set — id=0 / OW_DATA / OW_CMD_ECHO) share this
+        link with command responses, so they are demuxed out here: each one is
+        surfaced via the logger and skipped, and reading continues until a real
+        response frame arrives. Malformed/bad-CRC frames are dropped the same
+        way. Raises ValueError if nothing valid arrives within the timeout.
+        """
         if self.demo_mode:
             return UartPacket(
                 id=0, packetType=OW_ERROR, command=0, addr=0, reserved=0, data=[]
             )
-        return super().send_packet(*args, **kwargs)
+        if self.serial is None:
+            raise CommandError("UART not open")
+        with self._io_lock:
+            start_time = time.monotonic()
+            while timeout == -1 or time.monotonic() - start_time < timeout:
+                try:
+                    chunk = self.serial.read_all()
+                except serial.SerialException as se:
+                    self._notify_io_error(getattr(se, "errno", None), str(se))
+                    raise
+                if chunk:
+                    self._rx_buf.extend(chunk)
+                    # Dispatch every complete frame currently buffered.
+                    while True:
+                        frame = extract_frame(self._rx_buf)
+                        if frame is None:
+                            break
+                        try:
+                            packet = UartPacket(buffer=frame)
+                        except ValueError:
+                            continue  # bad CRC / malformed — drop and resync
+                        if is_log_packet(packet):
+                            emit_log_packet(packet, self.descriptor)
+                            continue
+                        return packet
+                time.sleep(0.005)
 
-    # Throttle hooks (called by PacketTransport.send_packet holding the send
-    # lock) — keep at least _MIN_CMD_INTERVAL_S between the previous response
-    # and the next command so the firmware's CDC RX has re-armed.
-    def _pace_before_send(self) -> None:
-        wait = self._last_cmd_ts + _MIN_CMD_INTERVAL_S - time.monotonic()
-        if wait > 0:
-            time.sleep(wait)
+        raise ValueError("No data received from UART within timeout")
 
-    def _mark_send_done(self) -> None:
-        self._last_cmd_ts = time.monotonic()
+    def send_packet(
+        self,
+        id=None,
+        packetType=OW_ACK,
+        command=OW_CMD_NOP,
+        addr: int = 0,
+        reserved: int = 0,
+        data=None,
+        timeout: int = 20,
+    ) -> Optional[UartPacket]:
+        """Send a command packet and return the matching response.
+
+        Returns None only when the transport is closed (caller should treat
+        as a connection error). Raises `CommandError` on validation errors
+        and re-raises `serial.SerialException` after notifying the I/O
+        error callback so the handle can transition out of CONNECTED.
+        """
+        try:
+            if not self.demo_mode and (
+                self.serial is None or not self.serial.is_open
+            ):
+                logger.error("Cannot send packet. UART not open.")
+                return None
+
+            if id is None:
+                self.packet_count += 1
+                if self.packet_count >= 0xFFFF:
+                    self.packet_count = 1
+                id = self.packet_count
+
+            if data:
+                if not isinstance(data, (bytes, bytearray)):
+                    raise ValueError("Data must be bytes or bytearray")
+                payload = data
+                payload_length = len(payload)
+            else:
+                payload_length = 0
+                payload = b""
+
+            packet = bytearray()
+            packet.append(OW_START_BYTE)
+            packet.extend(id.to_bytes(2, "big"))
+            packet.append(packetType)
+            packet.append(command)
+            packet.append(addr)
+            packet.append(reserved)
+            packet.extend(payload_length.to_bytes(2, "big"))
+            if payload_length > 0:
+                packet.extend(payload)
+
+            crc_value = util_crc16(packet[1:])  # exclude start byte
+            packet.extend(crc_value.to_bytes(2, "big"))
+            packet.append(OW_END_BYTE)
+
+            with self._io_lock:
+                self._tx(packet)
+                time.sleep(0.0005)
+                ret_packet = self.read_packet(timeout=timeout)
+                time.sleep(0.0005)
+                return ret_packet
+
+        except ValueError as ve:
+            logger.error("Validation error in send_packet: %s", ve)
+            raise CommandError(str(ve)) from ve
+        except serial.SerialException as se:
+            # Already notified on_io_error from _tx/read_packet — the
+            # handle's state machine logs the disconnect at INFO. Logging
+            # here at DEBUG keeps in-flight commands from spamming ERROR
+            # during the disconnect window. The exception is still
+            # re-raised so callers can react.
+            logger.debug("Serial error in send_packet: %s", se)
+            raise
+
+    def clear_buffer(self) -> None:
+        # Drop any partial frame we were holding so it can't bleed into the
+        # next command's response, then flush the OS input buffer.
+        self._rx_buf.clear()
+        if self.demo_mode or self.serial is None:
+            return
+        try:
+            self.serial.reset_input_buffer()
+        except Exception:
+            pass
 
     def print(self) -> None:
         logger.info("    Serial Port: %s", self.port)
