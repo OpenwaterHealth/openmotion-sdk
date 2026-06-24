@@ -59,6 +59,16 @@ from .CalibrationWorkflow import (
     CalibrationThresholds,
 )
 from .connection_state import ConnectionState
+from .firmware_update import (
+    FirmwareKind,
+    FirmwareUpdater,
+    FirmwareUpdateError,
+    LatestInfo,
+    check_latest,
+    download_firmware,
+    is_update_available,
+    parse_version,
+)
 # Top-level handles + interface (deferred until after the leaf modules above
 # so MotionConsole/MotionSensor can do `from omotion import _log_root` during
 # their own module load without hitting the partially-loaded package).
@@ -85,4 +95,12 @@ __all__ = [
     "CalibrationResultRow",
     "CalibrationThresholds",
     "ConnectionState",
+    "FirmwareKind",
+    "FirmwareUpdater",
+    "FirmwareUpdateError",
+    "LatestInfo",
+    "check_latest",
+    "download_firmware",
+    "is_update_available",
+    "parse_version",
 ]
