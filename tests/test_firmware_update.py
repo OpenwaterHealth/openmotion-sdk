@@ -146,3 +146,41 @@ def test_updater_raises_if_dfu_never_appears(tmp_path):
     updater = FirmwareUpdater(programmer=dfu)
     with pytest.raises(FirmwareUpdateError):
         updater.update(handle, tmp_path / "fw.bin")
+
+
+# ---------------------------------------------------------------------------
+# Task 1: _release_tag + prerelease-aware is_update_available
+# ---------------------------------------------------------------------------
+from omotion.firmware_update import _release_tag
+
+
+@pytest.mark.parametrize("v,expected", [
+    ("1.8.0", "1.8.0"),
+    ("v1.8.0", "1.8.0"),
+    ("1.8.1-rc.0", "1.8.1-rc.0"),
+    ("1.8.1-dev.5", "1.8.1-dev.5"),
+    ("1.8.1-rc.0-2-gf09e8dc", "1.8.1-rc.0"),
+    ("1.8.1-rc.0-2-gf09e8dc-dirty", "1.8.1-rc.0"),
+    ("1.8.0-dirty", "1.8.0"),
+    ("", ""),
+])
+def test_release_tag(v, expected):
+    assert _release_tag(v) == expected
+
+
+@pytest.mark.parametrize("installed,latest,expected", [
+    ("1.8.1-rc.0-2-gf09e8dc-dirty", "1.8.1-rc.0", False),  # device on/ahead of latest
+    ("1.8.1-rc.0", "1.8.1-dev.5", True),                   # newer-published dev wins
+    ("1.8.0", "1.8.1-dev.0", True),
+    ("1.8.1-dev.5", "1.8.1-dev.5", False),                 # already on it
+    ("v1.8.0", "1.8.0", False),                            # equal after normalize
+    ("", "1.8.1-rc.0", False),                             # empty installed -> no update
+])
+def test_is_update_available_prerelease(installed, latest, expected):
+    assert is_update_available(installed, latest, prerelease=True) is expected
+
+
+def test_is_update_available_stable_unchanged():
+    assert is_update_available("1.8.0", "1.8.1") is True
+    assert is_update_available("1.8.1-rc.0", "1.8.1") is False   # same M.M.P
+    assert is_update_available("1.8.0", "1.8.0") is False
