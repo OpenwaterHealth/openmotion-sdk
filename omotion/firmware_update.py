@@ -51,6 +51,9 @@ def _release_tag(version: str) -> str:
         v = v[1:]
     if v.endswith("-dirty"):
         v = v[: -len("-dirty")]
+    # Assumes real release tags never end in the git-describe pattern
+    # '-<N>-g<sha>'; that suffix only appears in describe output for commits
+    # AFTER a tag, so stripping it here recovers the base release tag.
     return _GIT_DESCRIBE_TAIL.sub("", v)
 
 
@@ -119,8 +122,10 @@ def check_latest(
                 return None
             # Most recently PUBLISHED wins (timestamp), even if its version is
             # "lower" semver — a dev released after an rc is the one to flash.
-            # published_at is ISO-8601, so lexicographic max == chronological;
-            # a missing value sorts oldest, falling back to API newest-first.
+            # published_at is ISO-8601, so lexicographic max == chronological.
+            # On a tie / missing published_at, Python's max keeps the FIRST
+            # maximal element and GitHub returns releases newest-first, so the
+            # API-newest release wins.
             rel = max(rels, key=lambda r: (r.get("published_at") or ""))
         else:
             rel = gh.get_latest_release(include_prerelease=False)
