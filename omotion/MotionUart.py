@@ -24,7 +24,6 @@ from omotion.config import (
     OW_ERROR,
     OW_START_BYTE,
 )
-from omotion.framing import emit_log_packet, extract_frame, is_log_packet
 from omotion.utils import util_crc16
 from omotion import _log_root
 from omotion.CommandError import CommandError
@@ -55,10 +54,6 @@ class MotionUart:
         self.descriptor = desc
         self.serial: Optional[serial.Serial] = None
         self._io_lock = threading.RLock()
-        # Bytes read from the port but not yet consumed as a complete frame.
-        # Lets read_packet reassemble fragmented frames and skip interleaved
-        # firmware log packets without losing trailing response bytes.
-        self._rx_buf = bytearray()
         self.on_io_error = on_io_error
 
     # ────────────────────────────────────────────────────────────────────
@@ -143,15 +138,7 @@ class MotionUart:
             raise
 
     def read_packet(self, timeout: int = 20) -> UartPacket:
-        """Block until a command response arrives or `timeout` seconds elapse.
-
-        Unsolicited firmware log packets (printf mirrored over the link when
-        DEBUG_FLAG_USB_PRINTF is set — id=0 / OW_DATA / OW_CMD_ECHO) share this
-        link with command responses, so they are demuxed out here: each one is
-        surfaced via the logger and skipped, and reading continues until a real
-        response frame arrives. Malformed/bad-CRC frames are dropped the same
-        way. Raises ValueError if nothing valid arrives within the timeout.
-        """
+        """Block until a packet arrives or `timeout` seconds elapse."""
         if self.demo_mode:
             return UartPacket(
                 id=0, packetType=OW_ERROR, command=0, addr=0, reserved=0, data=[]
@@ -160,30 +147,24 @@ class MotionUart:
             raise CommandError("UART not open")
         with self._io_lock:
             start_time = time.monotonic()
+            raw_data = b""
+            count = 0
+
             while timeout == -1 or time.monotonic() - start_time < timeout:
+                time.sleep(0.05)
                 try:
-                    chunk = self.serial.read_all()
+                    raw_data += self.serial.read_all()
                 except serial.SerialException as se:
                     self._notify_io_error(getattr(se, "errno", None), str(se))
                     raise
-                if chunk:
-                    self._rx_buf.extend(chunk)
-                    # Dispatch every complete frame currently buffered.
-                    while True:
-                        frame = extract_frame(self._rx_buf)
-                        if frame is None:
-                            break
-                        try:
-                            packet = UartPacket(buffer=frame)
-                        except ValueError:
-                            continue  # bad CRC / malformed — drop and resync
-                        if is_log_packet(packet):
-                            emit_log_packet(packet, self.descriptor)
-                            continue
-                        return packet
-                time.sleep(0.005)
+                if raw_data:
+                    count += 1
+                    if count > 1:
+                        break
 
-        raise ValueError("No data received from UART within timeout")
+        if not raw_data:
+            raise ValueError("No data received from UART within timeout")
+        return UartPacket(buffer=raw_data)
 
     def send_packet(
         self,
@@ -259,9 +240,6 @@ class MotionUart:
             raise
 
     def clear_buffer(self) -> None:
-        # Drop any partial frame we were holding so it can't bleed into the
-        # next command's response, then flush the OS input buffer.
-        self._rx_buf.clear()
         if self.demo_mode or self.serial is None:
             return
         try:

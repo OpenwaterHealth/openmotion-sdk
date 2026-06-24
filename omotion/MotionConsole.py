@@ -33,8 +33,6 @@ from omotion.config import (
     OW_CMD,
     OW_CMD_SERIAL,
     OW_CMD_DFU,
-    OW_CMD_DEBUG_FLAGS,
-    DEBUG_FLAG_USB_PRINTF,
     is_valid_serial,
     OW_FPGA_PROG,
     OW_CMD_ECHO,
@@ -532,96 +530,6 @@ class MotionConsole(SignalWrapper):
         except Exception as e:
             self._log_command_error("echo", e)
             raise  # Re-raise the exception for the caller to handle
-
-    def set_debug_flags(self, flags: int) -> bool:
-        """Set the firmware debug-flag bitmask (32-bit, RAM-only on the MCU).
-
-        Bit 0 (``DEBUG_FLAG_USB_PRINTF``) mirrors firmware ``printf()`` to this
-        USB CDC link; the SDK surfaces those log lines automatically as they
-        arrive (see :mod:`omotion.framing`). Mirrors
-        ``MotionSensor.set_debug_flags``. Returns True on success.
-        """
-        try:
-            if self.uart.demo_mode:
-                return True
-
-            if not self.is_connected():
-                raise ValueError("Console Device not connected")
-
-            r = self.uart.send_packet(
-                id=None,
-                packetType=OW_CMD,
-                command=OW_CMD_DEBUG_FLAGS,
-                reserved=1,  # reserved bit0 = SET
-                data=struct.pack("<I", flags & 0xFFFFFFFF),
-            )
-            self.uart.clear_buffer()
-
-            if r.packetType == OW_ERROR:
-                logger.error("Error setting debug flags")
-                return False
-
-            if r.data_len == 4:
-                logger.info(
-                    "Debug flags set to: 0x%08X", struct.unpack("<I", r.data)[0]
-                )
-            return True
-
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-        except Exception as e:
-            self._log_command_error("set_debug_flags", e)
-            raise  # Re-raise the exception for the caller to handle
-
-    def get_debug_flags(self) -> int:
-        """Return the current firmware debug-flag bitmask, or 0 on error."""
-        try:
-            if self.uart.demo_mode:
-                return 0
-
-            if not self.is_connected():
-                raise ValueError("Console Device not connected")
-
-            r = self.uart.send_packet(
-                id=None,
-                packetType=OW_CMD,
-                command=OW_CMD_DEBUG_FLAGS,
-                reserved=0,  # reserved bit0 = GET
-            )
-            self.uart.clear_buffer()
-
-            if r.packetType == OW_ERROR or r.data_len != 4:
-                logger.error("Error reading debug flags")
-                return 0
-
-            flags = struct.unpack("<I", r.data)[0]
-            logger.info("Debug flags: 0x%08X", flags)
-            return flags
-
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise  # Re-raise the exception for the caller to handle
-        except Exception as e:
-            self._log_command_error("get_debug_flags", e)
-            raise  # Re-raise the exception for the caller to handle
-
-    def enable_usb_printf(self, enable: bool = True) -> bool:
-        """Enable/disable mirroring of firmware ``printf()`` to this USB link.
-
-        Convenience read-modify-write of the ``DEBUG_FLAG_USB_PRINTF`` bit.
-        When enabled, firmware log lines arrive as unsolicited packets that the
-        SDK logs automatically (see :func:`omotion.framing.emit_log_packet`).
-        Returns True on success.
-        """
-        if self.uart.demo_mode:
-            return True
-        flags = self.get_debug_flags()
-        if enable:
-            flags |= DEBUG_FLAG_USB_PRINTF
-        else:
-            flags &= ~DEBUG_FLAG_USB_PRINTF
-        return self.set_debug_flags(flags)
 
     def toggle_led(self) -> bool:
         """
