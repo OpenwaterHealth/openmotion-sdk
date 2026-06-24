@@ -12,6 +12,11 @@ from typing import Callable, Optional, TYPE_CHECKING
 
 from omotion import _log_root
 from omotion.connection_state import ConnectionState
+from omotion.console_telemetry_conversions import (
+    tec_thermistor_voltage_to_celsius,
+    tec_current_to_amps,
+    tec_voltage_to_volts,
+)
 from omotion.MotionProcessing import (
     CorrectedBatch,
     HISTO_SIZE_WORDS,
@@ -38,6 +43,9 @@ _TELEMETRY_HEADERS: list[str] = [
     "timestamp",
     "tcm", "tcl", "pdc",
     "tec_v_raw", "tec_set_raw", "tec_curr_raw", "tec_volt_raw", "tec_good",
+    # Converted engineering units (°C / A / V) alongside the raw ADC values, so
+    # the TEC temperature is human-readable in the log. See bloodflow-app#244.
+    "tec_temp_c", "tec_set_c", "tec_curr_a", "tec_volt_v",
     *[f"pdu_raw_{i}" for i in range(16)],
     *[f"pdu_volt_{i}" for i in range(16)],
     "safety_se", "safety_so", "safety_ok",
@@ -52,6 +60,13 @@ def _snap_to_row(snap) -> list:
         snap.tcm, snap.tcl, snap.pdc,
         snap.tec_v_raw, snap.tec_set_raw, snap.tec_curr_raw, snap.tec_volt_raw,
         int(snap.tec_good),
+        # Converted engineering units, rounded to match the live display
+        # (temps 2 dp, current/voltage 3 dp). A missing RT table yields NaN,
+        # which is written through as-is.
+        round(tec_thermistor_voltage_to_celsius(snap.tec_v_raw), 2),
+        round(tec_thermistor_voltage_to_celsius(snap.tec_set_raw), 2),
+        round(tec_current_to_amps(snap.tec_curr_raw), 3),
+        round(tec_voltage_to_volts(snap.tec_volt_raw), 3),
     ]
     pdu_raws = snap.pdu_raws or []
     pdu_volts = snap.pdu_volts or []

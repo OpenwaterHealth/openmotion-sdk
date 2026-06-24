@@ -480,3 +480,46 @@ def test_start_scan_trigger_config_override_is_merged():
     # untouched keys fall through to the resolved default
     assert sent["LaserPulseSkipInterval"] == \
         motion.resolve_trigger_config(None)["LaserPulseSkipInterval"]
+
+
+def test_telemetry_csv_logs_converted_tec_engineering_units():
+    """The per-scan telemetry CSV records converted TEC engineering units
+    (measured/setpoint temperature in °C, current in A, voltage in V) alongside
+    the existing raw ADC values, so the TEC temperature is human-readable in the
+    log -- e.g. while watching the console cool down during power-off.
+    See OpenwaterHealth/openmotion-bloodflow-app#244.
+    """
+    from omotion.ScanWorkflow import _TELEMETRY_HEADERS, _snap_to_row
+    from omotion.ConsoleTelemetry import ConsoleTelemetry
+    from omotion.console_telemetry_conversions import (
+        tec_thermistor_voltage_to_celsius,
+        tec_current_to_amps,
+        tec_voltage_to_volts,
+    )
+
+    # Real device readings (~25 °C bench idle), distinct per field so the test
+    # also pins which raw column feeds which converted column.
+    snap = ConsoleTelemetry(
+        tec_v_raw=1.194286,
+        tec_set_raw=1.190256,
+        tec_curr_raw=1.504542,
+        tec_volt_raw=1.544029,
+        tec_good=True,
+    )
+
+    # The 4 converted columns sit immediately after tec_good, keeping the raw
+    # columns (and every column after) in place for header-based consumers.
+    gi = _TELEMETRY_HEADERS.index("tec_good")
+    assert _TELEMETRY_HEADERS[gi + 1:gi + 5] == [
+        "tec_temp_c", "tec_set_c", "tec_curr_a", "tec_volt_v",
+    ]
+
+    row = _snap_to_row(snap)
+    assert len(row) == len(_TELEMETRY_HEADERS)
+
+    # Each converted value is wired to the correct raw field and rounded to the
+    # same precision the live display uses (temps 2 dp, current/voltage 3 dp).
+    assert row[gi + 1] == round(tec_thermistor_voltage_to_celsius(snap.tec_v_raw), 2)
+    assert row[gi + 2] == round(tec_thermistor_voltage_to_celsius(snap.tec_set_raw), 2)
+    assert row[gi + 3] == round(tec_current_to_amps(snap.tec_curr_raw), 3)
+    assert row[gi + 4] == round(tec_voltage_to_volts(snap.tec_volt_raw), 3)
