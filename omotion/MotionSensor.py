@@ -852,6 +852,8 @@ class MotionSensor(SignalWrapper):
         Bit 0 (DEBUG_FLAG_USB_PRINTF) enables firmware printf output over USB.
         Bit 4 (DEBUG_FLAG_COMM_VERBOSE) enables cmd id and "." response prints.
         Bit 5 (DEBUG_FLAG_CMD_VERBOSE) enables printf in command handlers.
+        Bit 7 (DEBUG_FLAG_SEND_DEFER) defers the per-frame histogram send out
+        of the FSIN ISR into the main loop (sensor-fw#68).
         """
         if self.demo_mode:
             return True
