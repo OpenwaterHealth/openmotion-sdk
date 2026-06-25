@@ -170,6 +170,27 @@ class ScanDatabase:
             raise RuntimeError("Database connection is closed")
         return self._conn
 
+    def assert_writable(self) -> None:
+        """Force SQLite to attempt a write so a read-only file fails *here*.
+
+        Opening a read-only SQLite file succeeds — the error
+        (``sqlite3.OperationalError: attempt to write a readonly database``)
+        only surfaces on the first write. So ``__init__`` alone cannot detect
+        a read-only database file, and in WAL mode neither can a bare
+        ``BEGIN IMMEDIATE`` (its write is deferred to the ``-wal``). Callers
+        that must fail before a side effect — e.g. firing the laser at scan
+        start — call this to provoke the write up front.
+
+        Rewrites ``PRAGMA user_version`` to its current value: a header write
+        that fails on a read-only DB but is a semantic no-op when it succeeds,
+        so nothing is persisted. Raises ``sqlite3.OperationalError`` (or other
+        ``sqlite3.Error``) when the database is not writable; returns ``None``
+        otherwise.
+        """
+        conn = self._connection()
+        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        conn.execute(f"PRAGMA user_version = {version}")
+
     # ------------------------------------------------------------------
     # Sessions
     # ------------------------------------------------------------------

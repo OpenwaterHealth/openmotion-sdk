@@ -1,5 +1,7 @@
 """FrameClassificationStage — abs_frame_id unwrap + frame_type labeling."""
 
+import logging
+
 import numpy as np
 from omotion.pipeline.batch import FrameBatch
 from omotion.pipeline.stages.classify import FrameClassificationStage
@@ -71,6 +73,42 @@ def test_unwrap_handles_8bit_rollover():
     np.testing.assert_array_equal(batch.abs_frame_ids, expected_abs)
 
 
+def test_stale_leftover_frames_at_start_are_rejected_not_offsetting_epoch():
+    """Reproduces the Varun-unit left-sensor capture (issue #172): an unflushed
+    histogram buffer emits stale frames (raw 255, 173) after the real first
+    frame, then the real sequence resumes (4, 5, 6 …). The old unwrapper read
+    255 as a forward jump and 4 as a rollover, injecting a permanent +256
+    epoch offset that shifted the entire dark/warmup schedule. The stale frames
+    must be rejected without advancing the counter."""
+    raw_ids = [1, 255, 173, 4, 5, 6, 7, 8, 9, 10, 11]
+    batch = _batch_with_raw_ids({(0, 0): raw_ids})
+    FrameClassificationStage(discard_count=9, dark_interval=600).process(batch)
+    # 255 and 173 rejected as stale; real frames keep their true abs_id (no +256).
+    np.testing.assert_array_equal(
+        batch.frame_type,
+        ["warmup", "stale", "stale", "warmup", "warmup", "warmup",
+         "warmup", "warmup", "warmup", "dark", "light"],
+    )
+    np.testing.assert_array_equal(
+        batch.abs_frame_ids, [1, 255, 173, 4, 5, 6, 7, 8, 9, 10, 11]
+    )
+
+
+def test_midscan_counter_blip_is_rejected_and_sequence_resumes():
+    """A mid-scan counter glitch (…3, 4, [2, 3], 5 …) must not reset the epoch:
+    the spurious backward 2,3 are rejected and 5 continues the run."""
+    raw_ids = [1, 2, 3, 4, 2, 3, 5, 6]
+    batch = _batch_with_raw_ids({(0, 0): raw_ids})
+    FrameClassificationStage(discard_count=9, dark_interval=600).process(batch)
+    # backward 2,3 rejected; the real run 1..6 keeps monotonic abs ids.
+    assert list(batch.frame_type) == [
+        "warmup", "warmup", "warmup", "warmup",
+        "stale", "stale", "warmup", "warmup"]
+    np.testing.assert_array_equal(
+        batch.abs_frame_ids, [1, 2, 3, 4, 2, 3, 5, 6]
+    )
+
+
 def test_zero_filled_row_keeps_source_assigned_side():
     """A row whose raw_histogram is all zeros (e.g. firmware-dropped frame)
     must still be routed to its source-assigned side.
@@ -100,6 +138,32 @@ def test_zero_filled_row_keeps_source_assigned_side():
     # The unwrapper key is (side_idx, cam_id) — verify state went to side=1.
     assert (1, 0) in stage._unwrappers
     assert (0, 0) not in stage._unwrappers
+
+
+def test_dropped_stale_frames_are_logged_and_summarised(caplog):
+    """Stale/non-monotonic frames the unwrapper drops must be visible in the
+    log — a hardware-health signal. First occurrence logs live per camera;
+    on_scan_stop emits a per-scan total."""
+    batch = _batch_with_raw_ids({(0, 0): [1, 255, 173, 4, 5, 6]})
+    stage = FrameClassificationStage(discard_count=9, dark_interval=600)
+    with caplog.at_level(logging.WARNING):
+        stage.process(batch)
+        assert any("dropping stale frame" in r.message for r in caplog.records), \
+            "expected a live WARNING when a stale frame is dropped"
+        caplog.clear()
+        stage.on_scan_stop(batch)
+    summary = [r.message for r in caplog.records if "Scan summary" in r.message]
+    assert summary, "expected a stale-frame scan summary at on_scan_stop"
+    assert "2" in summary[0]  # 255 and 173 were dropped
+
+
+def test_clean_scan_logs_no_stale_warnings(caplog):
+    batch = _batch_with_raw_ids({(0, 0): list(range(1, 15))})
+    stage = FrameClassificationStage(discard_count=9, dark_interval=600)
+    with caplog.at_level(logging.WARNING):
+        stage.process(batch)
+        stage.on_scan_stop(batch)
+    assert not any("stale" in r.message.lower() for r in caplog.records)
 
 
 def test_reset_clears_unwrapper_state():

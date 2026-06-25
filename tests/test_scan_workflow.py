@@ -1,6 +1,8 @@
 """Tests for ScanWorkflow and ScanRequest."""
 
 import dataclasses
+import os
+import stat
 import threading
 import time
 from unittest import mock
@@ -391,6 +393,75 @@ def test_start_scan_sends_trigger_config_before_start_trigger():
     assert sent == expected_cfg
 
 
+def test_start_scan_aborts_synchronously_when_scan_db_readonly(tmp_path):
+    """Issue #213: a read-only scan DB must abort the scan in the synchronous
+    preflight — start_scan returns False (so the worker that fires the laser is
+    never spawned) and records last_scan_error. The old preflight only *opened*
+    the DB, which succeeds on a read-only file because opening never writes; the
+    write-probe forces the failure to surface here instead of asynchronously on
+    the first INSERT in the worker thread."""
+    db_path = tmp_path / "scans.db"
+    from omotion.ScanDatabase import ScanDatabase
+    ScanDatabase(db_path=str(db_path)).close()  # create while writable
+    os.chmod(db_path, stat.S_IREAD)             # then mark read-only
+    try:
+        motion = _build_motion_with_data_dir(str(tmp_path), scan_db_path=str(db_path))
+        request = ScanRequest(
+            subject_id="x", duration_sec=1,
+            left_camera_mask=0xFF, right_camera_mask=0, reduced_mode=False,
+        )
+        started = motion.scan_workflow.start_scan(request)
+
+        assert started is False
+        # No worker thread spawned -> the laser path is never reached.
+        assert motion.scan_workflow._thread is None
+        err = motion.scan_workflow.last_scan_error
+        assert err is not None
+        assert "readonly" in err.lower()
+    finally:
+        os.chmod(db_path, stat.S_IWRITE)
+
+
+def test_worker_invokes_on_error_when_scan_aborts(tmp_path):
+    """A scan failure that surfaces only in the worker thread (e.g. the scan DB
+    becoming unwritable in the race window after the synchronous preflight
+    passed) must notify the caller via ScanRequest.on_error — start_scan already
+    returned True, so a return value can't carry the failure. Without this the
+    worker dies silently and the app shows no error. See bloodflow-app #213."""
+    motion = _build_motion_with_data_dir(None)
+
+    errors = []
+    done = threading.Event()
+
+    def on_error(exc):
+        errors.append(exc)
+        done.set()
+
+    class _ExplodingCriticalSink:
+        critical = True
+        channels: set = set()
+
+        def on_scan_start(self, meta):
+            raise RuntimeError("db vanished mid-scan")
+
+        def consume(self, channel, payload):
+            pass
+
+        def on_complete(self):
+            pass
+
+    request = ScanRequest(
+        subject_id="x", duration_sec=1,
+        left_camera_mask=0xFF, right_camera_mask=0, reduced_mode=False,
+        sinks=[_ExplodingCriticalSink()], skip_default_storage=True,
+        on_error=on_error,
+    )
+    assert motion.scan_workflow.start_scan(request) is True
+    assert done.wait(timeout=5.0), "on_error was never invoked"
+    assert isinstance(errors[0], BaseException)
+    assert "db vanished mid-scan" in str(errors[0])
+
+
 def test_start_scan_trigger_config_override_is_merged():
     """A ScanRequest.trigger_config override is shallow-merged on top of the
     interface default before being sent to the console."""
@@ -409,3 +480,46 @@ def test_start_scan_trigger_config_override_is_merged():
     # untouched keys fall through to the resolved default
     assert sent["LaserPulseSkipInterval"] == \
         motion.resolve_trigger_config(None)["LaserPulseSkipInterval"]
+
+
+def test_telemetry_csv_logs_converted_tec_engineering_units():
+    """The per-scan telemetry CSV records converted TEC engineering units
+    (measured/setpoint temperature in °C, current in A, voltage in V) alongside
+    the existing raw ADC values, so the TEC temperature is human-readable in the
+    log -- e.g. while watching the console cool down during power-off.
+    See OpenwaterHealth/openmotion-bloodflow-app#244.
+    """
+    from omotion.ScanWorkflow import _TELEMETRY_HEADERS, _snap_to_row
+    from omotion.ConsoleTelemetry import ConsoleTelemetry
+    from omotion.console_telemetry_conversions import (
+        tec_thermistor_voltage_to_celsius,
+        tec_current_to_amps,
+        tec_voltage_to_volts,
+    )
+
+    # Real device readings (~25 °C bench idle), distinct per field so the test
+    # also pins which raw column feeds which converted column.
+    snap = ConsoleTelemetry(
+        tec_v_raw=1.194286,
+        tec_set_raw=1.190256,
+        tec_curr_raw=1.504542,
+        tec_volt_raw=1.544029,
+        tec_good=True,
+    )
+
+    # The 4 converted columns sit immediately after tec_good, keeping the raw
+    # columns (and every column after) in place for header-based consumers.
+    gi = _TELEMETRY_HEADERS.index("tec_good")
+    assert _TELEMETRY_HEADERS[gi + 1:gi + 5] == [
+        "tec_temp_c", "tec_set_c", "tec_curr_a", "tec_volt_v",
+    ]
+
+    row = _snap_to_row(snap)
+    assert len(row) == len(_TELEMETRY_HEADERS)
+
+    # Each converted value is wired to the correct raw field and rounded to the
+    # same precision the live display uses (temps 2 dp, current/voltage 3 dp).
+    assert row[gi + 1] == round(tec_thermistor_voltage_to_celsius(snap.tec_v_raw), 2)
+    assert row[gi + 2] == round(tec_thermistor_voltage_to_celsius(snap.tec_set_raw), 2)
+    assert row[gi + 3] == round(tec_current_to_amps(snap.tec_curr_raw), 3)
+    assert row[gi + 4] == round(tec_voltage_to_volts(snap.tec_volt_raw), 3)

@@ -2,6 +2,8 @@
 
 import json
 import os
+import sqlite3
+import stat
 import sys
 from pathlib import Path
 
@@ -74,3 +76,45 @@ def test_session_meta_survives_unicode_and_none(tmp_db: ScanDatabase) -> None:
     )
     session = tmp_db.get_session(sid)
     assert session["session_meta"] == meta
+
+
+# ---------------------------------------------------------------------------
+# assert_writable — write-probe so a read-only DB fails the scan preflight
+# synchronously (before the laser fires) instead of asynchronously on the
+# first INSERT inside the scan worker thread. See bloodflow-app issue #213.
+# ---------------------------------------------------------------------------
+
+def test_assert_writable_raises_on_readonly_db(tmp_path: Path) -> None:
+    """A read-only DB file opens fine (open never writes) but a write fails.
+    assert_writable must force that write and surface the OperationalError."""
+    p = tmp_path / "ro.db"
+    ScanDatabase(db_path=str(p)).close()  # create + schema while writable
+    os.chmod(p, stat.S_IREAD)             # Windows read-only attribute
+    db = ScanDatabase(db_path=str(p))     # reopen: succeeds, no write yet
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            db.assert_writable()
+    finally:
+        db.close()
+        os.chmod(p, stat.S_IWRITE)
+
+
+def test_assert_writable_noop_on_writable_db(tmp_db: ScanDatabase) -> None:
+    """On a writable DB the probe returns None and persists nothing."""
+    settings_before = tmp_db._connection().execute(
+        "SELECT COUNT(*) FROM database_settings"
+    ).fetchone()[0]
+    version_before = tmp_db._connection().execute(
+        "PRAGMA user_version"
+    ).fetchone()[0]
+
+    assert tmp_db.assert_writable() is None
+
+    settings_after = tmp_db._connection().execute(
+        "SELECT COUNT(*) FROM database_settings"
+    ).fetchone()[0]
+    version_after = tmp_db._connection().execute(
+        "PRAGMA user_version"
+    ).fetchone()[0]
+    assert settings_after == settings_before
+    assert version_after == version_before
