@@ -63,6 +63,58 @@ Signals are `pyqtSignal` when PyQt is importable, otherwise a fallback `MotionSi
 - Pure-software tests that run anywhere: the entire `tests/test_pipeline/` suite, plus `test_calibration_workflow_compute.py`, `test_contact_quality_workflow.py`, `test_scan_database.py`, `test_console_telemetry_unit.py`, `test_pedestal_height.py`. Run them with `pytest -m "not console and not sensor and not destructive"`.
 - Pure-software scripts: `scripts/test_jed_parser.py`, `scripts/test_github_release.py`, `scripts/run_pipeline_csv_tests.py`, `scripts/plot_telemetry.py`, `scripts/view_corrected_scan.py`.
 
+## Running a scan end-to-end (headless)
+
+`MotionInterface.start_scan(ScanRequest(...))` is the front door, but it **only enables
+streaming on already-powered-and-configured cameras** — it does *not* bring them up. The app
+does that on connect (`motion_connector._run_sensor_init`). A bare script must replicate it or
+you get `Failed to enable camera` / firmware "refuse stream enable on dead or unpowered camera"
+and **0 USB chunks**. This bites hardest right after a power-cycle or firmware flash, which
+cold-boots the cameras **OFF and unconfigured**. Close the app first — USB access is exclusive.
+
+```python
+from omotion import MotionInterface
+from omotion.ScanWorkflow import ScanRequest, ConfigureRequest
+import threading
+
+iface = MotionInterface(data_dir="scan_out", scan_db_path="scan_out/scans.db")
+iface.start()
+iface.wait_for_ready(console=True, sensors=2, timeout=15)
+assert all(iface.is_device_connected())            # (console, left, right)
+
+MASK = 0x66
+# 1) cold-boot bring-up — power THEN configure, else 0 frames flow:
+iface.left.enable_camera_power(0xFF); iface.right.enable_camera_power(0xFF)
+done = threading.Event()
+iface.start_configure_camera_sensors(
+    ConfigureRequest(left_camera_mask=MASK, right_camera_mask=MASK,
+                     power_off_unused_cameras=False),
+    on_complete_fn=lambda r: done.set())
+done.wait(90)
+iface.apply_laser_power()                           # laser-on only (cold-start: driver regs were cleared)
+# iface.left.set_debug_flags(0x01)                  # optional: surface firmware printf over USB (USB_PRINTF)
+
+# 2) run one scan, block until done:
+req = ScanRequest(subject_id="TEST", duration_sec=15,
+                  left_camera_mask=MASK, right_camera_mask=MASK,
+                  disable_laser=False,              # False = external (console/laser) FSIN; True = internal
+                  write_telemetry_csv=True,
+                  raw_save_max_duration_s=None)     # None = full-scan raw CSV; 0 = no raw tee
+iface.start_scan(req)
+iface.scan_workflow.await_complete(timeout_sec=req.duration_sec + 15)
+iface.stop()
+```
+
+- **Output** lands in `data_dir`: `{YYYYMMDD_HHMMSS}_{subject}_{side}_mask{MASK:02X}_raw.csv`
+  (columns `cam_id,frame_id,timestamp_s,type,<1024 bins>,temperature,sum`), a telemetry CSV,
+  and `scans.db`. `timestamp_s` is **scan-relative** — a *negative* value is a leftover frame
+  from a previous scan re-shipped into this one.
+- This path runs the full pipeline (classify + timestamp-repair + sinks), so it reproduces the
+  app's warnings. `scripts/capture_data.py` is the *low-level* alternative — raw bytes to `.raw`,
+  no pipeline, no CSV.
+- Calibration / contact-quality sub-scans share the same engine via `run_collection_scan(...)`
+  (ScanWorkflow.py) with a collector sink and `skip_default_storage=True`.
+
 ## Existing in-repo docs (read before re-explaining)
 
 | Doc | Purpose |
