@@ -19,6 +19,7 @@ from omotion.config import (
     OW_CAMERA_SINGLE_HISTOGRAM,
     OW_CAMERA_SET_CONFIG,
     OW_CMD,
+    OW_CMD_DIAG_STATS,
     OW_CMD_ECHO,
     OW_CMD_HWID,
     OW_CMD_I2C_REG_READ,
@@ -552,6 +553,56 @@ class MotionSensor(SignalWrapper):
             "fpgas": [bool(fpga_mask & (1 << i)) for i in range(8)],
             "cameras_expected": d[5],
             "all_present": bool(d[6]),
+        }
+
+    # ------------------------------------------------------------------
+    # Diagnostics (sensor-fw#70)
+    # ------------------------------------------------------------------
+
+    _DIAG_STATS_FMT = "<B3x8IIIII"  # version, pad[3], cam_overrun_count[8], cmp_fail/timeout/fallback_count, cmp_max_time_us
+    _DIAG_STATS_SIZE = struct.calcsize(_DIAG_STATS_FMT)  # 52 bytes
+
+    def get_diag_stats(self) -> dict | None:
+        """Return the live firmware diagnostics snapshot, or None on error.
+
+        Printf-independent (works regardless of DEBUG_FLAG_USB_PRINTF) —
+        queries cam_diag_stats_t directly via OW_CMD_DIAG_STATS. Counters are
+        for the CURRENT scan (reset at scan start/end by the firmware); query
+        mid-scan to see live values, see sensor-fw camera_manager.c.
+
+        Returns a dict::
+
+            {
+                "version": int,
+                "cam_overrun_count": [int] * 8,  # per-camera SPI/USART RX overruns
+                "cmp_fail_count": int,           # rle_compress dst_max overflow
+                "cmp_timeout_count": int,         # rle_compress hit its time budget (#70)
+                "cmp_fallback_count": int,        # frames sent uncompressed (either above)
+                "cmp_max_time_us": int,           # worst-case compression time this scan
+            }
+        """
+        if self.demo_mode:
+            return {
+                "version": 1,
+                "cam_overrun_count": [0] * 8,
+                "cmp_fail_count": 0,
+                "cmp_timeout_count": 0,
+                "cmp_fallback_count": 0,
+                "cmp_max_time_us": 0,
+            }
+        r = self._send(packetType=OW_CMD, command=OW_CMD_DIAG_STATS)
+        if r is None or r.packetType in _ERROR_TYPES or r.data_len < self._DIAG_STATS_SIZE:
+            return None
+        (version, *counts) = struct.unpack(
+            self._DIAG_STATS_FMT, r.data[: self._DIAG_STATS_SIZE]
+        )
+        return {
+            "version": version,
+            "cam_overrun_count": list(counts[0:8]),
+            "cmp_fail_count": counts[8],
+            "cmp_timeout_count": counts[9],
+            "cmp_fallback_count": counts[10],
+            "cmp_max_time_us": counts[11],
         }
 
     def _check_i2c_health(self) -> None:
