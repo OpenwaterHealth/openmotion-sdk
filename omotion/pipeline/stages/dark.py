@@ -263,7 +263,8 @@ class PendingInterval:
 
     def flush(self) -> Interval:
         """Return the closed interval; reset for next interval."""
-        assert self.is_closed(), "flush() called on non-closed interval"
+        if not self.is_closed():
+            raise RuntimeError("flush() called on non-closed interval")
         interval = Interval(
             left=self._left,
             right=self._right,

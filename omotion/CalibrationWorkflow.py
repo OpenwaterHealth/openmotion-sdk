@@ -1005,7 +1005,7 @@ class CalibrationWorkflow:
                 try:
                     self._interface.scan_workflow.cancel_scan()
                 except Exception:
-                    pass
+                    logger.exception("Calibration watchdog: cancel_scan raised.")
             wd = threading.Timer(request.max_duration_sec, _watchdog)
             wd.daemon = True
             wd.start()
@@ -1416,7 +1416,7 @@ class CalibrationWorkflow:
                 try:
                     self._interface.scan_workflow.cancel_scan()
                 except Exception:
-                    pass
+                    logger.exception("Test-scan watchdog: cancel_scan raised.")
 
             wd = threading.Timer(request.max_duration_sec, _watchdog)
             wd.daemon = True

@@ -659,14 +659,13 @@ class MotionSensor(SignalWrapper):
     # ------------------------------------------------------------------
     # Factory Commands
     # ------------------------------------------------------------------
-    def i2c_scan(self) -> list[int]:
+    def i2c_scan(self) -> list[int] | Literal[False]:
         """Scan the I2C bus and return a list of found device addresses.
 
         Returns:
-            List of 7-bit I2C addresses (integers) that responded.
-
-        Raises:
-            OWNotConnectedError, OWCommunicationError, OWDeviceError.
+            List of 7-bit I2C addresses (integers) that responded, or
+            ``False`` if the device returned an error response (check
+            with ``is False``).
         """
         r = self._send(packetType=OW_FPGA_PROG, command=OW_FACTORY_I2C_SCAN)
         if r.packetType in _ERROR_TYPES:
@@ -677,7 +676,7 @@ class MotionSensor(SignalWrapper):
                     [f"0x{a:02X}" for a in addresses])
         return addresses
     
-    def creset(self, state: bool | None = None) -> int:
+    def creset(self, state: bool | None = None) -> int | Literal[False]:
         """Control or read the FPGA CRESET pin.
 
         Args:
@@ -686,10 +685,9 @@ class MotionSensor(SignalWrapper):
                    None  → read current state without changing it.
 
         Returns:
-            Current CRESET pin state: 1 = high, 0 = low.
-
-        Raises:
-            OWNotConnectedError, OWCommunicationError, OWDeviceError.
+            Current CRESET pin state: 1 = high, 0 = low, or ``False``
+            if the device returned an error response. 0 is a valid pin
+            state — distinguish errors with ``is False``.
         """
         if state is None:
             data = None          # 0-byte payload → firmware reads pin
@@ -703,7 +701,9 @@ class MotionSensor(SignalWrapper):
         logger.debug("LP creset: pin=%d", pin)
         return pin
 
-    def i2c_write(self, dev_addr: int, data: bytes | bytearray) -> None:
+    def i2c_write(
+        self, dev_addr: int, data: bytes | bytearray
+    ) -> Literal[False] | None:
         """Write bytes to an I2C device.
 
         Payload: [dev_addr, write_len_hi, write_len_lo, data...]
@@ -712,9 +712,12 @@ class MotionSensor(SignalWrapper):
             dev_addr: 7-bit I2C device address.
             data: Bytes to write.
 
+        Returns:
+            None on success, or ``False`` if the device returned an
+            error response (check with ``is False``).
+
         Raises:
             ValueError: If data is empty.
-            OWNotConnectedError, OWCommunicationError, OWDeviceError.
         """
         if not data:
             raise ValueError("i2c_write requires at least 1 data byte")
@@ -730,7 +733,7 @@ class MotionSensor(SignalWrapper):
         logger.debug("LP i2c_write: addr=0x%02X len=%d data=%s",
                      dev_addr, write_len, [f"0x{b:02X}" for b in data])
     
-    def i2c_read(self, dev_addr: int, read_len: int) -> bytes:
+    def i2c_read(self, dev_addr: int, read_len: int) -> bytes | Literal[False]:
         """Read bytes from an I2C device.
 
         Payload: [dev_addr, read_len_hi, read_len_lo]
@@ -740,11 +743,11 @@ class MotionSensor(SignalWrapper):
             read_len: Number of bytes to read.
 
         Returns:
-            Bytes read from the device.
+            Bytes read from the device, or ``False`` if the device
+            returned an error response (check with ``is False``).
 
         Raises:
             ValueError: If read_len < 1.
-            OWNotConnectedError, OWCommunicationError, OWDeviceError.
         """
         if read_len < 1:
             raise ValueError("i2c_read requires read_len >= 1")
@@ -761,7 +764,7 @@ class MotionSensor(SignalWrapper):
         return result
 
     def i2c_write_read(self, dev_addr: int, data: bytes | bytearray,
-                       read_len: int) -> bytes:
+                       read_len: int) -> bytes | Literal[False]:
         """Write bytes then read bytes from an I2C device (combined transfer).
 
         Payload: [dev_addr, write_len_hi, write_len_lo,
@@ -773,11 +776,11 @@ class MotionSensor(SignalWrapper):
             read_len: Number of bytes to read back.
 
         Returns:
-            Bytes read from the device.
+            Bytes read from the device, or ``False`` if the device
+            returned an error response (check with ``is False``).
 
         Raises:
             ValueError: If data is empty or read_len < 1.
-            OWNotConnectedError, OWCommunicationError, OWDeviceError.
         """
         if not data:
             raise ValueError("i2c_write_read requires at least 1 write byte")
@@ -802,7 +805,7 @@ class MotionSensor(SignalWrapper):
 
     def i2c_read_register(self, dev_addr: int, reg_addr: int, read_len: int = 1,
                           reg_addr_size: int = 1,
-                          mux_channel: Optional[int] = None) -> bytes:
+                          mux_channel: Optional[int] = None) -> bytes | Literal[False]:
         """Read register bytes from an arbitrary I2C device on the sensor bus.
 
         Payload (7 bytes, big-endian):
@@ -819,11 +822,11 @@ class MotionSensor(SignalWrapper):
                 or None to read a device directly on the bus.
 
         Returns:
-            Bytes read from the device, or False on an error response.
+            Bytes read from the device, or ``False`` on an error
+            response (check with ``is False``).
 
         Raises:
             ValueError: On out-of-range arguments.
-            OWNotConnectedError, OWCommunicationError, OWDeviceError.
         """
         if not (0x00 <= dev_addr <= 0x7F):
             raise ValueError(f"dev_addr must be 0x00-0x7F, got {dev_addr:#04x}")

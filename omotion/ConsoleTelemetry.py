@@ -436,9 +436,15 @@ class ConsoleTelemetryPoller:
             )
 
     def _read_analog(self, snap: ConsoleTelemetry) -> None:
-        # get_lsync_pulsecount swallows transient errors and returns None;
-        # default to 0 so a single bad poll doesn't raise TypeError.
-        lsync = self._console.get_lsync_pulsecount()
+        # Tolerate a transient lsync failure — one bad read must not fail
+        # the whole snapshot; tcm just defaults to 0 for this poll.
+        # (get_lsync_pulsecount re-raises transport errors, matching its
+        # fsync sibling.)
+        try:
+            lsync = self._console.get_lsync_pulsecount()
+        except Exception as e:
+            logger.debug("lsync read failed for this poll; tcm -> 0: %s", e)
+            lsync = None
         snap.tcm = int(lsync) if lsync is not None else 0
 
         tcl_raw, _ = self._console.read_i2c_packet(

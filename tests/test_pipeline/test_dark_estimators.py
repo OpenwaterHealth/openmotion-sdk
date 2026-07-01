@@ -76,6 +76,15 @@ def test_pending_interval_collects_frames_between_darks():
     assert len(interval.light_frames) == 3
 
 
+def test_flush_on_non_closed_interval_raises():
+    """flush() must fail loudly even under ``python -O`` (where assert is
+    stripped); silently proceeding emits an interval with right=None."""
+    pi = PendingInterval()
+    pi.set_left_dark(DarkObservation(t=0.0, u1=100.0, std=10.0), abs_frame_id=10)
+    with pytest.raises(RuntimeError):
+        pi.flush()
+
+
 def test_linear_interpolation_dark_baseline_across_interval():
     pi = PendingInterval()
     pi.set_left_dark(DarkObservation(t=0.0, u1=100.0, std=10.0), abs_frame_id=10)
