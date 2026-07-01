@@ -117,6 +117,70 @@ def test_start_scan_uses_new_runner():
     assert isinstance(motion.scan_workflow._runner, ScanRunner)
 
 
+def test_start_scan_excludes_unconnected_unmasked_sensor_from_live_source():
+    """bloodflow-app issue #274: on a single-sensor rig, ``right`` is a real
+    ``MotionSensor`` object (never ``None`` — see ``MotionInterface.__init__``)
+    that's simply never connected, and the request correctly sets
+    ``right_camera_mask=0``. start_scan must NOT hand that unconnected,
+    unrequested sensor to LiveUsbSource: LiveUsbSource's own ``sensor is not
+    None`` filter is a no-op against a permanently-instantiated sensor
+    object, so passing it through unconditionally makes __iter__ call
+    ``sensor.uart.histo.start_streaming(...)`` on a sensor whose ``.uart``
+    is None — 'NoneType' object has no attribute 'histo', on every scan."""
+    motion = _build_motion_with_data_dir(None)
+    # Simulate the field failure mode: left is connected, right never is
+    # (single-sensor rig) — both are still real objects either way.
+    with mock.patch.object(motion.left, "is_connected", return_value=True), \
+         mock.patch.object(motion.right, "is_connected", return_value=False):
+        request = ScanRequest(
+            subject_id="x", duration_sec=1,
+            left_camera_mask=0xFF, right_camera_mask=0x00, reduced_mode=False,
+        )
+
+        captured = {}
+
+        def _factory(*, console, left, right, batch_size_frames, metadata):
+            captured["left"] = left
+            captured["right"] = right
+            return _EmptySource(metadata=metadata)
+
+        with mock.patch("omotion.pipeline.sources.LiveUsbSource", _factory):
+            assert motion.scan_workflow.start_scan(request)
+
+        assert captured["right"] is None, (
+            "right sensor (unconnected, unmasked) was passed into "
+            "LiveUsbSource — it will crash __iter__ on sensor.uart.histo"
+        )
+        assert captured["left"] is motion.left
+
+
+def test_start_scan_excludes_masked_out_sensor_even_when_connected():
+    """A dual-sensor rig doing a left-only scan (right physically connected
+    but right_camera_mask=0) must also exclude right from LiveUsbSource —
+    otherwise the pipeline silently streams+records a side the caller never
+    asked for."""
+    motion = _build_motion_with_data_dir(None)
+    with mock.patch.object(motion.left, "is_connected", return_value=True), \
+         mock.patch.object(motion.right, "is_connected", return_value=True):
+        request = ScanRequest(
+            subject_id="x", duration_sec=1,
+            left_camera_mask=0xFF, right_camera_mask=0x00, reduced_mode=False,
+        )
+
+        captured = {}
+
+        def _factory(*, console, left, right, batch_size_frames, metadata):
+            captured["left"] = left
+            captured["right"] = right
+            return _EmptySource(metadata=metadata)
+
+        with mock.patch("omotion.pipeline.sources.LiveUsbSource", _factory):
+            assert motion.scan_workflow.start_scan(request)
+
+        assert captured["right"] is None
+        assert captured["left"] is motion.left
+
+
 def test_start_scan_auto_injects_csv_sink_when_data_dir_set(tmp_path):
     from omotion.pipeline.sinks import CsvSink
     motion = _build_motion_with_data_dir(str(tmp_path))

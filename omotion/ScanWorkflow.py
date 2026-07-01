@@ -550,10 +550,24 @@ class ScanWorkflow:
         all_sinks = default_sinks + list(request.sinks)
 
         # ── Build source + runner (set self._runner synchronously) ─────────
+        # self._interface.left / .right are permanent MotionSensor objects
+        # (see MotionInterface.__init__) — never None, even when no physical
+        # sensor is attached to that side. LiveUsbSource only filters a side
+        # out when its sensor is None, so passing an unconnected/unrequested
+        # sensor through unconditionally makes __iter__ crash on
+        # sensor.uart.histo (uart is None until connect()) on every scan on
+        # a single-sensor rig, or silently streams a side the caller never
+        # asked for on a dual-sensor rig doing a one-sided scan
+        # (bloodflow-app issue #274). Match _resolve_active_sides' gate:
+        # only hand off a sensor that's both requested (nonzero mask) and
+        # actually connected.
+        def _live_sensor(sensor, mask: int):
+            return sensor if (int(mask) != 0 and sensor.is_connected()) else None
+
         source = LiveUsbSource(
             console=self._interface.console,
-            left=self._interface.left,
-            right=self._interface.right,
+            left=_live_sensor(self._interface.left, request.left_camera_mask),
+            right=_live_sensor(self._interface.right, request.right_camera_mask),
             batch_size_frames=request.batch_size_frames or 10,
             metadata=meta,
         )
