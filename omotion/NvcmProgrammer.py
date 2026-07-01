@@ -160,7 +160,7 @@ class _SensorI2CDriver(I2CDriver):
         # dispatch nothing — counted on both sim and hardware drivers.
         if self._state == _TxState.WRITE_PHASE and self._write_buf:
             # MotionSensor.i2c_write returns None on success, False on a
-            # firmware error packet (despite its docstring claiming it raises).
+            # firmware error packet.
             if self._sensor.i2c_write(self._addr, bytes(self._write_buf)) is False:
                 raise NvcmTransportError(
                     f"i2c_write failed at transaction {self.count}")
@@ -200,7 +200,7 @@ class _SensorI2CDriver(I2CDriver):
             result = self._sensor.i2c_read(self._addr, num_bytes)
             what = "i2c_read"
         # MotionSensor returns bytes on success, False on a firmware error
-        # packet (despite its docstring claiming it raises).
+        # packet.
         if result is False or result is None:
             raise NvcmTransportError(
                 f"{what} failed at transaction {self.count}")

@@ -135,3 +135,17 @@ def test_poller_attaches_dropped_delta_to_first_sample_only():
     poller._tick_once()
     assert received[0].dropped_delta == 7
     assert received[1].dropped_delta == 0
+
+
+def test_read_analog_tolerates_lsync_failure():
+    """A transient lsync failure must not propagate out of _read_analog —
+    one bad read shouldn't fail the whole telemetry snapshot (tcm just
+    defaults to 0 for that poll)."""
+    console = _FakeConsoleForDrain([])
+    console.get_lsync_pulsecount = MagicMock(side_effect=RuntimeError("uart busy"))
+    poller = ConsoleTelemetryPoller(console)
+    snap = ConsoleTelemetry()
+
+    poller._read_analog(snap)
+
+    assert snap.tcm == 0
