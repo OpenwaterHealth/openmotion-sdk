@@ -546,6 +546,134 @@ def test_start_scan_trigger_config_override_is_merged():
         motion.resolve_trigger_config(None)["LaserPulseSkipInterval"]
 
 
+# ---------------------------------------------------------------------------
+# OFF TriggerStateEvent must survive stop_trigger failures
+# ---------------------------------------------------------------------------
+#
+# Downstream trigger-state consumers (e.g. bloodflow-app's _TriggerStateSink,
+# see OpenwaterHealth/openmotion-bloodflow-app#201) rely on the OFF
+# TriggerStateEvent to close their trigger clock. The emit used to sit AFTER
+# console.stop_trigger() inside the same try block, so any stop_trigger
+# failure (console powered off / unplugged mid-scan) silently swallowed the
+# OFF event and consumers never saw the trigger close.
+
+def _off_trigger_events(collector):
+    from omotion.pipeline.batch import TriggerStateEvent
+    return [e for e in collector.events
+            if isinstance(e, TriggerStateEvent) and e.state == "OFF"]
+
+
+def test_cancel_scan_emits_trigger_off_even_when_stop_trigger_raises():
+    """cancel_scan must dispatch the OFF TriggerStateEvent even when
+    console.stop_trigger() raises (dead console mid-scan)."""
+    motion = _build_motion_with_data_dir(None)
+    collector = _DiagnosticsCollector()
+    request = ScanRequest(
+        subject_id="x", duration_sec=30,
+        left_camera_mask=0xFF, right_camera_mask=0, reduced_mode=False,
+        skip_default_storage=True, sinks=[collector],
+    )
+
+    captured_source = {}
+
+    def _factory(*, console, left, right, batch_size_frames, metadata):
+        src = _MockSource(metadata=metadata)
+        captured_source["src"] = src
+        return src
+
+    with mock.patch("omotion.pipeline.sources.LiveUsbSource", _factory), \
+         mock.patch.object(motion.console, "stop_trigger",
+                           side_effect=RuntimeError("console powered off")):
+        assert motion.scan_workflow.start_scan(request)
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and "src" not in captured_source:
+            time.sleep(0.01)
+        assert "src" in captured_source, "mock source was not constructed"
+        time.sleep(0.1)
+
+        motion.scan_workflow.cancel_scan(join_timeout=5.0)
+
+    assert _off_trigger_events(collector), (
+        "no OFF TriggerStateEvent dispatched — a stop_trigger failure in "
+        "cancel_scan swallowed the trigger-close notification"
+    )
+
+
+def test_duration_guard_emits_trigger_off_even_when_stop_trigger_raises():
+    """The end-of-scan duration guard must dispatch the OFF TriggerStateEvent
+    even when console.stop_trigger() raises."""
+    motion = _build_motion_with_data_dir(None)
+    collector = _DiagnosticsCollector()
+    request = ScanRequest(
+        subject_id="x", duration_sec=1,
+        left_camera_mask=0xFF, right_camera_mask=0, reduced_mode=False,
+        skip_default_storage=True, sinks=[collector],
+    )
+
+    with mock.patch.object(motion.console, "stop_trigger",
+                           side_effect=RuntimeError("console powered off")):
+        assert motion.scan_workflow.start_scan(request)
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline and motion.scan_workflow.running:
+            time.sleep(0.05)
+        assert not motion.scan_workflow.running, "scan did not finish"
+
+    assert _off_trigger_events(collector), (
+        "no OFF TriggerStateEvent dispatched — a stop_trigger failure in the "
+        "duration guard swallowed the trigger-close notification"
+    )
+
+
+def test_console_disconnect_mid_scan_emits_trigger_off():
+    """A console DISCONNECTING transition mid-scan definitionally means the
+    trigger is no longer firing — _on_scan_handle_state must dispatch the OFF
+    TriggerStateEvent itself, since the teardown path's stop_trigger against
+    the dead console will raise."""
+    from omotion.connection_state import ConnectionState
+
+    motion = _build_motion_with_data_dir(None)
+    collector = _DiagnosticsCollector()
+    request = ScanRequest(
+        subject_id="x", duration_sec=30,
+        left_camera_mask=0xFF, right_camera_mask=0, reduced_mode=False,
+        skip_default_storage=True, sinks=[collector],
+    )
+
+    captured_source = {}
+
+    def _factory(*, console, left, right, batch_size_frames, metadata):
+        src = _MockSource(metadata=metadata)
+        captured_source["src"] = src
+        return src
+
+    with mock.patch("omotion.pipeline.sources.LiveUsbSource", _factory):
+        assert motion.scan_workflow.start_scan(request)
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and "src" not in captured_source:
+            time.sleep(0.01)
+        assert "src" in captured_source, "mock source was not constructed"
+
+        wf = motion.scan_workflow
+        # The demo-mode fixture short-circuits the active-sensor block, so
+        # _scan_subscribe_state never ran; register the console by hand the
+        # way a live scan would.
+        wf._scan_active_handles = [motion.console]
+        wf._on_scan_handle_state(
+            motion.console,
+            ConnectionState.CONNECTED,
+            ConnectionState.DISCONNECTING,
+            "usb removed",
+        )
+
+        assert wf._stop_evt.is_set(), "console disconnect did not abort scan"
+        assert _off_trigger_events(collector), (
+            "console disconnect mid-scan did not dispatch an OFF "
+            "TriggerStateEvent"
+        )
+
+        wf.cancel_scan(join_timeout=5.0)
+
+
 def test_telemetry_csv_logs_converted_tec_engineering_units():
     """The per-scan telemetry CSV records converted TEC engineering units
     (measured/setpoint temperature in °C, current in A, voltage in V) alongside
