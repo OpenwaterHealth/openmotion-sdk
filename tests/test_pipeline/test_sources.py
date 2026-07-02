@@ -134,6 +134,33 @@ def test_live_usb_source_close_stops_event():
     assert src._stop.is_set()
 
 
+def test_batch_queue_depth_is_configurable():
+    """The parsed-batch buffer between the reader threads and the runner is
+    sized via batch_queue_size so a slow runner can't backpressure dev.read
+    too quickly (see the 2026-06 histo-drop soak)."""
+    src = LiveUsbSource(
+        console=None, left=None, right=None,
+        metadata=_meta(), batch_queue_size=32,
+    )
+    assert src._batch_queue.maxsize == 32
+
+
+def test_batch_queue_default_targets_three_seconds_regardless_of_batch_size():
+    """Default buffer is sized to absorb a ~3 s downstream stall (so a
+    transient runner stall doesn't backpressure dev.read into the firmware
+    histo-queue overflow), derived from the capture rate + batch size rather
+    than a magic constant — so the intent holds for a different batch size."""
+    from omotion.config import CAPTURE_HZ
+    for batch_frames in (10, 20):
+        src = LiveUsbSource(
+            console=None, left=None, right=None,
+            metadata=_meta(), batch_size_frames=batch_frames,
+        )
+        seconds = src._batch_queue.maxsize * batch_frames / CAPTURE_HZ
+        # ~3 s, rounded up by at most one batch — not over-provisioned.
+        assert 3.0 <= seconds < 3.0 + batch_frames / CAPTURE_HZ
+
+
 def test_live_usb_source_reader_loop_builds_batches_from_packet_queue(monkeypatch):
     """Mock parse_histogram_stream to feed fake samples; verify _reader_loop
     accumulates them into FrameBatches and pushes to the batch queue."""

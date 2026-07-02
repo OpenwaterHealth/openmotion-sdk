@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import csv
 import logging
+import math
 import queue
 import threading
 import time
@@ -20,11 +21,19 @@ from typing import Any, Iterator, Optional, Protocol, runtime_checkable
 
 import numpy as np
 
+from omotion.config import CAPTURE_HZ
 from .batch import FrameBatch
 from .sinks import ScanMetadata
 
 
 logger = logging.getLogger("openmotion.sdk.pipeline.sources")
+
+# How long a downstream stall (a slow sink, a GC pause, a pipeline CPU spike)
+# the host should absorb before the USB reader is starved and the sensor
+# firmware's 4-deep (~100 ms) histo queue overflows. The batch queue default
+# is sized to hold this many seconds of frames so the stall is buffered here
+# instead of backpressuring dev.read. See the 2026-06 long-scan soak.
+_TARGET_BUFFER_SECONDS = 3.0
 
 
 @runtime_checkable
@@ -195,6 +204,7 @@ class LiveUsbSource(_BaseSource):
                  batch_size_frames: int = 10,
                  flush_interval_s: float = 0.25,
                  packet_queue_size: int = 64,
+                 batch_queue_size: Optional[int] = None,
                  metadata: ScanMetadata):
         super().__init__(metadata=metadata)
         self._console = console
@@ -205,7 +215,20 @@ class LiveUsbSource(_BaseSource):
             side: queue.Queue(maxsize=packet_queue_size)
             for side, sensor in self._sensors.items() if sensor is not None
         }
-        self._batch_queue: queue.Queue = queue.Queue(maxsize=4)
+        # Parsed-batch buffer between the per-side reader threads and the
+        # runner. Was a hardcoded 4 (~1 s); a transient runner stall (sink
+        # fsync, GC) filled it and backpressured the parser -> dev.read ->
+        # the firmware's 4-deep histo queue overflowed and dropped frames.
+        # Default it to ~_TARGET_BUFFER_SECONDS of frames, derived from the
+        # 40 Hz capture rate and the batch size (so the intent survives a
+        # different batch_size_frames), and keep it tunable. The runner stalls
+        # before the parser does, so this batch buffer is the slack that keeps
+        # dev.read flowing; the 64-deep packet queue adds ~1.6 s more behind
+        # it. See the 2026-06 long-scan soak root-cause + AsyncSink.
+        if batch_queue_size is None:
+            frames = _TARGET_BUFFER_SECONDS * CAPTURE_HZ
+            batch_queue_size = math.ceil(frames / max(1, self._batch_size))
+        self._batch_queue: queue.Queue = queue.Queue(maxsize=max(1, int(batch_queue_size)))
         self._stop = threading.Event()
         self._reader_threads: list[threading.Thread] = []
 

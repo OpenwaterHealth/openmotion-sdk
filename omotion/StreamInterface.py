@@ -119,6 +119,19 @@ class StreamInterface(USBInterfaceBase):
         self.expected_size = None
         self.isStreaming = False
         self.packets_received: int = 0  # USB transfers queued since last start_streaming
+        # Host-side backpressure stats since last start_streaming. A put that
+        # blocks because the parser/runner stalled is the host-side cause of
+        # the sensor firmware's "HISTO enqueue fail" drops; surfacing it per
+        # scan makes that previously-invisible stall measurable.
+        self.backpressure_stalls: int = 0      # puts that blocked >= warn threshold
+        self.backpressure_stall_s: float = 0.0  # total seconds blocked on those puts
+        self.dropped_chunks: int = 0            # chunks dropped (queue full past timeout)
+        self._last_backpressure_warn_s: float = 0.0
+        # A put blocking this long is a sub-second stall worth counting/warning.
+        self._backpressure_warn_s: float = 0.1
+        # Drop a chunk only after the queue has been full this long (the loop's
+        # original >1 s drop policy). Kept as an attribute so tests can shorten it.
+        self._put_timeout_s: float = 1.0
 
     def start_streaming(self, queue_obj, expected_size):
         # Recover from a stale thread left over by a previous scan whose
@@ -143,6 +156,10 @@ class StreamInterface(USBInterfaceBase):
         self.data_queue = queue_obj
         self.expected_size = expected_size
         self.packets_received = 0
+        self.backpressure_stalls = 0
+        self.backpressure_stall_s = 0.0
+        self.dropped_chunks = 0
+        self._last_backpressure_warn_s = 0.0
         self.stop_event.clear()
         self.thread = threading.Thread(target=self._stream_loop, daemon=True)
         self.thread.start()
@@ -168,10 +185,19 @@ class StreamInterface(USBInterfaceBase):
         self.isStreaming = False
         self.data_queue = None
         self.expected_size = None
-        logger.info(
+        summary = (
             f"{self.desc}: Streaming stopped — "
             f"{self.packets_received} USB read chunk(s) received"
         )
+        if self.backpressure_stalls or self.dropped_chunks:
+            summary += (
+                f"; host backpressure: {self.backpressure_stalls} stall(s) "
+                f">{int(self._backpressure_warn_s * 1000)}ms "
+                f"totalling {self.backpressure_stall_s:.2f}s, "
+                f"{self.dropped_chunks} chunk(s) dropped"
+            )
+        log = logger.warning if self.dropped_chunks else logger.info
+        log(summary)
 
     def flush_stale_data(
         self,
@@ -359,6 +385,51 @@ class StreamInterface(USBInterfaceBase):
             self.data_queue.put(raw)
         return cmp_count, cmp_errors
 
+    def _enqueue_chunk(self, data_queue, data) -> bool:
+        """Put one USB chunk onto the packet queue, measuring host-side
+        backpressure.
+
+        A put that returns immediately costs nothing; one that blocks means
+        the parser/runner has stalled and is holding the queue full — the
+        host-side cause of the firmware's histo-queue overflow. We time the
+        block: any wait >= ``_backpressure_warn_s`` is counted (and rate-limit
+        warned) so sub-second stalls are visible, not just the >1 s drops.
+
+        Returns True if the chunk was enqueued, False if it was dropped
+        because the queue stayed full past ``_put_timeout_s``.
+        """
+        t0 = time.monotonic()
+        try:
+            data_queue.put(data, timeout=self._put_timeout_s)
+        except queue.Full:
+            self.dropped_chunks += 1
+            # Real host-side data loss — warn (rate-limited) so it's visible
+            # mid-scan, not only in the stop summary.
+            if t0 - self._last_backpressure_warn_s >= 5.0:
+                self._last_backpressure_warn_s = t0
+                logger.warning(
+                    "%s: packet queue full for >%.0fs (parser falling behind) "
+                    "— dropping %d-byte chunk; %d dropped so far this scan",
+                    self.desc, self._put_timeout_s, len(data), self.dropped_chunks,
+                )
+            return False
+        blocked = time.monotonic() - t0
+        self.packets_received += 1
+        if blocked >= self._backpressure_warn_s:
+            self.backpressure_stalls += 1
+            self.backpressure_stall_s += blocked
+            # Rate-limit to at most once per 5 s so a sustained stall doesn't
+            # flood the log; every stall is still counted above.
+            if t0 - self._last_backpressure_warn_s >= 5.0:
+                self._last_backpressure_warn_s = t0
+                logger.warning(
+                    "%s: USB read stalled %.0f ms on a full packet queue "
+                    "(parser/runner falling behind — risks firmware histo "
+                    "drops); %d stall(s) so far this scan",
+                    self.desc, blocked * 1000.0, self.backpressure_stalls,
+                )
+        return True
+
     def _stream_loop(self):
         # Read timeout must exceed the worst-case USB transfer latency for the
         # final frame.  Normal cadence is ~25 ms; the last frame of a scan can
@@ -392,22 +463,15 @@ class StreamInterface(USBInterfaceBase):
                     timeout=_READ_TIMEOUT_MS,
                 )
                 if data and data_queue is self.data_queue:
-                    # Use a bounded put so the loop can never block forever
-                    # on a stopped/slow parser. With self.stop_event set the
+                    # Bounded put (see _enqueue_chunk) so the loop can never
+                    # block forever on a stopped/slow parser, and so host-side
+                    # backpressure is measured. With self.stop_event set the
                     # parser also drains until empty (see parse_histogram_stream),
-                    # so this drop window is only ever 1s of backlog at scan
-                    # teardown — small price for a guaranteed loop exit.
-                    try:
-                        data_queue.put(bytes(data), timeout=1.0)
-                        self.packets_received += 1
-                    except queue.Full:
-                        if self.stop_event.is_set():
-                            break
-                        logger.warning(
-                            "%s: data_queue full for >1s during streaming "
-                            "(parser falling behind?); dropping %d-byte chunk",
-                            self.desc, len(data),
-                        )
+                    # so a drop here is only ever <=_put_timeout_s of backlog at
+                    # scan teardown — small price for a guaranteed loop exit.
+                    if not self._enqueue_chunk(data_queue, bytes(data)) \
+                            and self.stop_event.is_set():
+                        break
             except usb.core.USBError as e:
                 if e.errno in (110, 10060):
                     # Timeout — no data arrived within the read window.
