@@ -544,11 +544,21 @@ class ScanWorkflow:
         all_sinks = default_sinks + list(request.sinks)
 
         # ── Build source + runner (set self._runner synchronously) ─────────
+        # Active-camera count sizes the source's batch queue: a batch row is
+        # one per-camera sample, so the data rate scales with the mask
+        # popcounts, not just CAPTURE_HZ.
+        active_cameras = (
+            (bin(request.left_camera_mask).count("1")
+             if self._interface.left is not None else 0)
+            + (bin(request.right_camera_mask).count("1")
+               if self._interface.right is not None else 0)
+        )
         source = LiveUsbSource(
             console=self._interface.console,
             left=self._interface.left,
             right=self._interface.right,
             batch_size_frames=request.batch_size_frames or 10,
+            active_cameras=active_cameras or None,
             metadata=meta,
         )
         self._runner = ScanRunner(

@@ -126,7 +126,10 @@ class StreamInterface(USBInterfaceBase):
         self.backpressure_stalls: int = 0      # puts that blocked >= warn threshold
         self.backpressure_stall_s: float = 0.0  # total seconds blocked on those puts
         self.dropped_chunks: int = 0            # chunks dropped (queue full past timeout)
-        self._last_backpressure_warn_s: float = 0.0
+        # Separate rate-limit tokens: a benign stall warning must never
+        # suppress a data-loss (drop) warning, and vice versa.
+        self._last_stall_warn_s: float = 0.0
+        self._last_drop_warn_s: float = 0.0
         # A put blocking this long is a sub-second stall worth counting/warning.
         self._backpressure_warn_s: float = 0.1
         # Drop a chunk only after the queue has been full this long (the loop's
@@ -159,7 +162,8 @@ class StreamInterface(USBInterfaceBase):
         self.backpressure_stalls = 0
         self.backpressure_stall_s = 0.0
         self.dropped_chunks = 0
-        self._last_backpressure_warn_s = 0.0
+        self._last_stall_warn_s = 0.0
+        self._last_drop_warn_s = 0.0
         self.stop_event.clear()
         self.thread = threading.Thread(target=self._stream_loop, daemon=True)
         self.thread.start()
@@ -403,10 +407,12 @@ class StreamInterface(USBInterfaceBase):
             data_queue.put(data, timeout=self._put_timeout_s)
         except queue.Full:
             self.dropped_chunks += 1
-            # Real host-side data loss — warn (rate-limited) so it's visible
-            # mid-scan, not only in the stop summary.
-            if t0 - self._last_backpressure_warn_s >= 5.0:
-                self._last_backpressure_warn_s = t0
+            # Real host-side data loss — warn (rate-limited on its OWN token,
+            # so a recent benign stall warning can't suppress it) so it's
+            # visible mid-scan, not only in the stop summary.
+            now = time.monotonic()
+            if now - self._last_drop_warn_s >= 5.0:
+                self._last_drop_warn_s = now
                 logger.warning(
                     "%s: packet queue full for >%.0fs (parser falling behind) "
                     "— dropping %d-byte chunk; %d dropped so far this scan",
@@ -420,8 +426,8 @@ class StreamInterface(USBInterfaceBase):
             self.backpressure_stall_s += blocked
             # Rate-limit to at most once per 5 s so a sustained stall doesn't
             # flood the log; every stall is still counted above.
-            if t0 - self._last_backpressure_warn_s >= 5.0:
-                self._last_backpressure_warn_s = t0
+            if t0 - self._last_stall_warn_s >= 5.0:
+                self._last_stall_warn_s = t0
                 logger.warning(
                     "%s: USB read stalled %.0f ms on a full packet queue "
                     "(parser/runner falling behind — risks firmware histo "

@@ -155,6 +155,74 @@ def test_wrapped_exposes_the_inner_sink_for_introspection():
     assert AsyncSink(inner).wrapped is inner
 
 
+class _WedgeableSink:
+    """Sink whose consume blocks until released — simulates a wedged disk."""
+
+    channels = {"final"}
+
+    def __init__(self) -> None:
+        self.release = threading.Event()
+        self.consumed: list = []
+        self.completed = threading.Event()
+
+    def on_scan_start(self, meta) -> None:
+        pass
+
+    def consume(self, channel, payload) -> None:
+        self.release.wait(timeout=10.0)
+        self.consumed.append(payload)
+
+    def on_complete(self) -> None:
+        self.completed.set()
+
+
+def test_join_timeout_defers_finalize_to_the_worker():
+    """If the worker can't drain within join_timeout_s, on_complete must NOT
+    finalize the wrapped sink on the runner thread (that would race the
+    in-flight consume — and for ScanDBSink could delete the session as
+    'empty' while its data is still buffered). The worker finalizes after it
+    unwedges, so every buffered item is still persisted before on_complete
+    runs."""
+    inner = _WedgeableSink()
+    sink = AsyncSink(inner, join_timeout_s=0.1)
+
+    sink.on_scan_start(meta=None)
+    sink.consume("final", "a")   # worker wedges inside this consume
+    sink.consume("final", "b")   # stays buffered
+    sink.on_complete()           # join times out
+
+    assert not inner.completed.is_set()   # finalize deferred, no race
+    assert inner.consumed == []
+
+    inner.release.set()                   # disk unwedges
+    assert inner.completed.wait(timeout=5.0)
+    assert inner.consumed == ["a", "b"]   # nothing was lost or skipped
+
+
+def test_reuse_after_timed_out_scan_gets_a_fresh_queue():
+    """A previous scan whose worker never drained must not poison the next
+    scan: scan 2 gets a fresh queue + worker, never sees scan 1's stale items
+    or sentinel, and completes normally."""
+    inner = _WedgeableSink()
+    sink = AsyncSink(inner, join_timeout_s=0.1)
+
+    sink.on_scan_start(meta=None)
+    sink.consume("final", "scan1-item")
+    sink.on_complete()                    # times out; worker still wedged
+
+    sink.on_scan_start(meta=None)         # scan 2 on the same instance
+    sink.consume("final", "scan2-item")
+    inner.release.set()                   # both workers may now proceed
+    sink.on_complete()
+
+    # Scan 2's item was delivered; the stale scan-1 sentinel never killed
+    # scan 2's worker, and consume() never deadlocked.
+    deadline = time.monotonic() + 5.0
+    while "scan2-item" not in inner.consumed and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert "scan2-item" in inner.consumed
+
+
 def test_async_sink_satisfies_the_sink_protocol():
     from omotion.pipeline import Sink
     assert isinstance(AsyncSink(_RecordingSink()), Sink)

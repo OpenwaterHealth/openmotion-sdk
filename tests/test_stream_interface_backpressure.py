@@ -69,6 +69,39 @@ def test_enqueue_chunk_drops_when_queue_full_past_timeout():
     assert si.packets_received == 0
 
 
+def test_drop_warning_not_suppressed_by_recent_stall_warning(caplog):
+    """Stall and drop warnings rate-limit on separate tokens: a benign
+    sub-second stall warning moments earlier must not swallow the first
+    real data-loss (drop) warning."""
+    import logging
+
+    si = _si()
+    si._backpressure_warn_s = 0.01
+    si._put_timeout_s = 0.05
+
+    # 1) A stall: queue full, freed after ~30 ms -> stall warning fires.
+    q: queue.Queue = queue.Queue(maxsize=1)
+    q.put(b"occupied")
+
+    def _free_slot():
+        time.sleep(0.03)
+        q.get()
+
+    threading.Thread(target=_free_slot, daemon=True).start()
+    with caplog.at_level(logging.WARNING):
+        assert si._enqueue_chunk(q, b"frame") is True
+        assert si.backpressure_stalls == 1
+
+        # 2) Immediately after: a real drop (the queue still holds the chunk
+        #    from step 1, so it is full and never freed this time). Must warn
+        #    despite the stall warning having just consumed its own token.
+        assert si._enqueue_chunk(q, b"frame2") is False
+        assert si.dropped_chunks == 1
+
+    drop_warnings = [r for r in caplog.records if "dropping" in r.getMessage()]
+    assert len(drop_warnings) == 1
+
+
 def test_start_streaming_resets_backpressure_counters(monkeypatch):
     si = _si()
     si.backpressure_stalls = 7

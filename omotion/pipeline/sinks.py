@@ -56,6 +56,16 @@ class Sink(Protocol):
     ``critical`` is optional (the runner reads it via getattr with a False
     default), so it is deliberately NOT declared as a protocol member — adding
     a data attribute here would make runtime isinstance() checks require it.
+
+    Contract notes for implementers:
+      * Payloads are dispatched BY REFERENCE: every sink on a channel gets the
+        same object, and AsyncSink-wrapped sinks consume it concurrently on
+        worker threads. Treat payloads as immutable; copy before transforming.
+      * ``consume()`` runs on the scan runner thread, which also drains the
+        live USB batch queue — blocking I/O there can starve dev.read and
+        drop frames on the wire. Wrap I/O-bound sinks in
+        ``omotion.pipeline.AsyncSink`` (the SDK does this for its own CSV/DB
+        sinks).
     """
     channels: set[str]
 

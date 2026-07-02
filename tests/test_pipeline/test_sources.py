@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import math
 import threading
 import time
 from unittest import mock
@@ -145,20 +146,38 @@ def test_batch_queue_depth_is_configurable():
     assert src._batch_queue.maxsize == 32
 
 
-def test_batch_queue_default_targets_three_seconds_regardless_of_batch_size():
+def test_batch_queue_default_targets_three_seconds_of_row_rate():
     """Default buffer is sized to absorb a ~3 s downstream stall (so a
     transient runner stall doesn't backpressure dev.read into the firmware
-    histo-queue overflow), derived from the capture rate + batch size rather
-    than a magic constant — so the intent holds for a different batch size."""
+    histo-queue overflow). A batch ROW is one per-camera sample, so the
+    wall-clock capacity must be computed against CAPTURE_HZ x active_cameras
+    — the original PR formula divided by CAPTURE_HZ alone and undersized the
+    buffer ~16x on a dual-sensor full-mask scan."""
     from omotion.config import CAPTURE_HZ
     for batch_frames in (10, 20):
-        src = LiveUsbSource(
-            console=None, left=None, right=None,
-            metadata=_meta(), batch_size_frames=batch_frames,
-        )
-        seconds = src._batch_queue.maxsize * batch_frames / CAPTURE_HZ
-        # ~3 s, rounded up by at most one batch — not over-provisioned.
-        assert 3.0 <= seconds < 3.0 + batch_frames / CAPTURE_HZ
+        for active_cameras in (8, 16):
+            src = LiveUsbSource(
+                console=None, left=None, right=None,
+                metadata=_meta(), batch_size_frames=batch_frames,
+                active_cameras=active_cameras,
+            )
+            rows_per_s = CAPTURE_HZ * active_cameras
+            seconds = src._batch_queue.maxsize * batch_frames / rows_per_s
+            # ~3 s, rounded up by at most one batch — not over-provisioned.
+            assert 3.0 <= seconds < 3.0 + batch_frames / rows_per_s
+
+
+def test_batch_queue_default_worst_cases_cameras_when_count_unknown():
+    """Without an explicit active-camera count the default assumes a fully
+    populated module per connected side (8 cameras x 1 side here, since no
+    sensors are wired), never the bare 40 Hz capture rate."""
+    from omotion.config import CAPTURE_HZ
+    src = LiveUsbSource(
+        console=None, left=None, right=None,
+        metadata=_meta(), batch_size_frames=10,
+    )
+    # No sensors connected -> worst-cases one side x 8 cameras = 320 rows/s.
+    assert src._batch_queue.maxsize == math.ceil(3.0 * CAPTURE_HZ * 8 / 10)
 
 
 def test_live_usb_source_reader_loop_builds_batches_from_packet_queue(monkeypatch):

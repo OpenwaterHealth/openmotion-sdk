@@ -19,11 +19,20 @@ Lifecycle:
   * ``on_scan_start`` runs the wrapped sink synchronously and propagates any
     exception, so a ``critical`` sink whose start fails still aborts the scan
     (ScanRunner reads ``.critical``) and the sink is fully initialized before
-    any ``consume`` is enqueued.
+    any ``consume`` is enqueued. Each start gets a FRESH queue and worker, so
+    a previous scan's wedged worker can never poison the next scan.
   * ``consume`` enqueues ``(channel, payload)`` (cheap) for the worker.
-  * ``on_complete`` enqueues a sentinel, waits for the worker to drain every
-    buffered item, then calls the wrapped sink's ``on_complete`` — so no
-    buffered data is lost.
+  * ``on_complete`` enqueues a sentinel and waits for the worker. The WORKER
+    finalizes the wrapped sink after draining every buffered item, so
+    finalize is always serialized with consume — the wrapped sink is
+    single-threaded by construction, even if the join below times out. On a
+    join timeout on_complete returns without finalizing (the worker will
+    finalize when it unwedges) rather than racing the worker's in-flight
+    write or finalizing a sink whose data is still buffered.
+
+Payloads are dispatched to sinks BY REFERENCE (see ScanRunner.dispatch_event)
+and may be consumed concurrently by other sinks' workers: a wrapped sink must
+treat every payload as immutable shared state.
 """
 
 from __future__ import annotations
@@ -44,10 +53,10 @@ class AsyncSink:
     def __init__(self, sink: Any, *, max_queue: int = 64,
                  join_timeout_s: float = 60.0) -> None:
         self._sink = sink
-        self._queue: queue.Queue = queue.Queue(maxsize=max(1, int(max_queue)))
+        self._max_queue = max(1, int(max_queue))
+        self._queue: queue.Queue = queue.Queue(maxsize=self._max_queue)
         self._join_timeout_s = float(join_timeout_s)
         self._worker: threading.Thread | None = None
-        self._started = False
         self._closed = False
         self._name = type(sink).__name__
         # Mirror the attributes the runner reads off a sink so AsyncSink is a
@@ -66,15 +75,26 @@ class AsyncSink:
         # raise so ScanRunner aborts before the laser fires, and the sink must
         # be ready before the first enqueued consume runs on the worker.
         self._sink.on_scan_start(meta)
+        if self._worker is not None and self._worker.is_alive():
+            # Previous scan's worker never drained (its on_complete join timed
+            # out). It keeps its own queue (bound as a _run argument) and will
+            # finalize the wrapped sink for THAT scan when it unwedges; this
+            # scan gets a fresh queue + worker so stale items or the stale
+            # sentinel can never leak into it.
+            logger.warning(
+                "AsyncSink(%s): previous scan's worker still draining; "
+                "starting a fresh queue for this scan", self._name,
+            )
+        self._queue = queue.Queue(maxsize=self._max_queue)
         self._closed = False
         self._worker = threading.Thread(
-            target=self._run, name=f"AsyncSink-{self._name}", daemon=True,
+            target=self._run, args=(self._queue,),
+            name=f"AsyncSink-{self._name}", daemon=True,
         )
-        self._started = True
         self._worker.start()
 
     def consume(self, channel: str, payload: Any) -> None:
-        if not self._started or self._closed:
+        if self._worker is None or self._closed:
             # No worker to service the item (start failed/skipped or already
             # finalized). Dropping is correct: there is nowhere to deliver it.
             return
@@ -83,7 +103,7 @@ class AsyncSink:
         self._queue.put((channel, payload))
 
     def on_complete(self) -> None:
-        if not self._started:
+        if self._worker is None:
             # on_scan_start never ran (or raised) — no worker was created;
             # finalize the wrapped sink directly so it still tears down.
             self._sink.on_complete()
@@ -94,18 +114,34 @@ class AsyncSink:
         self._queue.put(_SENTINEL)
         self._worker.join(timeout=self._join_timeout_s)
         if self._worker.is_alive():
+            # Do NOT finalize here: the worker may be mid-consume on the
+            # wrapped sink, and finalizing under it would race the in-flight
+            # write (for ScanDBSink it could even delete the session as
+            # "empty" while its data is still buffered). The worker owns
+            # finalization and will run it after draining, whenever it
+            # unwedges.
             logger.error(
                 "AsyncSink(%s): worker did not drain within %.0fs; "
-                "%d buffered item(s) may be lost",
-                self._name, self._join_timeout_s, self._queue.qsize(),
+                "%d buffered item(s) still pending — finalization deferred "
+                "to the worker", self._name, self._join_timeout_s,
+                self._queue.qsize(),
             )
-        self._sink.on_complete()
 
-    def _run(self) -> None:
+    def _run(self, q: queue.Queue) -> None:
+        # `q` is bound per worker (not read off self) so a fresh scan's queue
+        # swap can never redirect a still-draining previous worker.
         while True:
-            item = self._queue.get()
+            item = q.get()
             try:
                 if item is _SENTINEL:
+                    # Finalize on the worker so it is always serialized with
+                    # consume — see on_complete.
+                    try:
+                        self._sink.on_complete()
+                    except Exception:
+                        logger.exception(
+                            "AsyncSink(%s): on_complete raised", self._name,
+                        )
                     return
                 channel, payload = item
                 try:
@@ -116,4 +152,4 @@ class AsyncSink:
                         "continuing", self._name, channel,
                     )
             finally:
-                self._queue.task_done()
+                q.task_done()

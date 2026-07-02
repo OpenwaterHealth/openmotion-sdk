@@ -238,7 +238,7 @@ def test_duration_guard_skips_redundant_stop_trigger_and_close_on_cancel(tmp_pat
 
     captured_source = {}
 
-    def _factory(*, console, left, right, batch_size_frames, metadata):
+    def _factory(*, console, left, right, batch_size_frames, metadata, **kwargs):
         src = _MockSource(metadata=metadata)
         captured_source["src"] = src
         return src
@@ -352,7 +352,7 @@ def _run_scan_capturing_trigger(motion, request):
     per-side hardware bring-up so the worker reaches the trigger send."""
     calls = []
 
-    def _factory(*, console, left, right, batch_size_frames, metadata):
+    def _factory(*, console, left, right, batch_size_frames, metadata, **kwargs):
         return _MockSource(metadata=metadata)
 
     fake_side = ("left", request.left_camera_mask or 0xFF, mock.MagicMock())

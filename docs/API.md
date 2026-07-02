@@ -381,6 +381,21 @@ scan aborts (this is how `ScanDBSink` guarantees no silent data loss). Pass
 custom sinks via `ScanRequest.sinks` (+ `skip_default_storage=True` to suppress
 the auto-injected CSV/DB sinks).
 
+**`consume()` has a latency budget.** During a live scan the runner thread that
+calls `consume()` is the same thread that drains the USB batch queue: a sink
+that blocks it long enough (disk fsync, DB commit, network call) backpressures
+the parser and `dev.read`, overflows the sensor firmware's ~100 ms histo queue,
+and **drops frames on the wire** (root-caused on a 2026-06 soak). The SDK wraps
+its own storage sinks in `omotion.pipeline.AsyncSink`, which runs `consume()`
+on a worker thread behind a bounded buffer — wrap any custom sink that does
+I/O the same way: `ScanRequest(sinks=[AsyncSink(MySink())])`. Keep unwrapped
+sinks to in-memory work (a plot buffer append, a counter).
+
+**Payloads are shared, not owned.** Every sink subscribed to a channel receives
+the *same* payload object, and `AsyncSink`-wrapped sinks consume it on their
+own threads concurrently. Never mutate a payload in `consume()` — copy first if
+you must transform it.
+
 Sources: `LiveUsbSource` (hardware), `CsvReplaySource` (raw CSV — the only
 raw record; the scan DB stores corrected data only). See
 [SciencePipeline.md](./SciencePipeline.md) for the stage chain.
@@ -395,7 +410,8 @@ real `pyqtSignal`s; otherwise they are `MotionSignal` objects with the same
 
 Up to three daemon threads run concurrently after `start()`: the hotplug
 **ConnectionMonitor**, the per-endpoint **stream readers**, and the **telemetry
-poller**. Scans add a worker thread. **Signals fire from these threads** — UI
+poller**. Scans add a worker thread, plus one **AsyncSink worker** per wrapped
+storage sink (the auto-injected CSV and DB sinks are wrapped by default). **Signals fire from these threads** — UI
 code must marshal to the main thread (the apps use `Qt.QueuedConnection`).
 Connection transitions surface as `ConnectionState` updates on the handles.
 
