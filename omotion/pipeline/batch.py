@@ -186,7 +186,7 @@ class FrameBatch:
       NoiseFloor:      (mutates raw_histograms in place — no new field)
       Moments:         mean_raw, std_raw, contrast_raw
       PedestalSubtraction: subtracted_mean
-      DarkCorrection:  dark_baseline_rt, mean_dc_rt, std_dc_rt
+      DarkCorrection:  dark_baseline_rt, mean_dc_rt, std_dc_rt, low_light_rt
                        (also appends IntervalClosed to events when interval closes)
       ShotNoise:       std_sn_rt, contrast_sn_rt
       BfiBvi:          bfi_live, bvi_live
@@ -296,6 +296,16 @@ class FrameBatch:
     # (N, 2, 8) float32 — dark-corrected std: sqrt(max(0, raw_var -
     # predicted_dark_var)). Realtime estimate. NaN during warmup.
     std_dc_rt:        Optional[np.ndarray] = None
+
+    # (N, 2, 8) bool — True where a LIGHT-typed frame's raw mean was at or
+    # below pedestal + max_above_pedestal, i.e. the camera received no
+    # meaningful light (sensor covered / off target / laser-off artifact).
+    # For these slots DarkCorrectionStage suppresses realtime emission
+    # (mean_dc_rt stays NaN), so this flag is the only way consumers can
+    # distinguish "frame arrived but unlit" from "no prediction yet"
+    # (warmup). Always False for scheduled dark frames — those are expected
+    # to be unlit. None until DarkCorrectionStage runs.
+    low_light_rt:     Optional[np.ndarray] = None
 
     # ── ShotNoiseCorrectionStage outputs ─────────────────────────────────
 

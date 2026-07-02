@@ -119,6 +119,52 @@ def test_dark_like_light_frame_suppresses_realtime_emission():
     assert np.isnan(batch.dark_baseline_rt[2, 0, 0])
 
 
+def test_low_light_rt_flags_unlit_light_frames_only():
+    """low_light_rt distinguishes "frame arrived but unlit" (covered sensor,
+    laser-off artifact) from warmup NaN. It must be True exactly for
+    light-typed frames whose u1 is within the dark-integrity threshold, and
+    False for genuine light frames and scheduled dark frames (expected to
+    be unlit)."""
+    # dark@10 (u1=65), genuine light@11 (u1=500), dark-like light@12 (u1=66).
+    mean = np.array([[65.0], [500.0], [66.0]], dtype=np.float32).reshape(3, 1, 1) * np.ones((1, 2, 8))
+    std  = np.array([[10.0], [20.0], [11.0]], dtype=np.float32).reshape(3, 1, 1) * np.ones((1, 2, 8))
+    batch = _batch(3, ["dark", "light", "light"], [10, 11, 12],
+                   mean_raw=mean.astype(np.float32), std_raw=std.astype(np.float32))
+
+    stage = DarkCorrectionStage(
+        realtime_estimator=HybridRealtimePredictor(),
+        batch_estimator=LinearInterpolation(),
+    )
+    stage.process(batch)
+
+    assert batch.low_light_rt is not None
+    assert not batch.low_light_rt[0, 0, 0]   # scheduled dark — not flagged
+    assert not batch.low_light_rt[1, 0, 0]   # genuine light — not flagged
+    assert batch.low_light_rt[2, 0, 0]       # unlit light frame — flagged
+    # Slots for cameras that never appear in the batch stay False.
+    assert not batch.low_light_rt[:, 1, :].any()
+
+
+def test_low_light_rt_all_frames_covered_sensor():
+    """A covered sensor streams light-typed frames that are all unlit —
+    every one must be flagged so liveness consumers can tell the camera is
+    alive (frames arriving) even though nothing is plottable."""
+    mean = np.full((4, 2, 8), 66.0, dtype=np.float32)   # pedestal 64 + 2
+    std  = np.full((4, 2, 8), 10.0, dtype=np.float32)
+    batch = _batch(4, ["light", "light", "light", "light"], [11, 12, 13, 14],
+                   mean_raw=mean, std_raw=std)
+
+    stage = DarkCorrectionStage(
+        realtime_estimator=HybridRealtimePredictor(),
+        batch_estimator=LinearInterpolation(),
+    )
+    stage.process(batch)
+
+    assert batch.low_light_rt[:, 0, 0].all()
+    # And realtime emission stays suppressed (NaN), per the existing rule.
+    assert np.isnan(batch.mean_dc_rt[:, 0, 0]).all()
+
+
 def test_emits_corrected_interval():
     """DarkCorrectionStage emits raw CorrectedInterval (enrichment is done
     by downstream stages ShotNoiseCorrectionStage and BfiBviStage)."""

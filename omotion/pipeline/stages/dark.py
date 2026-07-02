@@ -368,7 +368,9 @@ class DarkCorrectionStage:
 
     Per non-dark frame: populates batch.dark_baseline_rt, batch.mean_dc_rt,
     batch.std_dc_rt using HybridRealtimePredictor (NaN where no prediction
-    is available — the warmup window).
+    is available — the warmup window), and batch.low_light_rt (True where a
+    light-typed frame's u1 sat at/below pedestal + max_above_pedestal, so
+    realtime emission was suppressed — covered sensor or laser-off artifact).
 
     Per dark frame: runs the integrity guard, appends to DarkHistory + the
     appropriate PendingInterval, and emits an IntervalClosed event when an
@@ -439,6 +441,7 @@ class DarkCorrectionStage:
         baseline_rt = np.full((n, 2, 8), np.nan, dtype=np.float32)
         mean_dc_rt  = np.full((n, 2, 8), np.nan, dtype=np.float32)
         std_dc_rt   = np.full((n, 2, 8), np.nan, dtype=np.float32)
+        low_light_rt = np.zeros((n, 2, 8), dtype=bool)
 
         for i in range(n):
             ftype = str(batch.frame_type[i])
@@ -502,6 +505,10 @@ class DarkCorrectionStage:
                 pedestal = (self._pedestals.left if side == "left"
                             else self._pedestals.right)
                 dark_like = u1 <= pedestal + self._guard.max_above_pedestal
+                # Surface the classification so consumers can tell "frame
+                # arrived but unlit" (covered sensor, laser-off artifact)
+                # apart from warmup NaN. See FrameBatch.low_light_rt.
+                low_light_rt[i, side_idx, cam_id] = dark_like
 
                 pred = None
                 if not dark_like:
@@ -543,6 +550,7 @@ class DarkCorrectionStage:
         batch.dark_baseline_rt = baseline_rt
         batch.mean_dc_rt = mean_dc_rt
         batch.std_dc_rt = std_dc_rt
+        batch.low_light_rt = low_light_rt
         return batch
 
     def reset(self) -> None:
