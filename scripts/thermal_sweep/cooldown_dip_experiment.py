@@ -149,8 +149,24 @@ def run_scan(rig: ShellyOutlet, fan: ShellyOutlet, subject: str, data_dir: Path,
     return rc
 
 
-def cooldown(rig: ShellyOutlet, fan: ShellyOutlet, minutes: float, fan_on: bool) -> None:
-    """Rig OFF (whole assembly cools, no board self-heat), fan ON/OFF, wait."""
+def cooldown(rig: ShellyOutlet, fan: ShellyOutlet, minutes: float, fan_on: bool,
+             powered: bool = False) -> None:
+    """Gap between scans.
+
+    powered=False (default): rig OFF -- the whole assembly cools with no board
+    self-heat. This is the cold-soak protocol every dip campaign has used.
+
+    powered=True: rig stays ON and the fan stays off -- the module sits powered
+    but not streaming, which is the real between-scans state in the field. Used
+    for the warm-restart ladder, where the point is to start the next scan from
+    a partially-warm assembly rather than a cold one.
+    """
+    if powered:
+        _shelly(rig, True, "rig")
+        _shelly(fan, False, "fan")
+        log(f"powered idle {minutes:g} min (rig ON, fan OFF -- assembly stays warm)")
+        time.sleep(minutes * 60.0)
+        return
     _shelly(rig, False, "rig")
     _shelly(fan, fan_on, "fan")
     log(f"cooldown {minutes:g} min (rig OFF, fan {'ON' if fan_on else 'OFF'})")
@@ -201,7 +217,8 @@ def _parse_ladder(spec: str) -> "list[tuple[float, bool, int | None, float, bool
         warmup = float(parts[3]) if len(parts) > 3 and parts[3] else 0.0
         crop = bool(int(parts[4])) if len(parts) > 4 and parts[4] else False
         raw = bool(int(parts[5])) if len(parts) > 5 and parts[5] else False
-        out.append((float(cd), bool(int(fan)), mask, warmup, crop, raw))
+        powered = bool(int(parts[6])) if len(parts) > 6 and parts[6] else False
+        out.append((float(cd), bool(int(fan)), mask, warmup, crop, raw, powered))
     return out
 
 
@@ -232,7 +249,7 @@ def main() -> int:
     data_dir.mkdir(parents=True, exist_ok=True)
     stop_file = data_dir / "STOP"
     default_mask = int(args.camera_mask, 0)
-    ladder = _parse_ladder(args.ladder) if args.ladder else [(cd, fan, None, 0.0, False, False) for cd, fan in LADDER]
+    ladder = _parse_ladder(args.ladder) if args.ladder else [(cd, fan, None, 0.0, False, False, False) for cd, fan in LADDER]
     prefix = args.subject_prefix
 
     rig = ShellyOutlet(RIG_HOST)
@@ -251,16 +268,22 @@ def main() -> int:
 
     # Phase 2: cooldown ladder.
     log("--- Phase 2: cooldown ladder ---")
-    for k, (cd_min, fan_on, step_mask, warmup, crop, raw) in enumerate(ladder):
+    for k, (cd_min, fan_on, step_mask, warmup, crop, raw, powered) in enumerate(ladder):
         if stop_file.exists():
             log("STOP file present -> exiting"); break
         idx = args.start_index + k
         mask = step_mask if step_mask is not None else default_mask
-        wu = (f", warm-up->{warmup:g}C" if warmup > 0 else "") + \
-             (", CROP" if crop else "") or " (control)"
-        log(f"=== ladder {k+1}/{len(ladder)}: {cd_min:g} min cooldown "
-            f"(fan {'ON' if fan_on else 'OFF'}), mask 0x{mask:02X}{wu} -> {prefix}_{idx:02d} ===")
-        cooldown(rig, fan, cd_min, fan_on)
+        # describe every lever this step actually pulls (a step with none is the control)
+        levers = ", ".join(filter(None, [
+            f"warm-up->{warmup:g}C" if warmup > 0 else "",
+            "CROP" if crop else "",
+            "RAW" if raw else "",
+        ])) or "control"
+        gap = (f"{cd_min:g} min powered idle (rig ON)" if powered
+               else f"{cd_min:g} min cooldown (fan {'ON' if fan_on else 'OFF'})")
+        log(f"=== ladder {k+1}/{len(ladder)}: {gap}, mask 0x{mask:02X} "
+            f"[{levers}] -> {prefix}_{idx:02d} ===")
+        cooldown(rig, fan, cd_min, fan_on, powered)
         run_scan(rig, fan, f"{prefix}_{idx:02d}", data_dir, mask, warmup, crop, raw)
 
     _shelly(rig, False, "rig")     # leave rig off (module cool) at the end
