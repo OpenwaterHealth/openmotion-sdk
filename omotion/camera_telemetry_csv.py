@@ -57,7 +57,19 @@ CAMERA_TELEMETRY_HEADERS: List[str] = [
     "expo_cmd", "expo_applied", "again_x", "dgain_x",
     "aec_mode", "dcg_state", "blc_ctrl", "isp_ctrl",
     "isp_real_gain", "isp_dig_gain", "isp_blc", "isp_expo",
-] + [f"blc_offset_{i}" for i in range(8)]
+] + [f"blc_offset_{i}" for i in range(8)] + [
+    # --- optical-black block (sensor-fw#103) ---
+    # z_avg_00/01/10/11 are the zero-line (dark row) averages per Bayer
+    # position; mono sensor, so all four should agree (z_avg_spread == 0).
+    "z_avg_00", "z_avg_01", "z_avg_10", "z_avg_11",
+    "z_avg_mean", "z_avg_spread",
+    "blc_thres", "blk_lvl_target",
+    "bl_start", "bl_end", "blk_ln_num", "blc_ln_mode",
+    "zl_start", "zl_end", "zero_ln_num",
+    "zavg_ctrl", "z_avg_sel", "zl_start2", "zl_end2",
+    "blc_trig_ctrl", "blc_fault_latch", "blc_fault_state",
+    "dig_test_fail", "dtr_fault",
+] + [f"blc_offset_z_{i}" for i in range(4)]
 
 
 def _cam_row(host_time: float, side: str, cam_id: int,
@@ -98,6 +110,25 @@ def _cam_row(host_time: float, side: str, cam_id: int,
     offsets = c.get("blc_offsets") or []
     for i in range(8):
         row.append(offsets[i] if i < len(offsets) else "")
+
+    # Optical-black block (sensor-fw#103).
+    z_avg = c.get("z_avg") or []
+    row += [z_avg[i] if i < len(z_avg) else "" for i in range(4)]
+    row += [
+        round(c.get("z_avg_mean", 0.0), 2) if z_avg else "",
+        c.get("z_avg_spread", ""),
+        c.get("blc_thres", ""), c.get("blk_lvl_target", ""),
+        c.get("bl_start", ""), c.get("bl_end", ""),
+        c.get("blk_ln_num", ""), c.get("blc_ln_mode", ""),
+        c.get("zl_start", ""), c.get("zl_end", ""), c.get("zero_ln_num", ""),
+        c.get("zavg_ctrl", ""), c.get("z_avg_sel", ""),
+        c.get("zl_start2", ""), c.get("zl_end2", ""),
+        c.get("blc_trig_ctrl", ""), c.get("blc_fault_latch", ""),
+        c.get("blc_fault_state", ""),
+        c.get("dig_test_fail", ""), c.get("dtr_fault", ""),
+    ]
+    offsets_z = c.get("blc_offsets_z") or []
+    row += [offsets_z[i] if i < len(offsets_z) else "" for i in range(4)]
     return row
 
 

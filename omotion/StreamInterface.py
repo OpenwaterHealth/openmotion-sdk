@@ -242,7 +242,24 @@ class StreamInterface(USBInterfaceBase):
                 if is_usb_timeout(e):
                     # Timeout — endpoint buffer is now empty.
                     break
-                elif e.errno in (19, 5, 32):
+                elif e.errno == 32:
+                    # EPIPE: the host-side pipe is halted — typically left
+                    # over from a reader that died mid-transfer (a cancelled
+                    # read halts the pipe in the host controller, and the
+                    # halt persists across handle close/reopen). This is
+                    # recoverable: clear the halt and keep flushing. Without
+                    # this the whole streaming session is stillborn and only
+                    # a device power cycle "fixes" it.
+                    logger.warning(
+                        f"{self.desc}: pipe halted during flush — clearing "
+                        f"halt and retrying ({e})"
+                    )
+                    try:
+                        self.dev.clear_halt(self.ep_in.bEndpointAddress)
+                    except usb.core.USBError as ce:
+                        logger.warning(f"{self.desc}: clear_halt failed: {ce}")
+                        break
+                elif e.errno in (19, 5):
                     # Device lost during flush — stop silently.
                     logger.warning(f"{self.desc}: device error during flush: {e}")
                     break
@@ -371,6 +388,12 @@ class StreamInterface(USBInterfaceBase):
         # (the old behaviour) caused the final frame to be dropped whenever it
         # arrived after the 100 ms read window had already closed.
         _READ_TIMEOUT_MS = 500
+        # EPIPE (halted pipe) is recoverable via clear_halt — e.g. stale
+        # halt state left by a previous reader that died mid-transfer.
+        # Cap the consecutive recovery attempts so a genuinely broken
+        # device still exits the loop.
+        _MAX_PIPE_RECOVERIES = 3
+        pipe_errors = 0
 
         while True:
             # Check stop FIRST so a stop-then-clear race in stop_streaming
@@ -391,6 +414,7 @@ class StreamInterface(USBInterfaceBase):
                     self.ep_in.bEndpointAddress, expected_size,
                     timeout=_READ_TIMEOUT_MS,
                 )
+                pipe_errors = 0
                 if data and data_queue is self.data_queue:
                     # Use a bounded put so the loop can never block forever
                     # on a stopped/slow parser. With self.stop_event set the
@@ -415,8 +439,29 @@ class StreamInterface(USBInterfaceBase):
                         # Stop requested and endpoint is now empty: exit cleanly.
                         break
                     # Otherwise keep waiting — scan is still running.
-                elif e.errno in (19, 5, 32):
-                    # Fatal device errors: ENODEV, EIO, EPIPE — device is gone.
+                elif e.errno == 32:
+                    # EPIPE: host-side pipe halted (stale state from a dead
+                    # reader, or a transfer cancelled mid-packet). Clear the
+                    # halt and keep streaming; only give up after several
+                    # consecutive failures.
+                    pipe_errors += 1
+                    if pipe_errors > _MAX_PIPE_RECOVERIES or self.stop_event.is_set():
+                        logger.error(
+                            f"{self.desc} stream error (pipe halted, "
+                            f"{pipe_errors} consecutive): {e}"
+                        )
+                        break
+                    logger.warning(
+                        f"{self.desc}: pipe halted mid-stream — clearing halt "
+                        f"and resuming (attempt {pipe_errors})"
+                    )
+                    try:
+                        self.dev.clear_halt(self.ep_in.bEndpointAddress)
+                    except usb.core.USBError as ce:
+                        logger.error(f"{self.desc}: clear_halt failed: {ce}")
+                        break
+                elif e.errno in (19, 5):
+                    # Fatal device errors: ENODEV, EIO — device is gone.
                     logger.error(f"{self.desc} stream error (device lost): {e}")
                     break
                 else:

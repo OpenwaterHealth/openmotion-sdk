@@ -1,4 +1,4 @@
-"""Unit tests for parse_camera_telemetry (sensor-fw#94 / #162).
+"""Unit tests for parse_camera_telemetry (sensor-fw#94 / #162, OB block #103).
 
 Builds synthetic cam_telemetry_response_t blobs byte-for-byte against the wire
 format in sensor-fw Core/Inc/camera_telemetry.h and checks the parser's
@@ -26,6 +26,13 @@ NOMINAL = dict(
     wd=[0, 0, 0, 0x2D, 0x80, 0], sc_state=0x07, otp=[0xAA, 0x55],
     trig=0, yavg=42, aec=0xA8, dcg=0x40, blc_ctrl=0x23, isp_ctrl=0x34,
     err=0, sweeps=5,
+    # OB / black-level block (#103). Config values are the base config table's.
+    z_avg=[0x0080] * 4, blc_z=[0x0100] * 4,
+    blc_thres=0x0000, blk_lvl_target=0x0080, zero_ln_num=0x0002,
+    blc_trig_ctrl=0xF9, bl_start=0x04, bl_end=0x1B, blk_ln_num=0x04,
+    blc_ln_mode=0x50, zl_start=0x02, zl_end=0x0D, zavg_ctrl=0x00,
+    zl_start2=0x08, zl_end2=0x0D, blc_fault_latch=0x00, blc_fault_state=0x00,
+    dig_test_fail=0x00, dtr_fault=0x00,
 )
 
 
@@ -44,6 +51,12 @@ def make_cam(**overrides):
         v["vm_cp_latched"], *v["wd"], v["sc_state"], *v["otp"],
         v["trig"], v["yavg"], v["aec"], v["dcg"], v["blc_ctrl"],
         v["isp_ctrl"], v["err"], v["sweeps"],
+        *v["z_avg"], *v["blc_z"],
+        v["blc_thres"], v["blk_lvl_target"], v["zero_ln_num"],
+        v["blc_trig_ctrl"], v["bl_start"], v["bl_end"], v["blk_ln_num"],
+        v["blc_ln_mode"], v["zl_start"], v["zl_end"], v["zavg_ctrl"],
+        v["zl_start2"], v["zl_end2"], v["blc_fault_latch"],
+        v["blc_fault_state"], v["dig_test_fail"], v["dtr_fault"],
     )
 
 
@@ -56,14 +69,15 @@ def make_blob(cams=None, version=CAM_TELEMETRY_VERSION, valid=0xFF, size=None,
 
 
 def test_wire_sizes_match_firmware():
-    assert _CAM_TELEM_CAM_SIZE == 74
-    assert _CAM_TELEM_SIZE == 604
+    # Must track the _Static_asserts in sensor-fw Core/Inc/camera_telemetry.h.
+    assert _CAM_TELEM_CAM_SIZE == 110
+    assert _CAM_TELEM_SIZE == 892
 
 
 def test_nominal_conversions():
     t = parse_camera_telemetry(make_blob())
     assert t is not None
-    assert t["version"] == 1 and t["valid_mask"] == 0xFF
+    assert t["version"] == 2 and t["valid_mask"] == 0xFF
     assert t["fsin_pulse_count"] == 42 and t["uptime_ms"] == 99000
     c = t["cameras"][0]
     assert c["valid"] is True
@@ -116,6 +130,49 @@ def test_vm_raw_masking_and_blc_msb_mask():
     assert t["cameras"][0]["blc_offsets"][0] == 0x0123
 
 
+def test_ob_block_nominal():
+    """OB block decodes at the right offsets with the base config's values."""
+    c = parse_camera_telemetry(make_blob())["cameras"][0]
+    assert c["z_avg"] == [0x80] * 4
+    assert c["z_avg_mean"] == 128.0
+    assert c["z_avg_spread"] == 0
+    assert c["blc_offsets_z"] == [0x0100] * 4
+    assert c["blk_lvl_target"] == 0x080      # base config 0x4005 = 0x80
+    assert c["bl_start"] == 4 and c["bl_end"] == 0x1B    # 0x4008/09
+    assert c["zl_start"] == 2 and c["zl_end"] == 0x0D    # 0x4050/51
+    assert c["blk_ln_num"] == 4 and c["zero_ln_num"] == 2
+    assert c["blc_trig_ctrl"] == 0xF9        # base config 0x4000
+    assert c["z_avg_sel"] == 0
+    assert c["blc_fault_latch"] == 0 and c["blc_fault_state"] == 0
+
+
+def test_z_avg_spread_flags_channel_mismatch():
+    """Mono sensor: the four dark-row averages should agree; spread is the tell."""
+    cam = make_cam(z_avg=[0x0080, 0x0082, 0x0080, 0x0091])
+    c = parse_camera_telemetry(make_blob([cam] + [make_cam()] * 7))["cameras"][0]
+    assert c["z_avg"] == [0x80, 0x82, 0x80, 0x91]
+    assert c["z_avg_spread"] == 0x11
+    assert c["z_avg_mean"] == (0x80 + 0x82 + 0x80 + 0x91) / 4.0
+
+
+def test_ob_field_masking():
+    """z_avg / offsets are 15-bit; the reserved MSB must not leak into values."""
+    cam = make_cam(z_avg=[0x8123] * 4, blc_z=[0xFFFF] * 4,
+                   blc_thres=0xF801, blk_lvl_target=0xF900,
+                   zero_ln_num=0xFC05, bl_start=0xC4, bl_end=0xC1,
+                   zavg_ctrl=0x3E, blc_fault_state=0xFE)
+    c = parse_camera_telemetry(make_blob([cam] + [make_cam()] * 7))["cameras"][0]
+    assert c["z_avg"] == [0x0123] * 4                 # bit 15 reserved
+    assert c["blc_offsets_z"] == [0x7FFF] * 4
+    assert c["blc_thres"] == 0x001                    # thres_l is 11-bit
+    assert c["blk_lvl_target"] == 0x100               # 11-bit
+    assert c["zero_ln_num"] == 0x005                  # 10-bit
+    assert c["bl_start"] == 4 and c["bl_end"] == 1    # 0x4008/09 are [5:0]
+    assert c["z_avg_sel"] == 2                        # 0x40E8[1:0]
+    assert c["zavg_ctrl"] == 0x3E                     # raw byte preserved too
+    assert c["blc_fault_state"] == 0                  # 0x40F2[0]
+
+
 def test_valid_mask_bits():
     t = parse_camera_telemetry(make_blob(valid=0b00000101))
     valids = [c["valid"] for c in t["cameras"]]
@@ -126,5 +183,6 @@ def test_rejects_malformed():
     assert parse_camera_telemetry(None) is None
     assert parse_camera_telemetry(b"") is None
     assert parse_camera_telemetry(make_blob()[:-1]) is None          # short
-    assert parse_camera_telemetry(make_blob(version=2)) is None      # future version
-    assert parse_camera_telemetry(make_blob(size=73)) is None        # struct drift
+    assert parse_camera_telemetry(make_blob(version=3)) is None      # future version
+    assert parse_camera_telemetry(make_blob(version=1)) is None      # pre-OB firmware
+    assert parse_camera_telemetry(make_blob(size=109)) is None       # struct drift

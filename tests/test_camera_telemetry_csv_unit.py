@@ -31,8 +31,18 @@ def _fake_telem(uptime=5000):
         "isp_real_gain": 0x100, "isp_dig_gain": 0x400,
         "isp_blc": 0x80, "isp_expo": 0x48,
         "blc_offsets": [256] * 8,
+        # OB / black-level block (sensor-fw#103) — base config values.
+        "z_avg": [128] * 4, "z_avg_mean": 128.0, "z_avg_spread": 0,
+        "blc_offsets_z": [256] * 4,
+        "blc_thres": 0, "blk_lvl_target": 128, "zero_ln_num": 2,
+        "blc_trig_ctrl": 0xF9, "bl_start": 4, "bl_end": 0x1B,
+        "blk_ln_num": 4, "blc_ln_mode": 0x50,
+        "zl_start": 2, "zl_end": 0x0D,
+        "zavg_ctrl": 0, "z_avg_sel": 0, "zl_start2": 8, "zl_end2": 0x0D,
+        "blc_fault_latch": 0, "blc_fault_state": 0,
+        "dig_test_fail": 0, "dtr_fault": 0,
     }
-    return {"version": 1, "valid_mask": 0xFF, "fsin_pulse_count": 3,
+    return {"version": 2, "valid_mask": 0xFF, "fsin_pulse_count": 3,
             "uptime_ms": uptime, "cameras": [dict(cam) for _ in range(8)]}
 
 
@@ -72,6 +82,12 @@ def test_writes_one_csv_per_camera_with_samples(tmp_path):
         rows = _read_csv(path)
         assert rows[0] == CAMERA_TELEMETRY_HEADERS
         assert len(rows) >= 3, f"expected >=2 samples in {path.name}"
+        # dict(zip(...)) below truncates silently on a width mismatch, so the
+        # row width has to be asserted on its own.
+        for n, row in enumerate(rows[1:], start=1):
+            assert len(row) == len(CAMERA_TELEMETRY_HEADERS), (
+                f"{path.name} row {n}: {len(row)} cols, "
+                f"expected {len(CAMERA_TELEMETRY_HEADERS)}")
         r = dict(zip(CAMERA_TELEMETRY_HEADERS, rows[1]))
         assert r["side"] == "left" and int(r["cam"]) == cam_id
         assert int(r["read_ok"]) == 1 and r["error"] == ""
@@ -81,6 +97,12 @@ def test_writes_one_csv_per_camera_with_samples(tmp_path):
         assert float(r["again_x"]) == 16.0
         assert int(r["blc_offset_7"]) == 256
         assert int(r["fsin_pulse_count"]) == 3
+        # OB block (sensor-fw#103): last column group must land intact.
+        assert int(r["z_avg_00"]) == 128 and int(r["z_avg_11"]) == 128
+        assert int(r["z_avg_spread"]) == 0
+        assert int(r["zl_start"]) == 2 and int(r["zl_end"]) == 0x0D
+        assert int(r["blk_lvl_target"]) == 128
+        assert int(r["blc_offset_z_3"]) == 256
     assert sensor.calls >= 2
 
 
@@ -92,10 +114,12 @@ def test_failure_rows_and_survival(tmp_path):
     log.stop()
     rows = _read_csv(tmp_path / "s2_x_right_cam0_telemetry.csv")
     assert len(rows) >= 2
+    assert len(rows[1]) == len(CAMERA_TELEMETRY_HEADERS)
     r = dict(zip(CAMERA_TELEMETRY_HEADERS, rows[1]))
     assert int(r["read_ok"]) == 0
     assert "usb detached" in r["error"]
     assert r["avdd_v"] == ""  # blank data columns on failed reads
+    assert r["z_avg_00"] == "" and r["dtr_fault"] == ""
 
 
 def test_two_sensors_get_sixteen_files(tmp_path):
