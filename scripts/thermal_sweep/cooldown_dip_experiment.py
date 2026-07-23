@@ -156,16 +156,18 @@ def cooldown(rig: ShellyOutlet, fan: ShellyOutlet, minutes: float, fan_on: bool,
     powered=False (default): rig OFF -- the whole assembly cools with no board
     self-heat. This is the cold-soak protocol every dip campaign has used.
 
-    powered=True: rig stays ON and the fan stays off -- the module sits powered
-    but not streaming, which is the real between-scans state in the field. Used
-    for the warm-restart ladder, where the point is to start the next scan from
-    a partially-warm assembly rather than a cold one.
+    powered=True: rig stays ON (module powered but not streaming, the real
+    between-scans state in the field), with the fan following fan_on. Used for
+    the warm-restart ladder: the next scan starts from a partially-warm assembly
+    rather than a cold one, and fan_on sets how far it cools during the gap.
     """
     if powered:
         _shelly(rig, True, "rig")
-        _shelly(fan, False, "fan")
-        log(f"powered idle {minutes:g} min (rig ON, fan OFF -- assembly stays warm)")
+        _shelly(fan, fan_on, "fan")
+        log(f"powered idle {minutes:g} min (rig ON, fan {'ON' if fan_on else 'OFF'} "
+            f"-- assembly cools from the streaming plateau but stays powered)")
         time.sleep(minutes * 60.0)
+        _shelly(fan, False, "fan")
         return
     _shelly(rig, False, "rig")
     _shelly(fan, fan_on, "fan")
@@ -251,6 +253,18 @@ def main() -> int:
     default_mask = int(args.camera_mask, 0)
     ladder = _parse_ladder(args.ladder) if args.ladder else [(cd, fan, None, 0.0, False, False, False) for cd, fan in LADDER]
     prefix = args.subject_prefix
+
+    # Powered-idle gaps keep the rig ON between scans, so there is no power cycle
+    # to clear a stalled COMM endpoint. Sustained camera-telemetry polling stalls
+    # that endpoint (Errno 10060) partway through a scan (sensor-fw #96); with a
+    # rig-OFF cooldown the next scan's power cycle recovers it, but a powered-idle
+    # gap carries the stall forward and the next connect times out. Until #96 is
+    # fixed the two are incompatible -- disable telemetry when any step is powered.
+    if CAMERA_TELEMETRY and any(step[6] for step in ladder):
+        log("WARNING: camera telemetry disabled -- a powered-idle step is present and "
+            "sustained telemetry polling stalls the COMM endpoint with no power cycle to "
+            "recover it (sensor-fw #96). Die temp + intensity come from the raw stream anyway.")
+        CAMERA_TELEMETRY = False
 
     rig = ShellyOutlet(RIG_HOST)
     fan = ShellyOutlet(FAN_HOST)
