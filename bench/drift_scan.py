@@ -68,6 +68,8 @@ CONTROL_CHANNEL = 3
 CAMERA_MASK = 0xFF
 CAMERA_CROP = False   # set from --camera-crop; crops output to 1720x1280 at configure (sensor-fw#86)
 CAMERA_RAW = False    # set from --camera-raw; disables on-sensor corrections at configure (sensor-fw#89)
+CAMERA_REG_WRITES: list = []  # set from --camera-reg; (addr,val) written to each masked camera AFTER
+                              # configure, before streaming (vendor register tests, e.g. 0x4001=0x2b)
 CONFIGURE_TIMEOUT_S = 240.0
 END_MARGIN_S = 5.0  # don't schedule a dark window this close to scan end
 THORLABS_SAMPLE_INTERVAL_S = 0.1  # ~10 Hz -- plenty to resolve a 1s dark window
@@ -138,6 +140,10 @@ def parse_cli() -> argparse.Namespace:
                         help="Set DEBUG_FLAG_CAMERA_RAW before camera configure: raw scientific-sensor mode, "
                              "all on-sensor pixel corrections off (BLC, DC-BLC, dither, OTP-DPC; sensor-fw#89). "
                              "Dark level sits at the raw ADC pedestal (~255+ DN) and may drift with temperature.")
+    parser.add_argument("--camera-reg", action="append", default=[], metavar="ADDR=VAL",
+                        help="Write a camera register to EVERY masked camera AFTER configure, before "
+                             "streaming, e.g. --camera-reg 0x4001=0x2b (repeatable). Applied via I2C "
+                             "passthrough; use for vendor register-change tests. Read back in telemetry.")
     parser.add_argument("--camera-telemetry", action="store_true",
                         help="Log 1 Hz per-camera condition telemetry (sensor-fw#94: on-die rails, dual die "
                              "temps, yavg frame mean, commanded/applied exposure + gains, DCG/BLC/ISP state, "
@@ -222,6 +228,24 @@ def connect_and_configure_sensor(data_dir: Path):
         iface.stop()
         raise RuntimeError(f"Camera configure failed: {result.error if result else 'no result'}")
     print(f"[+] Cameras configured (mask 0x{CAMERA_MASK:02X})")
+
+    # Vendor register-change tests: write each requested register to every masked
+    # camera now (post-configure, pre-stream), so the value is in place for the
+    # whole scan. Applied per camera via the I2C passthrough (device 0x36), the
+    # same path camera_set_gain uses. Read back in the telemetry CSV to confirm.
+    if CAMERA_REG_WRITES:
+        import time as _t
+        from omotion.i2c_packet import I2C_Packet
+        masked = [i for i in range(8) if CAMERA_MASK & (1 << i)]
+        for addr, val in CAMERA_REG_WRITES:
+            for cam_id in masked:
+                sensor.switch_camera(cam_id)
+                _t.sleep(0.05)
+                sensor.camera_i2c_write(I2C_Packet(device_address=0x36,
+                                                   register_address=addr, data=val))
+                _t.sleep(0.05)
+            print(f"[+] Camera reg 0x{addr:04X}=0x{val:02X} written to cams "
+                  f"{[c + 1 for c in masked]}")
 
     # The console's FSYNC trigger needs the laser driver armed to sustain
     # streaming for the full requested duration (see module docstring) --
@@ -391,6 +415,11 @@ def main() -> int:
     CAMERA_MASK = int(args.camera_mask, 0)   # hex (0xC3) or int (195); powers/streams only these cameras
     CAMERA_CROP = bool(args.camera_crop)
     CAMERA_RAW = bool(args.camera_raw)
+    global CAMERA_REG_WRITES
+    CAMERA_REG_WRITES = []
+    for spec in (args.camera_reg or []):
+        addr_s, val_s = spec.split("=")
+        CAMERA_REG_WRITES.append((int(addr_s, 0), int(val_s, 0)))
     args.data_dir.mkdir(parents=True, exist_ok=True)
 
     log_path = args.data_dir / f"{args.subject_id}_run.log"
@@ -687,6 +716,7 @@ def main() -> int:
         "camera_telemetry_csvs": (cam_telem_logger.paths if cam_telem_logger is not None else None),
         "camera_crop": CAMERA_CROP,
         "camera_raw": CAMERA_RAW,
+        "camera_reg_writes": [f"0x{a:04X}=0x{v:02X}" for a, v in CAMERA_REG_WRITES] or None,
     }
     meta_path = args.data_dir / f"{args.subject_id}_drift_meta.json"
     meta_path.write_text(json.dumps(meta, indent=2))
