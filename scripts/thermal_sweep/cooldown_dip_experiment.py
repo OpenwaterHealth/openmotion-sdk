@@ -110,7 +110,8 @@ CAMERA_TELEMETRY = False   # set by main() from --camera-telemetry; passed to ev
 
 
 def run_scan(rig: ShellyOutlet, fan: ShellyOutlet, subject: str, data_dir: Path,
-             mask: int, warmup_temp: float = 0.0, crop: bool = False, raw: bool = False) -> int:
+             mask: int, warmup_temp: float = 0.0, crop: bool = False, raw: bool = False,
+             reg_write: str = "") -> int:
     """Fan OFF, rig ON (cold boot), enumerate, run one 30-min drift scan on the given
     camera mask with the source held on. drift_scan reads the IMU temp at start + end.
     Only the masked cameras are powered, so the thermal load matches that config.
@@ -118,8 +119,10 @@ def run_scan(rig: ShellyOutlet, fan: ShellyOutlet, subject: str, data_dir: Path,
     and restores it when cam 7's die reaches warmup_temp (deg C).
     crop = configure the cameras cropped to 1720x1280 (DEBUG_FLAG_CAMERA_CROP)."""
     _shelly(fan, False, "fan")            # never cool the cameras during a scan (external .214 fan)
-    _shelly(rig, True, "rig")
-    log(f"rig ON (cold boot); waiting {ENUM_WAIT_S:.0f}s for enumeration")
+    already_on = rig.is_on()
+    _shelly(rig, True, "rig")             # no-op if a powered-idle gap left it on (no power cycle)
+    log(f"rig ON ({'already powered' if already_on else 'cold boot'}); "
+        f"waiting {ENUM_WAIT_S:.0f}s for enumeration")
     time.sleep(ENUM_WAIT_S)
     cmd = [sys.executable, "-u", str(DRIFT),
            "--duration-sec", str(SCAN_MIN * 60.0),
@@ -133,6 +136,8 @@ def run_scan(rig: ShellyOutlet, fan: ShellyOutlet, subject: str, data_dir: Path,
         cmd += ["--camera-crop"]
     if raw:
         cmd += ["--camera-raw"]
+    if reg_write:
+        cmd += ["--camera-reg", reg_write]
     if CAMERA_TELEMETRY:
         cmd += ["--camera-telemetry"]
     wu = f", sensor-fan-off->{warmup_temp:g}C" if warmup_temp > 0 else ""
@@ -220,7 +225,8 @@ def _parse_ladder(spec: str) -> "list[tuple[float, bool, int | None, float, bool
         crop = bool(int(parts[4])) if len(parts) > 4 and parts[4] else False
         raw = bool(int(parts[5])) if len(parts) > 5 and parts[5] else False
         powered = bool(int(parts[6])) if len(parts) > 6 and parts[6] else False
-        out.append((float(cd), bool(int(fan)), mask, warmup, crop, raw, powered))
+        regw = bool(int(parts[7])) if len(parts) > 7 and parts[7] else False
+        out.append((float(cd), bool(int(fan)), mask, warmup, crop, raw, powered, regw))
     return out
 
 
@@ -241,6 +247,10 @@ def main() -> int:
     ap.add_argument("--camera-mask", default="0xFF",
                     help="default camera mask (hex 0xC3 or int) for scans; per-ladder-step masks override it. "
                          "Clinical 'far 4' = 0xC3 (cams 1,2,7,8); all-8 = 0xFF.")
+    ap.add_argument("--camera-reg", default="", metavar="ADDR=VAL",
+                    help="camera register write (e.g. 0x4001=0x2b) applied on ladder steps whose 8th "
+                         "field (regwrite) is 1. Written to every masked camera post-configure via "
+                         "drift_scan --camera-reg. For vendor register-change tests.")
     ap.add_argument("--camera-telemetry", action="store_true",
                     help="pass --camera-telemetry to every drift_scan (1 Hz per-camera condition CSVs; "
                          "needs the sensor-fw#94 telemetry firmware).")
@@ -251,7 +261,7 @@ def main() -> int:
     data_dir.mkdir(parents=True, exist_ok=True)
     stop_file = data_dir / "STOP"
     default_mask = int(args.camera_mask, 0)
-    ladder = _parse_ladder(args.ladder) if args.ladder else [(cd, fan, None, 0.0, False, False, False) for cd, fan in LADDER]
+    ladder = _parse_ladder(args.ladder) if args.ladder else [(cd, fan, None, 0.0, False, False, False, False) for cd, fan in LADDER]
     prefix = args.subject_prefix
 
     # Powered-idle gaps keep the rig ON between scans, so there is no power cycle
@@ -282,23 +292,25 @@ def main() -> int:
 
     # Phase 2: cooldown ladder.
     log("--- Phase 2: cooldown ladder ---")
-    for k, (cd_min, fan_on, step_mask, warmup, crop, raw, powered) in enumerate(ladder):
+    for k, (cd_min, fan_on, step_mask, warmup, crop, raw, powered, regw) in enumerate(ladder):
         if stop_file.exists():
             log("STOP file present -> exiting"); break
         idx = args.start_index + k
         mask = step_mask if step_mask is not None else default_mask
+        reg = args.camera_reg if regw else ""
         # describe every lever this step actually pulls (a step with none is the control)
         levers = ", ".join(filter(None, [
             f"warm-up->{warmup:g}C" if warmup > 0 else "",
             "CROP" if crop else "",
             "RAW" if raw else "",
+            f"REG {reg}" if reg else "",
         ])) or "control"
         gap = (f"{cd_min:g} min powered idle (rig ON)" if powered
                else f"{cd_min:g} min cooldown (fan {'ON' if fan_on else 'OFF'})")
         log(f"=== ladder {k+1}/{len(ladder)}: {gap}, mask 0x{mask:02X} "
             f"[{levers}] -> {prefix}_{idx:02d} ===")
         cooldown(rig, fan, cd_min, fan_on, powered)
-        run_scan(rig, fan, f"{prefix}_{idx:02d}", data_dir, mask, warmup, crop, raw)
+        run_scan(rig, fan, f"{prefix}_{idx:02d}", data_dir, mask, warmup, crop, raw, reg)
 
     _shelly(rig, False, "rig")     # leave rig off (module cool) at the end
     _shelly(fan, False, "fan")
