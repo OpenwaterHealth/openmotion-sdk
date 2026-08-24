@@ -62,7 +62,7 @@ Signals are `pyqtSignal` when PyQt is importable, otherwise a fallback `MotionSi
 
 - `MotionInterface(demo_mode=True)` **or** `OPENMOTION_DEMO=1` — skips device discovery, generates fake data. The first thing to reach for if a script is hanging on enumeration. (Note: the *new pipeline* scan path does not yet support demo mode end-to-end — demo sensors have no real `uart`, so a full `start_scan` in demo mode will not stream. Demo mode is for discovery/connection-level work.)
 - Pure-software tests that run anywhere: the entire `tests/test_pipeline/` suite, plus `test_calibration_workflow_compute.py`, `test_contact_quality_workflow.py`, `test_scan_database.py`, `test_console_telemetry_unit.py`, `test_pedestal_height.py`. Run them with `pytest -m "not console and not sensor and not destructive"`.
-- Pure-software scripts: `scripts/test_jed_parser.py`, `scripts/test_github_release.py`, `scripts/run_pipeline_csv_tests.py`, `scripts/plot_telemetry.py`, `scripts/view_corrected_scan.py`.
+- Pure-software scripts: `scripts/test_jed_parser.py`, `scripts/test_github_release.py`, `scripts/run_pipeline_csv_tests.py`, `scripts/visualize_scan.py` (the one scan/telemetry CSV viewer — needs the `viz` extra), `scripts/plot_dark_drift.py`.
 
 ## Running a scan end-to-end (headless)
 

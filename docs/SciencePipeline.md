@@ -679,7 +679,7 @@ Per-side packet queues feed per-side reader threads that run `omotion.MotionProc
 
 ### 7.2 CsvReplaySource
 
-**Used by:** offline analysis, regression testing, the `view_corrected_scan.py` script.
+**Used by:** offline analysis and regression testing. (To *look at* a scan rather than re-run the pipeline over it, use `scripts/visualize_scan.py`, which reads the finished CSVs directly.)
 
 Replays a raw-histogram CSV produced by `CsvSink` (one CSV per side, optionally one or both). Schema: `cam_id, frame_id, timestamp_s, type, 0..1023, temperature, sum, tcm, tcl, pdc`. Yields `FrameBatch`es of `batch_size_frames` (default 100) per side, in order. Because the legacy schema has no packet-id column, replay reconstructs packet boundaries in row order: a timestamp change or repeated camera starts the next packet. The repeated-camera rule preserves boundaries during a timestamp freeze.
 

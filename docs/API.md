@@ -82,13 +82,27 @@ python scripts/sdk_examples.py                  # all of the above, one connecti
 hardware. `--duration` (seconds) applies to `scan` / `test-scan`. Output lands
 under a temp directory printed at connect time.)
 
-To plot a finished scan, [`scripts/visualize_scan.py`](../scripts/visualize_scan.py)
-renders BFI / BVI / mean / contrast over time (16 cameras, per-side average bold)
-from the corrected CSV the `scan` example writes:
+To view a finished scan, [`scripts/visualize_scan.py`](../scripts/visualize_scan.py)
+writes a single self-contained interactive HTML page — BFI / BVI / mean /
+contrast / temperature per camera with the per-side average overlaid, plus a
+quality flag on hover when the CSV carries one. Every panel shares one time
+axis, so zooming any panel moves them all, and clicking a camera in the legend
+hides it everywhere at once.
+
+It accepts any CSV the current app writes — the corrected CSV the `scan`
+example produces, a History → Export CSV, a reduced (clinical side-average)
+CSV, a raw-histogram CSV (reduced to per-camera image mean and standard
+deviation), and the console telemetry CSV. Pass more than one to overlay them
+on the same axis:
 
 ```
-python scripts/visualize_scan.py --csv <scan_id>_<subject>.csv   # -> <stem>_viz.png
+python scripts/visualize_scan.py <scan_id>_<subject>.csv          # -> <stem>_viz.html
+python scripts/visualize_scan.py <scan>.csv <scan>_telemetry.csv  # overlaid
+python scripts/visualize_scan.py <folder>                         # newest of each kind
 ```
+
+Requires the `viz` extra (`pip install -e ".[viz]"`). Legacy CSV layouts that
+predate the current pipeline are rejected by name rather than mis-parsed.
 
 ---
 
