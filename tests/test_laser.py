@@ -2,6 +2,9 @@
 
 from types import SimpleNamespace
 
+from omotion.data.fpga_model import FPGA_MODEL
+from omotion.data.laser_params import LASER_PARAMS
+from omotion.data.laser_params_fault import LASER_PARAMS_FAULT
 from omotion.laser import FpgaMap, apply_laser_power, load_laser_params
 
 
@@ -33,12 +36,60 @@ class _ConfigConsole(_FakeConsole):
 
 def test_load_laser_params_returns_bundled_list():
     params = load_laser_params()
-    assert params, "bundled laser_params.json should be non-empty"
+    assert params, "bundled LASER_PARAMS should be non-empty"
     assert all("friendlyName" in p and "dataToSend" in p for p in params)
+    assert params == LASER_PARAMS
 
 
 def test_load_laser_params_fault_set_available():
-    assert load_laser_params(force_fault=True), "fault param set should load"
+    fault = load_laser_params(force_fault=True)
+    assert fault, "fault param set should load"
+    assert fault == LASER_PARAMS_FAULT
+
+
+# ── compiled-in data modules (sdk#278) ────────────────────────────────────
+#
+# The register baseline used to be JSON files parsed at every call; each call
+# now returns a deep copy of a module constant. The copy matters: the app's
+# alt-laser path edits the list it gets back, and the baseline behind it must
+# survive that for the next connect.
+
+def test_load_laser_params_returns_a_fresh_copy_each_call():
+    first = load_laser_params()
+    first[0]["dataToSend"][0] = 0xFF
+    first.append({"friendlyName": "BOGUS", "dataToSend": [1]})
+    second = load_laser_params()
+    assert second == LASER_PARAMS
+    assert second[0]["dataToSend"][0] == 27
+    assert LASER_PARAMS[0]["dataToSend"][0] == 27
+
+
+def test_fpga_map_does_not_alias_the_module_constant():
+    fmap = FpgaMap()
+    fmap._model[0]["channel"] = 99
+    assert FPGA_MODEL[0]["channel"] == 4
+    assert FpgaMap().get_entry_by_friendly_name("TA_PULSE_WIDTH")["channel"] == 4
+
+
+def test_fault_set_mirrors_baseline_register_order():
+    # Same registers in the same order; only the faulted value(s) differ, so
+    # apply_laser_power walks both sets identically.
+    assert [p["friendlyName"] for p in LASER_PARAMS_FAULT] == [
+        p["friendlyName"] for p in LASER_PARAMS
+    ]
+
+
+def test_every_baseline_register_resolves_and_has_the_right_width():
+    fmap = FpgaMap()
+    for params in (LASER_PARAMS, LASER_PARAMS_FAULT):
+        for p in params:
+            entry = fmap.get_entry_by_friendly_name(p["friendlyName"])
+            assert entry is not None, p["friendlyName"]
+            width = int(entry["data_size"].rstrip("B")) // 8
+            assert len(p["dataToSend"]) == width, p["friendlyName"]
+            assert all(isinstance(b, int) and 0 <= b <= 0xFF for b in p["dataToSend"]), (
+                p["friendlyName"]
+            )
 
 
 def test_fpga_map_lookup_known_entry():
@@ -115,8 +166,8 @@ def _faulted_entries():
     return {k: v for k, v in fault.items() if normal.get(k) != v}
 
 
-def test_fault_file_differs_from_baseline():
-    assert _faulted_entries(), "fault file should change at least one register"
+def test_fault_set_differs_from_baseline():
+    assert _faulted_entries(), "fault set should change at least one register"
 
 
 def test_force_fault_user_override_cannot_neutralize_fault_registers():
@@ -189,7 +240,7 @@ def test_normal_apply_still_honors_override_on_fault_registers():
 
 def test_force_fault_keeps_trailing_drive_cl_write_when_not_faulted():
     # EE_THRESH/EE_GAIN drive the trailing Safety EE DRIVE CL write (ch 6,
-    # reg 0x10). The current fault file doesn't fault DRIVE CL, so the
+    # reg 0x10). The current fault set doesn't fault DRIVE CL, so the
     # config-derived write must survive force_fault untouched.
     assert (6, 0x10) not in {
         (FpgaMap().get_entry_by_friendly_name(n)["channel"],
