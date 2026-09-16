@@ -479,3 +479,31 @@ both active-setting checks passed, and no trigger, restoration, resource,
 or report-artifact failure was recorded. The human report included all four
 console-board FPGA revisions while omitting sensor-camera FPGA revision
 fields, request metadata, and the redundant pre-mutation topology table.
+
+## 17. Operator override mode (engineering only, 2026-08-21)
+
+Epic OpenwaterHealth/openmotion-bloodflow-app#482 adds the same
+password-gated operator override as the single-sensor procedure
+(`omotion/calibration/override.py`, `--allow-override`; the password and then
+the minimum/maximum/target energies - 10-1000 microjoules, Enter keeps the
+factory value - are asked before any hardware is touched; the optional
+`--min-energy-uj` / `--max-energy-uj` / `--target-energy-uj` flags pre-supply
+those answers). Nothing changes unless it is switched on for a run:
+
+- The operator's band and target replace the injected window of section 4
+  for that run and steer sections 9 and 10: the current floor without an
+  acceptable setting, and energy still below the minimum at the
+  600-microsecond ceiling, no longer end the run as NCR; the closest
+  candidate (or the ceiling setting) is kept and the miss is recorded as an
+  `override` event.
+- A cross-check inside the operator's band but with at least one side
+  outside the factory 300-400 window asks one question before the section
+  11 write. After three complete cross-checks outside the band, the third
+  pair is offered the same way. The question shows both side means, the
+  midpoint, both bands and the configuration about to be written, then
+  requires a free-text reason. A decline is exactly the section 12 NCR.
+- An accepted override writes through the same exact-readback path as a
+  pass and ends in `ProcedureStatus.OVERRIDDEN` (`Final result: OVERRIDE`,
+  exit code 3, settings and decision in `run.json` and the amber HTML
+  status). A pair inside the factory window stays PASSED even in override
+  mode.

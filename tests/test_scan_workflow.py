@@ -715,3 +715,85 @@ def test_telemetry_csv_logs_converted_tec_engineering_units():
     assert row[gi + 2] == round(tec_thermistor_voltage_to_celsius(snap.tec_set_raw), 2)
     assert row[gi + 3] == round(tec_current_to_amps(snap.tec_curr_raw), 3)
     assert row[gi + 4] == round(tec_voltage_to_volts(snap.tec_volt_raw), 3)
+
+
+# ---------------------------------------------------------------------------
+# Configure workflow — security-UID cache refresh (bloodflow-app#497)
+# ---------------------------------------------------------------------------
+
+def _make_configured_sensor():
+    """Mock sensor that succeeds through the whole configure bring-up."""
+    sensor = mock.Mock()
+    sensor.is_connected.return_value = True
+    sensor.get_camera_power_status.return_value = [False] * 8
+    sensor.enable_camera_power.return_value = True
+    sensor.disable_camera_power.return_value = True
+    sensor.get_camera_status.side_effect = lambda m: {
+        i: 0x01 for i in range(8) if m & (1 << i)
+    }
+    sensor.program_fpga.return_value = True
+    sensor.camera_configure_registers.return_value = True
+    return sensor
+
+
+def _run_configure(workflow, request):
+    """Start the configure worker and wait for its completion callback."""
+    done = threading.Event()
+    results = []
+
+    def _on_complete(res):
+        results.append(res)
+        done.set()
+
+    assert workflow.start_configure_camera_sensors(
+        request, on_complete_fn=_on_complete
+    )
+    assert done.wait(timeout=10.0), "configure worker did not complete"
+    return results[0]
+
+
+def test_configure_refreshes_security_uid_cache_after_bringup():
+    """Camera security UIDs are only readable once cameras are powered +
+    FPGA-programmed + configured (boot leaves them off since sensor-fw
+    1.7.0), so a successful configure must re-read the connect-time cache
+    — which at that point holds all zeros (bloodflow-app#497)."""
+    from omotion.ScanWorkflow import ConfigureRequest
+
+    motion = _build_motion_with_data_dir(None)
+    workflow = motion.scan_workflow
+    sensor = _make_configured_sensor()
+
+    with mock.patch.object(
+        ScanWorkflow, "_resolve_active_sides", return_value=[("left", 0x01, sensor)]
+    ):
+        result = _run_configure(
+            workflow, ConfigureRequest(left_camera_mask=0x01, right_camera_mask=0)
+        )
+
+    assert result.ok, result.error
+    sensor.refresh_id_cache.assert_called_once()
+    # The refresh must happen after bring-up, not before: the sensor mock
+    # records call order globally, so configure calls must all precede it.
+    ops = [c[0] for c in sensor.method_calls]
+    assert ops.index("camera_configure_registers") < ops.index("refresh_id_cache")
+
+
+def test_configure_failure_skips_security_uid_refresh():
+    """A failed bring-up leaves the UID cache untouched — the registers are
+    not readable, and a refresh would only overwrite with zeros."""
+    from omotion.ScanWorkflow import ConfigureRequest
+
+    motion = _build_motion_with_data_dir(None)
+    workflow = motion.scan_workflow
+    sensor = _make_configured_sensor()
+    sensor.program_fpga.return_value = False
+
+    with mock.patch.object(
+        ScanWorkflow, "_resolve_active_sides", return_value=[("left", 0x01, sensor)]
+    ):
+        result = _run_configure(
+            workflow, ConfigureRequest(left_camera_mask=0x01, right_camera_mask=0)
+        )
+
+    assert not result.ok
+    sensor.refresh_id_cache.assert_not_called()

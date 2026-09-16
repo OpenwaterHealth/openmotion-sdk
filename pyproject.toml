@@ -57,7 +57,7 @@ namespaces = false
 include-package-data = true
 
 [tool.setuptools.package-data]
-"*" = ["**/*.bin", "**/*.json", "**/*.cfg", "**/*.txt", "**/*.dll"]
+"*" = ["**/*.bin", "**/*.cfg", "**/*.txt", "**/*.dll"]
 "omotion" = [
     "dfu-util/**/*",
     "dfu-util/**/dfu-util",

@@ -46,6 +46,14 @@ from ._procedure import (
     RunRecorder,
     deeply_immutable,
 )
+from .override import (
+    OverrideConsentFn,
+    OverrideDecision,
+    OverrideRequest,
+    OverrideSettings,
+    factory_band_description,
+    within_factory_band,
+)
 
 __all__ = [
     "LaserCalibrationBench",
@@ -166,6 +174,13 @@ class SingleSensorLaserCalibrationResult:
     active_default_restore_failure: str | None = None
     events: tuple[ProcedureEvent, ...] = ()
     target_energy_uj: float = TARGET_ENERGY_UJ
+    minimum_accepted_energy_uj: float = MIN_ACCEPTABLE_ENERGY_UJ
+    maximum_accepted_energy_uj: float = MAX_ACCEPTABLE_ENERGY_UJ
+    # Override mode (omotion.calibration.override): the settings the run was
+    # started with and, when the operator was asked, the decision. Both stay
+    # None outside override mode.
+    override: OverrideSettings | None = None
+    override_decision: OverrideDecision | None = None
     report_paths: tuple[Path | str, ...] = ()
     report_artifact: ReportArtifactEvidence | None = None
     # Bench-close failure captured by the operator script (parity with the
@@ -196,6 +211,10 @@ class LaserCalibrationBench(LaserBench, Protocol):
 class _RunState:
     request: SingleSensorLaserCalibrationRequest
     target_energy_uj: float = TARGET_ENERGY_UJ
+    minimum_accepted_energy_uj: float = MIN_ACCEPTABLE_ENERGY_UJ
+    maximum_accepted_energy_uj: float = MAX_ACCEPTABLE_ENERGY_UJ
+    override: OverrideSettings | None = None
+    override_decision: OverrideDecision | None = None
     side: SensorSide | None = None
     preflight: PreflightSnapshot | None = None
     topology_revalidation: TopologySnapshot | None = None
@@ -236,6 +255,10 @@ class _RunState:
             status=status,
             side=self.side,
             target_energy_uj=self.target_energy_uj,
+            minimum_accepted_energy_uj=self.minimum_accepted_energy_uj,
+            maximum_accepted_energy_uj=self.maximum_accepted_energy_uj,
+            override=self.override,
+            override_decision=self.override_decision,
             sdk_version=self.request.sdk_version,
             started_at=self.request.started_at,
             ended_at=ended_at,
@@ -280,23 +303,44 @@ class SingleSensorLaserCalibrationWorkflow(LaserWorkflowBase):
         recorder: RunRecorder,
         *,
         target_energy_uj: float = TARGET_ENERGY_UJ,
+        override: OverrideSettings | None = None,
+        override_consent: OverrideConsentFn | None = None,
     ):
+        self._configure_override(override, override_consent)
+        if override is not None:
+            # Override mode: the operator's band and target replace the
+            # factory window for this run (omotion.calibration.override).
+            minimum = override.minimum_energy_uj
+            maximum = override.maximum_energy_uj
+            target_energy_uj = override.target_energy_uj
+        else:
+            minimum = MIN_ACCEPTABLE_ENERGY_UJ
+            maximum = MAX_ACCEPTABLE_ENERGY_UJ
         target_energy_uj = float(target_energy_uj)
         if not (
             math.isfinite(target_energy_uj)
-            and MIN_ACCEPTABLE_ENERGY_UJ
-            <= target_energy_uj
-            <= MAX_ACCEPTABLE_ENERGY_UJ
+            and minimum <= target_energy_uj <= maximum
         ):
-            raise ValueError("target energy must be finite and between 300 and 400 uJ")
+            raise ValueError(
+                "target energy must be finite and between "
+                f"{minimum:g} and {maximum:g} uJ"
+            )
         self._bench = bench
         self._recorder = recorder
         self._target_energy_uj = target_energy_uj
+        self._minimum_energy_uj = float(minimum)
+        self._maximum_energy_uj = float(maximum)
 
     def run(
         self, request: SingleSensorLaserCalibrationRequest
     ) -> SingleSensorLaserCalibrationResult:
-        state = _RunState(request=request, target_energy_uj=self._target_energy_uj)
+        state = _RunState(
+            request=request,
+            target_energy_uj=self._target_energy_uj,
+            minimum_accepted_energy_uj=self._minimum_energy_uj,
+            maximum_accepted_energy_uj=self._maximum_energy_uj,
+            override=self._override,
+        )
         failure: ProcedureFailure | None = None
         configuration_started = False
         try:
@@ -389,19 +433,15 @@ class SingleSensorLaserCalibrationWorkflow(LaserWorkflowBase):
                         "Final", final_measurement, final_criteria
                     ),
                 )
-            if not (
-                MIN_ACCEPTABLE_ENERGY_UJ
-                <= final_measurement.mean_uj
-                <= MAX_ACCEPTABLE_ENERGY_UJ
-            ):
-                raise ProcedureFailure(
-                    FailureKind.NCR,
-                    "Final energy must be between 300 and 400 uJ inclusive.",
-                )
+            self._accept_final_energy(state, final_measurement)
             self._write_passing_configuration(
                 state,
                 written_message=(
-                    "Passing tuned User Configuration was written and read back exactly."
+                    "Tuned User Configuration was written under operator "
+                    "override and read back exactly."
+                    if self._written_under_override(state)
+                    else "Passing tuned User Configuration was written and "
+                    "read back exactly."
                 ),
             )
             self._checkpoint(state)
@@ -442,7 +482,8 @@ class SingleSensorLaserCalibrationWorkflow(LaserWorkflowBase):
             )
         if failure is None:
             result = state.result(
-                ProcedureStatus.PASSED, ended_at=datetime.now(timezone.utc)
+                self._terminal_success_status(state),
+                ended_at=datetime.now(timezone.utc),
             )
             self._recorder.checkpoint(result)
             return result
@@ -500,11 +541,7 @@ class SingleSensorLaserCalibrationWorkflow(LaserWorkflowBase):
         )
         assert selected is not None
         selected_current, selected_measurement = selected
-        accepted = (
-            MIN_ACCEPTABLE_ENERGY_UJ
-            <= selected_measurement.mean_uj
-            <= MAX_ACCEPTABLE_ENERGY_UJ
-        )
+        accepted = self._within_band(selected_measurement.mean_uj)
         state.selection = TuningSelection(
             "downward_current",
             "closest_candidate",
@@ -518,15 +555,16 @@ class SingleSensorLaserCalibrationWorkflow(LaserWorkflowBase):
                 "lower requested setting wins a tie."
                 if accepted
                 else "The closest valid requested current was outside the "
-                "accepted 300 to 400 uJ range; lower requested setting "
-                "wins a tie."
+                f"accepted {self._band_description()} range; lower "
+                "requested setting wins a tie."
             ),
         )
         self._checkpoint(state)
         if not accepted:
-            raise ProcedureFailure(
-                FailureKind.NCR,
-                "No downward-current candidate is within 300 to 400 uJ.",
+            self._handle_out_of_band(
+                state,
+                "No downward-current candidate is within "
+                f"{self._band_description()}.",
             )
         if selected_current != current_setting:
             self._checked_register_write(state, "TA_CURRENT_DRV", selected_current)
@@ -560,24 +598,38 @@ class SingleSensorLaserCalibrationWorkflow(LaserWorkflowBase):
             pulse_setting = next_setting
             if (
                 pulse_setting == MAX_PULSE_WIDTH_US
-                and candidate_measurement.mean_uj < MIN_ACCEPTABLE_ENERGY_UJ
+                and candidate_measurement.mean_uj < self._minimum_energy_uj
             ):
-                state.selection = TuningSelection(
-                    "upward_pulse",
-                    "bound",
-                    False,
-                    state.current_requested_ma,
-                    pulse_setting,
-                    candidate_measurement.mean_uj,
-                    "The 600 us pulse-width bound was reached with energy "
-                    "below 300 uJ, so closest-candidate selection was "
-                    "intentionally bypassed.",
+                ceiling_reason = (
+                    f"Energy remained below {self._minimum_energy_uj:g} uJ "
+                    "at the 600 us pulse-width ceiling."
+                )
+                if self._override is None:
+                    state.selection = TuningSelection(
+                        "upward_pulse",
+                        "bound",
+                        False,
+                        state.current_requested_ma,
+                        pulse_setting,
+                        candidate_measurement.mean_uj,
+                        "The 600 us pulse-width bound was reached with energy "
+                        f"below {self._minimum_energy_uj:g} uJ, so "
+                        "closest-candidate selection was intentionally "
+                        "bypassed.",
+                    )
+                    self._checkpoint(state)
+                    raise ProcedureFailure(FailureKind.NCR, ceiling_reason)
+                # Override mode: the ceiling is the best this unit can do;
+                # fall through to closest-candidate selection and let the
+                # operator decide against the final measurement.
+                self._record_event(
+                    state,
+                    "override",
+                    f"{ceiling_reason} Override mode continues with the "
+                    "closest candidate; the operator is asked before "
+                    "anything is written.",
                 )
                 self._checkpoint(state)
-                raise ProcedureFailure(
-                    FailureKind.NCR,
-                    "Energy remained below 300 uJ at the 600 us pulse-width ceiling.",
-                )
             if (
                 candidate_measurement.mean_uj >= self._target_energy_uj
                 or pulse_setting == MAX_PULSE_WIDTH_US
@@ -592,11 +644,7 @@ class SingleSensorLaserCalibrationWorkflow(LaserWorkflowBase):
         )
         assert selected is not None
         selected_pulse, selected_measurement = selected
-        accepted = (
-            MIN_ACCEPTABLE_ENERGY_UJ
-            <= selected_measurement.mean_uj
-            <= MAX_ACCEPTABLE_ENERGY_UJ
-        )
+        accepted = self._within_band(selected_measurement.mean_uj)
         state.selection = TuningSelection(
             "upward_pulse",
             "closest_candidate",
@@ -610,15 +658,16 @@ class SingleSensorLaserCalibrationWorkflow(LaserWorkflowBase):
                 "lower requested setting wins a tie."
                 if accepted
                 else "The closest valid requested pulse width was outside the "
-                "accepted 300 to 400 uJ range; lower requested setting wins "
-                "a tie."
+                f"accepted {self._band_description()} range; lower "
+                "requested setting wins a tie."
             ),
         )
         self._checkpoint(state)
         if not accepted:
-            raise ProcedureFailure(
-                FailureKind.NCR,
-                "No upward-pulse candidate is within 300 to 400 uJ.",
+            self._handle_out_of_band(
+                state,
+                "No upward-pulse candidate is within "
+                f"{self._band_description()}.",
             )
         if selected_pulse != pulse_setting:
             self._checked_register_write(state, "TA_PULSE_WIDTH", selected_pulse)
@@ -638,6 +687,62 @@ class SingleSensorLaserCalibrationWorkflow(LaserWorkflowBase):
                 ),
             )
         return candidate_measurement
+
+    def _within_band(self, mean_uj: float) -> bool:
+        return self._minimum_energy_uj <= mean_uj <= self._maximum_energy_uj
+
+    def _band_description(self) -> str:
+        return f"{self._minimum_energy_uj:g} to {self._maximum_energy_uj:g} uJ"
+
+    def _accept_final_energy(
+        self, state: _RunState, measurement: EnergyMeasurement
+    ) -> None:
+        """The final acceptance gate, before anything is written.
+
+        Outside override mode a final energy outside the factory window is
+        the terminal NCR it always was. In override mode the operator's band
+        is the acceptance band, but anything outside the *factory* window
+        still asks the operator first, with the measured numbers and the
+        configuration that would be written; a decline is the same NCR.
+        """
+        mean = measurement.mean_uj
+        within_band = self._within_band(mean)
+        if within_band and (self._override is None or within_factory_band(mean)):
+            return
+        if within_band:
+            assert self._override is not None
+            reason = (
+                f"Final energy {mean:.1f} uJ is inside the override band "
+                f"({self._override.band_description()}) but outside the "
+                f"factory {factory_band_description()} band."
+            )
+        else:
+            reason = (
+                f"Final energy must be between {self._minimum_energy_uj:g} "
+                f"and {self._maximum_energy_uj:g} uJ inclusive."
+            )
+        if self._override is None:
+            raise ProcedureFailure(FailureKind.NCR, reason)
+        decision = self._request_override(
+            state,
+            OverrideRequest(
+                criterion="final_energy_band",
+                reason=reason,
+                measured={
+                    "final_mean_uj": mean,
+                    "final_stdev_uj": measurement.stdev_uj,
+                    "target_uj": self._target_energy_uj,
+                },
+                accepted_band=self._override.band_description(),
+                factory_band=factory_band_description(),
+                proposed_configuration={
+                    "TA_CURRENT_DRV": state.current_requested_ma,
+                    "TA_PULSE_WIDTH": state.pulse_requested_us,
+                },
+            ),
+        )
+        if not decision.accepted:
+            raise ProcedureFailure(FailureKind.NCR, reason)
 
     @staticmethod
     def _confirmed_side(request: SingleSensorLaserCalibrationRequest) -> SensorSide:

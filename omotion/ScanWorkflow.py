@@ -1157,6 +1157,19 @@ class ScanWorkflow:
                         )
                     )
 
+                # Cameras are now powered, FPGA-programmed, and configured —
+                # the first state in which the OX02C1B security-UID registers
+                # are readable. The connect-time cache read them while the
+                # boot-time health scan (sensor-fw >= 1.7.0) had left every
+                # camera off, so it holds zeros; re-read here so cache
+                # consumers (calibration report, run manifest) see real UIDs.
+                # Refs OpenwaterHealth/openmotion-bloodflow-app#497.
+                for side, _mask, sensor in active:
+                    try:
+                        sensor.refresh_id_cache()
+                    except Exception as e:
+                        _emit_log(f"{side}: security-UID cache refresh failed: {e}")
+
                 ok = True
                 _emit_log("FPGAs programmed & registers configured")
             except Exception as e:

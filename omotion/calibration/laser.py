@@ -22,6 +22,10 @@ class ProcedureStatus(str, Enum):
     FAILED = "failed"
     FAILED_NCR = "failed_ncr"
     CANCELED = "canceled"
+    # Written outside the acceptance criteria with explicit operator consent
+    # (omotion.calibration.override). Deliberately distinct from PASSED: the
+    # evidence, the script verdict and the exit code all say "override".
+    OVERRIDDEN = "overridden"
 
 
 class FailureKind(str, Enum):

@@ -31,6 +31,12 @@ from .laser import (
     validate_serial,
     within_percent,
 )
+from .override import (
+    OverrideConsentFn,
+    OverrideDecision,
+    OverrideRequest,
+    OverrideSettings,
+)
 
 
 def deeply_immutable(value):
@@ -196,6 +202,10 @@ class LaserWorkflowBase:
 
     _bench: LaserBench
     _recorder: RunRecorder
+    # Override mode (omotion.calibration.override). Both stay None outside
+    # override mode, which is the default for every constructor.
+    _override: OverrideSettings | None = None
+    _override_consent: OverrideConsentFn | None = None
 
     def _checkpoint(self, state) -> None:
         self._recorder.checkpoint(state.result(ProcedureStatus.IN_PROGRESS))
@@ -204,6 +214,111 @@ class LaserWorkflowBase:
         event = ProcedureEvent(datetime.now(timezone.utc), stage, message)
         state.events.append(event)
         self._recorder.record(event)
+
+    # ------------------------------------------------------- override mode
+    def _configure_override(
+        self,
+        override: OverrideSettings | None,
+        override_consent: OverrideConsentFn | None,
+    ) -> None:
+        if override is None:
+            self._override = None
+            self._override_consent = None
+            return
+        if not isinstance(override, OverrideSettings):
+            raise TypeError("override must be an OverrideSettings instance")
+        if override_consent is None:
+            raise ValueError("override mode requires an override_consent callback")
+        self._override = override
+        self._override_consent = override_consent
+
+    @property
+    def override_mode(self) -> bool:
+        return self._override is not None
+
+    @staticmethod
+    def _written_under_override(state) -> bool:
+        decision = getattr(state, "override_decision", None)
+        return decision is not None and decision.accepted
+
+    def _terminal_success_status(self, state) -> ProcedureStatus:
+        """PASSED, or OVERRIDDEN when the operator consented to the write."""
+        if self._written_under_override(state):
+            return ProcedureStatus.OVERRIDDEN
+        return ProcedureStatus.PASSED
+
+    def _handle_out_of_band(self, state, reason: str) -> None:
+        """Outside override mode this is the NCR it always was.
+
+        In override mode the tuning loop records the miss and carries on with
+        the closest candidate: nothing is written yet, and the operator is
+        asked against the final measured numbers before any write.
+        """
+        if self._override is None:
+            raise ProcedureFailure(FailureKind.NCR, reason)
+        self._record_event(
+            state,
+            "override",
+            f"{reason} Override mode continues with the closest candidate; "
+            "the operator is asked before anything is written.",
+        )
+        self._checkpoint(state)
+
+    def _request_override(self, state, request: OverrideRequest) -> OverrideDecision:
+        """Ask the operator to accept a write outside the acceptance criteria.
+
+        Fail-closed: any problem with the consent callback, a missing
+        decision, or an acceptance without a justification is a decline.
+        The request and the decision are both checkpointed, so an
+        interrupted run shows the question that was pending.
+        """
+        assert self._override is not None and self._override_consent is not None
+        operator = getattr(state.request, "operator", "")
+        self._record_event(
+            state, "override", f"Operator override requested: {request.reason}"
+        )
+        self._checkpoint(state)
+        try:
+            decision = self._override_consent(request)
+        except Exception as error:
+            decision = OverrideDecision(
+                request,
+                False,
+                operator,
+                f"consent callback failed: {type(error).__name__}: {error}",
+            )
+        if not isinstance(decision, OverrideDecision):
+            decision = OverrideDecision(
+                request, False, operator, "consent callback returned no decision"
+            )
+        if decision.accepted and not (
+            isinstance(decision.justification, str)
+            and decision.justification.strip()
+        ):
+            decision = OverrideDecision(
+                request,
+                False,
+                decision.operator,
+                "override accepted without a justification; treated as declined",
+            )
+        state.override_decision = decision
+        if decision.accepted:
+            self._record_event(
+                state,
+                "override",
+                f"Operator override accepted by {decision.operator}: "
+                f"{decision.justification}",
+            )
+        else:
+            detail = f" ({decision.justification})" if decision.justification else ""
+            self._record_event(
+                state,
+                "override",
+                "Operator override declined; the run fails exactly as it would "
+                f"without override mode.{detail}",
+            )
+        self._checkpoint(state)
+        return decision
 
     def _validate_shared_preflight(
         self,

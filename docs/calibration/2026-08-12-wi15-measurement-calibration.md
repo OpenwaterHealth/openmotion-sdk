@@ -138,7 +138,9 @@ Bounds are inclusive. Every active camera must have:
 
 If any criterion fails, mark the side and procedure failed, record all rows,
 and stop before a calibration configuration write. There is no `allow-dim`,
-bench-threshold, or continue-to-write override in the supported procedure.
+bench-threshold, or continue-to-write override in the supported procedure -
+except the password-gated engineering override mode of section 19, which is
+off unless the script is started with `--allow-override`.
 
 ## 9. Calibration calculation
 
@@ -227,7 +229,7 @@ validation, followed by complete post-restart persistence.
 Every failure returns nonzero with side, camera when applicable, criterion,
 observed value, threshold, and reason. Cleanup always stops scan/trigger
 activity. No threshold override or continue-anyway prompt is permitted in the
-supported procedure.
+supported procedure outside the engineering override mode of section 19.
 
 ## 15. Report and artifacts
 
@@ -340,3 +342,25 @@ bloodflow-app's Calibrate button. Against the sections above:
   the absolute brightness gates for dim dev benches and prints that a
   pass does not certify signal level). The supported operator flow (the
   test-app Procedures pane) never passes it.
+
+## 19. Operator override mode (engineering only, 2026-08-21)
+
+Epic OpenwaterHealth/openmotion-bloodflow-app#482 adds a password-gated
+operator override to the thin runner (`--allow-override`); the engine hook
+behind it (`MotionInterface.start_calibration(on_override_fn=...)`) is
+passed only by this runner, never by the bloodflow-app, so the section 8
+never-write rule is unchanged everywhere else:
+
+- The operator types the override password (three attempts) before any
+  hardware is touched. The factory limits stay in force; this is not the
+  `--bench-thresholds` flag.
+- When the section 8 gate fails, the engine asks once with the failing
+  cameras' mean and contrast, then requires a free-text reason. A decline
+  is the usual FAILED run with nothing written.
+- An accepted override continues to the section 11 validation scan and
+  then writes the console once, unless any camera fails the ambient-dark
+  check - that is a data-integrity fault and is never overridable, so the
+  run FAILS with nothing written.
+- The run ends with outcome `overridden` (`Final result: OVERRIDE`, exit
+  code 3); the JSON manifest records `override_granted` and
+  `override_justification` alongside `calibration_written`.

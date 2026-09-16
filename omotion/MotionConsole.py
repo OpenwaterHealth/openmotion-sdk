@@ -393,11 +393,17 @@ class MotionConsole(SignalWrapper):
             logger.error("Unexpected error during %s: %s", method_name, e)
 
     def _drive_disconnecting(self, reason: str) -> None:
-        self._set_state(ConnectionState.DISCONNECTING, reason=reason)
+        # Stop the telemetry poller BEFORE leaving CONNECTED. Its poll
+        # thread may be mid-command; stop() joins it, so the in-flight
+        # command completes over the still-open UART. Flipping the state
+        # first made that command trip the ``is_connected()`` guard and
+        # log "ValueError: Console controller not connected" at ERROR on
+        # every ordinary teardown (#128).
         try:
             self.telemetry.stop()
         except Exception:
             logger.exception("telemetry stop failed")
+        self._set_state(ConnectionState.DISCONNECTING, reason=reason)
         try:
             self.uart.close()
         except Exception:
@@ -1546,7 +1552,7 @@ class MotionConsole(SignalWrapper):
                 return 0
 
         except ValueError as v:
-            logger.error("ValueError: %s", v)
+            self._log_command_error("get_lsync_pulsecount", v)
             raise  # Re-raise the exception for the caller to handle
 
         except Exception as e:
@@ -2131,7 +2137,7 @@ class MotionConsole(SignalWrapper):
             return pdu
 
         except ValueError as v:
-            logger.error("ValueError: %s", v)
+            self._log_command_error("read_pdu_mon", v)
             raise  # Re-raise the exception for the caller to handle
 
         except Exception as e:
@@ -2348,38 +2354,45 @@ class MotionConsole(SignalWrapper):
         """Read the BFI/BVI calibration from the console EEPROM JSON.
 
         Returns a :class:`omotion.Calibration` with ``source="console"`` if
-        the JSON contains a valid ``calibration`` block, otherwise a fresh
-        :meth:`Calibration.default` (``source="default"``). Never raises on
-        bad data — invalid blocks are logged and replaced with defaults.
+        the JSON contains a valid ``calibration`` block. Returns a fresh
+        :meth:`Calibration.default` (``source="default"``) only when the
+        config was read successfully and holds no usable block: the key is
+        absent (a console that has never been calibrated) or the block
+        fails validation (logged as a warning by ``parse_calibration``).
+
+        A read that *fails* is reported, never papered over with defaults:
+        callers that carry stored values forward (the calibration workflow
+        writes the un-targeted cameras' rows back to the EEPROM) must be
+        able to tell "nothing stored" from "could not read what is stored".
 
         Raises:
             ValueError: if the UART is not connected (propagates from
                 ``read_config``).
+            RuntimeError: if the device returned an error or an
+                undecodable config payload (``read_config`` returned None).
+            Exception: any transport error raised by ``read_config``.
         """
-        try:
-            cfg = self.read_config()
-        except ValueError:
-            raise
-        except Exception as e:
-            logger.warning(
-                "read_calibration: read_config raised %s; using SDK defaults.",
-                e,
-            )
-            return Calibration.default()
+        cfg = self.read_config()
 
         if cfg is None:
-            logger.info(
-                "read_calibration: no config returned from device; "
-                "using SDK defaults."
+            raise RuntimeError(
+                "read_calibration: console config could not be read "
+                "(device returned an error or an undecodable payload)."
             )
-            return Calibration.default()
 
-        parsed = parse_calibration(cfg.json_data or {})
+        json_data = cfg.json_data or {}
+        parsed = parse_calibration(json_data)
         if parsed is None:
-            logger.info(
-                "read_calibration: no calibration on device or invalid; "
-                "using SDK defaults."
-            )
+            if CALIBRATION_JSON_KEY in json_data:
+                logger.warning(
+                    "read_calibration: calibration block on device is "
+                    "invalid; using SDK defaults."
+                )
+            else:
+                logger.info(
+                    "read_calibration: no calibration block on device; "
+                    "using SDK defaults."
+                )
             return Calibration.default()
 
         logger.info("read_calibration: loaded calibration from console.")

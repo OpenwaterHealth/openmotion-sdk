@@ -36,14 +36,19 @@ from omotion import (
 )
 from omotion.MotionInterface import MotionInterface
 from omotion.ScanWorkflow import ConfigureRequest
+from omotion.calibration.override import EXIT_OVERRIDE, OverrideRequest
 from omotion.calibration.reporting import _safe_component
 from omotion.calibration.script_support import (
     OperatorCanceled as _OperatorCanceled,
+    OverrideNotAuthorized,
+    add_override_arguments,
     confirmed as _confirmed,
     emit_detail as _emit_detail,
     forward_library_logging,
+    make_override_consent,
     make_parser,
     required_value as _required_value,
+    resolve_override_mode,
     utc_run_id as _run_id,
 )
 
@@ -116,6 +121,7 @@ def _parser() -> argparse.ArgumentParser:
             "--thresholds-json", default=None,
             help="JSON file of CalibrationThresholds overrides; "
                  "default: factory values")
+        add_override_arguments(parser, energy_band=False)
 
     return make_parser(__doc__, extra)
 
@@ -147,6 +153,8 @@ _STAGE_LINES = {
     ),
     "compute_calibration": "Computing the calibration values ...",
     "gate": "Checking the values against the limits ...",
+    "override": "One or more cameras are outside the limits. "
+                "Asking about the override ...",
     "write_calibration": "Saving the calibration to the console ...",
     "validation_scan": "Running a short check scan ...",
     "evaluate": "Checking the final result ...",
@@ -216,6 +224,39 @@ def _build_thresholds(
             "factory (mean 40/80, contrast 0.25, SPEC-69 BFI/BVI, dark 3.0)")
 
 
+def _gate_override_prompt(consent, thresholds_label: str):
+    """Adapt the engine's gate hook to the shared operator consent question."""
+
+    def on_override(gate_rows):
+        failing = [
+            row for row in gate_rows
+            if row.mean_test == "FAIL" or row.contrast_test == "FAIL"
+        ]
+        labels = [
+            f"{'L' if row.side == 'left' else 'R'}{row.cam_id + 1}"
+            for row in failing
+        ]
+        measured = {}
+        for label, row in zip(labels, failing):
+            measured[f"{label} mean"] = round(row.mean, 3)
+            measured[f"{label} contrast"] = round(row.avg_contrast, 4)
+        return consent(OverrideRequest(
+            criterion="calibration_gate",
+            reason=("Scan mean/contrast below the limits on "
+                    f"{', '.join(labels) or 'no camera'}."),
+            measured=measured,
+            accepted_band=f"limits: {thresholds_label}",
+            factory_band="factory (mean 40/80, contrast 0.25)",
+            proposed_configuration={
+                "console calibration block": "computed from this scan; "
+                "written after the check scan unless the ambient-dark "
+                "check fails",
+            },
+        ))
+
+    return on_override
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -230,6 +271,11 @@ def main(
 
     try:
         operator = _required_value(args.operator, "Operator: ", input_func)
+        # Override mode is decided (and password-checked) before any other
+        # prompt and before any hardware is touched.
+        override = resolve_override_mode(
+            args, operator=operator, input_func=input_func, output_func=output_func
+        )
         fixture_id = _required_value(
             args.fixture_id, "Fixture ID: ", input_func)
         side = _selected_side(args.side, input_func, output_func)
@@ -241,6 +287,10 @@ def main(
             input_func,
         ):
             raise _OperatorCanceled
+    except OverrideNotAuthorized as exc:
+        output_func(f"Override mode not enabled: {exc}. Nothing was changed.")
+        output_func("Final result: FAIL")
+        return 1
     except (EOFError, KeyboardInterrupt, _OperatorCanceled):
         output_func("Measurement Calibration canceled. Nothing was changed.")
         return 1
@@ -402,9 +452,18 @@ def main(
         output_func("*** Do not touch the setup while it runs. ***")
         # The engine enforces the never-write rule itself: any camera
         # outside any limit means FAILED and the console EEPROM is never
-        # touched — there is no consent hook to wire up.
+        # touched. In override mode (password-checked above) the engine
+        # instead asks through on_override_fn at the pre-write gate; the
+        # call stays byte-identical outside override mode.
+        start_kwargs: dict = {}
+        if override is not None:
+            start_kwargs["on_override_fn"] = _gate_override_prompt(
+                make_override_consent(input_func, output_func, operator=operator),
+                thresholds_label,
+            )
         if not iface.start_calibration(request, on_complete_fn=on_complete,
-                                       on_progress_fn=on_progress):
+                                       on_progress_fn=on_progress,
+                                       **start_kwargs):
             return fail("could not start (is another calibration running?)")
         if not done.wait(CAL_MAX_DURATION_SEC + 60):
             iface.cancel_calibration()
@@ -414,6 +473,7 @@ def main(
         run_info["result"] = result
         outcome = getattr(result.outcome, "value", str(result.outcome))
         passed = outcome == "passed"
+        overridden = outcome == "overridden"
         _emit_detail(output_func, f"outcome: {outcome}")
         if result.rows:
             _emit_detail(output_func,
@@ -428,6 +488,13 @@ def main(
                     f"{row.bvi:>8.3f}")
         if passed:
             output_func("All cameras are within the limits.")
+        elif overridden:
+            justification = getattr(result, "override_justification", "")
+            output_func(
+                "One or more cameras are outside the limits. The calibration "
+                "was saved to the console UNDER OPERATOR OVERRIDE"
+                + (f": {justification}" if justification else "") + "."
+            )
         else:
             if result.error:
                 output_func(f"Problem: {result.error}")
@@ -437,9 +504,13 @@ def main(
                 output_func("Nothing was saved to the console.")
         if passed:
             run_info["verdict"] = "PASS"
+        elif overridden:
+            run_info["verdict"] = "OVERRIDE"
         elif outcome == "canceled":
             run_info["verdict"] = "CANCELED"
-        return 0 if passed else 1
+        if passed:
+            return 0
+        return EXIT_OVERRIDE if overridden else 1
 
     try:
         code = calibrate()
@@ -464,7 +535,7 @@ def main(
                 remapped = _remap_path(path, output_root, final_root)
                 output_func(f"Saved data ({label}): {remapped}")
     output_func(f"Final result: {run_info['verdict']}")
-    if run_info["verdict"] == "PASS":
+    if run_info["verdict"] in ("PASS", "OVERRIDE"):
         output_func("Note: for a two-sensor unit, also run this for "
                     "the other side.")
     return code

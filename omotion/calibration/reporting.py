@@ -199,7 +199,7 @@ class HtmlRunReport:
             "th,td{border:1px solid #9fb3c8;padding:0.45rem;text-align:left;vertical-align:top;}"
             "th{background:#eaf2f8;}.status{font-size:1.4rem;font-weight:bold;padding:0.7rem;}"
             ".status-passed{background:#d9f7e5;color:#075c35;}.status-failed,.status-failed_ncr{background:#ffe0e0;color:#8b0000;}"
-            ".status-canceled{background:#fff2cc;color:#6f5300;}.reason{font-size:1.15rem;font-weight:bold;color:#8b0000;}"
+            ".status-canceled{background:#fff2cc;color:#6f5300;}.status-overridden{background:#ffe8cc;color:#7a3e00;}.reason{font-size:1.15rem;font-weight:bold;color:#8b0000;}"
             ".changed{background:#fff3bf;font-weight:bold;}.muted{color:#52616b;}</style></head><body>",
             f"<h1>{self._DOCUMENT_HEADING}</h1>",
             f'<p class="status status-{escape(str(status), quote=True)}">Status: {self._text(status)}</p>',
@@ -231,8 +231,19 @@ class HtmlRunReport:
                 self._table("Request metadata", request_data.items()),
                 self._table(
                     "Calibration target",
-                    (("Target energy uJ", result_data.get("target_energy_uj")),),
+                    (
+                        ("Target energy uJ", result_data.get("target_energy_uj")),
+                        (
+                            "Minimum accepted energy uJ",
+                            result_data.get("minimum_accepted_energy_uj"),
+                        ),
+                        (
+                            "Maximum accepted energy uJ",
+                            result_data.get("maximum_accepted_energy_uj"),
+                        ),
+                    ),
                 ),
+                self._override(result_data),
                 self._topology(result_data.get("topology")),
                 self._identities(result_data.get("identities", [])),
                 self._ophir(
@@ -376,7 +387,9 @@ class HtmlRunReport:
                 sections.append(self._table(title, configuration.items()))
         default = result.get("requested_default_config")
         tuned = result.get("requested_final_config")
-        is_passing = result.get("status") == "passed"
+        status = result.get("status")
+        is_overridden = status == "overridden"
+        is_passing = status == "passed" or is_overridden
         if isinstance(default, dict) and isinstance(tuned, dict):
             comparison_title = (
                 "Default versus tuned configuration"
@@ -390,7 +403,9 @@ class HtmlRunReport:
             sections.append(
                 self._table(
                     (
-                        "Passing tuned User Configuration"
+                        "Tuned User Configuration written under operator override"
+                        if is_overridden
+                        else "Passing tuned User Configuration"
                         if is_passing
                         else "Requested tuned User Configuration (unconfirmed)"
                     ),
@@ -404,6 +419,38 @@ class HtmlRunReport:
                     result["final_config_readback"].items(),
                 )
             )
+        return "".join(sections)
+
+    def _override(self, result: dict[str, Any]) -> str:
+        """Override-mode settings and the operator's decision, when present."""
+        settings = result.get("override")
+        decision = result.get("override_decision")
+        sections = []
+        if isinstance(settings, dict):
+            sections.append(
+                self._table("Operator override mode settings", settings.items())
+            )
+        if isinstance(decision, dict):
+            rows: list[tuple[str, object]] = [
+                ("Accepted", decision.get("accepted")),
+                ("Operator", decision.get("operator")),
+                ("Justification", decision.get("justification")),
+                ("Decided at", decision.get("decided_at")),
+            ]
+            request = decision.get("request")
+            if isinstance(request, dict):
+                rows.extend(
+                    (label, request.get(key))
+                    for label, key in (
+                        ("Criterion", "criterion"),
+                        ("Reason", "reason"),
+                        ("Measured", "measured"),
+                        ("Accepted band", "accepted_band"),
+                        ("Factory band", "factory_band"),
+                        ("Proposed configuration", "proposed_configuration"),
+                    )
+                )
+            sections.append(self._table("Operator override decision", rows))
         return "".join(sections)
 
     def _measurements(self, measurements: object, criteria: object) -> str:

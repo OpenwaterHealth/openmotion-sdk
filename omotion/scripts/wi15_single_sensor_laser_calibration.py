@@ -21,14 +21,18 @@ from omotion.calibration.script_support import (
     EventEchoRecorder,
     OperatorCanceled as _OperatorCanceled,
     OperatorRunReportRequest,
+    OverrideNotAuthorized,
+    add_override_arguments,
     apply_cleanup_failure,
     close_bench_capturing,
     close_best_effort as _close_best_effort,
     confirmed as _confirmed,
     finalize_run_artifacts,
     forward_library_logging,
+    make_override_consent,
     make_parser,
     required_value as _required_value,
+    resolve_override_mode,
     utc_run_id as _run_id,
 )
 from omotion.calibration.single_sensor_laser import (
@@ -61,10 +65,11 @@ NARRATION_STEPS = {
 
 
 def _parser() -> argparse.ArgumentParser:
-    return make_parser(
-        __doc__,
-        lambda parser: parser.add_argument("--fixture-calibration-status"),
-    )
+    def extra(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument("--fixture-calibration-status")
+        add_override_arguments(parser, energy_band=True)
+
+    return make_parser(__doc__, extra)
 
 
 def _selected_side(
@@ -90,6 +95,11 @@ def main(
     args = _parser().parse_args(argv)
     try:
         operator = _required_value(args.operator, "Operator: ", input_func)
+        # Override mode is decided (and password-checked) before any other
+        # prompt and before any hardware is touched.
+        override = resolve_override_mode(
+            args, operator=operator, input_func=input_func, output_func=output_func
+        )
         build_revision = args.build_revision or "unspecified"
         fixture_id = _required_value(args.fixture_id, "Fixture ID: ", input_func)
         fixture_calibration_status = args.fixture_calibration_status
@@ -115,6 +125,10 @@ def main(
             input_func,
         ):
             raise _OperatorCanceled
+    except OverrideNotAuthorized as exc:
+        output_func(f"Override mode not enabled: {exc}. Nothing was changed.")
+        output_func("Final result: FAIL")
+        return 1
     except (EOFError, KeyboardInterrupt, _OperatorCanceled):
         output_func("Calibration canceled. Nothing was changed.")
         return 1
@@ -132,9 +146,21 @@ def main(
             bench_factory(meter),
             output_func,
             steps=NARRATION_STEPS,
-            target_energy_uj=TARGET_ENERGY_UJ,
+            target_energy_uj=(
+                override.target_energy_uj if override is not None
+                else TARGET_ENERGY_UJ
+            ),
         )
-        workflow = workflow_factory(bench, recorder)
+        # The factory call stays byte-identical outside override mode.
+        workflow_kwargs = {}
+        if override is not None:
+            workflow_kwargs = {
+                "override": override,
+                "override_consent": make_override_consent(
+                    input_func, output_func, operator=operator
+                ),
+            }
+        workflow = workflow_factory(bench, recorder, **workflow_kwargs)
         request = SingleSensorLaserCalibrationRequest(
             side=side,
             side_confirmed=True,

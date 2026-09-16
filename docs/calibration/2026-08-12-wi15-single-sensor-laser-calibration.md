@@ -453,3 +453,37 @@ at 590 microseconds) and 600-microsecond ceiling NCRs on the dim unit (run
 identifiers recorded on openmotion-sdk#214). Run
 `WI-00015-20260814T165720Z` additionally motivated carrying the underlying
 exception identity into energy-measurement failure reasons.
+
+## 16. Operator override mode (engineering only, 2026-08-21)
+
+Epic OpenwaterHealth/openmotion-bloodflow-app#482 adds a password-gated
+operator override for the test-app Procedures pane and headless bench runs
+(`omotion/calibration/override.py`, `--allow-override` on the script). It
+changes nothing unless it is switched on for a run:
+
+- The script must be started with `--allow-override`; the operator then
+  types the override password (three attempts) before any hardware is
+  touched, and is asked for the minimum, maximum and target energy for the
+  run (10-1000 microjoules each, Enter keeps the factory 300/400/350 value,
+  asked again until minimum <= target <= maximum). `--min-energy-uj`,
+  `--max-energy-uj` and `--target-energy-uj` pre-supply those answers for
+  headless runs and are accepted only together with `--allow-override`.
+- The operator's band steers sections 8.2 and 8.3: a closest candidate
+  outside it, or energy still below the minimum at the 600-microsecond
+  ceiling, no longer ends the run as NCR. The candidate is kept and the miss
+  is recorded as an `override` event.
+- Before the section 9 write, a final energy outside the factory 300-400
+  window, or outside the operator's own band, asks one question with the
+  measured energy, both bands and the configuration about to be written,
+  then requires a free-text reason. A decline (including EOF, an empty
+  reason, or a failing callback) is exactly the section 10 NCR, including
+  the active-default restore.
+- An accepted override writes through the same exact-readback path as a
+  pass and ends in `ProcedureStatus.OVERRIDDEN`: `Final result: OVERRIDE`,
+  exit code 3 (`EXIT_OVERRIDE`), and the settings plus the decision
+  (operator, justification, timestamp, request) in `run.json` and in the
+  HTML report, which renders the status amber and never as passing. A final
+  energy inside the factory window stays PASSED even in override mode; the
+  mode is still recorded in the evidence.
+- Safety Calibration has no override mode, and the clinical bloodflow-app
+  never enables override mode for any procedure.

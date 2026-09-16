@@ -25,6 +25,8 @@ from omotion.calibration.script_support import (
     BenchNarrator,
     EventEchoRecorder,
     OperatorRunReportRequest,
+    OverrideNotAuthorized,
+    add_override_arguments,
     apply_cleanup_failure,
     close_bench_capturing,
     close_best_effort as _close_best_effort,
@@ -32,8 +34,10 @@ from omotion.calibration.script_support import (
     emit_detail as _emit_detail,
     finalize_run_artifacts,
     forward_library_logging,
+    make_override_consent,
     make_parser,
     required_value as _required_value,
+    resolve_override_mode,
     utc_run_id as _run_id,
 )
 
@@ -61,10 +65,11 @@ NARRATION_STEPS = {
 
 
 def _parser() -> argparse.ArgumentParser:
-    return make_parser(
-        __doc__,
-        lambda parser: parser.add_argument("--fixture-calibration-status"),
-    )
+    def extra(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument("--fixture-calibration-status")
+        add_override_arguments(parser, energy_band=True)
+
+    return make_parser(__doc__, extra)
 
 
 def main(
@@ -80,12 +85,21 @@ def main(
     args = _parser().parse_args(argv)
     try:
         operator = _required_value(args.operator, "Operator: ", input_func)
+        # Override mode is decided (and password-checked) before any other
+        # prompt and before any hardware is touched.
+        override = resolve_override_mode(
+            args, operator=operator, input_func=input_func, output_func=output_func
+        )
         build_revision = args.build_revision or "unspecified"
         fixture_id = _required_value(args.fixture_id, "Fixture ID: ", input_func)
         fixture_calibration_status = args.fixture_calibration_status
         procedure_revision = _required_value(
             args.procedure_revision, "Procedure revision: ", input_func
         )
+    except OverrideNotAuthorized as exc:
+        output_func(f"Override mode not enabled: {exc}. Nothing was changed.")
+        output_func("Final result: FAIL")
+        return 1
     except (EOFError, KeyboardInterrupt):
         output_func("Calibration canceled. Nothing was changed.")
         return 1
@@ -112,7 +126,18 @@ def main(
             )
             return _confirmed(prompt, input_func)
 
-        workflow = workflow_factory(bench, recorder, acknowledge_placement)
+        # The factory call stays byte-identical outside override mode.
+        workflow_kwargs = {}
+        if override is not None:
+            workflow_kwargs = {
+                "override": override,
+                "override_consent": make_override_consent(
+                    input_func, output_func, operator=operator
+                ),
+            }
+        workflow = workflow_factory(
+            bench, recorder, acknowledge_placement, **workflow_kwargs
+        )
         request = DualSensorLaserCalibrationRequest(
             operator=operator,
             build_id=build_revision,

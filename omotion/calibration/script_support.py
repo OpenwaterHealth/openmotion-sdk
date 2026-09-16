@@ -8,7 +8,9 @@ collaborators as arguments.
 from __future__ import annotations
 
 import argparse
+import getpass
 import logging
+import math
 import sys
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -16,6 +18,9 @@ from pathlib import Path
 from typing import Callable, Mapping
 
 from .laser import (
+    MAX_ACCEPTABLE_ENERGY_UJ,
+    MIN_ACCEPTABLE_ENERGY_UJ,
+    TARGET_ENERGY_UJ,
     EnergyMeasurement,
     FailureKind,
     ProcedureStatus,
@@ -23,6 +28,18 @@ from .laser import (
 )
 from .reporting import _safe_component
 from ._procedure import ReportArtifactEvidence, ReportArtifactStatus
+from .override import (
+    EXIT_OVERRIDE,
+    OVERRIDE_MAX_ENERGY_UJ,
+    OVERRIDE_MIN_ENERGY_UJ,
+    OVERRIDE_PASSWORD_ATTEMPTS,
+    OVERRIDE_PASSWORD_PROMPT,
+    OverrideDecision,
+    OverrideRequest,
+    OverrideSettings,
+    factory_band_description,
+    verify_override_password,
+)
 
 
 PROCEDURE_ID = "WI-00015"
@@ -307,7 +324,9 @@ def apply_cleanup_failure(result, cleanup_failure: str | None, recorder):
     """Fold a bench-close failure into the terminal result and checkpoint it."""
     if cleanup_failure is None:
         return result
-    was_passing = result.status is ProcedureStatus.PASSED
+    was_passing = result.status in (
+        ProcedureStatus.PASSED, ProcedureStatus.OVERRIDDEN
+    )
     result = replace(
         result,
         status=ProcedureStatus.FAILED if was_passing else result.status,
@@ -426,7 +445,9 @@ def finalize_run_artifacts(
             raise RuntimeError("HTML report writer did not create the expected file")
     except Exception as exc:
         report_failure = str(exc) or exc.__class__.__name__
-        was_passing = result.status is ProcedureStatus.PASSED
+        was_passing = result.status in (
+            ProcedureStatus.PASSED, ProcedureStatus.OVERRIDDEN
+        )
         failed_result = replace(
             incomplete_result,
             status=ProcedureStatus.FAILED if was_passing else result.status,
@@ -451,17 +472,319 @@ def finalize_run_artifacts(
         return 1
     recorder.checkpoint(finalized_result)
     emit_detail(output_func, f"procedure status: {finalized_result.status.value}")
-    if finalized_result.status is ProcedureStatus.PASSED:
+    status = finalized_result.status
+    if status is ProcedureStatus.PASSED:
         verdict = "PASS"
-    elif finalized_result.status is ProcedureStatus.CANCELED:
+    elif status is ProcedureStatus.OVERRIDDEN:
+        verdict = "OVERRIDE"
+    elif status is ProcedureStatus.CANCELED:
         verdict = "CANCELED"
     else:
         verdict = "FAIL"
     output_func(f"Final result: {verdict}")
+    if status is ProcedureStatus.OVERRIDDEN:
+        output_func(_override_summary(finalized_result))
     if finalized_result.failure_kind is not None:
         output_func(f"Problem type: {finalized_result.failure_kind.value}")
     if finalized_result.failure_reason is not None:
         output_func(f"Problem: {finalized_result.failure_reason}")
     output_func(f"Saved data (JSON): {Path(recorder.json_path).resolve()}")
     output_func(f"Saved report (HTML): {Path(report_path).resolve()}")
-    return 0 if finalized_result.status is ProcedureStatus.PASSED else 1
+    if status is ProcedureStatus.PASSED:
+        return 0
+    if status is ProcedureStatus.OVERRIDDEN:
+        return EXIT_OVERRIDE
+    return 1
+
+
+def _override_summary(result) -> str:
+    decision = getattr(result, "override_decision", None)
+    settings = getattr(result, "override", None)
+    text = "The calibration was written under operator override"
+    if decision is not None:
+        text += f" by {decision.operator}: {decision.justification}"
+    if settings is not None:
+        text += f" (acceptance band {settings.describe()})"
+    return text + "."
+
+
+# ------------------------------------------------------------ override mode
+#
+# Override mode (omotion.calibration.override) is opt-in per run: the script
+# must be started with --allow-override and the operator must type the
+# override password before any hardware is touched. These helpers are the
+# whole of that handshake, so every procedure script behaves identically.
+
+
+class OverrideNotAuthorized(Exception):
+    """Override mode was requested but could not be enabled."""
+
+
+def add_override_arguments(
+    parser: argparse.ArgumentParser, *, energy_band: bool
+) -> None:
+    parser.add_argument(
+        "--allow-override",
+        action="store_true",
+        help=(
+            "enable operator override mode (password required): a result "
+            "outside the acceptance criteria asks before anything is written "
+            "and is recorded as an override, never a pass"
+        ),
+    )
+    if energy_band:
+        for flag, what in (
+            ("--min-energy-uj", "minimum accepted"),
+            ("--max-energy-uj", "maximum accepted"),
+            ("--target-energy-uj", "target"),
+        ):
+            parser.add_argument(
+                flag,
+                type=float,
+                default=None,
+                help=(
+                    f"override mode only: the {what} energy in uJ for this "
+                    "run (asked in the terminal when omitted)"
+                ),
+            )
+
+
+# (argparse attribute, OverrideSettings field, operator-facing label)
+_ENERGY_FIELDS = (
+    ("min_energy_uj", "minimum_energy_uj", "Minimum accepted"),
+    ("max_energy_uj", "maximum_energy_uj", "Maximum accepted"),
+    ("target_energy_uj", "target_energy_uj", "Target"),
+)
+
+
+def _supplied_energies(args) -> dict[str, float]:
+    """The band/target values given as flags (laser scripts only)."""
+    supplied = {}
+    for attribute, name, _label in _ENERGY_FIELDS:
+        value = getattr(args, attribute, None)
+        if value is not None:
+            supplied[name] = value
+    return supplied
+
+
+def _settings_from(
+    values: Mapping[str, float], *, operator: str
+) -> OverrideSettings:
+    try:
+        return OverrideSettings(authorized_by=operator, **values)
+    except ValueError as error:
+        raise OverrideNotAuthorized(f"invalid override energies: {error}") from error
+
+
+def override_settings_from_args(args, *, operator: str) -> OverrideSettings | None:
+    """The run's override settings from the flags alone, or None when
+    override mode is off. No prompting - see ``resolve_override_mode``.
+
+    The energy flags are only meaningful in override mode; given without
+    ``--allow-override`` they are refused rather than silently ignored.
+    """
+    supplied = _supplied_energies(args)
+    if not getattr(args, "allow_override", False):
+        if supplied:
+            raise OverrideNotAuthorized(
+                "--min-energy-uj, --max-energy-uj and --target-energy-uj "
+                "require --allow-override"
+            )
+        return None
+    return _settings_from(supplied, operator=operator)
+
+
+def _ask_energy(
+    label: str,
+    default: float,
+    input_func: Callable[[str], str],
+    output_func: Callable[[str], None],
+) -> float:
+    low, high = OVERRIDE_MIN_ENERGY_UJ, OVERRIDE_MAX_ENERGY_UJ
+    prompt = f"{label} energy in uJ ({low:g}-{high:g}) [{default:g}]: "
+    while True:
+        raw = input_func(prompt).strip()
+        if not raw:
+            return float(default)
+        try:
+            value = float(raw)
+        except ValueError:
+            output_func("Please type a number.")
+            continue
+        if not (math.isfinite(value) and low <= value <= high):
+            output_func(f"Please type a number between {low:g} and {high:g}.")
+            continue
+        return value
+
+
+def prompt_override_energies(
+    supplied: Mapping[str, float],
+    input_func: Callable[[str], str],
+    output_func: Callable[[str], None],
+) -> dict[str, float]:
+    """Ask the operator for the acceptance band and target not given as flags.
+
+    Enter keeps the factory value. Each number must lie within
+    ``OVERRIDE_MIN_ENERGY_UJ``-``OVERRIDE_MAX_ENERGY_UJ``; the values are
+    asked again together until minimum <= target <= maximum holds.
+    """
+    defaults = {
+        "minimum_energy_uj": MIN_ACCEPTABLE_ENERGY_UJ,
+        "maximum_energy_uj": MAX_ACCEPTABLE_ENERGY_UJ,
+        "target_energy_uj": TARGET_ENERGY_UJ,
+    }
+    while True:
+        values = dict(supplied)
+        for _attribute, name, label in _ENERGY_FIELDS:
+            if name not in values:
+                values[name] = _ask_energy(
+                    label, defaults[name], input_func, output_func
+                )
+        minimum = values["minimum_energy_uj"]
+        maximum = values["maximum_energy_uj"]
+        target = values["target_energy_uj"]
+        if minimum <= target <= maximum or len(supplied) == 3:
+            # Fully flagged values that are inconsistent are refused by
+            # OverrideSettings itself; there is nothing left to ask.
+            return values
+        output_func(
+            "The energies must satisfy minimum <= target <= maximum "
+            f"(got {minimum:g} <= {target:g} <= {maximum:g}). "
+            "Please enter them again."
+        )
+
+
+def default_password_input(prompt: str) -> str:
+    """Masked on a terminal; plain ``input`` on a pipe, where the Procedures
+    pane masks the field itself."""
+    try:
+        interactive = sys.stdin is not None and sys.stdin.isatty()
+    except Exception:
+        interactive = False
+    if interactive:
+        return getpass.getpass(prompt)
+    return input(prompt)
+
+
+def authorize_override(
+    input_func: Callable[[str], str],
+    output_func: Callable[[str], None],
+    *,
+    password_input_func: Callable[[str], str] | None = None,
+    attempts: int = OVERRIDE_PASSWORD_ATTEMPTS,
+) -> bool:
+    """Ask for the override password; True only after a correct entry."""
+    ask = password_input_func
+    if ask is None:
+        ask = default_password_input if input_func is input else input_func
+    for attempt in range(1, attempts + 1):
+        try:
+            candidate = ask(OVERRIDE_PASSWORD_PROMPT)
+        except (EOFError, KeyboardInterrupt):
+            return False
+        if verify_override_password(str(candidate).rstrip("\r\n")):
+            return True
+        remaining = attempts - attempt
+        output_func(
+            "Incorrect override password."
+            + (f" {remaining} attempt(s) left." if remaining else "")
+        )
+    return False
+
+
+def resolve_override_mode(
+    args,
+    *,
+    operator: str,
+    input_func: Callable[[str], str],
+    output_func: Callable[[str], None],
+    password_input_func: Callable[[str], str] | None = None,
+) -> OverrideSettings | None:
+    """Enable override mode for this run, or return None when it is off.
+
+    After the password, a laser procedure asks the operator for the
+    acceptance band and target in the terminal (``prompt_override_energies``)
+    unless the flags already supplied them. Raises ``OverrideNotAuthorized``
+    when the flags are inconsistent or the password is not accepted; callers
+    fail the run before touching hardware.
+    """
+    supplied = _supplied_energies(args)
+    if not getattr(args, "allow_override", False):
+        if supplied:
+            raise OverrideNotAuthorized(
+                "--min-energy-uj, --max-energy-uj and --target-energy-uj "
+                "require --allow-override"
+            )
+        return None
+    if not authorize_override(
+        input_func, output_func, password_input_func=password_input_func
+    ):
+        raise OverrideNotAuthorized("the override password was not accepted")
+    output_func("*** OVERRIDE MODE is ON for this run. ***")
+    values: Mapping[str, float] = supplied
+    if hasattr(args, "min_energy_uj"):
+        # A laser procedure: the operator types the acceptance band and
+        # target for this run (flags pre-supply them for headless use).
+        if len(supplied) < 3:
+            output_func(
+                "Type the acceptance band and target for this run, or press "
+                "Enter to keep the factory value."
+            )
+        values = prompt_override_energies(supplied, input_func, output_func)
+    settings = _settings_from(values, operator=operator)
+    output_func(
+        f"Acceptance band: {settings.describe()} "
+        f"(factory: {factory_band_description()}, target {TARGET_ENERGY_UJ:g} uJ)."
+    )
+    output_func(
+        "A result outside the factory band will ask before anything is "
+        "written and will be recorded as an override, never a pass."
+    )
+    return settings
+
+
+def make_override_consent(
+    input_func: Callable[[str], str],
+    output_func: Callable[[str], None],
+    *,
+    operator: str,
+) -> Callable[[OverrideRequest], OverrideDecision]:
+    """The operator-facing consent question the workflows ask at the write point."""
+
+    def consent(request: OverrideRequest) -> OverrideDecision:
+        output_func("*** The result does not meet the acceptance criteria. ***")
+        output_func(f"Problem: {request.reason}")
+        for name, value in request.measured.items():
+            output_func(f"  {name}: {_format_value(value)}")
+        if request.accepted_band:
+            output_func(f"  accepted band: {request.accepted_band}")
+        if request.factory_band:
+            output_func(f"  factory band: {request.factory_band}")
+        if request.proposed_configuration:
+            output_func(
+                "  would write: "
+                + ", ".join(
+                    f"{key}={_format_value(value)}"
+                    for key, value in request.proposed_configuration.items()
+                )
+            )
+        justification = None
+        try:
+            accepted = confirmed(
+                "Write this calibration to the console anyway? (yes/no): ",
+                input_func,
+            )
+            if accepted:
+                justification = required_value(
+                    None, "Reason for the override: ", input_func
+                )
+        except (EOFError, KeyboardInterrupt):
+            accepted = False
+            justification = "operator input ended before a decision"
+        if accepted:
+            output_func("Override accepted. Writing the calibration ...")
+        else:
+            output_func("Override declined. Nothing will be written.")
+        return OverrideDecision(request, accepted, operator, justification)
+
+    return consent

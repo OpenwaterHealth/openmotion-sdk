@@ -49,6 +49,14 @@ from ._procedure import (
     RunRecorder,
     deeply_immutable,
 )
+from .override import (
+    OverrideConsentFn,
+    OverrideDecision,
+    OverrideRequest,
+    OverrideSettings,
+    factory_band_description,
+    within_factory_band,
+)
 
 
 @dataclass(frozen=True)
@@ -187,6 +195,11 @@ class DualSensorLaserCalibrationResult:
     target_energy_uj: float = TARGET_ENERGY_UJ
     minimum_accepted_energy_uj: float = MIN_ACCEPTABLE_ENERGY_UJ
     maximum_accepted_energy_uj: float = MAX_ACCEPTABLE_ENERGY_UJ
+    # Override mode (omotion.calibration.override): the settings the run was
+    # started with and, when the operator was asked, the decision. Both stay
+    # None outside override mode.
+    override: OverrideSettings | None = None
+    override_decision: OverrideDecision | None = None
     report_paths: tuple[Path | str, ...] = ()
     report_artifact: ReportArtifactEvidence | None = None
 
@@ -220,6 +233,8 @@ class _RunState:
     target_energy_uj: float = TARGET_ENERGY_UJ
     minimum_accepted_energy_uj: float = MIN_ACCEPTABLE_ENERGY_UJ
     maximum_accepted_energy_uj: float = MAX_ACCEPTABLE_ENERGY_UJ
+    override: OverrideSettings | None = None
+    override_decision: OverrideDecision | None = None
     preflight: DualPreflightSnapshot | None = None
     topology_revalidation: TopologySnapshot | None = None
     pre_existing_config: Mapping[str, float] | None = None
@@ -267,6 +282,8 @@ class _RunState:
             target_energy_uj=self.target_energy_uj,
             minimum_accepted_energy_uj=self.minimum_accepted_energy_uj,
             maximum_accepted_energy_uj=self.maximum_accepted_energy_uj,
+            override=self.override,
+            override_decision=self.override_decision,
             sdk_version=self.request.sdk_version,
             started_at=self.request.started_at,
             ended_at=ended_at,
@@ -313,7 +330,16 @@ class DualSensorLaserCalibrationWorkflow(LaserWorkflowBase):
         target_energy_uj: float = TARGET_ENERGY_UJ,
         minimum_accepted_energy_uj: float = MIN_ACCEPTABLE_ENERGY_UJ,
         maximum_accepted_energy_uj: float = MAX_ACCEPTABLE_ENERGY_UJ,
+        override: OverrideSettings | None = None,
+        override_consent: OverrideConsentFn | None = None,
     ):
+        self._configure_override(override, override_consent)
+        if override is not None:
+            # Override mode: the operator's band and target replace the
+            # injected/default window for this run.
+            target_energy_uj = override.target_energy_uj
+            minimum_accepted_energy_uj = override.minimum_energy_uj
+            maximum_accepted_energy_uj = override.maximum_energy_uj
         target_energy_uj = float(target_energy_uj)
         minimum_accepted_energy_uj = float(minimum_accepted_energy_uj)
         maximum_accepted_energy_uj = float(maximum_accepted_energy_uj)
@@ -351,6 +377,7 @@ class DualSensorLaserCalibrationWorkflow(LaserWorkflowBase):
             target_energy_uj=self._target_energy_uj,
             minimum_accepted_energy_uj=self._minimum_accepted_energy_uj,
             maximum_accepted_energy_uj=self._maximum_accepted_energy_uj,
+            override=self._override,
         )
         failure: ProcedureFailure | None = None
         stage = "setup"
@@ -420,23 +447,27 @@ class DualSensorLaserCalibrationWorkflow(LaserWorkflowBase):
                 self._record_event(state, "crosscheck", crosscheck.label)
                 self._checkpoint(state)
                 if accepted:
-                    self._write_passing_configuration(
-                        state,
-                        written_message=(
-                            "Final configuration verification — passing tuned "
-                            "User Configuration was written and read back exactly."
-                        ),
-                    )
+                    self._accept_pair(state, pair)
+                    self._write_final_configuration(state)
                     break
                 latest_pair = pair
             else:
-                raise ProcedureFailure(
-                    FailureKind.NCR,
+                reason = (
                     "Both sensors were not within "
                     f"{self._minimum_accepted_energy_uj:g} to "
                     f"{self._maximum_accepted_energy_uj:g} uJ after three "
-                    "complete cross-checks.",
+                    "complete cross-checks."
                 )
+                if self._override is None:
+                    raise ProcedureFailure(FailureKind.NCR, reason)
+                # Override mode: the third cross-check is the best this unit
+                # reached; the operator decides against those numbers.
+                decision = self._request_override(
+                    state, self._pair_override_request(state, latest_pair, reason)
+                )
+                if not decision.accepted:
+                    raise ProcedureFailure(FailureKind.NCR, reason)
+                self._write_final_configuration(state)
         except ProcedureFailure as caught:
             failure = caught
         except Exception as error:
@@ -467,7 +498,8 @@ class DualSensorLaserCalibrationWorkflow(LaserWorkflowBase):
             )
         if failure is None:
             result = state.result(
-                ProcedureStatus.PASSED, ended_at=datetime.now(timezone.utc)
+                self._terminal_success_status(state),
+                ended_at=datetime.now(timezone.utc),
             )
             self._recorder.checkpoint(result)
             return result
@@ -733,9 +765,10 @@ class DualSensorLaserCalibrationWorkflow(LaserWorkflowBase):
                 self._maximum_accepted_energy_uj,
             )
         ):
-            raise ProcedureFailure(
-                FailureKind.NCR,
-                "The current floor was reached without an acceptable selected-sensor setting.",
+            self._handle_out_of_band(
+                state,
+                "The current floor was reached without an acceptable "
+                "selected-sensor setting.",
             )
         if selected_setting != active_setting:
             self._checked_register_write(
@@ -790,11 +823,36 @@ class DualSensorLaserCalibrationWorkflow(LaserWorkflowBase):
             state.pulse_requested_us >= MAX_PULSE_WIDTH_US
             and source.measurement.mean_uj < self._minimum_accepted_energy_uj
         ):
-            raise ProcedureFailure(
-                FailureKind.NCR,
+            ceiling_reason = (
                 f"Energy remained below {self._minimum_accepted_energy_uj:g} uJ "
-                "at the 600 us pulse-width ceiling.",
+                "at the 600 us pulse-width ceiling."
             )
+            if self._override is None:
+                raise ProcedureFailure(FailureKind.NCR, ceiling_reason)
+            # Override mode: nothing left to adjust on this side - keep the
+            # ceiling setting and let the cross-check / operator decide.
+            self._record_event(
+                state,
+                "override",
+                f"{ceiling_reason} Override mode keeps the ceiling setting; "
+                "the operator is asked before anything is written.",
+            )
+            selection = TuningSelection(
+                direction="upward_pulse",
+                selected_side=side,
+                target_uj=target,
+                requested_current_ma=state.current_requested_ma,
+                requested_pulse_width_us=state.pulse_requested_us,
+                selected_mean_uj=source.measurement.mean_uj,
+                rationale=(
+                    "The 600 us pulse-width ceiling was already active; "
+                    "override mode keeps it."
+                ),
+            )
+            tuning_round = replace(tuning_round, selection=selection)
+            state.tuning_rounds[-1] = tuning_round
+            self._checkpoint(state)
+            return tuning_round
         if not state.used_upward_tuning:
             self._checked_register_write(
                 state, "EE_PULSE_WIDTH_UL", TEMPORARY_PULSE_WIDTH_LIMIT_US
@@ -841,11 +899,12 @@ class DualSensorLaserCalibrationWorkflow(LaserWorkflowBase):
                 and observation.measurement.mean_uj
                 < self._minimum_accepted_energy_uj
             ):
-                raise ProcedureFailure(
-                    FailureKind.NCR,
+                self._handle_out_of_band(
+                    state,
                     f"Energy remained below {self._minimum_accepted_energy_uj:g} uJ "
                     "at the 600 us pulse-width ceiling.",
                 )
+                break
             if observation.measurement.mean_uj >= target:
                 break
         selected = select_closest_valid_setting_to_target(candidates, target)
@@ -874,6 +933,65 @@ class DualSensorLaserCalibrationWorkflow(LaserWorkflowBase):
         state.tuning_rounds[-1] = tuning_round
         self._checkpoint(state)
         return tuning_round
+
+    def _accept_pair(self, state: _RunState, pair: PairObservation) -> None:
+        """A cross-check inside the acceptance band, about to be written.
+
+        Outside override mode the band *is* the factory window, so there is
+        nothing more to check. In override mode a pair inside the operator's
+        band but outside the factory window still asks the operator first; a
+        decline is the NCR the run would otherwise have ended in.
+        """
+        if self._override is None:
+            return
+        left = pair.metrics.left_mean_uj
+        right = pair.metrics.right_mean_uj
+        if within_factory_band(left) and within_factory_band(right):
+            return
+        reason = (
+            "Both sensors are inside the override band "
+            f"({self._override.band_description()}) but at least one is "
+            f"outside the factory {factory_band_description()} band: "
+            f"left {left:.1f} uJ, right {right:.1f} uJ."
+        )
+        decision = self._request_override(
+            state, self._pair_override_request(state, pair, reason)
+        )
+        if not decision.accepted:
+            raise ProcedureFailure(FailureKind.NCR, reason)
+
+    def _pair_override_request(
+        self, state: _RunState, pair: PairObservation, reason: str
+    ) -> OverrideRequest:
+        assert self._override is not None
+        return OverrideRequest(
+            criterion="pair_energy_band",
+            reason=reason,
+            measured={
+                "left_mean_uj": pair.metrics.left_mean_uj,
+                "right_mean_uj": pair.metrics.right_mean_uj,
+                "midpoint_uj": pair.metrics.midpoint_uj,
+                "target_uj": self._target_energy_uj,
+            },
+            accepted_band=self._override.band_description(),
+            factory_band=factory_band_description(),
+            proposed_configuration={
+                "TA_CURRENT_DRV": state.current_requested_ma,
+                "TA_PULSE_WIDTH": state.pulse_requested_us,
+            },
+        )
+
+    def _write_final_configuration(self, state: _RunState) -> None:
+        self._write_passing_configuration(
+            state,
+            written_message=(
+                "Final configuration verification — tuned User Configuration "
+                "was written under operator override and read back exactly."
+                if self._written_under_override(state)
+                else "Final configuration verification — passing tuned "
+                "User Configuration was written and read back exactly."
+            ),
+        )
 
     def _crosscheck_label(self, number: int, accepted: bool) -> str:
         accepted_range = (

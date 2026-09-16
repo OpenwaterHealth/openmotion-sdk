@@ -46,6 +46,7 @@ class DualSensorHtmlRunReport(HtmlRunReport):
                         ),
                     ),
                 ),
+                self._override(result_data),
                 self._topology(result_data.get("topology")),
                 self._identities(result_data.get("identities", [])),
                 self._ophir(

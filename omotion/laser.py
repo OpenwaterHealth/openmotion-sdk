@@ -7,13 +7,17 @@ light until these are written. The bloodflow app does this on its scan path
 (its "Issue #108" guard); this module is the SDK-owned equivalent so any SDK
 consumer (scripts, headless tools) can do it without the app.
 
-The register values live in two bundled data files under ``omotion/data``:
+The register values are Python modules under ``omotion.data`` (they were
+JSON data files until openmotion-sdk#278 compiled them into the package so a
+shipped application carries no editable data file):
 
-* ``laser_params.json``  — list of ``{"friendlyName", "dataToSend"}`` driver
-  register payloads (the locked baseline; mirrors the bloodflow app's
-  ``config/laser_params.json``).
-* ``fpga_model.json``    — maps each ``friendlyName`` to its I2C location
-  (mux/channel/device addr/register offset/size).
+* :data:`omotion.data.laser_params.LASER_PARAMS` — list of
+  ``{"friendlyName", "dataToSend"}`` driver register payloads (the locked
+  baseline).
+* :data:`omotion.data.laser_params_fault.LASER_PARAMS_FAULT` — the same set
+  with register(s) deliberately faulted, for testing the safety interlock.
+* :data:`omotion.data.fpga_model.FPGA_MODEL` — maps each ``friendlyName`` to
+  its I2C location (mux/channel/device addr/register offset/size).
 
 This is laser-sensitive: editing the bundled values risks wrong pulse widths
 or tripping the safety interlock. Treat them as locked baseline data.
@@ -21,35 +25,30 @@ or tripping the safety interlock. Treat them as locked baseline data.
 
 from __future__ import annotations
 
-import json
+import copy
 import logging
-from pathlib import Path
 from typing import Any, Optional
 
-logger = logging.getLogger("openmotion.sdk.laser")
+from omotion.data.fpga_model import FPGA_MODEL
+from omotion.data.laser_params import LASER_PARAMS
+from omotion.data.laser_params_fault import LASER_PARAMS_FAULT
 
-_DATA_DIR = Path(__file__).resolve().parent / "data"
-_FPGA_MODEL_PATH = _DATA_DIR / "fpga_model.json"
+logger = logging.getLogger("openmotion.sdk.laser")
 
 
 class FpgaMap:
     """Maps a laser-driver ``friendlyName`` to its I2C location.
 
-    Backed by the bundled ``fpga_model.json``. This is the minimal lookup the
-    laser-power write needs — it deliberately omits the bloodflow app's QML
-    scale-override machinery and the legacy ``FpgaModel.js`` fallback.
+    Backed by the bundled :data:`omotion.data.fpga_model.FPGA_MODEL`. This is
+    the minimal lookup the laser-power write needs — it deliberately omits the
+    bloodflow app's QML scale-override machinery and the legacy
+    ``FpgaModel.js`` fallback.
     """
 
     def __init__(self, model: Optional[list] = None) -> None:
-        if model is not None:
-            self._model = model
-            return
-        try:
-            with open(_FPGA_MODEL_PATH, "r", encoding="utf-8") as f:
-                self._model = json.load(f)
-        except Exception as e:  # pragma: no cover - data file ships with package
-            logger.error("Failed to load bundled fpga_model.json: %s", e)
-            self._model = []
+        # Deep copy so no caller can mutate the compiled-in baseline through
+        # the map (each instance used to parse its own fresh copy from disk).
+        self._model = model if model is not None else copy.deepcopy(FPGA_MODEL)
 
     def get_entry_by_friendly_name(self, friendly_name: str) -> Optional[dict]:
         """Return the I2C location + format for ``friendly_name`` or None.
@@ -76,29 +75,25 @@ class FpgaMap:
 def load_laser_params(force_fault: bool = False) -> list:
     """Load the bundled laser-driver register payloads.
 
-    Returns a list of ``{"friendlyName", "dataToSend"}`` dicts, or an empty
-    list on error. ``force_fault`` loads ``laser_params_fault.json`` — a set
+    Returns a fresh list of ``{"friendlyName", "dataToSend"}`` dicts — a deep
+    copy, so callers may edit their copy (the app's alt-laser overrides do)
+    without touching the compiled-in baseline. ``force_fault`` selects
+    :data:`~omotion.data.laser_params_fault.LASER_PARAMS_FAULT` — a set
     engineered to trip the laser-safety interlock for testing the safety path.
     """
-    name = "laser_params_fault.json" if force_fault else "laser_params.json"
-    path = _DATA_DIR / name
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            params = json.load(f)
-        logger.info("Loaded %d laser parameter sets from %s", len(params), path)
-        return params
-    except Exception as e:
-        logger.error("Failed to load laser params from %s: %s", path, e)
-        return []
+    if force_fault:
+        params, source = LASER_PARAMS_FAULT, "omotion.data.laser_params_fault"
+    else:
+        params, source = LASER_PARAMS, "omotion.data.laser_params"
+    logger.info("Loaded %d laser parameter sets from %s", len(params), source)
+    return copy.deepcopy(params)
 
 
 def _fault_diff_names() -> set:
     """friendlyNames whose value the fault set deliberately changes.
 
-    Computed by diffing the two bundled files so a future fault vector
-    (a different register, or several) is picked up automatically. If the
-    baseline fails to load, every fault-set key counts as faulted — in the
-    test-only fault path, erring toward writing the fault file verbatim.
+    Computed by diffing the two bundled sets so a future fault vector
+    (a different register, or several) is picked up automatically.
     """
     normal = {e["friendlyName"]: e["dataToSend"] for e in load_laser_params()}
     fault = {

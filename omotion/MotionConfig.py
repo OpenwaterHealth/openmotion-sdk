@@ -116,11 +116,19 @@ class MotionConfig:
         # Parse JSON (handle null terminator if present)
         json_str = json_bytes.rstrip(b"\x00").decode("utf-8", errors="ignore")
 
+        # An undecodable payload is a transport/flash problem (a truncated
+        # read most often), not an empty configuration. Treating it as {}
+        # made every stored key look absent: read_calibration() then fell
+        # back to SDK defaults, and write_calibration()'s read-modify-write
+        # would have re-written the config without the other keys. Raise
+        # so read_config() reports the failure (returns None) instead.
         try:
             json_data = json.loads(json_str) if json_str else {}
         except json.JSONDecodeError as e:
-            logger.warning(f"Failed to parse JSON: {e}. Using empty config.")
-            json_data = {}
+            raise ValueError(
+                f"Config JSON payload is not decodable ({e}); "
+                f"header json_len={header.json_len}, received {len(json_bytes)} bytes"
+            ) from e
 
         return cls(header=header, json_data=json_data)
 
