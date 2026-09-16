@@ -325,12 +325,12 @@ class FrameBatch:
     # None when telemetry is unavailable.
     pdc:            Optional[np.ndarray]
 
-    # (N,) optional float — TEC module temperature (TCM) from console
+    # (N,) optional int64 — MCU (lsync) trigger count from console
     # telemetry. Diagnostic only.
     tcm:            Optional[np.ndarray]
 
-    # (N,) optional float — TEC laser temperature (TCL) from console
-    # telemetry. Diagnostic only.
+    # (N,) optional int64 — laser trigger count from console telemetry.
+    # Diagnostic only.
     tcl:            Optional[np.ndarray]
 
     # ── Source: side assignment ───────────────────────────────────────────
@@ -375,7 +375,7 @@ class FrameBatch:
 
     # (N, 2, 8) float32 — raw contrast. Intentionally left None by
     # MomentsStage because contrast requires pedestal subtraction
-    # (K = std / (mean - pedestal)). Computed downstream by BfiBviStage.
+    # (K = std / (mean - pedestal)). Computed downstream by ShotNoiseCorrectionStage.
     contrast_raw:   Optional[np.ndarray] = None
 
     # ── PedestalSubtractionStage output ──────────────────────────────────
