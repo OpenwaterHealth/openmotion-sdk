@@ -1209,12 +1209,11 @@ class CalibrationWorkflow:
         on the other side) carries that side's row forward. Its baseline is
         read fresh from the console before the calibration scan — never
         taken from the SDK's in-memory cache, which starts as SDK defaults
-        and is only populated when the host calls ``log_console_info``. If
-        that read fails and either mask is not 0xFF, the run ends as ERROR
-        before scanning and nothing is written: the alternative was writing
-        SDK defaults over the other side's calibration. A console with no
-        calibration block reads as SDK defaults, and those are what gets
-        carried forward.
+        and is only populated when the host calls ``log_console_info``
+        (#281: the WI-15 script runs each side in a fresh process). If that
+        read fails the run ends as ERROR before scanning and nothing is
+        written. A console with no calibration block reads as SDK defaults,
+        and those are what gets carried forward.
 
         Returns False without starting when a run is already in flight, or
         when the request's thresholds cannot fail the pre-write gate and
@@ -1424,55 +1423,21 @@ class CalibrationWorkflow:
                     return
 
                 # ── Phase 0.5: read the console's current calibration ────
-                # A side that is not being calibrated (mask 0x00) keeps its
-                # stored row: the block written in phase 6 carries it
-                # forward from this read. It is a fresh console read, not
-                # the SDK cache: the cache starts as SDK defaults and is
-                # only populated when the host calls log_console_info(),
-                # and a transient read failure used to reset it to defaults
-                # — either way a right-only run then overwrote the left
-                # module's stored calibration with defaults. Read before
-                # the scans so an unreadable console fails fast instead of
-                # after 16 s of scanning. Calibration always runs all 8
-                # cameras of a side at once, so "a side is carried forward"
-                # is simply "a mask is not 0xFF".
-                carry_forward = (
-                    request.left_camera_mask != 0xFF
-                    or request.right_camera_mask != 0xFF
-                )
+                # The side not being calibrated (mask 0x00) keeps its stored
+                # row: the block written in phase 6 carries it forward from
+                # this read. Read the console, never the SDK cache: the
+                # cache starts as SDK defaults and is only populated when
+                # the host calls log_console_info(), so a right-only run in
+                # a fresh process (the WI-15 script) overwrote the left
+                # module's stored calibration with defaults (#281). A
+                # failed read raises out of the worker — outcome ERROR,
+                # nothing scanned, nothing written — rather than guessing.
                 _emit_log("Calibration: reading current console calibration…")
-                try:
-                    baseline = self._interface.refresh_calibration()
-                except Exception as e:
-                    if carry_forward:
-                        error = (
-                            "could not read the console's current "
-                            f"calibration ({e}); refusing to run because "
-                            "the side not being calibrated would be "
-                            "written with SDK defaults instead of its "
-                            "stored values"
-                        )
-                        logger.error("Calibration phase 0.5: %s", error)
-                        _emit_log(f"Calibration: ERROR — {error}.")
-                        return
-                    baseline = self._interface.get_calibration()
-                    logger.warning(
-                        "Calibration phase 0.5: console calibration read "
-                        "failed (%s); both sides are being calibrated so "
-                        "nothing is carried forward — continuing with the "
-                        "cached calibration (source=%s).",
-                        e, baseline.source,
-                    )
-                else:
-                    logger.info(
-                        "Calibration phase 0.5 done: baseline for a side "
-                        "not being calibrated is %s%s.",
-                        "the console's stored calibration"
-                        if baseline.source == "console"
-                        else "SDK defaults (no calibration block on the console)",
-                        "" if carry_forward
-                        else " (unused: both sides are being calibrated)",
-                    )
+                baseline = self._interface.refresh_calibration()
+                logger.info(
+                    "Calibration phase 0.5 done: console calibration read "
+                    "(source=%s).", baseline.source,
+                )
 
                 _emit_progress("calibration_scan")
                 _emit_log("Calibration: starting calibration scan…")

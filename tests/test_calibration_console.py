@@ -315,20 +315,3 @@ def test_log_console_info_keeps_cache_on_truncated_payload(interface):
     interface.log_console_info()
     assert interface.get_calibration().source == "console"
 
-
-def test_write_calibration_caches_written_values_when_readback_fails(interface):
-    """EEPROM write OK, read-back fails: the cache must hold what was
-    written (source=console), not defaults and not a stale override."""
-    interface.console.write_calibration = MagicMock(
-        return_value=Calibration(
-            c_min=np.zeros((2, 8)), c_max=np.full((2, 8), 0.42),
-            i_min=np.zeros((2, 8)), i_max=np.full((2, 8), 275.0),
-            source="console"))
-    interface.console.read_config = MagicMock(return_value=None)
-    cal = interface.write_calibration(
-        np.zeros((2, 8)), np.full((2, 8), 0.42),
-        np.zeros((2, 8)), np.full((2, 8), 275.0),
-    )
-    assert cal.source == "console"
-    np.testing.assert_array_equal(interface.get_calibration().c_max,
-                                  np.full((2, 8), 0.42))

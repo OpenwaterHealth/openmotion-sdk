@@ -769,9 +769,9 @@ def test_right_only_run_on_never_calibrated_console_carries_sdk_defaults(
 def test_right_only_run_refuses_when_console_calibration_unreadable(
     interface, request_obj,
 ):
-    """If the console cannot be read, a one-side run must not guess: it
-    ends as ERROR before any scan and writes nothing — the alternative was
-    writing SDK defaults over the left module's stored calibration."""
+    """If the console cannot be read, the run must not guess: it ends as
+    ERROR before any scan and writes nothing — the alternative was writing
+    SDK defaults over the left module's stored calibration."""
     from omotion.CalibrationWorkflow import CalibrationOutcome
     _make_fake_scan_workflow(interface, _LEFT, _RIGHT)
     interface.console.read_config = MagicMock(return_value=None)  # device error
@@ -785,26 +785,26 @@ def test_right_only_run_refuses_when_console_calibration_unreadable(
 
     assert r.outcome is CalibrationOutcome.ERROR
     assert r.calibration_written is False
-    assert "could not read the console's current calibration" in r.error
-    assert "SDK defaults" in r.error
+    assert "could not be read" in r.error
     interface.write_calibration.assert_not_called()
     assert scans == []                       # failed fast, before phase 1
     assert os.path.exists(r.json_path)       # manifest still records the run
 
 
-def test_full_mask_run_tolerates_unreadable_console_calibration(
+def test_both_sides_run_also_refuses_when_console_unreadable(
     interface, request_obj,
 ):
-    """With both masks 0xFF nothing is carried forward, so an unreadable
-    console is a warning, not a refusal; the run proceeds."""
+    """Deliberately no mask special-casing: an unreadable console fails
+    every run the same way, even one that would overwrite both rows."""
+    from omotion.CalibrationWorkflow import CalibrationOutcome
     _make_fake_scan_workflow(interface, _LEFT, _RIGHT)
     interface.console.read_config = MagicMock(return_value=None)
-    captured = _capture_written(interface)
+    interface.write_calibration = MagicMock()
 
     r = _run_to_completion(interface, request_obj)   # masks 0xFF / 0xFF
 
-    assert r.passed and r.calibration_written
-    np.testing.assert_allclose(captured["c_max"], np.full((2, 8), 0.4))
+    assert r.outcome is CalibrationOutcome.ERROR
+    interface.write_calibration.assert_not_called()
 
 
 def test_run_reads_console_before_first_scan(interface, request_obj):

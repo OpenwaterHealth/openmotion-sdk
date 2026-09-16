@@ -525,22 +525,11 @@ class MotionInterface:
         """Validate inputs, write the calibration to the console EEPROM,
         then read it back into the cache. Returns the cached value.
 
-        If the write succeeds but the read-back fails, the values just
-        written are cached (``source="console"``) and the failure is
-        logged: the EEPROM holds them, and the cache must not fall back
-        to defaults or keep a validation-time override.
+        Raises if the write or the read-back fails (see
+        :meth:`refresh_calibration`).
         """
-        written = self.console.write_calibration(c_min, c_max, i_min, i_max)
-        try:
-            return self.refresh_calibration()
-        except Exception as e:
-            logger.warning(
-                "write_calibration: console write succeeded but the "
-                "read-back failed (%s); caching the values just written.",
-                e,
-            )
-            self.scan_workflow._install_calibration(written)
-            return written
+        self.console.write_calibration(c_min, c_max, i_min, i_max)
+        return self.refresh_calibration()
 
     def log_sensor_info(self, side: str) -> None:
         sensor = self.left if side == "left" else self.right if side == "right" else None

@@ -290,10 +290,10 @@ defaults and is filled from the console when the host calls
 `iface.log_console_info()` on console-connect (the bloodflow app does; a bare
 script must) or `iface.refresh_calibration()`, which raises if the console
 cannot be read. `iface.scan_workflow.set_realtime_calibration(...)` overrides
-the cache. The calibration workflow does not trust the cache for the cameras
-it is not measuring: it re-reads the console before the calibration scan, and
-a one-side run whose console read fails ends as ERROR with nothing written
-rather than writing SDK defaults over the other side's stored calibration.
+the cache. The calibration workflow does not trust the cache for the side it
+is not measuring: it re-reads the console before the calibration scan, and a
+run whose console read fails ends as ERROR with nothing written rather than
+writing SDK defaults over the other side's stored calibration.
 `CalibrationResult` / `CalibrationResultRow` / `CalibrationThresholds` describe
 the outcome and the pass/fail gates. `factory_calibration_thresholds()` is the
 canonical WI-00015/SPEC-69 acceptance set — start from it instead of writing
