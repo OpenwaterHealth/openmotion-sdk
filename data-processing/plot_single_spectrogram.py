@@ -3,6 +3,7 @@ import matplotlib.pyplot as plt
 
 CSV_FILE = "histogram.csv"
 NUM_BINS = 1024
+BIN_COLS = [str(i) for i in range(NUM_BINS)]
 CAMERA_ID = 0
 FRAME_ID_MAX = 256  # Since frame_id wraps around at 255 -> 0
 
@@ -40,7 +41,7 @@ def plot_camera_histograms(csv_path):
     cam_df = cam_df.sort_values(by="logical_frame_index")
 
     # Extract only the histogram bins (columns 2 to 2+1024)
-    histo_matrix = cam_df.iloc[:, 2:2 + NUM_BINS].to_numpy()
+    histo_matrix = cam_df[BIN_COLS].to_numpy()
     histo_matrix[:, -1] = 0  # Optional: zero out last bin for visualization
 
     # Plot spectrogram

@@ -5,6 +5,7 @@ import numpy as np
 CSV_FILE      = "histogram.csv"
 CAMERA_ID     = 0
 NUM_BINS      = 1024
+BIN_COLS = [str(i) for i in range(NUM_BINS)]
 FRAME_ID_MAX  = 256            # frame_id wraps 255 → 0
 
 
@@ -33,7 +34,7 @@ def plot_weighted_average(csv_path, cam_id):
                    .sort_values("logical_frame_index")
 
     # ---- Extract histogram bins ----
-    histo_matrix = cam_df.iloc[:, 2: 2 + NUM_BINS].to_numpy()
+    histo_matrix = cam_df[BIN_COLS].to_numpy()
     histo_matrix[:, -1] = 0                       # zero-out bin 1023
 
     frame_ids = cam_df['logical_frame_index'].to_numpy()
