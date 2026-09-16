@@ -472,34 +472,51 @@ class MotionInterface:
             self._load_calibration_from_console()
 
     def _load_calibration_from_console(self) -> None:
-        """Read calibration from the console and install it into ScanWorkflow.
+        """Best-effort connect-time load: read the console calibration into
+        the ScanWorkflow cache, or leave the cache untouched.
 
-        Best-effort: any failure is logged and the existing cache is kept.
-        Called automatically on console-connect via ``log_console_info``;
-        also exposed publicly via ``refresh_calibration``.
+        A failed read never downgrades the cache: a cache that already
+        holds the console's calibration keeps it, and a fresh cache stays
+        at SDK defaults. Runs when the host calls ``log_console_info`` on
+        console-connect (the SDK does not hook the CONNECTED transition
+        itself). Strict callers use :meth:`refresh_calibration`.
         """
         try:
-            cal = self.console.read_calibration()
+            self.refresh_calibration()
         except Exception as e:
             logger.warning(
                 "Could not load calibration from console: %s. "
                 "Keeping existing cached calibration (source=%s).",
                 e, self.scan_workflow._calibration.source,
             )
-            return
-        self.scan_workflow._install_calibration(cal)
 
     def refresh_calibration(self) -> Calibration:
         """Re-read calibration from the console and update the cache.
 
         Returns the resulting :class:`Calibration` (the same value
-        accessible via :meth:`get_calibration`).
+        accessible via :meth:`get_calibration`). ``source`` is
+        ``"console"`` for a stored block and ``"default"`` when the console
+        holds no usable block.
+
+        Raises when the console config cannot be read (UART not connected,
+        device error, undecodable payload); the cache is left untouched in
+        that case. The calibration workflow relies on this to refuse a
+        partial-mask run rather than write SDK defaults over the stored
+        values of the cameras it is not measuring.
         """
-        self._load_calibration_from_console()
-        return self.scan_workflow._calibration
+        cal = self.console.read_calibration()
+        self.scan_workflow._install_calibration(cal)
+        return cal
 
     def get_calibration(self) -> Calibration:
-        """Return the currently cached calibration."""
+        """Return the currently cached calibration.
+
+        This is a cache: SDK defaults until the console calibration is
+        loaded (``log_console_info`` / ``refresh_calibration``), or an
+        ``"override"`` installed via ``scan_workflow.set_realtime_calibration``.
+        Code that needs what the EEPROM actually holds must call
+        :meth:`refresh_calibration`.
+        """
         return self.scan_workflow._calibration
 
     def write_calibration(
@@ -507,9 +524,23 @@ class MotionInterface:
     ) -> Calibration:
         """Validate inputs, write the calibration to the console EEPROM,
         then read it back into the cache. Returns the cached value.
+
+        If the write succeeds but the read-back fails, the values just
+        written are cached (``source="console"``) and the failure is
+        logged: the EEPROM holds them, and the cache must not fall back
+        to defaults or keep a validation-time override.
         """
-        self.console.write_calibration(c_min, c_max, i_min, i_max)
-        return self.refresh_calibration()
+        written = self.console.write_calibration(c_min, c_max, i_min, i_max)
+        try:
+            return self.refresh_calibration()
+        except Exception as e:
+            logger.warning(
+                "write_calibration: console write succeeded but the "
+                "read-back failed (%s); caching the values just written.",
+                e,
+            )
+            self.scan_workflow._install_calibration(written)
+            return written
 
     def log_sensor_info(self, side: str) -> None:
         sensor = self.left if side == "left" else self.right if side == "right" else None

@@ -727,3 +727,96 @@ def test_real_nan_stats_still_fail_the_gate():
     assert len(rows) == 1
     assert math.isnan(rows[0].avg_contrast)
     assert rows[0].contrast_test == "FAIL"
+
+
+# ---------------------------------------------------------------------------
+# Partial-mask baseline (#117): cameras outside the request masks carry
+# their baseline row forward; only measured cameras get new values.
+# ---------------------------------------------------------------------------
+
+def _console_calibration():
+    """A stored calibration with rows that are distinguishable from both
+    the SDK defaults and anything the fake samples below would compute."""
+    import numpy as np
+    from omotion.Calibration import Calibration
+    return Calibration(
+        c_min=np.zeros((2, 8)),
+        c_max=np.array([[0.31] * 8, [0.37] * 8]),
+        i_min=np.zeros((2, 8)),
+        i_max=np.array([[222.0] * 8, [333.0] * 8]),
+        source="console",
+    )
+
+
+def test_has_inactive_cameras():
+    from omotion.CalibrationWorkflow import _has_inactive_cameras
+    assert _has_inactive_cameras(0xFF, 0xFF) is False
+    assert _has_inactive_cameras(0x00, 0xFF) is True     # right-only run
+    assert _has_inactive_cameras(0xFF, 0x00) is True     # left-only run
+    assert _has_inactive_cameras(0x66, 0xFF) is True     # sub-mask on one side
+    assert _has_inactive_cameras(0xFF, 0xFE) is True     # a single camera out
+
+
+def test_right_only_compute_carries_left_row_from_baseline():
+    """A right-only run must leave the left module's stored calibration
+    exactly as read from the console, and compute only the right row."""
+    import numpy as np
+    from omotion.CalibrationWorkflow import _compute_calibration_from_samples
+    from omotion.config import CALIBRATION_I_MAX_MULTIPLIER
+
+    samples = [
+        _light("right", cam, mean=200.0, contrast=0.4, frame_id=fid)
+        for cam in range(8) for fid in (10, 11)
+    ]
+    cal = _compute_calibration_from_samples(
+        samples, left_camera_mask=0x00, right_camera_mask=0xFF,
+        baseline=_console_calibration(),
+    )
+    np.testing.assert_array_equal(cal.c_max[0], np.full(8, 0.31))
+    np.testing.assert_array_equal(cal.i_max[0], np.full(8, 222.0))
+    np.testing.assert_allclose(cal.c_max[1], np.full(8, 0.4))
+    np.testing.assert_allclose(
+        cal.i_max[1], np.full(8, CALIBRATION_I_MAX_MULTIPLIER * 200.0))
+
+
+def test_sub_mask_compute_carries_unmeasured_cameras_from_baseline():
+    """Same rule within one module: cameras cleared in the mask keep the
+    baseline value, so a 0x66 run cannot reset cameras 1/4/5/8."""
+    import numpy as np
+    from omotion.CalibrationWorkflow import _compute_calibration_from_samples
+
+    mask = 0x66
+    samples = [
+        _light("left", cam, mean=200.0, contrast=0.4, frame_id=fid)
+        for cam in range(8) if mask & (1 << cam) for fid in (10, 11)
+    ]
+    cal = _compute_calibration_from_samples(
+        samples, left_camera_mask=mask, right_camera_mask=0x00,
+        baseline=_console_calibration(),
+    )
+    for cam in range(8):
+        if mask & (1 << cam):
+            assert cal.c_max[0, cam] == pytest.approx(0.4)
+        else:
+            assert cal.c_max[0, cam] == 0.31
+            assert cal.i_max[0, cam] == 222.0
+    np.testing.assert_array_equal(cal.c_max[1], np.full(8, 0.37))
+
+
+def test_compute_without_baseline_falls_back_to_sdk_defaults():
+    """No baseline means a never-calibrated console: the un-measured rows
+    are the SDK defaults, which is the documented fallback."""
+    import numpy as np
+    from omotion.Calibration import Calibration
+    from omotion.CalibrationWorkflow import _compute_calibration_from_samples
+
+    samples = [
+        _light("right", cam, mean=200.0, contrast=0.4, frame_id=10)
+        for cam in range(8)
+    ]
+    cal = _compute_calibration_from_samples(
+        samples, left_camera_mask=0x00, right_camera_mask=0xFF,
+    )
+    defaults = Calibration.default()
+    np.testing.assert_array_equal(cal.c_max[0], defaults.c_max[0])
+    np.testing.assert_array_equal(cal.i_max[0], defaults.i_max[0])

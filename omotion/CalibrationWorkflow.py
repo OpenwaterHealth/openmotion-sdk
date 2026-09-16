@@ -279,6 +279,15 @@ def _camera_active(mask: int, cam_id: int) -> bool:
     return bool(mask & (1 << cam_id))
 
 
+def _has_inactive_cameras(left_camera_mask: int, right_camera_mask: int) -> bool:
+    """True when at least one camera on either module is outside the
+    request masks. Those cameras are not measured by the run; the block
+    written in phase 6 carries their rows forward from the console's
+    current calibration (or SDK defaults on a never-calibrated console)."""
+    full = (1 << CAMS_PER_MODULE) - 1
+    return (left_camera_mask & full) != full or (right_camera_mask & full) != full
+
+
 def _compute_calibration_from_samples(
     samples: list[Sample],
     *,
@@ -1204,6 +1213,18 @@ class CalibrationWorkflow:
         ambient-dark check, which is never overridable and leaves the
         console untouched. A falsy return is the usual FAILED path.
 
+        **Cameras outside the request masks keep their stored values.**
+        The written block covers all 16 cameras, so a run restricted to one
+        side (or a sub-mask) carries the un-measured cameras' rows forward.
+        Their baseline is read fresh from the console before the
+        calibration scan — never taken from the SDK's in-memory cache, which
+        starts as SDK defaults and is only populated when the host calls
+        ``log_console_info``. If that read fails and any camera is outside
+        the masks, the run ends as ERROR before scanning and nothing is
+        written: the alternative was writing SDK defaults over the other
+        side's calibration. A console with no calibration block reads as
+        SDK defaults, and those are what gets carried forward.
+
         Returns False without starting when a run is already in flight, or
         when the request's thresholds cannot fail the pre-write gate and
         ``request.allow_ungated`` is not set (#256) — the refusal reason is
@@ -1259,6 +1280,7 @@ class CalibrationWorkflow:
             canceled = False
             timed_out = False
             prior_cal: Optional[Calibration] = None
+            baseline: Optional[Calibration] = None
             wrote_calibration = False
             applied_override = False
             override_granted = False
@@ -1410,6 +1432,54 @@ class CalibrationWorkflow:
                     error = "canceled after flash"
                     return
 
+                # ── Phase 0.5: read the console's current calibration ────
+                # Cameras outside the request masks are not measured; the
+                # block written in phase 6 carries their rows forward from
+                # this read. It is a fresh console read, not the SDK cache:
+                # the cache starts as SDK defaults and is only populated
+                # when the host calls log_console_info(), and a transient
+                # read failure used to reset it to defaults — either way a
+                # right-only run then overwrote the left module's stored
+                # calibration with defaults. Read before the scans so an
+                # unreadable console fails fast instead of after 16 s of
+                # scanning.
+                carry_forward = _has_inactive_cameras(
+                    request.left_camera_mask, request.right_camera_mask,
+                )
+                _emit_log("Calibration: reading current console calibration…")
+                try:
+                    baseline = self._interface.refresh_calibration()
+                except Exception as e:
+                    if carry_forward:
+                        error = (
+                            "could not read the console's current "
+                            f"calibration ({e}); refusing to run because "
+                            "cameras outside the request masks would be "
+                            "written with SDK defaults instead of their "
+                            "stored values"
+                        )
+                        logger.error("Calibration phase 0.5: %s", error)
+                        _emit_log(f"Calibration: ERROR — {error}.")
+                        return
+                    baseline = self._interface.get_calibration()
+                    logger.warning(
+                        "Calibration phase 0.5: console calibration read "
+                        "failed (%s); every camera is in the request masks "
+                        "so nothing is carried forward — continuing with "
+                        "the cached calibration (source=%s).",
+                        e, baseline.source,
+                    )
+                else:
+                    logger.info(
+                        "Calibration phase 0.5 done: baseline for cameras "
+                        "outside the request masks is %s%s.",
+                        "the console's stored calibration"
+                        if baseline.source == "console"
+                        else "SDK defaults (no calibration block on the console)",
+                        "" if carry_forward
+                        else " (unused: every camera is in the request masks)",
+                    )
+
                 _emit_progress("calibration_scan")
                 _emit_log("Calibration: starting calibration scan…")
                 logger.info(
@@ -1454,19 +1524,17 @@ class CalibrationWorkflow:
                 _emit_progress("compute_calibration")
                 _emit_log("Calibration: computing arrays…")
                 logger.info("Calibration phase 2: computing (2, 8) arrays.")
-                # Issue #117: pass the currently-cached calibration as
-                # ``baseline`` so inactive cameras (those excluded by a
-                # left-only / right-only mask) keep their on-device
-                # values instead of falling back to SDK defaults at
-                # write time. The cache is refreshed after every
-                # write_calibration, so it reflects what's actually on
-                # the console EEPROM.
+                # Issue #117: inactive cameras (those excluded by a
+                # left-only / right-only mask, or a sub-mask) keep their
+                # on-device values instead of falling back to SDK defaults
+                # at write time. ``baseline`` is the fresh console read
+                # from phase 0.5, not the SDK cache.
                 try:
                     cal_obj = _compute_calibration_from_samples(
                         cal_samples,
                         left_camera_mask=request.left_camera_mask,
                         right_camera_mask=request.right_camera_mask,
-                        baseline=self._interface.get_calibration(),
+                        baseline=baseline,
                     )
                 except DegenerateCalibrationError as e:
                     error = str(e)
