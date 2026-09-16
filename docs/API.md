@@ -292,7 +292,7 @@ script must) or `iface.refresh_calibration()`, which raises if the console
 cannot be read. `iface.scan_workflow.set_realtime_calibration(...)` overrides
 the cache. The calibration workflow does not trust the cache for the cameras
 it is not measuring: it re-reads the console before the calibration scan, and
-a partial-mask run whose console read fails ends as ERROR with nothing written
+a one-side run whose console read fails ends as ERROR with nothing written
 rather than writing SDK defaults over the other side's stored calibration.
 `CalibrationResult` / `CalibrationResultRow` / `CalibrationThresholds` describe
 the outcome and the pass/fail gates. `factory_calibration_thresholds()` is the

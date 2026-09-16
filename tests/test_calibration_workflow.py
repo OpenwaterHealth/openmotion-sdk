@@ -680,11 +680,11 @@ def test_gate_failure_skips_validation_scan(interface, request_obj):
 
 
 # ---------------------------------------------------------------------------
-# Partial-mask runs carry the un-measured cameras forward from a FRESH
-# console read, never from the SDK cache (#117 follow-up: a right-only run
-# was writing SDK defaults over the left module's stored calibration
-# whenever the cache had not been loaded from the console, or had been
-# reset to defaults by a transient read failure).
+# One-side runs carry the other side forward from a FRESH console read,
+# never from the SDK cache (#281: a right-only run was writing SDK
+# defaults over the left module's stored calibration whenever the cache
+# had not been loaded from the console, or had been reset to defaults by
+# a transient read failure).
 # ---------------------------------------------------------------------------
 
 def _right_only(request_obj):
@@ -769,8 +769,8 @@ def test_right_only_run_on_never_calibrated_console_carries_sdk_defaults(
 def test_right_only_run_refuses_when_console_calibration_unreadable(
     interface, request_obj,
 ):
-    """If the console cannot be read, a partial run must not guess: it ends
-    as ERROR before any scan and writes nothing — the alternative was
+    """If the console cannot be read, a one-side run must not guess: it
+    ends as ERROR before any scan and writes nothing — the alternative was
     writing SDK defaults over the left module's stored calibration."""
     from omotion.CalibrationWorkflow import CalibrationOutcome
     _make_fake_scan_workflow(interface, _LEFT, _RIGHT)
@@ -795,8 +795,8 @@ def test_right_only_run_refuses_when_console_calibration_unreadable(
 def test_full_mask_run_tolerates_unreadable_console_calibration(
     interface, request_obj,
 ):
-    """With every camera in the masks nothing is carried forward, so an
-    unreadable console is a warning, not a refusal; the run proceeds."""
+    """With both masks 0xFF nothing is carried forward, so an unreadable
+    console is a warning, not a refusal; the run proceeds."""
     _make_fake_scan_workflow(interface, _LEFT, _RIGHT)
     interface.console.read_config = MagicMock(return_value=None)
     captured = _capture_written(interface)

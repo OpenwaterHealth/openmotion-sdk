@@ -279,15 +279,6 @@ def _camera_active(mask: int, cam_id: int) -> bool:
     return bool(mask & (1 << cam_id))
 
 
-def _has_inactive_cameras(left_camera_mask: int, right_camera_mask: int) -> bool:
-    """True when at least one camera on either module is outside the
-    request masks. Those cameras are not measured by the run; the block
-    written in phase 6 carries their rows forward from the console's
-    current calibration (or SDK defaults on a never-calibrated console)."""
-    full = (1 << CAMS_PER_MODULE) - 1
-    return (left_camera_mask & full) != full or (right_camera_mask & full) != full
-
-
 def _compute_calibration_from_samples(
     samples: list[Sample],
     *,
@@ -1213,17 +1204,17 @@ class CalibrationWorkflow:
         ambient-dark check, which is never overridable and leaves the
         console untouched. A falsy return is the usual FAILED path.
 
-        **Cameras outside the request masks keep their stored values.**
-        The written block covers all 16 cameras, so a run restricted to one
-        side (or a sub-mask) carries the un-measured cameras' rows forward.
-        Their baseline is read fresh from the console before the
-        calibration scan — never taken from the SDK's in-memory cache, which
-        starts as SDK defaults and is only populated when the host calls
-        ``log_console_info``. If that read fails and any camera is outside
-        the masks, the run ends as ERROR before scanning and nothing is
-        written: the alternative was writing SDK defaults over the other
-        side's calibration. A console with no calibration block reads as
-        SDK defaults, and those are what gets carried forward.
+        **A side that is not being calibrated keeps its stored values.**
+        The written block covers both modules, so a one-side run (mask 0x00
+        on the other side) carries that side's row forward. Its baseline is
+        read fresh from the console before the calibration scan — never
+        taken from the SDK's in-memory cache, which starts as SDK defaults
+        and is only populated when the host calls ``log_console_info``. If
+        that read fails and either mask is not 0xFF, the run ends as ERROR
+        before scanning and nothing is written: the alternative was writing
+        SDK defaults over the other side's calibration. A console with no
+        calibration block reads as SDK defaults, and those are what gets
+        carried forward.
 
         Returns False without starting when a run is already in flight, or
         when the request's thresholds cannot fail the pre-write gate and
@@ -1433,18 +1424,21 @@ class CalibrationWorkflow:
                     return
 
                 # ── Phase 0.5: read the console's current calibration ────
-                # Cameras outside the request masks are not measured; the
-                # block written in phase 6 carries their rows forward from
-                # this read. It is a fresh console read, not the SDK cache:
-                # the cache starts as SDK defaults and is only populated
-                # when the host calls log_console_info(), and a transient
-                # read failure used to reset it to defaults — either way a
-                # right-only run then overwrote the left module's stored
-                # calibration with defaults. Read before the scans so an
-                # unreadable console fails fast instead of after 16 s of
-                # scanning.
-                carry_forward = _has_inactive_cameras(
-                    request.left_camera_mask, request.right_camera_mask,
+                # A side that is not being calibrated (mask 0x00) keeps its
+                # stored row: the block written in phase 6 carries it
+                # forward from this read. It is a fresh console read, not
+                # the SDK cache: the cache starts as SDK defaults and is
+                # only populated when the host calls log_console_info(),
+                # and a transient read failure used to reset it to defaults
+                # — either way a right-only run then overwrote the left
+                # module's stored calibration with defaults. Read before
+                # the scans so an unreadable console fails fast instead of
+                # after 16 s of scanning. Calibration always runs all 8
+                # cameras of a side at once, so "a side is carried forward"
+                # is simply "a mask is not 0xFF".
+                carry_forward = (
+                    request.left_camera_mask != 0xFF
+                    or request.right_camera_mask != 0xFF
                 )
                 _emit_log("Calibration: reading current console calibration…")
                 try:
@@ -1454,8 +1448,8 @@ class CalibrationWorkflow:
                         error = (
                             "could not read the console's current "
                             f"calibration ({e}); refusing to run because "
-                            "cameras outside the request masks would be "
-                            "written with SDK defaults instead of their "
+                            "the side not being calibrated would be "
+                            "written with SDK defaults instead of its "
                             "stored values"
                         )
                         logger.error("Calibration phase 0.5: %s", error)
@@ -1464,20 +1458,20 @@ class CalibrationWorkflow:
                     baseline = self._interface.get_calibration()
                     logger.warning(
                         "Calibration phase 0.5: console calibration read "
-                        "failed (%s); every camera is in the request masks "
-                        "so nothing is carried forward — continuing with "
-                        "the cached calibration (source=%s).",
+                        "failed (%s); both sides are being calibrated so "
+                        "nothing is carried forward — continuing with the "
+                        "cached calibration (source=%s).",
                         e, baseline.source,
                     )
                 else:
                     logger.info(
-                        "Calibration phase 0.5 done: baseline for cameras "
-                        "outside the request masks is %s%s.",
+                        "Calibration phase 0.5 done: baseline for a side "
+                        "not being calibrated is %s%s.",
                         "the console's stored calibration"
                         if baseline.source == "console"
                         else "SDK defaults (no calibration block on the console)",
                         "" if carry_forward
-                        else " (unused: every camera is in the request masks)",
+                        else " (unused: both sides are being calibrated)",
                     )
 
                 _emit_progress("calibration_scan")
@@ -1525,10 +1519,10 @@ class CalibrationWorkflow:
                 _emit_log("Calibration: computing arrays…")
                 logger.info("Calibration phase 2: computing (2, 8) arrays.")
                 # Issue #117: inactive cameras (those excluded by a
-                # left-only / right-only mask, or a sub-mask) keep their
-                # on-device values instead of falling back to SDK defaults
-                # at write time. ``baseline`` is the fresh console read
-                # from phase 0.5, not the SDK cache.
+                # left-only / right-only mask) keep their on-device values
+                # instead of falling back to SDK defaults at write time.
+                # ``baseline`` is the fresh console read from phase 0.5,
+                # not the SDK cache.
                 try:
                     cal_obj = _compute_calibration_from_samples(
                         cal_samples,
