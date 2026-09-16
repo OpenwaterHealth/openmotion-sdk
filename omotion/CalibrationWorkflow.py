@@ -1204,6 +1204,17 @@ class CalibrationWorkflow:
         ambient-dark check, which is never overridable and leaves the
         console untouched. A falsy return is the usual FAILED path.
 
+        **A side that is not being calibrated keeps its stored values.**
+        The written block covers both modules, so a one-side run (mask 0x00
+        on the other side) carries that side's row forward. Its baseline is
+        read fresh from the console before the calibration scan — never
+        taken from the SDK's in-memory cache, which starts as SDK defaults
+        and is only populated when the host calls ``log_console_info``
+        (#281: the WI-15 script runs each side in a fresh process). If that
+        read fails the run ends as ERROR before scanning and nothing is
+        written. A console with no calibration block reads as SDK defaults,
+        and those are what gets carried forward.
+
         Returns False without starting when a run is already in flight, or
         when the request's thresholds cannot fail the pre-write gate and
         ``request.allow_ungated`` is not set (#256) — the refusal reason is
@@ -1259,6 +1270,7 @@ class CalibrationWorkflow:
             canceled = False
             timed_out = False
             prior_cal: Optional[Calibration] = None
+            baseline: Optional[Calibration] = None
             wrote_calibration = False
             applied_override = False
             override_granted = False
@@ -1410,6 +1422,23 @@ class CalibrationWorkflow:
                     error = "canceled after flash"
                     return
 
+                # ── Phase 0.5: read the console's current calibration ────
+                # The side not being calibrated (mask 0x00) keeps its stored
+                # row: the block written in phase 6 carries it forward from
+                # this read. Read the console, never the SDK cache: the
+                # cache starts as SDK defaults and is only populated when
+                # the host calls log_console_info(), so a right-only run in
+                # a fresh process (the WI-15 script) overwrote the left
+                # module's stored calibration with defaults (#281). A
+                # failed read raises out of the worker — outcome ERROR,
+                # nothing scanned, nothing written — rather than guessing.
+                _emit_log("Calibration: reading current console calibration…")
+                baseline = self._interface.refresh_calibration()
+                logger.info(
+                    "Calibration phase 0.5 done: console calibration read "
+                    "(source=%s).", baseline.source,
+                )
+
                 _emit_progress("calibration_scan")
                 _emit_log("Calibration: starting calibration scan…")
                 logger.info(
@@ -1454,19 +1483,17 @@ class CalibrationWorkflow:
                 _emit_progress("compute_calibration")
                 _emit_log("Calibration: computing arrays…")
                 logger.info("Calibration phase 2: computing (2, 8) arrays.")
-                # Issue #117: pass the currently-cached calibration as
-                # ``baseline`` so inactive cameras (those excluded by a
-                # left-only / right-only mask) keep their on-device
-                # values instead of falling back to SDK defaults at
-                # write time. The cache is refreshed after every
-                # write_calibration, so it reflects what's actually on
-                # the console EEPROM.
+                # Issue #117: inactive cameras (those excluded by a
+                # left-only / right-only mask) keep their on-device values
+                # instead of falling back to SDK defaults at write time.
+                # ``baseline`` is the fresh console read from phase 0.5,
+                # not the SDK cache.
                 try:
                     cal_obj = _compute_calibration_from_samples(
                         cal_samples,
                         left_camera_mask=request.left_camera_mask,
                         right_camera_mask=request.right_camera_mask,
-                        baseline=self._interface.get_calibration(),
+                        baseline=baseline,
                     )
                 except DegenerateCalibrationError as e:
                     error = str(e)
