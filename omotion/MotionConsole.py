@@ -393,11 +393,17 @@ class MotionConsole(SignalWrapper):
             logger.error("Unexpected error during %s: %s", method_name, e)
 
     def _drive_disconnecting(self, reason: str) -> None:
-        self._set_state(ConnectionState.DISCONNECTING, reason=reason)
+        # Stop the telemetry poller BEFORE leaving CONNECTED. Its poll
+        # thread may be mid-command; stop() joins it, so the in-flight
+        # command completes over the still-open UART. Flipping the state
+        # first made that command trip the ``is_connected()`` guard and
+        # log "ValueError: Console controller not connected" at ERROR on
+        # every ordinary teardown (#128).
         try:
             self.telemetry.stop()
         except Exception:
             logger.exception("telemetry stop failed")
+        self._set_state(ConnectionState.DISCONNECTING, reason=reason)
         try:
             self.uart.close()
         except Exception:
@@ -1546,7 +1552,7 @@ class MotionConsole(SignalWrapper):
                 return 0
 
         except ValueError as v:
-            logger.error("ValueError: %s", v)
+            self._log_command_error("get_lsync_pulsecount", v)
             raise  # Re-raise the exception for the caller to handle
 
         except Exception as e:
@@ -2131,7 +2137,7 @@ class MotionConsole(SignalWrapper):
             return pdu
 
         except ValueError as v:
-            logger.error("ValueError: %s", v)
+            self._log_command_error("read_pdu_mon", v)
             raise  # Re-raise the exception for the caller to handle
 
         except Exception as e:
