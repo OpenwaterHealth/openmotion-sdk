@@ -2,15 +2,21 @@
 download, and a thin DFU flash orchestrator. UI-agnostic (no Qt)."""
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Iterable
 
+from omotion import _log_root
 from omotion.GitHubReleases import GitHubReleases
 from omotion.DFUProgrammer import DFUProgrammer, DFUProgress, DFUResult
 from omotion.boot_mode import BootMode, flash_address_for
+
+logger = logging.getLogger(
+    f"{_log_root}.firmware_update" if _log_root else "firmware_update"
+)
 
 # ---------------------------------------------------------------------------
 # Version parsing
@@ -401,16 +407,33 @@ class FirmwareUpdater:
             raise FirmwareUpdateError("DFU device did not appear after enter_dfu()")
 
         mode = self._dfu.detect_boot_mode()
+        # Report what was actually observed, not what we fall back to below --
+        # callers (and the apps' lock indicator) must not read a guess as fact.
         self.last_boot_mode = mode
+
+        effective = mode
         if mode is BootMode.UNKNOWN:
-            raise FirmwareUpdateError(
-                "could not tell whether this device has the bootloader installed; "
-                "refusing to flash, because the wrong address would brick it"
+            # Refusing here strands any device we cannot classify, and a device
+            # that cannot be flashed is worse than one flashed on a safe
+            # assumption. Bare metal IS the safe assumption, because it is
+            # enforced by the hardware rather than by this guess: both
+            # bootloaders clamp their DFU write window to the application slot
+            # and mark sector 0 read-only, so a bare-metal write at 0x08000000
+            # against a bootloader unit is rejected by the bootloader and fails
+            # loudly. The opposite default has no such backstop -- a signed
+            # image at 0x08020000 writes happily into the middle of a bare-metal
+            # device and leaves it unbootable.
+            effective = BootMode.BARE_METAL
+            logger.warning(
+                "could not classify this device from its DFU alt settings; "
+                "proceeding as bare metal (%s). If it does have the bootloader "
+                "installed, the write is rejected rather than applied.",
+                flash_address_for(effective),
             )
 
-        target = self._select_image(bin_path, mode)
+        target = self._select_image(bin_path, effective)
         return self._dfu.flash_bin(
-            target, address=flash_address_for(mode), progress=progress_cb
+            target, address=flash_address_for(effective), progress=progress_cb
         )
 
     def _select_image(self, bin_path: Path, mode: BootMode) -> Path:

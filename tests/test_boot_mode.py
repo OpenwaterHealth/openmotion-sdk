@@ -63,10 +63,69 @@ def test_option_bytes_alt_wins_even_if_flash_alt_looks_locked():
     assert parse_boot_mode(weird) is BootMode.BARE_METAL
 
 
-def test_single_fully_writable_alt_is_unknown_not_bootloader():
-    """One alt with no read-only run is not openmotion-bl. Refuse to guess
-    rather than mis-detect and write to the wrong address."""
+def test_single_fully_writable_alt_is_bare_metal():
+    """A fully-writable flash descriptor is decisive for the ROM loader.
+
+    Both bootloaders hard-code their descriptor and both always mark sector 0
+    (the bootloader itself) plus the reserved/config region read-only — that
+    clamp is the security property they exist to enforce:
+
+        openmotion-bl        01*128Ka,04*128Kg,11*128Ka
+        open-motion-console-bl  01*128Ka,08*128Kg,07*128Ka
+
+    So an Internal Flash alt at 0x08000000 with *no* read-only run cannot be an
+    openmotion bootloader. This used to report UNKNOWN, which made a bare-metal
+    unit unflashable whenever dfu-util listed only the Internal Flash alt
+    (openmotion-sdk#197).
+    """
     listing = BL_LISTING.replace("01*128Ka,04*128Kg,11*128Ka", "16*128Kg")
+    assert parse_boot_mode(listing) is BootMode.BARE_METAL
+
+
+def test_console_bootloader_listing_is_bootloader():
+    """The console bootloader has a bigger app slot than the sensor one, but the
+    same read-only clamp, so it must still classify as BOOTLOADER."""
+    listing = BL_LISTING.replace("01*128Ka,04*128Kg,11*128Ka",
+                                 "01*128Ka,08*128Kg,07*128Ka")
+    assert parse_boot_mode(listing) is BootMode.BOOTLOADER
+
+
+# Exactly what a bench console in the ST ROM loader produced (2 alts, not the 4
+# the ROM loader is often documented as exposing) — the case from #197.
+ROM_TWO_ALT_LISTING = """dfu-util 0.11
+
+Copyright 2005-2009 Weston Schmidt, Harald Welte and OpenMoko Inc.
+
+Found DFU: [0483:df11] ver=0200, devnum=54, cfg=1, intf=0, path="2-1.1.1", alt=1, name="@Option Bytes   /0x5200201C/01*128 e", serial="200364500000"
+Found DFU: [0483:df11] ver=0200, devnum=54, cfg=1, intf=0, path="2-1.1.1", alt=0, name="@Internal Flash   /0x08000000/16*128Kg", serial="200364500000"
+"""
+
+
+def test_observed_two_alt_rom_listing_is_bare_metal():
+    assert parse_boot_mode(ROM_TWO_ALT_LISTING) is BootMode.BARE_METAL
+
+
+def test_internal_flash_alt_alone_is_bare_metal():
+    """The regression from #197: drop the Option Bytes alt and the remaining
+    Internal Flash alt must still classify, or the unit cannot be updated."""
+    only_flash = "\n".join(
+        line for line in ROM_TWO_ALT_LISTING.splitlines()
+        if "Option Bytes" not in line
+    )
+    assert parse_boot_mode(only_flash) is BootMode.BARE_METAL
+
+
+def test_internal_flash_alt_with_no_parseable_runs_is_unknown():
+    """No access letters at all is still not evidence of anything."""
+    listing = BL_LISTING.replace("01*128Ka,04*128Kg,11*128Ka", "wharrgarbl")
+    assert parse_boot_mode(listing) is BootMode.UNKNOWN
+
+
+def test_writable_alt_at_a_different_address_is_unknown():
+    """The bare-metal call is anchored to Internal Flash at 0x08000000. A
+    writable descriptor somewhere else is not a device we recognise."""
+    listing = BL_LISTING.replace("0x08000000/01*128Ka,04*128Kg,11*128Ka",
+                                 "0x90000000/16*128Kg")
     assert parse_boot_mode(listing) is BootMode.UNKNOWN
 
 
