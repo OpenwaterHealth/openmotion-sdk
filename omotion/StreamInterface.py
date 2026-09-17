@@ -1,5 +1,6 @@
 import logging
 import queue
+import struct
 import time
 import usb.core
 import usb.util

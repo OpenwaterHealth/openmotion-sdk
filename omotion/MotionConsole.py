@@ -1016,7 +1016,7 @@ class MotionConsole(SignalWrapper):
         Returns:
             tuple[bytes, int]: The received data and its length, None if failed
         """
-        """Validate MUX index and channel parameters"""
+        # Validate MUX index and channel parameters.
         if mux_index not in (0, 1):
             raise ValueError(f"Invalid mux_index {mux_index}. Must be 0 or 1")
         if channel < 0 or channel > 7:
@@ -1052,7 +1052,8 @@ class MotionConsole(SignalWrapper):
             # The underlying error is already logged by MotionUart.send_packet()
             # Only log here if we want additional context about the I2C operation
             logger.debug(
-                f"I2C read operation failed (underlying error logged by UART layer): {str(e)}"
+                "I2C read operation failed (underlying error logged by UART layer): %s",
+                e,
             )
             return None, None
 
@@ -1072,7 +1073,7 @@ class MotionConsole(SignalWrapper):
         Returns:
             bool: True if write succeeded, False otherwise
         """
-        """Validate MUX index and channel parameters"""
+        # Validate MUX index and channel parameters.
         if mux_index not in (0, 1):
             raise ValueError(f"Invalid mux_index {mux_index}. Must be 0 or 1")
         if channel < 0 or channel > 7:
@@ -1102,7 +1103,7 @@ class MotionConsole(SignalWrapper):
                 return True
 
         except Exception as e:
-            print(f"I2C Write failed: {str(e)}")
+            logger.error("I2C Write failed: %s", e)
             return False
 
     def set_fan_speed(self, fan_speed: int = 50) -> int:
@@ -1557,6 +1558,7 @@ class MotionConsole(SignalWrapper):
 
         except Exception as e:
             self._log_command_error("get_lsync_pulsecount", e)
+            raise  # Re-raise the exception for the caller to handle
 
     def get_system_odometer_minutes(self) -> Optional[int]:
         """Cumulative console uptime in minutes, persisted in flash.
@@ -1951,7 +1953,7 @@ class MotionConsole(SignalWrapper):
         try:
             # Demo mode mock
             if getattr(self.uart, "demo_mode", False):
-                return (1.0, 0.5, 0.5, 25.0, True)
+                return ("1.000000", "0.500000", "0.500000", "25.000000", True)
 
             if not self.is_connected():
                 raise ValueError("Motion Console not connected")
@@ -2121,7 +2123,7 @@ class MotionConsole(SignalWrapper):
                 id=None, packetType=OW_CONTROLLER, command=OW_CTRL_PDUMON, data=None
             )
             self.uart.clear_buffer()
-            r.print_packet()
+            # r.print_packet()
             if r.packetType == OW_ERROR:
                 logger.error("Error retrieving PDU MON data")
                 return None
@@ -2869,7 +2871,7 @@ class MotionConsole(SignalWrapper):
                 raise CommandError("FPGA_PROG_UFM_READ_PAGE failed", response=r)
 
             if len(r.data) != XO2_FLASH_PAGE_SIZE:
-                raise ValueError(
+                raise CommandError(
                     f"UFM read page returned {len(r.data)} bytes, expected {XO2_FLASH_PAGE_SIZE}",
                     response=r,
                 )
@@ -2904,7 +2906,7 @@ class MotionConsole(SignalWrapper):
         try:
             if getattr(self.uart, "demo_mode", False):
                 logger.info("Demo mode: simulating fpga read status")
-                return None
+                return 0
 
             if not self.uart or not self.is_connected():
                 raise ValueError("Console Device not connected")
@@ -2925,7 +2927,7 @@ class MotionConsole(SignalWrapper):
                 raise CommandError("FPGA_PROG_READ_STATUS failed", response=r)
 
             if len(r.data) != 4:
-                raise ValueError(
+                raise CommandError(
                     f"READ_STATUS returned {len(r.data)} bytes, expected 4",
                     response=r,
                 )
