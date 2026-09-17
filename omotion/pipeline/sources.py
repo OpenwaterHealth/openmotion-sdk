@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import csv
 import logging
+import math
 import queue
 import threading
 import time
@@ -20,11 +21,37 @@ from typing import Any, Iterator, Optional, Protocol, runtime_checkable
 
 import numpy as np
 
+from omotion.config import CAPTURE_HZ
 from .batch import FrameBatch
 from .sinks import ScanMetadata
 
 
 logger = logging.getLogger("openmotion.sdk.pipeline.sources")
+
+# How long a downstream stall (a slow sink, a GC pause, a pipeline CPU spike)
+# the host should absorb before the USB reader is starved and the sensor
+# firmware's 4-deep (~100 ms) histo queue overflows. The batch queue default
+# is sized to hold this many seconds of DATA so the stall is buffered here
+# instead of backpressuring dev.read. See the 2026-06 long-scan soak.
+_TARGET_BUFFER_SECONDS = 3.0
+
+# Cameras per fully-populated sensor module (the sizing worst case when the
+# caller doesn't pass the actual active-camera count).
+_CAMERAS_PER_SIDE = 8
+
+
+def batch_queue_depth_for(seconds: float, active_cameras: int,
+                          batch_size_frames: int) -> int:
+    """Batch-queue depth that buffers ``seconds`` of parsed data.
+
+    A batch ROW is one per-camera histogram sample (parse_histogram_stream
+    fires on_row once per camera per capture), so the row rate is
+    CAPTURE_HZ x active_cameras — NOT CAPTURE_HZ. At 40 Hz with 16 active
+    cameras that is 640 rows/s: ~64 ten-row batches per second into the
+    shared queue.
+    """
+    rows_per_s = CAPTURE_HZ * max(1, int(active_cameras))
+    return math.ceil(seconds * rows_per_s / max(1, int(batch_size_frames)))
 
 
 @runtime_checkable
@@ -215,6 +242,8 @@ class LiveUsbSource(_BaseSource):
                  batch_size_frames: int = 10,
                  flush_interval_s: float = 0.25,
                  packet_queue_size: int = 64,
+                 batch_queue_size: Optional[int] = None,
+                 active_cameras: Optional[int] = None,
                  metadata: ScanMetadata):
         super().__init__(metadata=metadata)
         self._console = console
@@ -225,7 +254,27 @@ class LiveUsbSource(_BaseSource):
             side: queue.Queue(maxsize=packet_queue_size)
             for side, sensor in self._sensors.items() if sensor is not None
         }
-        self._batch_queue: queue.Queue = queue.Queue(maxsize=4)
+        # Parsed-batch buffer between the per-side reader threads and the
+        # runner. Was a hardcoded 4 (only ~60 ms at the dual-sensor full-mask
+        # row rate of 640 rows/s); a transient runner stall (sink fsync, GC)
+        # filled it and backpressured the parser -> dev.read -> the firmware's
+        # 4-deep histo queue overflowed and dropped frames. Default it to
+        # ~_TARGET_BUFFER_SECONDS of data at the ACTIVE-CAMERA row rate (a
+        # row is one per-camera sample, not one 40 Hz capture — see
+        # batch_queue_depth_for), worst-casing 8 cameras per connected side
+        # when the caller doesn't pass the mask popcount. Memory note: each
+        # buffered batch holds a dense (batch_size, 2, 8, 1024) uint32 array
+        # (~0.66 MB at the default 10), so the full 3 s budget can pin
+        # ~125 MB transiently during a worst-case dual-sensor stall — bounded
+        # and released as the runner drains.
+        if batch_queue_size is None:
+            if active_cameras is None:
+                sides = sum(1 for s in self._sensors.values() if s is not None)
+                active_cameras = _CAMERAS_PER_SIDE * max(1, sides)
+            batch_queue_size = batch_queue_depth_for(
+                _TARGET_BUFFER_SECONDS, active_cameras, self._batch_size,
+            )
+        self._batch_queue: queue.Queue = queue.Queue(maxsize=max(1, int(batch_queue_size)))
         self._stop = threading.Event()
         self._reader_threads: list[threading.Thread] = []
 

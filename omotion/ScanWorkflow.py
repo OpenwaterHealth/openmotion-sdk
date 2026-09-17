@@ -400,6 +400,7 @@ class ScanWorkflow:
         from omotion.pipeline.sinks import (
             CsvSink as PipelineCsvSink, DiagnosticsLogSink, ScanDBSink, ScanMetadata,
         )
+        from omotion.pipeline.async_sink import AsyncSink
         from omotion.pipeline.pedestal import SensorPedestals, pedestal_for_fw
 
         # Clear the prior scan's outcome up front so a refusal below (busy, or
@@ -502,8 +503,12 @@ class ScanWorkflow:
                     True if scan_db_path is None
                     else bool(request.write_corrected_csv)
                 )
+                # AsyncSink: run the CSV writes on a worker thread so a disk
+                # flush can't stall the runner's USB-drain loop and overflow
+                # the firmware histo queue (2026-06 soak root-cause).
                 default_sinks.append(
-                    PipelineCsvSink(output_dir=data_dir, write_corrected=write_corrected)
+                    AsyncSink(PipelineCsvSink(output_dir=data_dir,
+                                              write_corrected=write_corrected))
                 )
             if scan_db_path is not None:
                 # Pre-flight the scan DB before the laser fires. The DB is the
@@ -536,7 +541,11 @@ class ScanWorkflow:
                     with self._lock:
                         self._running = False
                     return False
-                default_sinks.append(ScanDBSink(db_path=scan_db_path))
+                # AsyncSink: keep the SQLite commit/fsync off the USB-drain
+                # thread. AsyncSink mirrors `critical`, so a DB on_scan_start
+                # failure still aborts the scan (and the pre-flight above
+                # already caught the common case with the laser off).
+                default_sinks.append(AsyncSink(ScanDBSink(db_path=scan_db_path)))
             # Telemetry CSV: per-scan snapshots from ConsoleTelemetryPoller.
             # Not a pipeline sink — the poller is its own daemon thread that
             # predates the sink-based architecture, so we register a listener
@@ -594,11 +603,21 @@ class ScanWorkflow:
         def _live_sensor(sensor, mask: int):
             return sensor if (int(mask) != 0 and sensor.is_connected()) else None
 
+        live_left = _live_sensor(self._interface.left, request.left_camera_mask)
+        live_right = _live_sensor(self._interface.right, request.right_camera_mask)
+        # Active-camera count sizes the source's batch queue: a batch row is
+        # one per-camera sample, so the data rate scales with the mask
+        # popcounts of the sides that actually stream, not just CAPTURE_HZ.
+        active_cameras = (
+            (bin(request.left_camera_mask).count("1") if live_left else 0)
+            + (bin(request.right_camera_mask).count("1") if live_right else 0)
+        )
         source = LiveUsbSource(
             console=self._interface.console,
-            left=_live_sensor(self._interface.left, request.left_camera_mask),
-            right=_live_sensor(self._interface.right, request.right_camera_mask),
+            left=live_left,
+            right=live_right,
             batch_size_frames=request.batch_size_frames or 10,
+            active_cameras=active_cameras or None,
             metadata=meta,
         )
         self._runner = ScanRunner(

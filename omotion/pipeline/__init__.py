@@ -36,6 +36,7 @@ from .runner import ScanRunner, CriticalSinkError
 from .factory import default_pipeline
 from .pedestal import SensorPedestals
 from .sinks import Sink, ScanMetadata, CsvSink, ScanDBSink, DiagnosticsLogSink
+from .async_sink import AsyncSink
 from .sources import Source, LiveUsbSource, CsvReplaySource
 from .telemetry import (
     TelemetryAggregator, TelemetryFeeder, TelemetryIngestStage, TelemetrySample,
@@ -51,7 +52,7 @@ __all__ = [
     "default_pipeline",
     "SensorPedestals",
     "Sink", "ScanMetadata",
-    "CsvSink", "ScanDBSink", "DiagnosticsLogSink",
+    "CsvSink", "ScanDBSink", "DiagnosticsLogSink", "AsyncSink",
     "Source", "LiveUsbSource", "CsvReplaySource",
     "TelemetryAggregator", "TelemetryFeeder", "TelemetryIngestStage",
     "TelemetrySample",
