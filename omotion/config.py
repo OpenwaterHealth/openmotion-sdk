@@ -343,6 +343,79 @@ DEFAULT_TRIGGER_CONFIG: dict = {
 }
 
 
+#: Capture rates the full stack supports (app config validation, sensor
+#: firmware FSIN generator, laser-safety scaling all key off this). 40 is
+#: the validated clinical rate; 60 is experimental (sdk#129).
+SUPPORTED_CAPTURE_RATES_HZ: tuple = (40, 60)
+
+
+def trigger_overrides_for_rate(rate_hz: float) -> dict:
+    """Trigger-config overrides for a non-default capture rate (sdk#129).
+
+    Scales the dark-frame pulse displacement (``LaserPulseSkipDelayUsec``)
+    with the period so the shortened inter-pulse interval on the frame after
+    a dark keeps the same proportional distance from the laser-safety
+    ``RATE_LL`` floor (which :func:`omotion.laser.apply_laser_power` scales
+    the same way). At 40 Hz the post-dark interval is 25000-1800 = 23200 us
+    vs a 22500 us floor; an unscaled 1800 us displacement at 60 Hz would be
+    16667-1800 = 14867 us vs a 15000 us floor — an interlock trip on every
+    dark frame. Scaled (1200 us at 60 Hz) the margin stays ~3%, and the
+    displaced pulse still lands well past the camera exposure window
+    (648 us), preserving the dark.
+
+    ``LaserPulseDelayUsec`` tracks the camera's exposed-row band, which
+    drifts to ~8.4 ms after FSIN at the 60 Hz VTS (the sensor's FSIN sync
+    latches a config-time-VTS-derived row-counter init). KNOWN LIMITATION
+    (sensor-fw#68, bench-proven): at this position the pulse fires inside
+    the FPGA SPI push window and its driver transient can glitch the
+    marginal SPI links (cams 6/8) at scan start — 14/16 stable all-16;
+    clinical mask unaffected. The clean fix is re-pinning the band to
+    ~100 us via the sensor's r_init_man registers (runtime writes did not
+    take; needs config-time programming — follow-up on sensor-fw#68).
+
+    Raises ``ValueError`` for rates outside
+    :data:`SUPPORTED_CAPTURE_RATES_HZ` — this helper feeds laser-safety
+    scaling, so an unvalidated rate must fail loudly, not half-configure.
+    """
+    if rate_hz not in SUPPORTED_CAPTURE_RATES_HZ:
+        raise ValueError(
+            f"unsupported capture rate {rate_hz!r} Hz "
+            f"(supported: {SUPPORTED_CAPTURE_RATES_HZ})"
+        )
+    baseline_hz = DEFAULT_TRIGGER_CONFIG["TriggerFrequencyHz"]
+    scale = float(baseline_hz) / float(rate_hz)
+    # All rate-managed keys are ALWAYS emitted (baseline values at 40 Hz)
+    # so a live rate switch back to 40 restores them.
+    _VTS_ROWS = {40: 2768, 60: 1845}
+    _ROW_PERIOD_US = 25000.0 / 2768  # 9.0318 us (native-40 mode)
+    shift_us = (_VTS_ROWS[baseline_hz] - _VTS_ROWS[rate_hz]) * _ROW_PERIOD_US
+    return {
+        "TriggerFrequencyHz": rate_hz,
+        "LaserPulseSkipDelayUsec": int(round(
+            DEFAULT_TRIGGER_CONFIG["LaserPulseSkipDelayUsec"] * scale
+        )),
+        "LaserPulseDelayUsec": int(round(
+            DEFAULT_TRIGGER_CONFIG["LaserPulseDelayUsec"] + shift_us
+        )),
+        # IEC 60825 compliance (app#327 / "Ultrasound & Laser Safety Limits
+        # Calculator" sheet, 'Laser Safety (with AEL)' tab: λ=795 nm,
+        # 500 µs @ 40 Hz, T=300 s, 3 mm beam, duty 2.0%): the gate width
+        # scales with the period so the duty cycle — and therefore every
+        # average-power AEL row, which scales as 1/rate — stays at the
+        # 40 Hz-validated value. Per-pulse energy then drops ∝ t while the
+        # per-pulse AEL falls only as t^0.75, so single-pulse and
+        # pulse-train (C5/N) margins strictly improve. 500 → 333 µs at
+        # 60 Hz. apply_laser_power scales the PULSE_WIDTH_UL interlock
+        # ceiling by the same factor so the safety FPGA enforces this.
+        # NOTE for bench validation at resurrect time: the optical pulse
+        # is driver-shaped at ~494 µs regardless of gate width, so a
+        # 333 µs gate CLIPS it — verify delivered energy optically.
+        "LaserPulseWidthUsec": int(round(
+            DEFAULT_TRIGGER_CONFIG["LaserPulseWidthUsec"] * scale
+        )),
+    }
+
+
 def merge_trigger_config(*overrides) -> dict:
     """Shallow-merge a stack of trigger-config overrides on top of
     :data:`DEFAULT_TRIGGER_CONFIG`. Later args win over earlier ones;
