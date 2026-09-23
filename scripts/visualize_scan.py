@@ -10,6 +10,7 @@ isolates it.
 
     python scripts/visualize_scan.py <scan.csv> [<telemetry.csv> ...]
     python scripts/visualize_scan.py <folder>          # newest of each kind
+                                                       # (raw: one per side)
 
 Passing a scan CSV *and* its telemetry CSV together overlays them on the
 shared axis, which is the point: laser/TEC/PDU behaviour lines up against
@@ -19,15 +20,17 @@ Supported (current app output only — legacy layouts are rejected by name):
 
 ===============  ===================================================
 scan             ``frame_id, timestamp_s, {bfi,bvi,mean,contrast,
-                 temp}_{l,r}{1..8}`` — the corrected CSV every scan
-                 writes, and the History -> Export CSV, which appends
-                 ``quality_l1``..``quality_r8`` (shown on hover).
+                 temp}_{l,r}{1..8}`` — the History -> Export CSV, which
+                 appends ``quality_l1``..``quality_r8`` (shown on
+                 hover), and the opt-in per-scan corrected CSV
+                 (``writeCorrectedCsv``).
 scan (reduced)   ``frame_id, timestamp_s, bfi_left, bfi_right,
                  bvi_left, bvi_right`` — clinical side-average mode.
 raw              ``cam_id, frame_id, timestamp_s, type, 0..1023,
                  temperature, sum, tcm, tcl, pdc`` — per-frame
                  histograms, reduced here to the image mean and
-                 standard deviation per camera.
+                 standard deviation per camera (dark frames drawn as
+                 markers, stale frames dropped).
 telemetry        ``timestamp, tcm, tcl, pdc, tec_*, pdu_*, safety_*``
                  — the ConsoleTelemetry CSV from ScanWorkflow.
 ===============  ===================================================
@@ -46,7 +49,6 @@ from __future__ import annotations
 import argparse
 import colorsys
 import csv
-import os
 import sys
 import webbrowser
 from dataclasses import dataclass, field
@@ -106,6 +108,7 @@ class Trace:
     hover_extra_label: str = ""
     width: float = 1.1
     dash: Optional[str] = None
+    mode: str = "lines"            # "markers" for sparse point series
 
 
 @dataclass
@@ -130,19 +133,26 @@ class Loaded:
 # CSV helpers
 # ---------------------------------------------------------------------------
 
-def _read_columns(path: Path) -> tuple[list[str], dict[str, np.ndarray], int]:
-    """Read the whole CSV into string columns. Ragged rows are dropped."""
+def _read_columns(path: Path) -> tuple[list[str], dict[str, np.ndarray], int, int]:
+    """Read the whole CSV into string columns. Ragged rows (wrong field
+    count) are dropped; how many is returned so the summary can say so."""
     with path.open("r", newline="", encoding="utf-8") as fh:
         reader = csv.reader(fh)
         header = next(reader, None)
         if not header:
             raise SystemExit(f"{path.name}: file is empty")
         width = len(header)
-        rows = [r for r in reader if len(r) == width]
+        rows = []
+        dropped = 0
+        for r in reader:
+            if len(r) == width:
+                rows.append(r)
+            elif r:
+                dropped += 1
     if not rows:
         raise SystemExit(f"{path.name}: no data rows")
     cols = {name: np.asarray(vals) for name, vals in zip(header, zip(*rows))}
-    return header, cols, len(rows)
+    return header, cols, len(rows), dropped
 
 
 def _floats(col: np.ndarray) -> np.ndarray:
@@ -222,7 +232,7 @@ _SCAN_METRICS = [
 
 
 def load_scan(path: Path) -> Loaded:
-    header, cols, n = _read_columns(path)
+    header, cols, n, dropped = _read_columns(path)
     t = _floats(cols["timestamp_s"])
     fid = _floats(cols["frame_id"]).astype(np.int64)
 
@@ -292,15 +302,21 @@ def load_scan(path: Path) -> Loaded:
             + (f"cam {','.join(str(c + 1) for c in cams)} (mask 0x{mask:02X})"
                if cams else "no cameras")
         )
-    if quality:
-        vals, counts = np.unique(np.concatenate(list(quality.values())), return_counts=True)
+    # Masked-off cameras export an all-blank quality column; counting them
+    # would bury the real distribution under thousands of "(blank)".
+    active_q = [q for tag, q in quality.items()
+                if int(tag[1:]) - 1 in active[tag[0]]]
+    if active_q:
+        vals, counts = np.unique(np.concatenate(active_q), return_counts=True)
         summary.append("quality: " + ", ".join(
             f"{v or '(blank)'}={c}" for v, c in zip(vals, counts)))
+    if dropped:
+        summary.append(f"{dropped} ragged row(s) dropped (wrong column count)")
     return Loaded(path=path, kind="scan", summary=summary, panels=panels)
 
 
 def load_scan_reduced(path: Path) -> Loaded:
-    header, cols, n = _read_columns(path)
+    header, cols, n, dropped = _read_columns(path)
     t = _floats(cols["timestamp_s"])
     panels = []
     for metric, title in (("bfi", "BFI"), ("bvi", "BVI")):
@@ -317,12 +333,12 @@ def load_scan_reduced(path: Path) -> Loaded:
         if panel.traces:
             panels.append(panel)
     span = float(t[-1] - t[0]) if n > 1 else 0.0
-    return Loaded(
-        path=path, kind="scan (reduced)",
-        summary=[f"{n} frames, {t[0]:.3f}..{t[-1]:.3f} s ({span:.1f} s), "
-                 "side averages only"],
-        panels=panels,
-    )
+    summary = [f"{n} frames, {t[0]:.3f}..{t[-1]:.3f} s ({span:.1f} s), "
+               "side averages only"]
+    if dropped:
+        summary.append(f"{dropped} ragged row(s) dropped (wrong column count)")
+    return Loaded(path=path, kind="scan (reduced)", summary=summary,
+                  panels=panels)
 
 
 def load_raw(path: Path, progress: bool = True) -> Loaded:
@@ -335,8 +351,13 @@ def load_raw(path: Path, progress: bool = True) -> Loaded:
     bins_sq = bins * bins
 
     per_cam: dict[int, list[tuple[float, float, float]]] = {}
+    # Scheduled dark frames (laser off) sit far below the light frames; mixed
+    # into the same line they read as a dip every dark interval. They get
+    # their own marker series instead.
+    per_cam_dark: dict[int, list[tuple[float, float, float]]] = {}
     n_rows = 0
     skipped = 0
+    ragged = 0
     types: dict[str, int] = {}
 
     with path.open("r", newline="", encoding="utf-8") as fh:
@@ -350,7 +371,14 @@ def load_raw(path: Path, progress: bool = True) -> Loaded:
                 f"{path.name}: bin columns 0..{BIN_COUNT - 1} are not contiguous")
         i_cam, i_ts, i_type = idx["cam_id"], idx["timestamp_s"], idx["type"]
 
+        width = len(header)
         for row in reader:
+            if len(row) != width:
+                # A truncated last line (scan interrupted mid-write) or any
+                # other malformed row: count it, don't crash on it.
+                if row:
+                    ragged += 1
+                continue
             n_rows += 1
             if progress and n_rows % 20000 == 0:
                 print(f"    …{n_rows} rows", file=sys.stderr)
@@ -368,36 +396,44 @@ def load_raw(path: Path, progress: bool = True) -> Loaded:
                 continue
             mu = float(bins @ hist) / total
             var = max(0.0, float(bins_sq @ hist) / total - mu * mu)
-            per_cam.setdefault(int(row[i_cam]), []).append(
+            dest = per_cam_dark if ftype == "dark" else per_cam
+            dest.setdefault(int(row[i_cam]), []).append(
                 (float(row[i_ts]), mu, float(np.sqrt(var))))
 
-    if not per_cam:
+    if not per_cam and not per_cam_dark:
         raise SystemExit(f"{path.name}: no usable histogram rows")
 
     mean_panel = Panel(title=f"Image mean — {label} (raw)", unit="bin index")
     std_panel = Panel(title=f"Image std — {label} (raw)", unit="bin index")
-    for cam in sorted(per_cam):
-        pts = sorted(per_cam[cam])
-        t = np.array([p[0] for p in pts])
-        mu = np.array([p[1] for p in pts])
-        sd = np.array([p[2] for p in pts])
+    all_cams = sorted(set(per_cam) | set(per_cam_dark))
+    for cam in all_cams:
         color = CAM_COLORS[side or "l"][cam % 8]
         tag = f"raw-{side or 'x'}{cam + 1}"
         title = f"{label} raw"
-        mean_panel.traces.append(Trace(
-            name=f"{label[0].upper()}{cam + 1} mean", x=t, y=mu,
-            color=color, group=tag, group_title=title))
-        std_panel.traces.append(Trace(
-            name=f"{label[0].upper()}{cam + 1} std", x=t, y=sd,
-            color=color, group=tag, group_title=title))
+        for series, suffix, mode in ((per_cam, "", "lines"),
+                                     (per_cam_dark, " dark", "markers")):
+            pts = sorted(series.get(cam, []))
+            if not pts:
+                continue
+            t = np.array([p[0] for p in pts])
+            mu = np.array([p[1] for p in pts])
+            sd = np.array([p[2] for p in pts])
+            mean_panel.traces.append(Trace(
+                name=f"{label[0].upper()}{cam + 1} mean{suffix}", x=t, y=mu,
+                color=color, group=tag, group_title=title, mode=mode))
+            std_panel.traces.append(Trace(
+                name=f"{label[0].upper()}{cam + 1} std{suffix}", x=t, y=sd,
+                color=color, group=tag, group_title=title, mode=mode))
 
     summary = [
-        f"{n_rows} histogram rows, {len(per_cam)} camera(s): "
-        f"{','.join(str(c + 1) for c in sorted(per_cam))}",
+        f"{n_rows} histogram rows, {len(all_cams)} camera(s): "
+        f"{','.join(str(c + 1) for c in all_cams)}",
         "frame types: " + ", ".join(f"{k}={v}" for k, v in sorted(types.items())),
     ]
     if skipped:
         summary.append(f"{skipped} row(s) skipped (stale or empty histogram)")
+    if ragged:
+        summary.append(f"{ragged} ragged row(s) dropped (wrong column count)")
     return Loaded(path=path, kind="raw", summary=summary,
                   panels=[mean_panel, std_panel])
 
@@ -426,7 +462,7 @@ _TELEM_GROUPS = [
 
 
 def load_telemetry(path: Path, offset: float = 0.0) -> Loaded:
-    header, cols, n = _read_columns(path)
+    header, cols, n, dropped = _read_columns(path)
     t_abs = _floats(cols["timestamp"])
     t = t_abs - t_abs[0] + offset
 
@@ -500,6 +536,8 @@ def load_telemetry(path: Path, offset: float = 0.0) -> Loaded:
             summary.append(f"{bad} sample(s) carry an error string")
     if offset:
         summary.append(f"shifted by --telemetry-offset {offset:+g} s")
+    if dropped:
+        summary.append(f"{dropped} ragged row(s) dropped (wrong column count)")
     return Loaded(path=path, kind="telemetry", summary=summary, panels=panels)
 
 
@@ -516,6 +554,7 @@ def _decimate(tr: Trace, max_points: int) -> Trace:
         group=tr.group, group_title=tr.group_title, hidden=tr.hidden,
         hover_extra=None if tr.hover_extra is None else tr.hover_extra[::step],
         hover_extra_label=tr.hover_extra_label, width=tr.width, dash=tr.dash,
+        mode=tr.mode,
     )
 
 
@@ -559,8 +598,9 @@ def build_figure(loads: list[Loaded], title: str, max_points: int):
             fig.add_trace(
                 Scatter(
                     x=tr.x.astype(np.float32), y=tr.y.astype(np.float32),
-                    name=tr.name, mode="lines",
+                    name=tr.name, mode=tr.mode,
                     line=dict(color=tr.color, width=tr.width, dash=tr.dash),
+                    marker=dict(color=tr.color, size=5, symbol="x"),
                     legendgroup=tr.group,
                     legendgrouptitle_text=tr.group_title if show_title else None,
                     showlegend=first_of_group,
@@ -613,12 +653,13 @@ def build_figure(loads: list[Loaded], title: str, max_points: int):
 # ---------------------------------------------------------------------------
 
 def _expand_folder(folder: Path) -> list[Path]:
-    """Newest scan CSV plus newest telemetry CSV in a directory."""
+    """Newest scan CSV, newest raw CSV per side, and newest telemetry CSV
+    in a directory."""
     csvs = sorted(folder.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
     if not csvs:
         raise SystemExit(f"No CSV files in {folder}")
     picked: list[Path] = []
-    want = {"scan", "scan_reduced", "raw", "telemetry"}
+    seen: set[str] = set()
     for c in csvs:
         try:
             with c.open("r", newline="", encoding="utf-8") as fh:
@@ -629,8 +670,12 @@ def _expand_folder(folder: Path) -> list[Path]:
         except OSError:
             continue
         bucket = "scan" if kind.startswith("scan") else kind
-        if bucket in want:
-            want.discard(bucket)
+        if kind == "raw":
+            # Left and right raw CSVs are separate files from the same scan;
+            # keep the newest of each rather than only the newest overall.
+            bucket = f"raw-{_side_from_name(c) or c.name}"
+        if bucket not in seen:
+            seen.add(bucket)
             picked.append(c)
     if not picked:
         raise SystemExit(f"No recognizable Open-Motion CSVs in {folder}")
