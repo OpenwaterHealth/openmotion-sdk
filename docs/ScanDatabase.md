@@ -127,7 +127,9 @@ CREATE TABLE session_data (
     bvi              REAL,
     contrast         REAL,
     mean             REAL,
-    quality          TEXT DEFAULT 'ok'
+    temp             REAL,                                  -- camera °C (schema v2)
+    correction_status TEXT DEFAULT '',                      -- schema v3; was `quality`
+    contact_quality  TEXT                                   -- schema v3
 );
 
 CREATE INDEX idx_session_data_session_time  ON session_data(session_id, timestamp_s);
@@ -144,6 +146,22 @@ Notes:
 * Metric values are stored rounded (matching the corrected CSV writer's
   precision policy). Non-finite values (NaN) are stored as NULL; a frame with
   no finite metric at all is skipped.
+* **`correction_status`** (bloodflow-app#589) is a comma-separated list of
+  the pipeline corrections applied to the sample: `ts_corrected` (timestamp
+  rewritten by TimestampRepairStage) and/or `nan_filled` (synthetic
+  placeholder for a frame that never arrived). Empty = clean. Until schema
+  v3 the column was `quality`, one worst-wins flag with `ok` as the clean
+  value; migration 3 renamed it without rewriting rows, so readers must
+  treat a stored `ok` as clean (`omotion.correction_status.parse` does).
+* **`contact_quality`** is the live contact-quality verdict latched for the
+  camera at that frame by the `ContactQualityMonitor` attached to the scan:
+  `ok`, `poor_contact`, `ambient_light`, or `poor_contact,ambient_light` —
+  the same debounced state that drove the operator's mid-scan warning.
+  NULL when the scan ran without a monitor, and on every pre-v3 row.
+* On side-average rows (`cam_id = -1`) both lists name the camera, since the
+  row covers several: `l3:ts_corrected,l5:nan_filled` and
+  `l2:poor_contact` (non-ok cameras only; empty = every camera in the
+  side's mask was ok). Tags are `l`/`r` plus the 1-based camera number.
 * `timestamp_s` is **seconds since scan start**, not firmware-clock seconds.
 * `cam_id` is **0-indexed**. The corrected CSV column names use 1-indexed
   cameras (e.g. `bfi_l3` is camera 3 (1-indexed) = `cam_id=2` (0-indexed)).
@@ -285,13 +303,20 @@ What's preserved exactly:
   across all (side, cam) cells.
 - Per-frame `timestamp_s` — minimum of all contributing samples,
   same rule as `CsvSink`.
-- `bfi`, `bvi`, `contrast`, `mean` cell values.
+- `bfi`, `bvi`, `contrast`, `mean`, `temp` cell values (`temp` is empty
+  for rows recorded before schema v2).
 
-What's *not* preserved:
+With `include_status=True` (what History → Export CSV passes) two
+export-only groups are appended, in normal and reduced mode alike:
 
-- `temp_*` cells are always empty (the DB doesn't carry temperature
-  in `session_data`). `plot_corrected_scan.py` ignores temperature,
-  so visualization still works.
+- `correction_status` — one camera-tagged list per row covering every
+  camera, e.g. `l3:ts_corrected,r5:nan_filled`; empty = clean.
+- `cq_l1` … `cq_r8` — each camera's `contact_quality` at that frame.
+  Empty for a camera outside the scan mask, and for rows recorded without a
+  live monitor or before schema v3.
+
+These replace the pre-v3 export's per-camera `quality_l1` … `quality_r8`
+columns. `include_quality=True` is still accepted as the old name.
 
 Pre-#92 Step F sessions raise `RuntimeError` — their `frame_id` rows
 are all the sentinel `-1`, so the row layout can't be reconstructed.
@@ -301,7 +326,8 @@ Callers should fall back to the on-disk corrected CSV in that case.
 
 Databases written by older SDK versions can differ in three ways. Current
 code opens them safely (`CREATE TABLE IF NOT EXISTS` is idempotent and
-schema migrations only ever ADD columns), but readers should know:
+schema migrations only add or rename columns — migration 3 renamed
+`quality` to `correction_status`), but readers should know:
 
 * **`session_raw` table** — older SDKs wrote raw histogram blobs to the DB.
   Current code neither reads nor writes that table; the data is left
@@ -351,8 +377,9 @@ rather than being opened and written by code that does not understand it.
 
 **Only real, used schema belongs in `MIGRATIONS`.** Every entry lands in every
 database in the field permanently, so an unused table or column becomes debt
-that cannot be cleanly removed. The registry currently holds only the baseline
-migration; the runner is verified in `tests/test_db_schema.py` two ways — against
+that cannot be cleanly removed. The registry holds the baseline (1),
+`session_data.temp` (2) and the `correction_status` / `contact_quality`
+change (3); the runner is verified in `tests/test_db_schema.py` two ways — against
 a **synthetic** migration registered by monkeypatch (adds a table and alters an
 existing one), and against a **checked-in legacy database**,
 `tests/fixtures/legacy_scans_v0.db`. That fixture is a real pre-versioning,

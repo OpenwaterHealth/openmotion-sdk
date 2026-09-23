@@ -21,9 +21,10 @@ Supported (current app output only — legacy layouts are rejected by name):
 ===============  ===================================================
 scan             ``frame_id, timestamp_s, {bfi,bvi,mean,contrast,
                  temp}_{l,r}{1..8}`` — the History -> Export CSV, which
-                 appends ``quality_l1``..``quality_r8`` (shown on
-                 hover), and the opt-in per-scan corrected CSV
-                 (``writeCorrectedCsv``).
+                 appends ``correction_status`` and ``cq_l1``..``cq_r8``
+                 (per-camera status shown on hover; older exports'
+                 ``quality_l1``..``quality_r8`` still are), and the
+                 opt-in per-scan corrected CSV (``writeCorrectedCsv``).
 scan (reduced)   ``frame_id, timestamp_s, bfi_left, bfi_right,
                  bvi_left, bvi_right`` — clinical side-average mode.
 raw              ``cam_id, frame_id, timestamp_s, type, 0..1023,
@@ -231,17 +232,54 @@ _SCAN_METRICS = [
 ]
 
 
+def _per_camera_status(cols: dict[str, np.ndarray], n: int) -> dict[str, np.ndarray]:
+    """Per-camera hover text, keyed ``l1``..``r8``.
+
+    Current exports (bloodflow-app#589) carry one camera-tagged
+    ``correction_status`` list per row (``l3:ts_corrected,r5:nan_filled``)
+    and a ``cq_<cam>`` contact-quality verdict; they are merged into one
+    string per camera, e.g. ``cq=poor_contact; ts_corrected``. Older
+    exports' ``quality_<cam>`` columns are passed through unchanged.
+    """
+    out: dict[str, np.ndarray] = {}
+    corrections: dict[str, dict[int, str]] = {}
+    status = cols.get("correction_status")
+    if status is not None:
+        for i, value in enumerate(status):
+            for token in str(value).split(","):
+                tag, sep, what = token.strip().partition(":")
+                if sep and what:
+                    prev = corrections.setdefault(tag, {}).get(i)
+                    corrections[tag][i] = f"{prev},{what}" if prev else what
+    for side in ("l", "r"):
+        for cam in range(1, 9):
+            tag = f"{side}{cam}"
+            legacy = cols.get(f"quality_{tag}")
+            if legacy is not None:
+                out[tag] = legacy
+                continue
+            cq = cols.get(f"cq_{tag}")
+            if cq is None and status is None:
+                continue
+            fixes = corrections.get(tag, {})
+            text = []
+            for i in range(n):
+                parts = []
+                if cq is not None and cq[i]:
+                    parts.append(f"cq={cq[i]}")
+                if i in fixes:
+                    parts.append(fixes[i])
+                text.append("; ".join(parts))
+            out[tag] = np.array(text, dtype=object)
+    return out
+
+
 def load_scan(path: Path) -> Loaded:
     header, cols, n, dropped = _read_columns(path)
     t = _floats(cols["timestamp_s"])
     fid = _floats(cols["frame_id"]).astype(np.int64)
 
-    quality: dict[str, np.ndarray] = {}
-    for side in ("l", "r"):
-        for cam in range(1, 9):
-            q = cols.get(f"quality_{side}{cam}")
-            if q is not None:
-                quality[f"{side}{cam}"] = q
+    quality = _per_camera_status(cols, n)
 
     panels: list[Panel] = []
     active: dict[str, list[int]] = {"l": [], "r": []}
@@ -273,7 +311,7 @@ def load_scan(path: Path) -> Loaded:
                         color=CAM_COLORS[side][cam],
                         group=f"cam-{tag}",
                         group_title=SIDE_NAMES[side].capitalize(),
-                        hover_extra=q, hover_extra_label="quality",
+                        hover_extra=q, hover_extra_label="status",
                     ))
             if present:
                 panel.traces.append(Trace(
@@ -302,13 +340,13 @@ def load_scan(path: Path) -> Loaded:
             + (f"cam {','.join(str(c + 1) for c in cams)} (mask 0x{mask:02X})"
                if cams else "no cameras")
         )
-    # Masked-off cameras export an all-blank quality column; counting them
+    # Masked-off cameras export an all-blank status column; counting them
     # would bury the real distribution under thousands of "(blank)".
     active_q = [q for tag, q in quality.items()
                 if int(tag[1:]) - 1 in active[tag[0]]]
     if active_q:
         vals, counts = np.unique(np.concatenate(active_q), return_counts=True)
-        summary.append("quality: " + ", ".join(
+        summary.append("status: " + ", ".join(
             f"{v or '(blank)'}={c}" for v, c in zip(vals, counts)))
     if dropped:
         summary.append(f"{dropped} ragged row(s) dropped (wrong column count)")
