@@ -22,13 +22,67 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Verify signing secrets are present
+      # EV signing (sdk#216) runs ONLY on manual workflow_dispatch — eSigner
+      # cloud signings are metered, and the shipped driver is signed once per
+      # driver change (dispatch → download artifact → vendor the zip into
+      # bloodflow-app resources/). PR-triggered runs always use the legacy
+      # self-signed PFX: zero eSigner cost, still proves the build end to end.
+      #
+      # EV path: the private key stays in SSL.com's cloud HSM; eSigner CKA
+      # registers a CNG provider and loads the cert into Cert:\CurrentUser\My
+      # so signtool signs by thumbprint (exported as CODESIGN_THUMBPRINT,
+      # which flips build_driver_msi.ps1 into EV mode).
+      - name: Set up signing (eSigner CKA on dispatch, legacy PFX otherwise)
+        shell: pwsh
+        working-directory: ${{ github.workspace }}
         env:
+          ES_USERNAME: ${{ secrets.ES_USERNAME }}
+          ES_PASSWORD: ${{ secrets.ES_PASSWORD }}
+          ES_TOTP_SECRET: ${{ secrets.ES_TOTP_SECRET }}
+          # repo variable ES_MODE=sandbox targets SSL.com's sandbox
+          # environment for pipeline testing (needs sandbox credentials)
+          ES_MODE: ${{ vars.ES_MODE || 'product' }}
           PFX_B64: ${{ secrets.OW_DRIVER_PFX_BASE64 }}
-          PFX_PW: ${{ secrets.OW_DRIVER_PFX_PASSWORD }}
         run: |
-          if (-not $env:PFX_B64) { throw "Secret OW_DRIVER_PFX_BASE64 is not set" }
-          if (-not $env:PFX_PW)  { throw "Secret OW_DRIVER_PFX_PASSWORD is not set" }
+          if ($env:GITHUB_EVENT_NAME -ne 'workflow_dispatch') {
+            Write-Host "PR build: signing with the legacy self-signed PFX (eSigner signings are metered; EV runs are workflow_dispatch only). Do not ship this artifact."
+            if (-not $env:PFX_B64) { throw "OW_DRIVER_PFX_BASE64 secret is not set" }
+            [IO.File]::WriteAllBytes("$env:GITHUB_WORKSPACE\winusb-driver\OpenMotion_signing_cert.pfx", [Convert]::FromBase64String($env:PFX_B64))
+          }
+          elseif ($env:ES_USERNAME -and $env:ES_PASSWORD -and $env:ES_TOTP_SECRET) {
+            $work = Join-Path $env:RUNNER_TEMP "esigner-cka"
+            New-Item -ItemType Directory -Force $work | Out-Null
+            Set-Location $work
+            Invoke-WebRequest -OutFile eSigner_CKA_Setup.zip "https://github.com/SSLcom/eSignerCKA/releases/download/v1.0.8/SSL.COM-eSigner-CKA_1.0.8.zip"
+            Expand-Archive -Force eSigner_CKA_Setup.zip
+            Move-Item -Destination "eSigner_CKA_Installer.exe" -Path "eSigner_CKA_Setup\*.exe"
+            $dir = Join-Path $env:USERPROFILE "eSignerCKA"
+            New-Item -ItemType Directory -Force $dir | Out-Null
+            Start-Process ".\eSigner_CKA_Installer.exe" -ArgumentList "/CURRENTUSER /VERYSILENT /SUPPRESSMSGBOXES /DIR=`"$dir`"" -Wait
+            # Post-install helpers from SSL.com's reference workflow; guarded
+            # because not every CKA build ships them (VC++ redists are already
+            # on the hosted runners).
+            foreach ($aux in @("$work\setup\vc_redist.x86.exe", "$work\setup\vc_redist.x64.exe")) {
+              if (Test-Path $aux) { Start-Process $aux -ArgumentList "/install /q" -Wait }
+            }
+            foreach ($aux in @("$dir\RegisterKSP.exe", "$dir\eSignerCSP.Config.exe")) {
+              if (Test-Path $aux) { & $aux | Out-Null }
+            }
+            & "$dir\eSignerCKATool.exe" config -mode $env:ES_MODE -user $env:ES_USERNAME -pass $env:ES_PASSWORD -totp $env:ES_TOTP_SECRET -key "$dir\master.key" -r
+            & "$dir\eSignerCKATool.exe" unload
+            & "$dir\eSignerCKATool.exe" load
+            $cert = Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert | Select-Object -First 1
+            if (-not $cert) { throw "eSigner CKA loaded no code-signing certificate" }
+            Write-Host "EV signing as: $($cert.Subject)  [$($cert.Thumbprint)]"
+            "CODESIGN_THUMBPRINT=$($cert.Thumbprint)" >> $env:GITHUB_ENV
+          }
+          elseif ($env:PFX_B64) {
+            Write-Host "::warning::eSigner secrets not set — signing with the LEGACY self-signed PFX; do not ship this artifact"
+            [IO.File]::WriteAllBytes("$env:GITHUB_WORKSPACE\winusb-driver\OpenMotion_signing_cert.pfx", [Convert]::FromBase64String($env:PFX_B64))
+          }
+          else {
+            throw "no signing credentials: set ES_USERNAME/ES_PASSWORD/ES_TOTP_SECRET (eSigner) or OW_DRIVER_PFX_BASE64/OW_DRIVER_PFX_PASSWORD (legacy)"
+          }
 
       - name: Install WiX 5.0.2
         run: |
@@ -40,14 +94,9 @@ jobs:
       - name: Show WiX version
         run: wix --version
 
-      - name: Decode signing PFX from secret
-        env:
-          PFX_B64: ${{ secrets.OW_DRIVER_PFX_BASE64 }}
-        run: |
-          [IO.File]::WriteAllBytes("$PWD\OpenMotion_signing_cert.pfx", [Convert]::FromBase64String($env:PFX_B64))
-
       - name: Build and sign driver MSI
         env:
+          # legacy-fallback path only; ignored in EV mode
           OW_DRIVER_PFX_PASSWORD: ${{ secrets.OW_DRIVER_PFX_PASSWORD }}
         run: .\build_driver_msi.ps1 -AppResourcesZip ""
 
