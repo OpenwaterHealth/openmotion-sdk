@@ -78,12 +78,19 @@ python scripts/sdk_examples.py read-scan        # summarize the scan DB (read-on
 python scripts/sdk_examples.py                  # all of the above on one connection
 ```
 
-Plot a finished scan with
-[`scripts/visualize_scan.py`](scripts/visualize_scan.py):
+View a finished scan with
+[`scripts/visualize_scan.py`](scripts/visualize_scan.py), which writes one
+self-contained interactive HTML page (zoom, hover, click a legend entry to
+hide a camera). It reads scan, History-export, raw-histogram and console
+telemetry CSVs, and plots several together on one linked time axis:
 
 ```
-python scripts/visualize_scan.py --csv <scan_id>_<subject>.csv   # -> <stem>_viz.png
+python scripts/visualize_scan.py <scan_id>_<subject>.csv          # -> <stem>_viz.html
+python scripts/visualize_scan.py <scan>.csv <scan>_telemetry.csv  # overlaid
+python scripts/visualize_scan.py <folder>                         # newest of each kind
 ```
+
+Needs `plotly` — `pip install -e ".[viz]"`.
 
 ## Install
 
