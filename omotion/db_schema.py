@@ -34,7 +34,7 @@ import logging
 logger = logging.getLogger("omotion.db_schema")
 
 # Bump this whenever a migration is appended to MIGRATIONS.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class SchemaTooNewError(RuntimeError):
@@ -136,6 +136,28 @@ def _migration_002_session_data_temp(conn) -> None:
     _add_column_if_missing(conn, "session_data", "temp", "REAL")
 
 
+def _migration_003_correction_status_contact_quality(conn) -> None:
+    """bloodflow-app#589. ``quality`` held one worst-wins correction flag
+    (clean = ``'ok'``); it becomes ``correction_status``, a comma-separated
+    list of every correction applied (clean = empty). Existing rows are NOT
+    rewritten — a scan DB can hold tens of millions of rows and a single
+    status is already a valid one-entry list — so readers treat a legacy
+    ``'ok'`` as clean (``omotion.correction_status.parse``).
+
+    ``contact_quality`` is the live contact-quality verdict latched for the
+    camera at that frame (``ok`` / ``poor_contact`` / ``ambient_light`` /
+    ``poor_contact,ambient_light``; camera-tagged non-ok entries on
+    side-average rows). NULL on rows recorded without a live monitor,
+    including every pre-migration row."""
+    cols = _columns(conn, "session_data")
+    if "quality" in cols and "correction_status" not in cols:
+        conn.execute(
+            "ALTER TABLE session_data RENAME COLUMN quality TO correction_status"
+        )
+    _add_column_if_missing(conn, "session_data", "correction_status", "TEXT DEFAULT ''")
+    _add_column_if_missing(conn, "session_data", "contact_quality", "TEXT")
+
+
 # (version, description, function) — ordered, append-only.
 #
 # Only real, used schema belongs here: every entry lands in every database in
@@ -147,6 +169,8 @@ MIGRATIONS: list[tuple[int, str, object]] = [
      _migration_001_baseline),
     (2, "session_data.temp — per-frame camera temperature",
      _migration_002_session_data_temp),
+    (3, "session_data.quality -> correction_status list; + contact_quality",
+     _migration_003_correction_status_contact_quality),
 ]
 
 
