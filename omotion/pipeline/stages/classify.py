@@ -529,7 +529,7 @@ class FrameClassificationStage:
             )
 
     def _is_dark(self, abs_id: int) -> bool:
-        """Per SciencePipeline.md §4.2:
+        """Per SciencePipeline.md §5.1 FrameClassificationStage (frame-type labelling):
             n == discard_count + 1 OR (n > discard_count + 1 AND (n-1) mod dark_interval == 0)
         """
         if abs_id == self.discard_count + 1:

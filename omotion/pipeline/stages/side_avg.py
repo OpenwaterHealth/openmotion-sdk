@@ -16,7 +16,7 @@ Both paths use spatial_side_average — a purely spatial operation (across
 cameras at one instant, no temporal element). Gated on ``enabled``
 (reduced mode).
 
-See docs/SciencePipeline.md §16 and
+See docs/SciencePipeline.md §5.11 SideAverageStage and
 docs/superpowers/specs/2026-05-28-reduced-mode-side-average-design.md.
 """
 

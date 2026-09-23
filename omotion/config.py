@@ -40,7 +40,8 @@ ELECTRON_WELL_CAPACITY: int = 11_000
 # Per-camera analog gain for the 8 cameras in a sensor module, indexed by
 # cam_id % 8. Outer positions (0, 7) use higher gain to compensate for the
 # reduced illumination at the array periphery. Used by ShotNoiseCorrectionStage
-# and DarkCorrectionStage's enrichment path; see SciencePipeline.md §8.3.
+# on both the realtime and batched (interval) paths; see SciencePipeline.md
+# §5.8.5 (batched enrichment) and §5.9 ShotNoiseCorrectionStage.
 CAMERA_GAIN_MAP: np.ndarray = np.array(
     [16, 4, 2, 1, 1, 2, 4, 16], dtype=np.float32
 )
