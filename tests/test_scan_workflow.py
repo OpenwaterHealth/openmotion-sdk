@@ -139,7 +139,7 @@ def test_start_scan_excludes_unconnected_unmasked_sensor_from_live_source():
 
         captured = {}
 
-        def _factory(*, console, left, right, batch_size_frames, metadata):
+        def _factory(*, console, left, right, batch_size_frames, metadata, **kwargs):
             captured["left"] = left
             captured["right"] = right
             return _EmptySource(metadata=metadata)
@@ -169,7 +169,7 @@ def test_start_scan_excludes_masked_out_sensor_even_when_connected():
 
         captured = {}
 
-        def _factory(*, console, left, right, batch_size_frames, metadata):
+        def _factory(*, console, left, right, batch_size_frames, metadata, **kwargs):
             captured["left"] = left
             captured["right"] = right
             return _EmptySource(metadata=metadata)
@@ -189,7 +189,10 @@ def test_start_scan_auto_injects_csv_sink_when_data_dir_set(tmp_path):
         left_camera_mask=0xFF, right_camera_mask=0, reduced_mode=False,
     )
     motion.scan_workflow.start_scan(request)
-    csv_sinks = [s for s in motion.scan_workflow._runner.sinks if isinstance(s, CsvSink)]
+    # Storage sinks are AsyncSink-wrapped (decoupled from the USB-drain
+    # thread); unwrap to assert on the concrete sink type.
+    csv_sinks = [s for s in motion.scan_workflow._runner.sinks
+                 if isinstance(getattr(s, "wrapped", s), CsvSink)]
     assert len(csv_sinks) == 1
 
 
@@ -201,7 +204,8 @@ def test_start_scan_skips_csv_sink_when_data_dir_none():
         left_camera_mask=0xFF, right_camera_mask=0, reduced_mode=False,
     )
     motion.scan_workflow.start_scan(request)
-    csv_sinks = [s for s in motion.scan_workflow._runner.sinks if isinstance(s, CsvSink)]
+    csv_sinks = [s for s in motion.scan_workflow._runner.sinks
+                 if isinstance(getattr(s, "wrapped", s), CsvSink)]
     assert csv_sinks == []
 
 
@@ -214,7 +218,8 @@ def test_start_scan_skips_default_storage_when_request_opts_out(tmp_path):
         skip_default_storage=True,
     )
     motion.scan_workflow.start_scan(request)
-    assert all(not isinstance(s, CsvSink) for s in motion.scan_workflow._runner.sinks)
+    assert all(not isinstance(getattr(s, "wrapped", s), CsvSink)
+               for s in motion.scan_workflow._runner.sinks)
 
 
 def test_start_scan_does_not_auto_wire_pipeline_telemetry_source():
@@ -297,7 +302,7 @@ def test_duration_guard_skips_redundant_stop_trigger_and_close_on_cancel(tmp_pat
 
     captured_source = {}
 
-    def _factory(*, console, left, right, batch_size_frames, metadata):
+    def _factory(*, console, left, right, batch_size_frames, metadata, **kwargs):
         src = _MockSource(metadata=metadata)
         captured_source["src"] = src
         return src
@@ -411,7 +416,7 @@ def _run_scan_capturing_trigger(motion, request):
     per-side hardware bring-up so the worker reaches the trigger send."""
     calls = []
 
-    def _factory(*, console, left, right, batch_size_frames, metadata):
+    def _factory(*, console, left, right, batch_size_frames, metadata, **kwargs):
         return _MockSource(metadata=metadata)
 
     fake_side = ("left", request.left_camera_mask or 0xFF, mock.MagicMock())
@@ -576,7 +581,7 @@ def test_cancel_scan_emits_trigger_off_even_when_stop_trigger_raises():
 
     captured_source = {}
 
-    def _factory(*, console, left, right, batch_size_frames, metadata):
+    def _factory(*, console, left, right, batch_size_frames, metadata, **kwargs):
         src = _MockSource(metadata=metadata)
         captured_source["src"] = src
         return src
@@ -641,7 +646,7 @@ def test_console_disconnect_mid_scan_emits_trigger_off():
 
     captured_source = {}
 
-    def _factory(*, console, left, right, batch_size_frames, metadata):
+    def _factory(*, console, left, right, batch_size_frames, metadata, **kwargs):
         src = _MockSource(metadata=metadata)
         captured_source["src"] = src
         return src
