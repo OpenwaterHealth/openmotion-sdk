@@ -11,13 +11,16 @@ Built up across 5 tasks:
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import logging
 from typing import Any, Deque, Optional
 
 import numpy as np
 
-from ..batch import DarkIntegrityWarning, FrameBatch, IntervalClosed, TerminalDarkResult
+from ..batch import (
+    QUALITY_RANK, DarkIntegrityWarning, FrameBatch, IntervalClosed,
+    TerminalDarkResult,
+)
 from ..pedestal import SensorPedestals
 
 
@@ -82,12 +85,13 @@ class DarkIntegrityGuard:
     """Flag dark frames whose u1 looks suspiciously bright.
 
     A genuine dark frame should have u1 within ~5 DN of the sensor pedestal.
-    Higher u1 means the dark reference is contaminated — either the laser
-    wasn't actually off (firmware off-by-one / fsync misalignment) or ambient
-    light is leaking onto the sensor. The guard appends a diagnostic event and
-    logs a WARNING, but does not drop the frame.
+    Higher u1 means the frame can't serve as a dark reference: the laser
+    wasn't actually off (frame numbering off, trigger/fsync misalignment) or
+    ambient light is leaking onto the sensor. The guard appends a diagnostic
+    event and logs a WARNING; DarkCorrectionStage then holds the last clean
+    dark in its place (#292).
 
-    See docs/SciencePipeline.md §11 (input validation rails).
+    See docs/SciencePipeline.md §5.8.1.
     """
 
     def __init__(self, max_above_pedestal: float = 5.0):
@@ -105,9 +109,10 @@ class DarkIntegrityGuard:
             ))
             logger.warning(
                 "dark frame brighter than expected: side=%s cam=%d abs_id=%d "
-                "u1=%.1f exceeds pedestal+%.1f=%.1f — dark reference contaminated "
-                "(laser on for this frame from trigger/fsync misalignment, or "
-                "ambient light leaking onto the sensor); dark correction will be skewed.",
+                "u1=%.1f exceeds pedestal+%.1f=%.1f — laser on for this frame "
+                "(frame numbering or trigger/fsync misalignment) or ambient light "
+                "on the sensor; not used as a dark reference, the last clean "
+                "dark is held in its place (quality=dark_held).",
                 side, int(cam_id), int(abs_frame_id),
                 float(u1), self.max_above_pedestal, float(threshold),
             )
@@ -164,6 +169,10 @@ class _LightSample:
 class _DarkBoundary:
     obs: DarkObservation
     abs_frame_id: int
+    # True when the scheduled dark failed the integrity guard: obs carries the
+    # boundary's own timestamp with a clean dark's level and noise, or NaN
+    # until one is available (#292).
+    held: bool = False
 
 
 @dataclass
@@ -248,8 +257,10 @@ class PendingInterval:
         self._right: Optional[_DarkBoundary] = None
         self._light: list[_LightSample] = []
 
-    def set_left_dark(self, obs: DarkObservation, *, abs_frame_id: int) -> None:
-        self._left = _DarkBoundary(obs=obs, abs_frame_id=int(abs_frame_id))
+    def set_left_dark(self, obs: DarkObservation, *, abs_frame_id: int,
+                      held: bool = False) -> None:
+        self._left = _DarkBoundary(obs=obs, abs_frame_id=int(abs_frame_id),
+                                   held=held)
         self._light = []
         self._right = None
 
@@ -261,8 +272,10 @@ class PendingInterval:
             quality=str(quality), temp_c=temp_c,
         ))
 
-    def set_right_dark(self, obs: DarkObservation, *, abs_frame_id: int) -> None:
-        self._right = _DarkBoundary(obs=obs, abs_frame_id=int(abs_frame_id))
+    def set_right_dark(self, obs: DarkObservation, *, abs_frame_id: int,
+                       held: bool = False) -> None:
+        self._right = _DarkBoundary(obs=obs, abs_frame_id=int(abs_frame_id),
+                                    held=held)
 
     def is_closed(self) -> bool:
         return self._left is not None and self._right is not None
@@ -412,6 +425,9 @@ class DarkCorrectionStage:
             max_above_pedestal=integrity_max_above_pedestal
         )
         self._last_realtime: dict[tuple[str, int], tuple[float, float, float]] = {}
+        # Most recent dark per camera that passed the integrity guard: what a
+        # flagged dark is replaced by (#292).
+        self._last_clean: dict[tuple[str, int], DarkObservation] = {}
         self._terminal_fsync_count: Optional[int] = None
 
     def set_terminal_fsync_count(self, count: int) -> None:
@@ -438,9 +454,40 @@ class DarkCorrectionStage:
         quadratic stencil.
         """
         side, cam_id = key
+        held = interval.left.held or interval.right.held
+        if held:
+            interval = self._resolve_held(side, interval)
         corrected = self._batch.correct_interval(interval, side=side, cam_id=cam_id)
         corrected.left_t = interval.left.obs.t
+        if held:
+            for f in corrected.frames:
+                if QUALITY_RANK.get(f.quality, 0) < QUALITY_RANK["dark_held"]:
+                    f.quality = "dark_held"
         events.append(IntervalClosed(corrected_batch=corrected))
+
+    def _resolve_held(self, side: str, interval: "Interval") -> "Interval":
+        """Fill held boundaries that had no clean dark to copy when they
+        arrived (the scan's first darks): from the other boundary when it has
+        a level, else the sensor pedestal. Works on copies, so a boundary
+        shared with the next interval can still take a clean dark that
+        arrives later."""
+        pedestal = self._pedestals.left if side == "left" else self._pedestals.right
+
+        def has_level(b: _DarkBoundary) -> bool:
+            return bool(np.isfinite(b.obs.u1))
+
+        def resolved(b: _DarkBoundary, other: _DarkBoundary) -> _DarkBoundary:
+            if has_level(b):
+                return b
+            u1, std = ((other.obs.u1, other.obs.std) if has_level(other)
+                       else (pedestal, 0.0))
+            return replace(b, obs=DarkObservation(t=b.obs.t, u1=u1, std=std))
+
+        return Interval(
+            left=resolved(interval.left, interval.right),
+            right=resolved(interval.right, interval.left),
+            light_frames=interval.light_frames,
+        )
 
     def process(self, batch: FrameBatch) -> FrameBatch:
         n = batch.frame_ids.shape[0]
@@ -475,21 +522,35 @@ class DarkCorrectionStage:
 
                 pedestal = (self._pedestals.left if side == "left"
                             else self._pedestals.right)
-                self._guard.check(
+                clean = self._guard.check(
                     side=side, cam_id=cam_id, abs_frame_id=abs_id,
                     u1=u1, pedestal=pedestal, events=batch.events,
                 )
-                self._history.append(side, cam_id, t=t, u1=u1, std=std)
+                if clean:
+                    boundary = DarkObservation(t=t, u1=u1, std=std)
+                    self._history.append(side, cam_id, t=t, u1=u1, std=std)
+                    self._last_clean[(side, cam_id)] = boundary
+                else:
+                    # A flagged frame is never a dark reference (#292). It
+                    # keeps its place in the schedule so intervals still close
+                    # on time, but takes the last clean dark's level and
+                    # noise; with none yet, _resolve_held fills it in.
+                    ref = self._last_clean.get((side, cam_id))
+                    boundary = DarkObservation(
+                        t=t,
+                        u1=ref.u1 if ref is not None else float("nan"),
+                        std=ref.std if ref is not None else float("nan"),
+                    )
 
                 pi = self._pending.get((side, cam_id))
                 if pi is None:
                     pi = PendingInterval()
                     self._pending[(side, cam_id)] = pi
-                    pi.set_left_dark(DarkObservation(t=t, u1=u1, std=std),
-                                     abs_frame_id=abs_id)
+                    pi.set_left_dark(boundary, abs_frame_id=abs_id,
+                                     held=not clean)
                 else:
-                    pi.set_right_dark(DarkObservation(t=t, u1=u1, std=std),
-                                      abs_frame_id=abs_id)
+                    pi.set_right_dark(boundary, abs_frame_id=abs_id,
+                                      held=not clean)
                     if pi.is_closed():
                         interval = pi.flush()
                         # After flush, pi's left has rolled to the just-flushed right.
@@ -521,6 +582,10 @@ class DarkCorrectionStage:
                     pred = self._realtime.predict(
                         side, cam_id, history=self._history, target_t=t,
                     )
+                    if pred is None and (side, cam_id) in self._pending:
+                        # A dark has passed but none was clean yet (#292):
+                        # subtract the pedestal rather than show nothing.
+                        pred = (pedestal, 0.0)
                 if pred is not None:
                     u1_hat, std_hat = pred
                     baseline_rt[i, side_idx, cam_id] = np.float32(u1_hat)
@@ -568,6 +633,7 @@ class DarkCorrectionStage:
         self._history.clear()
         self._pending.clear()
         self._last_realtime.clear()
+        self._last_clean.clear()
         self._terminal_fsync_count = None
 
     def on_scan_stop(self, batch: FrameBatch) -> None:
@@ -600,9 +666,7 @@ class DarkCorrectionStage:
         )
 
         for (side, cam_id), pi in self._pending.items():
-            if not pi._light:
-                continue
-            if self._history.size(side, cam_id) < 1:
+            if not pi._light or pi._left is None:
                 continue
 
             pedestal = self._pedestals.left if side == "left" else self._pedestals.right
