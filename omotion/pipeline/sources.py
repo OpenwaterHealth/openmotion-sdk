@@ -125,7 +125,7 @@ class _BaseSource:
 class CsvReplaySource(_BaseSource):
     """Replays a raw-histogram CSV produced by CsvSink.
 
-    CSV schema (SciencePipeline.md §12 / spec §12):
+    CSV schema (SciencePipeline.md §7.2 CsvReplaySource / §8.1 CsvSink):
         cam_id, frame_id, timestamp_s, type, 0..1023, temperature, sum, tcm, tcl, pdc
 
     Accepts up to two CSVs (one per side); if a side is None, only the
