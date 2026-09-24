@@ -139,3 +139,19 @@ def test_stencilled_dark_row_temp_none_when_neighbour_unstamped():
     assert dark_row.abs_frame_id == 10
     assert dark_row.temp_c is None
     assert dark_row.bfi == pytest.approx(4.0)  # other metrics still stencil
+
+
+def test_stencilled_dark_row_carries_its_neighbours_worst_quality():
+    """A dark row built from dark_held neighbours is dark_held too (#292)."""
+    frames = [_enriched_light(11, 0.275, 36.7), _enriched_light(12, 0.300, 36.8)]
+    frames[0].quality = "dark_held"
+    eci = _stencil_one_interval(frames)
+    assert eci.frames[0].abs_frame_id == 10
+    assert eci.frames[0].quality == "dark_held"
+
+
+def test_stencilled_dark_row_is_ok_when_its_neighbours_are():
+    eci = _stencil_one_interval(
+        [_enriched_light(11, 0.275, 36.7), _enriched_light(12, 0.300, 36.8)])
+    assert eci.frames[0].quality == "ok"
+
