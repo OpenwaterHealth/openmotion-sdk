@@ -33,12 +33,14 @@ class MotionComposite:
         desc: str = "COMPOSITE",
         async_mode: bool = False,
         on_io_error: Optional[Callable[[Optional[int], str], None]] = None,
+        on_stream_stall: Optional[Callable[[str, float], None]] = None,
     ):
         self.dev = dev
         self.desc = desc
         self.async_mode = async_mode
         self.demo_mode = False
         self.on_io_error = on_io_error
+        self.on_stream_stall = on_stream_stall
 
         self.comm = CommInterface(
             dev, 0, desc=f"{desc}-COMM", async_mode=True
@@ -46,6 +48,13 @@ class MotionComposite:
         self.histo = StreamInterface(dev, 1, desc=f"{desc}-HISTO")
         self.imu = StreamInterface(dev, 2, desc=f"{desc}-IMU")
         self.comm.on_io_error = self._forward_io_error
+        # #192: until now only the command interface had any route to report
+        # a fault, so a histogram stream that went silent mid-scan reached
+        # nobody at all. Only the histo stream is watched — it has a
+        # guaranteed ~40 fps cadence to measure against, whereas the IMU
+        # stream can be legitimately idle and would false-positive.
+        self.histo.on_stream_stall = self._forward_stream_stall
+        self.imu.stall_timeout_sec = 0
 
         self.packet_count = 0
 
@@ -99,3 +108,14 @@ class MotionComposite:
             cb(errno, message)
         except Exception as e:
             logger.warning("on_io_error callback raised: %s", e)
+
+    def _forward_stream_stall(self, stalled_for_sec: float) -> None:
+        """Forward a stalled histogram stream, tagged with this side's desc
+        so the consumer knows which sensor went quiet (#192)."""
+        cb = self.on_stream_stall
+        if cb is None:
+            return
+        try:
+            cb(self.histo.desc, stalled_for_sec)
+        except Exception as e:
+            logger.warning("on_stream_stall callback raised: %s", e)

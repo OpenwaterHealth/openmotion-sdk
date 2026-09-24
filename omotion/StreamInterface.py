@@ -12,6 +12,13 @@ logger = logging.getLogger(
     f"{_log_root}.StreamInterface" if _log_root else "StreamInterface"
 )
 
+# Seconds of total silence on an armed stream before it is reported as
+# stalled (#192). At the nominal 40 fps this is ~200 missed frames — an
+# order of magnitude above the app's per-camera dropout threshold (2 s,
+# fail-soft) and well inside its whole-scan stall timeout (15 s, #248), so
+# the specific fault is reported before the generic one.
+_DEFAULT_STALL_TIMEOUT_SEC = 5.0
+
 
 def _rle_decompress(data: bytes) -> bytes:
     """Decompress PackBits-style byte-level RLE data."""
@@ -119,6 +126,28 @@ class StreamInterface(USBInterfaceBase):
         self.expected_size = None
         self.isStreaming = False
         self.packets_received: int = 0  # USB transfers queued since last start_streaming
+        # Data-flow watchdog (#192). A silent-but-enumerated IN endpoint
+        # produces read timeouts forever, and the loop below deliberately
+        # keeps waiting on those — so a side that stopped delivering was
+        # indistinguishable from an idle one and a scan could run its full
+        # duration producing nothing. Nominal cadence is ~40 frames/s, so
+        # multi-second silence during an armed stream is not a slow device.
+        # Seconds of silence before reporting; <= 0 disables.
+        #
+        # This layer has no trigger awareness — it measures arrivals, not
+        # intent. That is safe for SDK-driven scans, where start_trigger()
+        # precedes the source iteration that arms streaming
+        # (ScanWorkflow.py:685 vs :765), so frames flow from the first read.
+        # A caller that deliberately holds the trigger off while streaming
+        # stays armed must set this to 0 for that window, or it will get one
+        # spurious report per session.
+        self.stall_timeout_sec: float = _DEFAULT_STALL_TIMEOUT_SEC
+        # Optional callback(stalled_for_sec). Detection only — what to DO
+        # about a dead side (abort the scan, warn, continue) is policy and
+        # lives above this layer.
+        self.on_stream_stall = None
+        self._last_data_mono: float | None = None
+        self._stall_reported = False
 
     def start_streaming(self, queue_obj, expected_size):
         # Recover from a stale thread left over by a previous scan whose
@@ -143,6 +172,10 @@ class StreamInterface(USBInterfaceBase):
         self.data_queue = queue_obj
         self.expected_size = expected_size
         self.packets_received = 0
+        # Fresh stall clock per session, so a stall in scan N cannot fire
+        # immediately at the start of N+1 (#192).
+        self._last_data_mono = time.monotonic()
+        self._stall_reported = False
         self.stop_event.clear()
         self.thread = threading.Thread(
             target=self._stream_loop, daemon=True, name=f"{self.desc}-stream"
@@ -380,6 +413,42 @@ class StreamInterface(USBInterfaceBase):
             self.data_queue.put(raw)
         return cmp_count, cmp_errors
 
+    def _check_stream_stall(self):
+        """Report a side that has stopped delivering frames (#192).
+
+        Fires at most once per streaming session. The point is to escalate,
+        not to fill the log at 2 Hz for the rest of a 12-hour scan; the
+        consumer decides what to do and can read ``packets_received`` for
+        the full picture. Never raises — a foreign callback must not be able
+        to kill the stream thread (same discipline as
+        ``CommInterface._notify_io_error``).
+        """
+        timeout_s = self.stall_timeout_sec
+        if not timeout_s or timeout_s <= 0 or self._stall_reported:
+            return
+        last = self._last_data_mono
+        if last is None:
+            return
+        stalled_for = time.monotonic() - last
+        if stalled_for < timeout_s:
+            return
+
+        self._stall_reported = True
+        logger.error(
+            "%s: no data for %.1fs on an armed stream (%d chunk(s) this "
+            "session) — stream stalled",
+            self.desc, stalled_for, self.packets_received,
+        )
+        cb = self.on_stream_stall
+        if cb is None:
+            return
+        try:
+            cb(stalled_for)
+        except Exception as e:  # noqa: BLE001 - foreign callback
+            logger.warning(
+                "%s: on_stream_stall callback raised: %s", self.desc, e
+            )
+
     def _stream_loop(self):
         # Read timeout must exceed the worst-case USB transfer latency for the
         # final frame.  Normal cadence is ~25 ms; the last frame of a scan can
@@ -413,12 +482,18 @@ class StreamInterface(USBInterfaceBase):
             data_queue = self.data_queue
             if expected_size is None or data_queue is None:
                 break
+            self._check_stream_stall()
             try:
                 data = self.dev.read(
                     self.ep_in.bEndpointAddress, expected_size,
                     timeout=_READ_TIMEOUT_MS,
                 )
                 pipe_errors = 0
+                if data:
+                    # The device is alive. Reset the clock on arrival, not on
+                    # a successful put: a full data_queue is a host-side
+                    # parser problem, not a stalled sensor (#192).
+                    self._last_data_mono = time.monotonic()
                 if data and data_queue is self.data_queue:
                     # Use a bounded put so the loop can never block forever
                     # on a stopped/slow parser. With self.stop_event set the
