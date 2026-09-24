@@ -125,7 +125,7 @@ Calls `tec_status()`. Asserts the returned tuple is `(float, float, float, float
 Calls `tec_adc(ch)` for channels 0, 1, 2, 3. Asserts each returns a float in [0.0, 3.3].
 
 **`test_tec_voltage_read`**
-Calls `tec_voltage()` (no argument). Asserts the returned float is in [0.0, 3.3].
+Calls `tec_voltage()` (no argument). Asserts the returned TEC DAC setpoint is a float in [-5.0, 5.0] V, the DAC's configured range and the range the setter accepts. This is deliberately not the [0.0, 3.3] ADC range used by `tec_adc()` / `tec_status()`: a small negative readback is valid.
 
 **`test_tec_voltage_set`**
 Sets a known voltage with `tec_voltage(1.5)`. Reads back with `tec_voltage()`. Asserts the read-back value is within ±0.05 V of the set point.
@@ -237,7 +237,7 @@ Connects the console. Waits 1.5 s. Calls `console.telemetry.get_snapshot()`. Ass
 Gets a snapshot. Asserts `tcm >= 0`, `tcl >= 0`, `pdu_raws` has 16 elements, `safety_ok` is a bool, `timestamp > 0`.
 
 **`test_telemetry_listener_fires`**
-Registers a callback via `add_listener`. Waits 2.5 s. Asserts the callback was called at least twice (confirming ~1 Hz rate). Removes the listener.
+Registers a callback via `add_listener`. Waits up to 5 s on a `threading.Event` that the callback sets on its second call, and asserts it was set (confirming the ~1 Hz slow-refresh rate without a fixed sleep window). Removes the listener in a `finally`, so a failure cannot leave it registered on the session-scoped poller.
 
 **`test_telemetry_poller_stops`**
 Calls `console.telemetry.stop()`. Waits 2 s. Records the snapshot timestamp. Waits another 2 s. Asserts the snapshot timestamp has not changed (poller is idle).

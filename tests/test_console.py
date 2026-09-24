@@ -3,6 +3,7 @@ Console module tests (Section 2 of the test plan).
 """
 
 import re
+import threading
 import time
 
 import pytest
@@ -88,7 +89,11 @@ def test_tec_adc_channels(console):
 def test_tec_voltage_read(console):
     v = console.tec_voltage()
     assert isinstance(v, float)
-    assert 0.0 <= v <= 3.3
+    # tec_voltage() reads back the TEC DAC setpoint. The DAC (AD5761R) is
+    # configured for -5 V .. +5 V in console firmware and the setter accepts
+    # the same range, so a small negative readback is valid. The 0 .. 3.3 V
+    # bounds used for tec_adc()/tec_status() are ADC bounds and do not apply.
+    assert -5.0 <= v <= 5.0, f"TEC DAC setpoint {v} V out of [-5.0, 5.0]"
 
 
 def test_tec_voltage_set_readback(console):
@@ -413,12 +418,25 @@ def test_telemetry_fields_populated(console):
 @pytest.mark.slow
 def test_telemetry_listener_fires(console):
     calls = []
-    console.telemetry.add_listener(calls.append)
-    time.sleep(2.5)
-    console.telemetry.remove_listener(calls.append)
-    assert len(calls) >= 2, (
-        f"Telemetry listener called {len(calls)} time(s) in 2.5 s; expected ≥2"
-    )
+    received_two = threading.Event()
+
+    def listener(snapshot):
+        calls.append(snapshot)
+        if len(calls) >= 2:
+            received_two.set()
+
+    console.telemetry.add_listener(listener)
+    try:
+        # The slow telemetry refresh fires every 10th 100 ms poller tick
+        # (~1 Hz), but each refresh does several UART reads that stretch the
+        # period, and the session-scoped poller can be at any phase when the
+        # listener is registered. Wait for the behavior under test instead of
+        # assuming two callbacks fit into a fixed sleep window.
+        assert received_two.wait(timeout=5.0), (
+            f"Telemetry listener called {len(calls)} time(s) in 5 s; expected >=2"
+        )
+    finally:
+        console.telemetry.remove_listener(listener)
 
 
 @pytest.mark.slow
