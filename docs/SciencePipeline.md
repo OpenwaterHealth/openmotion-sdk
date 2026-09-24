@@ -670,6 +670,8 @@ The runner consumes `for batch in source`, so any object that yields `FrameBatch
 
 Per-side packet queues feed per-side reader threads that run `omotion.MotionProcessing.parse_histogram_stream`. Its packet callback assigns one per-side packet ordinal to all samples in the parsed packet. Complete packets accumulate into `FrameBatch`es (default `batch_size_frames=10`, with a `flush_interval_s=0.25` time-based flush) and are pushed to a shared batch queue that the runner iterates; a batch boundary never splits a packet.
 
+The runner runs every stage and sink inline, so while it is busy (a dark-interval close with its DB writes, a GC pause, a slow disk) nothing drains the queues behind it. Each per-side packet queue therefore holds `PACKET_BUFFER_SECONDS` (10 s) of raw USB reads, sized for uncompressed packets, so a stall backs up there instead of stopping the USB reads; the sensor itself buffers only ~5 frames. Each side logs the queue's high-water mark when streaming stops and warns once it passed half full (#116).
+
 `close()` follows a strict shutdown sequence to avoid losing the firmware's terminal dark frame:
 
 1. `stop_streaming()` + `drain_final()` on each side's `StreamInterface`. Drained chunks are pushed into the per-side packet queue while the parser thread is still running, so the parser consumes them on its next iteration.

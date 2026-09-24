@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import csv
 import logging
+import math
 import queue
 import threading
 import time
@@ -20,11 +21,35 @@ from typing import Any, Iterator, Optional, Protocol, runtime_checkable
 
 import numpy as np
 
+from omotion.config import CAPTURE_HZ
 from .batch import FrameBatch
 from .sinks import ScanMetadata
 
 
 logger = logging.getLogger("openmotion.sdk.pipeline.sources")
+
+# Seconds of sensor output each side's raw packet queue holds while the scan
+# thread is busy with something else: a dark-interval close with its DB
+# writes, a GC pause, a slow or antivirus-scanned disk. The sensor itself
+# buffers only ~5 frames (125 ms); once this queue is full the USB reader
+# stops reading and the sensor drops frames on both modules at the same
+# instant, which the frame classifier can turn into a 6.4 s lockout (#116,
+# #286). The old fixed depth of 64 reads gave ~0.65 s of total slack.
+PACKET_BUFFER_SECONDS = 10.0
+
+
+def packet_queue_depth_for(seconds: float) -> int:
+    """Packet-queue depth that holds ``seconds`` of one side's output.
+
+    Queue items are USB reads of at most ``HISTOGRAM_BYTES``; an
+    uncompressed packet (``MAX_PACKET_SIZE``) takes 9 of them, a compressed
+    one fewer, so this is sized for the uncompressed worst case. Memory is
+    only used while the queue is actually backed up: at most
+    ``depth * HISTOGRAM_BYTES`` (~15 MB per side at 10 s).
+    """
+    from omotion.MotionProcessing import HISTOGRAM_BYTES, MAX_PACKET_SIZE
+    reads_per_packet = math.ceil(MAX_PACKET_SIZE / HISTOGRAM_BYTES)
+    return math.ceil(seconds * CAPTURE_HZ * reads_per_packet)
 
 
 @runtime_checkable
@@ -214,13 +239,15 @@ class LiveUsbSource(_BaseSource):
                  console: Any, left: Any, right: Any,
                  batch_size_frames: int = 10,
                  flush_interval_s: float = 0.25,
-                 packet_queue_size: int = 64,
+                 packet_queue_size: Optional[int] = None,
                  metadata: ScanMetadata):
         super().__init__(metadata=metadata)
         self._console = console
         self._sensors: dict[str, Any] = {"left": left, "right": right}
         self._batch_size = int(batch_size_frames)
         self._flush_interval = float(flush_interval_s)
+        if packet_queue_size is None:
+            packet_queue_size = packet_queue_depth_for(PACKET_BUFFER_SECONDS)
         self._packet_queues: dict[str, queue.Queue] = {
             side: queue.Queue(maxsize=packet_queue_size)
             for side, sensor in self._sensors.items() if sensor is not None
