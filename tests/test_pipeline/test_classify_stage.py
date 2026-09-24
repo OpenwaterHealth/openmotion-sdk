@@ -3,6 +3,7 @@
 import logging
 
 import numpy as np
+import pytest
 from omotion.pipeline.batch import CameraStreamGap, FrameBatch, FrameQuarantined
 from omotion.pipeline.stages.classify import FrameClassificationStage
 
@@ -264,18 +265,80 @@ def test_camera_gap_alerts_after_eight_then_reports_recovery(caplog):
     assert confirmed.abs_frame_ids[1] == 13
 
 
-def test_unannounced_large_gap_fails_closed_without_delivery_evidence():
+def test_large_gap_re_anchors_once_the_next_frame_confirms_it():
+    # A +10 jump the device clock agrees with, then a coherent +1: a real gap
+    # (#286). Only the first resumed frame is held back; nothing needs
+    # separate evidence that the camera went missing.
     stage = FrameClassificationStage()
     batch = _batch_with_raw_ids({(0, 0): [1, 11, 12]})
     batch.timestamp_s[:] = [0.000, 0.250, 0.275]
     stage.process(batch)
 
-    assert list(batch.frame_type) == ["warmup", "stale", "stale"]
+    assert list(batch.frame_type) == ["warmup", "stale", "light"]
     np.testing.assert_array_equal(batch.abs_frame_ids, [1, 11, 12])
     quarantined = [e for e in batch.events
                    if isinstance(e, FrameQuarantined)]
-    assert len(quarantined) == 2
-    assert {event.reason for event in quarantined} == {"gap_too_large"}
+    assert len(quarantined) == 1
+    assert quarantined[0].reason == "gap_too_large"
+
+
+def test_large_jump_the_clock_does_not_support_stays_quarantined():
+    # frame_id +40 in 25 ms is physically impossible: no candidate is held,
+    # and the next genuine frame continues the old sequence.
+    stage = FrameClassificationStage()
+    batch = _batch_with_raw_ids({(0, 0): [1, 41, 42, 2]})
+    batch.timestamp_s[:] = [0.000, 0.025, 0.050, 0.025]
+    stage.process(batch)
+
+    assert list(batch.frame_type) == ["warmup", "stale", "stale", "warmup"]
+    assert batch.abs_frame_ids[3] == 2
+
+
+def _capture_batch(frames, *, side=0, cams=range(8), first_packet=0):
+    """Packet-shaped rows: every camera of `side` delivers each frame in
+    `frames`, timestamped on the 25 ms cadence of its true frame number."""
+    rows = [(first_packet + p, (f - 1) * 0.025, side, cam, f & 0xFF)
+            for p, f in enumerate(frames) for cam in cams]
+    return _packet_batch(rows)
+
+
+def _run_module_gap(missing):
+    """1..1836, then a whole-module gap of `missing` frames, then 700 more
+    (far enough to reach the next scheduled dark)."""
+    stage = FrameClassificationStage(expected_camera_masks=(0xFF, 0))
+    truth = list(range(1, 1837)) + list(range(1837 + missing, 1837 + missing + 700))
+    rows = []
+    for i in range(0, len(truth), 16):
+        chunk = truth[i:i + 16]
+        batch = _capture_batch(chunk, first_packet=i)
+        stage.process(batch)
+        rows += list(zip(np.repeat(chunk, 8), batch.abs_frame_ids, batch.frame_type))
+    return rows
+
+
+def test_module_wide_gap_loses_only_the_first_resumed_capture():
+    # sdk#286: all 8 cameras skip 17 frames together. The old classifier
+    # quarantined ~240 captures and left every later id 256 low.
+    rows = _run_module_gap(17)
+    stale = [(t, a) for t, a, ft in rows if ft == "stale"]
+    assert [t for t, _ in stale] == [1854] * 8
+    assert all(a == t for t, a, ft in rows if ft != "stale")
+    darks = sorted({t for t, a, ft in rows if ft == "dark" and t > 1837})
+    assert darks == [2401]
+
+
+@pytest.mark.parametrize("missing", [200, 256 + 17, 256])
+def test_long_module_gap_takes_its_epoch_from_the_clock(missing):
+    # Gaps past 127 frames are ambiguous on the 8-bit wire id: 256+17 reads
+    # as +17, and a gap of 256 missing frames reads as a single +1 step. The
+    # device clock fixes the epoch, so ids stay right after the gap.
+    rows = _run_module_gap(missing)
+    resumed = 1837 + missing
+    assert [t for t, _, ft in rows if ft == "stale"] == [resumed] * 8
+    assert all(a == t for t, a, ft in rows if ft != "stale")
+    # The next scheduled dark after the gap lands on the true dark frame.
+    next_dark = next(k for k in range(resumed + 1, resumed + 700) if (k - 1) % 600 == 0)
+    assert min(t for t, a, ft in rows if ft == "dark" and t > resumed) == next_dark
 
 
 def test_large_corrupt_pair_does_not_poison_clean_counter_state():

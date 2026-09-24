@@ -38,11 +38,14 @@ _FRAME_ID_MODULUS = 256
 _NOMINAL_PERIOD_S = 0.025
 _CLOCK_RESIDUAL_ABS_S = 0.012
 _CLOCK_RESIDUAL_FRAC = 0.10
-# A larger jump needs more evidence than one counter/clock pair before it can
-# re-anchor the stream.  The first returning frame is quarantined; a second
-# consecutive counter/clock pair confirms a coherent resumed stream below.
+# Forward steps up to this size are accepted directly when the clock agrees.
+# Anything larger re-anchors only through a clock-derived candidate that a
+# second consecutive counter/clock pair confirms (#286).
 _MAX_FORWARD_GAP_FRAMES = 8
 _CAMERA_GAP_ALERT_FRAMES = 8
+# The sensor MCU and console crystals may disagree by up to ~100 ppm. Over a
+# long gap that is how far the device clock can drift from the frame cadence.
+_CLOCK_DRIFT_FRAC = 1e-4
 
 
 @dataclass(frozen=True)
@@ -74,17 +77,27 @@ class _FrameUnwrapper:
     A single-step counter with a bad timestamp is kept for downstream repair
     without adopting that timestamp as future classifier state.
 
-    Acceptance rules, in order:
+    Acceptance rules:
 
-    1. **Backward or duplicate step (<= 0)** — rejected as stale. Covers
-       leftover buffer contents at scan start (raw 1, 255, 173, 4, 5 …),
-       mid-scan counter blips, and corrupted frame_ids that happen to read
-       backward. State is untouched so the next genuine frame resumes the
-       sequence cleanly.
-    2. **Single forward step** — accepted. A clock disagreement makes the
-       timestamp untrusted but cannot poison the counter sequence.
-    3. **Multi-step gap** — accepted only when clock elapsed time supports it
-       and the gap is within the live-stream safety bound.
+    1. **Single forward step** — accepted. A clock disagreement makes the
+       timestamp untrusted but cannot poison the counter sequence, unless the
+       clock says whole 8-bit wraps went by (a gap of 256*n + 1 frames reads
+       as +1 on the wire); that case goes through rule 4.
+    2. **Forward step 2–8** — accepted when the clock supports the full step.
+    3. **Everything else is quarantined**: backward or duplicate steps (stale
+       leftovers at scan start, counter blips, corrupted ids that read
+       backward), steps > 8, and multi-step claims the clock contradicts.
+       Accepted state is untouched, so the next genuine frame resumes.
+    4. **Re-anchoring after a real gap.** When a quarantined frame's device
+       clock places it at an absolute id whose low byte is its wire id, that
+       id is held as a candidate. The stream re-anchors there only if the next
+       frame continues it by exactly one frame and ~25 ms (#286). A corrupted
+       frame id fails the first test (its low byte won't match the clock); a
+       single capture with matched counter+timestamp corruption fails the
+       second (the next clean frame doesn't continue it). A real gap of any
+       length, one camera or the whole module, passes both, and because the
+       epoch comes from the clock, absolute ids stay correct past 8-bit wraps.
+       Only the first resumed frame is lost.
     """
 
     __slots__ = (
@@ -101,18 +114,40 @@ class _FrameUnwrapper:
         # making every following honest frame look backward in time.
         self.clock_abs: int | None = None
         self.clock_ts: float | None = None
-        # A >8-frame jump is not adopted from a single counter/clock pair.
-        # Retain it separately so one more consecutive pair can re-anchor a
-        # genuinely resumed camera without poisoning the accepted state.
+        # (raw id, clock-implied abs id, timestamp) of a quarantined frame the
+        # next frame may confirm as the start of a resumed stream (rule 4).
         self.resync_candidate: tuple[int, int, float] | None = None
 
-    def unwrap(
-        self,
-        raw_frame_id: int,
-        timestamp_s: float,
-        *,
-        allow_large_resync: bool = False,
-    ) -> _UnwrapResult:
+    def _adopt(self, abs_id: int, raw_frame_id: int, ts: float, *,
+               clock: bool) -> None:
+        self.epoch = abs_id // _FRAME_ID_MODULUS
+        self.last_raw = raw_frame_id
+        self.last_abs = abs_id
+        if clock:
+            self.clock_abs = abs_id
+            self.clock_ts = ts
+
+    def _clock_candidate(self, raw_frame_id: int, ts: float) -> int | None:
+        """The absolute id the device clock implies for this frame, if its low
+        byte is the wire id. None when the clock can't vouch for the frame."""
+        if self.clock_abs is None or self.clock_ts is None:
+            return None
+        elapsed = ts - self.clock_ts
+        if elapsed <= 0:
+            return None
+        nearest = self.clock_abs + round(elapsed / _NOMINAL_PERIOD_S)
+        slack = _CLOCK_RESIDUAL_ABS_S + _CLOCK_DRIFT_FRAC * elapsed
+        for abs_id in (nearest - 1, nearest, nearest + 1):
+            if abs_id <= self.last_abs:
+                continue
+            if (abs_id - raw_frame_id) % _FRAME_ID_MODULUS:
+                continue
+            claimed = (abs_id - self.clock_abs) * _NOMINAL_PERIOD_S
+            if abs(elapsed - claimed) <= slack:
+                return abs_id
+        return None
+
+    def unwrap(self, raw_frame_id: int, timestamp_s: float) -> _UnwrapResult:
         """Adjudicate a counter/clock pair without adopting a bad witness."""
         ts = float(timestamp_s)
         if self.last_abs is None:
@@ -123,138 +158,127 @@ class _FrameUnwrapper:
                     reason="leading_frame",
                     detail="leading frame id is not the scan-start value 1",
                 )
-            self.last_raw = raw_frame_id
-            self.last_abs = raw_frame_id
-            self.clock_abs = raw_frame_id
-            self.clock_ts = ts
+            self._adopt(raw_frame_id, raw_frame_id, ts, clock=True)
             return _UnwrapResult(raw_frame_id, True)
 
-        counter_anchor_abs = self.last_abs
-        clock_anchor_abs = self.clock_abs
-        clock_anchor_ts = self.clock_ts
+        anchors = dict(
+            counter_anchor_abs_frame_id=self.last_abs,
+            clock_anchor_abs_frame_id=self.clock_abs,
+            clock_anchor_timestamp_s=self.clock_ts,
+        )
+        elapsed_s = (ts - self.clock_ts) if self.clock_ts is not None else None
 
-        pending = self.resync_candidate if allow_large_resync else None
-        if not allow_large_resync:
-            self.resync_candidate = None
+        pending, self.resync_candidate = self.resync_candidate, None
         if pending is not None:
             pending_raw, pending_abs, pending_ts = pending
-            pending_step = ((raw_frame_id - pending_raw + 128) & 0xFF) - 128
-            pending_elapsed = ts - pending_ts
             pending_slack = max(
                 _CLOCK_RESIDUAL_ABS_S,
                 _CLOCK_RESIDUAL_FRAC * _NOMINAL_PERIOD_S,
             )
-            self.resync_candidate = None
-            if (pending_step == 1
-                    and abs(pending_elapsed - _NOMINAL_PERIOD_S)
+            if (raw_frame_id == (pending_raw + 1) % _FRAME_ID_MODULUS
+                    and abs((ts - pending_ts) - _NOMINAL_PERIOD_S)
                     <= pending_slack):
                 abs_id = pending_abs + 1
-                self.epoch = abs_id // _FRAME_ID_MODULUS
-                self.last_raw = raw_frame_id
-                self.last_abs = abs_id
-                self.clock_abs = abs_id
-                self.clock_ts = ts
+                step = abs_id - self.last_abs
+                self._adopt(abs_id, raw_frame_id, ts, clock=True)
                 return _UnwrapResult(
                     abs_frame_id=abs_id,
                     accepted=True,
                     reason="resynchronized_after_large_gap",
-                    detail=("two consecutive counter/clock pairs confirmed "
-                            "the resumed stream"),
-                    step=abs_id - counter_anchor_abs,
-                    elapsed_s=(ts - clock_anchor_ts
-                               if clock_anchor_ts is not None else None),
-                    counter_anchor_abs_frame_id=counter_anchor_abs,
-                    clock_anchor_abs_frame_id=clock_anchor_abs,
-                    clock_anchor_timestamp_s=clock_anchor_ts,
+                    detail=("the device clock placed the resumed stream and "
+                            "the next frame confirmed it"),
+                    step=step,
+                    elapsed_s=elapsed_s,
+                    **anchors,
                 )
 
         # Signed step in [-128, 127]: positive = forward, <= 0 = backward
         # (stale leftover) or duplicate.
         step = ((raw_frame_id - self.last_raw + 128) & 0xFF) - 128
+        clock_residual_s: float | None = None
+        clock_ok = True
+        if step > 0:
+            abs_id = self.last_abs + step
+            if self.clock_abs is not None and self.clock_ts is not None:
+                claimed_s = (abs_id - self.clock_abs) * _NOMINAL_PERIOD_S
+                clock_residual_s = (ts - self.clock_ts) - claimed_s
+                clock_ok = abs(clock_residual_s) <= max(
+                    _CLOCK_RESIDUAL_ABS_S, _CLOCK_RESIDUAL_FRAC * claimed_s,
+                )
+            if step <= _MAX_FORWARD_GAP_FRAMES and clock_ok:
+                self._adopt(abs_id, raw_frame_id, ts, clock=True)
+                return _UnwrapResult(
+                    abs_frame_id=abs_id, accepted=True, step=step,
+                    elapsed_s=elapsed_s, **anchors,
+                )
+        else:
+            abs_id = self.epoch * _FRAME_ID_MODULUS + raw_frame_id
+
+        candidate = self._clock_candidate(raw_frame_id, ts)
+        if step == 1 and candidate in (None, abs_id):
+            # A single-step counter is the least ambiguous witness: accept it.
+            # When the clock disagrees, TimestampRepairStage repairs the
+            # timestamp and the clock anchor stays where it was.
+            self._adopt(abs_id, raw_frame_id, ts, clock=candidate == abs_id)
+            return _UnwrapResult(
+                abs_frame_id=abs_id, accepted=True, step=step,
+                elapsed_s=elapsed_s, **anchors,
+            )
+        if 1 < step <= _MAX_FORWARD_GAP_FRAMES and candidate == abs_id:
+            # Within the drift allowance for a long-stale clock anchor.
+            self._adopt(abs_id, raw_frame_id, ts, clock=True)
+            return _UnwrapResult(
+                abs_frame_id=abs_id, accepted=True, step=step,
+                elapsed_s=elapsed_s, **anchors,
+            )
+
+        if candidate is not None:
+            self.resync_candidate = (raw_frame_id, candidate, ts)
+            return _UnwrapResult(
+                abs_frame_id=candidate,
+                accepted=False,
+                reason="gap_too_large",
+                detail=(f"device clock places this frame "
+                        f"{candidate - self.last_abs} frames after the last "
+                        f"accepted one; held until the next frame confirms "
+                        f"the resumed stream"),
+                step=step,
+                elapsed_s=elapsed_s,
+                **anchors,
+            )
         if step <= 0:
             return _UnwrapResult(
-                abs_frame_id=self.epoch * _FRAME_ID_MODULUS + raw_frame_id,
+                abs_frame_id=abs_id,
                 accepted=False,
                 reason="non_monotonic",
                 detail="non-monotonic frame id (backward/duplicate)",
                 step=step,
-                elapsed_s=(ts - clock_anchor_ts
-                           if clock_anchor_ts is not None else None),
-                counter_anchor_abs_frame_id=counter_anchor_abs,
-                clock_anchor_abs_frame_id=clock_anchor_abs,
-                clock_anchor_timestamp_s=clock_anchor_ts,
+                elapsed_s=elapsed_s,
+                **anchors,
             )
-
-        candidate_epoch = self.epoch + int(raw_frame_id <= self.last_raw)
-        abs_id = candidate_epoch * _FRAME_ID_MODULUS + raw_frame_id
-        elapsed_s = (ts - clock_anchor_ts
-                     if clock_anchor_ts is not None else None)
-
-        clock_residual_s: float | None = None
-        clock_slack_s: float | None = None
-        if self.clock_abs is not None and self.clock_ts is not None:
-            clock_gap = abs_id - self.clock_abs
-            claimed_s = clock_gap * _NOMINAL_PERIOD_S
-            elapsed_s = ts - self.clock_ts
-            clock_residual_s = elapsed_s - claimed_s
-            clock_slack_s = max(
-                _CLOCK_RESIDUAL_ABS_S,
-                _CLOCK_RESIDUAL_FRAC * claimed_s,
+        if step > _MAX_FORWARD_GAP_FRAMES:
+            return _UnwrapResult(
+                abs_frame_id=abs_id,
+                accepted=False,
+                reason="gap_too_large",
+                detail=(f"forward frame-id gap +{step} exceeds direct "
+                        f"acceptance limit {_MAX_FORWARD_GAP_FRAMES} and the "
+                        f"device clock does not place the frame there"),
+                step=step,
+                elapsed_s=elapsed_s,
+                **anchors,
             )
-            if step > _MAX_FORWARD_GAP_FRAMES:
-                if (allow_large_resync
-                        and abs(clock_residual_s) <= clock_slack_s):
-                    self.resync_candidate = (raw_frame_id, abs_id, ts)
-                next_step = (
-                    "waiting for a second resumed frame"
-                    if allow_large_resync
-                    else "no independent camera-outage evidence permits re-anchoring"
-                )
-                return _UnwrapResult(
-                    abs_frame_id=abs_id,
-                    accepted=False,
-                    reason="gap_too_large",
-                    detail=(f"forward frame-id gap +{step} exceeds direct "
-                            f"acceptance limit {_MAX_FORWARD_GAP_FRAMES}; "
-                            f"{next_step}"),
-                    step=step,
-                    elapsed_s=elapsed_s,
-                    counter_anchor_abs_frame_id=counter_anchor_abs,
-                    clock_anchor_abs_frame_id=clock_anchor_abs,
-                    clock_anchor_timestamp_s=clock_anchor_ts,
-                )
-            # A single-step counter is the least ambiguous witness: accept it
-            # and let TimestampRepairStage repair the clock. For a multi-step
-            # counter claim, disagreement is a frame-id fault and fails closed.
-            if step > 1 and abs(clock_residual_s) > clock_slack_s:
-                return _UnwrapResult(
-                    abs_frame_id=abs_id,
-                    accepted=False,
-                    reason="counter_clock_mismatch",
-                    detail=(f"frame id claims +{step} frames but clock "
-                            f"residual is {clock_residual_s * 1e3:.0f} ms"),
-                    step=step,
-                    elapsed_s=elapsed_s,
-                    counter_anchor_abs_frame_id=counter_anchor_abs,
-                    clock_anchor_abs_frame_id=clock_anchor_abs,
-                    clock_anchor_timestamp_s=clock_anchor_ts,
-                )
-
-        self.epoch = candidate_epoch
-        self.last_raw = raw_frame_id
-        self.last_abs = abs_id
-        if (clock_residual_s is None or clock_slack_s is None
-                or abs(clock_residual_s) <= clock_slack_s):
-            self.clock_abs = abs_id
-            self.clock_ts = ts
+        # A multi-step counter claim the clock contradicts is a frame-id
+        # fault and fails closed.
         return _UnwrapResult(
             abs_frame_id=abs_id,
-            accepted=True,
+            accepted=False,
+            reason="counter_clock_mismatch",
+            detail=(f"frame id claims +{step} frames but clock "
+                    f"residual is {(clock_residual_s or 0.0) * 1e3:.0f} ms"),
             step=step,
             elapsed_s=elapsed_s,
-            counter_anchor_abs_frame_id=counter_anchor_abs,
-            clock_anchor_abs_frame_id=clock_anchor_abs,
-            clock_anchor_timestamp_s=clock_anchor_ts,
+            **anchors,
         )
 
 
@@ -278,9 +302,6 @@ class FrameClassificationStage:
             for side, mask in enumerate(masks)
         }
         self._camera_gaps: dict[tuple[int, int], _CameraGapState] = {}
-        # Long-gap re-anchoring is permitted only after source-packet evidence
-        # proved that this expected camera really disappeared and returned.
-        self._resync_allowed: set[tuple[int, int]] = set()
         # A non-zero quarantine count is a hardware-health signal. Log one
         # example per reason live, then report reason totals at scan stop.
         self._quarantine_counts: dict[str, int] = {}
@@ -351,13 +372,7 @@ class FrameClassificationStage:
                 unwrapper = _FrameUnwrapper()
                 self._unwrappers[key] = unwrapper
 
-            result = unwrapper.unwrap(
-                raw_id,
-                float(batch.timestamp_s[i]),
-                allow_large_resync=key in self._resync_allowed,
-            )
-            if result.accepted:
-                self._resync_allowed.discard(key)
+            result = unwrapper.unwrap(raw_id, float(batch.timestamp_s[i]))
             abs_id = result.abs_frame_id
             abs_ids[i] = abs_id
 
@@ -444,7 +459,6 @@ class FrameClassificationStage:
         if gap is None or not gap.alerted:
             return
         side, cam_id = key
-        self._resync_allowed.add(key)
         batch.events.append(CameraStreamGap(
             side=side,
             cam_id=cam_id,
@@ -543,4 +557,3 @@ class FrameClassificationStage:
         self._quarantine_counts.clear()
         self._quarantine_logged.clear()
         self._camera_gaps.clear()
-        self._resync_allowed.clear()
