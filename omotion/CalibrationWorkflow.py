@@ -1303,10 +1303,18 @@ class CalibrationWorkflow:
             wd.daemon = True
             wd.start()
 
-            skip_frames = int(round(request.scan_delay_sec * CAPTURE_HZ))
+            # Frame math must use the rate this run actually triggers at
+            # (interface default ⊕ request override — 60 Hz mode, sdk#129),
+            # not the 40 Hz CAPTURE_HZ constant, or the skip/window land
+            # at the wrong wall-times.
+            capture_hz = float(
+                self._interface.resolve_trigger_config(request.trigger_config)
+                .get("TriggerFrequencyHz", CAPTURE_HZ)
+            )
+            skip_frames = int(round(request.scan_delay_sec * capture_hz))
             # Bound the trailing edge to keep the firmware's terminal
             # dark frame (and any laser ramp-down) out of the average.
-            window_frames = int(round(request.duration_sec * CAPTURE_HZ))
+            window_frames = int(round(request.duration_sec * capture_hz))
             # Phase 1 (calibration scan) widens its averaging window
             # to swallow every laser-on corrected sample after the
             # leading scan_delay_sec skip when average_full_scan is set
@@ -1973,8 +1981,13 @@ class CalibrationWorkflow:
             wd.daemon = True
             wd.start()
 
-            skip_frames = int(round(request.scan_delay_sec * CAPTURE_HZ))
-            window_frames = int(round(request.duration_sec * CAPTURE_HZ))
+            # Same rate resolution as the calibration path above (sdk#129).
+            capture_hz = float(
+                self._interface.resolve_trigger_config(request.trigger_config)
+                .get("TriggerFrequencyHz", CAPTURE_HZ)
+            )
+            skip_frames = int(round(request.scan_delay_sec * capture_hz))
+            window_frames = int(round(request.duration_sec * capture_hz))
             phase1_window_frames = (
                 10 ** 9 if request.average_full_scan else window_frames
             )

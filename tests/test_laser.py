@@ -142,6 +142,122 @@ def test_apply_laser_power_holds_lock_around_writes():
     assert lk.locked == 1 and lk.unlocked == 1
 
 
+def _rate_ll_writes(console):
+    # Both RATE_LL registers live at 0x41 offset 0x08 (EE ch 6, OPT ch 7).
+    return {
+        ch: data
+        for (mux, ch, dev, reg, data) in console.writes
+        if dev == 0x41 and reg == 0x08 and ch in (6, 7)
+    }
+
+
+def test_apply_laser_power_default_rate_keeps_baseline_rate_ll():
+    console = _FakeConsole()
+    assert apply_laser_power(console, trigger_freq_hz=40.0) is True
+    writes = _rate_ll_writes(console)
+    # Baseline: 70313 ticks x 0.32 us = 22,500 us min period.
+    assert writes[6] == (70313).to_bytes(4, "little")
+    assert writes[7] == (70313).to_bytes(4, "little")
+
+
+def test_apply_laser_power_60hz_scales_rate_ll():
+    console = _FakeConsole()
+    assert apply_laser_power(console, trigger_freq_hz=60.0) is True
+    writes = _rate_ll_writes(console)
+    # 70313 * 40/60 = 46875 ticks x 0.32 us = 15,000 us min period —
+    # same 0.9x proportional margin at the 16,667 us period of 60 Hz.
+    assert writes[6] == (46875).to_bytes(4, "little")
+    assert writes[7] == (46875).to_bytes(4, "little")
+
+
+def test_apply_laser_power_none_rate_keeps_baseline_rate_ll():
+    console = _FakeConsole()
+    assert apply_laser_power(console) is True
+    writes = _rate_ll_writes(console)
+    assert writes[6] == (70313).to_bytes(4, "little")
+    assert writes[7] == (70313).to_bytes(4, "little")
+
+
+def test_apply_laser_power_60hz_scales_user_config_rate_ll_override():
+    """A stored per-key RATE_LL user-config override (us, calibrated for
+    40 Hz) must be rescaled like the bundled baseline — written verbatim
+    at 60 Hz it would exceed the pulse period and trip the interlock on
+    every pulse (sdk#129 review finding)."""
+    class _FakeConsoleWithCfg(_FakeConsole):
+        def read_config(self):
+            class _Cfg:
+                json_data = {"EE_RATE_LL": 22500.0}
+            return _Cfg()
+
+    console = _FakeConsoleWithCfg()
+    assert apply_laser_power(console, trigger_freq_hz=60.0) is True
+    writes = _rate_ll_writes(console)
+    # override 22,500 us / 0.32 = 70312.5 raw ticks, x 40/60 = 46875.
+    assert writes[6] == (46875).to_bytes(4, "little")
+    # OPT side has no override — bundled baseline scaling still applies.
+    assert writes[7] == (46875).to_bytes(4, "little")
+
+
+def test_trigger_overrides_for_rate_rejects_unsupported_rate():
+    from omotion.config import trigger_overrides_for_rate
+    import pytest
+
+    with pytest.raises(ValueError):
+        trigger_overrides_for_rate(0)
+    with pytest.raises(ValueError):
+        trigger_overrides_for_rate(100)
+
+
+def test_trigger_overrides_for_rate_scales_skip_delay():
+    from omotion.config import trigger_overrides_for_rate
+
+    o60 = trigger_overrides_for_rate(60)
+    assert o60["TriggerFrequencyHz"] == 60
+    # 1800 us x 40/60 = 1200 us: post-dark interval 16667-1200 = 15467 us
+    # stays above the scaled 15000 us RATE_LL floor.
+    assert o60["LaserPulseSkipDelayUsec"] == 1200
+    o40 = trigger_overrides_for_rate(40)
+    assert o40["LaserPulseSkipDelayUsec"] == 1800
+
+
+def test_trigger_overrides_for_rate_moves_pulse_delay_with_vts():
+    from omotion.config import trigger_overrides_for_rate
+
+    # Band at 60 Hz sits (2768-1845) rows x 9.0318 us later -> pulse at
+    # 8436 us (bench-swept). Known #68 limitation: this is inside the SPI
+    # push window; see trigger_overrides_for_rate docstring.
+    assert trigger_overrides_for_rate(60)["LaserPulseDelayUsec"] == 8436
+    assert trigger_overrides_for_rate(40)["LaserPulseDelayUsec"] == 100
+
+
+def test_trigger_overrides_for_rate_scales_pulse_width_for_60825():
+    from omotion.config import trigger_overrides_for_rate
+
+    # IEC 60825 (AEL calculator sheet): hold duty at the 40 Hz-validated
+    # 2.0% -> gate width scales with the period. 500 us x 40/60 = 333 us;
+    # 60 Hz x 333.33 us = 2.0% duty, so every average-power AEL row is
+    # unchanged and per-pulse/pulse-train margins improve.
+    assert trigger_overrides_for_rate(60)["LaserPulseWidthUsec"] == 333
+    assert trigger_overrides_for_rate(40)["LaserPulseWidthUsec"] == 500
+
+
+def test_apply_laser_power_60hz_scales_pulse_width_ul():
+    console = _FakeConsole()
+    assert apply_laser_power(console, trigger_freq_hz=60.0) is True
+    # PULSE_WIDTH_UL lives at 0x41 offset 0x0C? No: RATE regs at 0x08/0x0C
+    # are RATE_LL/UL; PULSE_WIDTH_LL/UL are the entries preceding them in
+    # laser_params.json. Baseline UL raw 3125 x 0.32 us = 1000 us; at
+    # 60 Hz the ceiling scales to 2083 raw = 666.7 us so the interlock
+    # ENFORCES the shortened 60825-compliant gate.
+    ul_writes = [
+        data for (mux, ch, dev, reg, data) in console.writes
+        if dev == 0x41 and reg == 0x04 and ch in (6, 7)
+    ]
+    assert ul_writes, "expected PULSE_WIDTH_UL writes"
+    for data in ul_writes:
+        assert data == (2083).to_bytes(4, "little")
+
+
 def test_apply_laser_power_releases_lock_on_write_failure():
     lk = _Lock()
     assert apply_laser_power(_FakeConsole(write_ok=False), lock=lk) is False
