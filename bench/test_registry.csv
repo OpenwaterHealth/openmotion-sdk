@@ -71,3 +71,6 @@ run_timestamp,subject_id,sensor_serial,side,control_voltage_v,supply_voltage_v,d
 2026-08-05T19:36:57,VREG1_02,,right,2.0,24.0,1800.0,60.0,1.0,31,bench\vendor_reg_out\20260806_020644_VREG1_02_right_maskC3_raw.csv,845.2,bench\vendor_reg_out\VREG1_02_thorlabs.csv,dropout_check_failed
 2026-08-05T22:08:23,VREG1_03,,right,2.0,24.0,1800.0,60.0,1.0,31,bench\vendor_reg_out\20260806_043809_VREG1_03_right_maskC3_raw.csv,853.7,bench\vendor_reg_out\VREG1_03_thorlabs.csv,dropout_check_failed
 2026-09-28T16:22:33,RECHECK,WWWA4Q40013R,left,2.0,24.0,60.0,30.0,1.0,2,bench\recheck_out\20260928_232127_RECHECK_left_maskC3_raw.csv,27.1,bench\recheck_out\RECHECK_thorlabs.csv,dropout_check_failed
+2026-09-28T19:52:05,REBASE_01,WWWA4Q40013R,left,2.0,24.0,1800.0,60.0,1.0,31,bench\rebaseline_out\20260929_022200_REBASE_01_left_maskC3_raw.csv,823.9,bench\rebaseline_out\REBASE_01_thorlabs.csv,dropout_check_failed
+2026-09-28T22:23:19,REBASE_02,WWWA4Q40013R,left,2.0,24.0,1800.0,60.0,1.0,31,bench\rebaseline_out\20260929_045315_REBASE_02_left_maskC3_raw.csv,824.3,bench\rebaseline_out\REBASE_02_thorlabs.csv,dropout_check_failed
+2026-09-29T00:54:33,REBASE_03,WWWA4Q40013R,left,2.0,24.0,1800.0,60.0,1.0,31,bench\rebaseline_out\20260929_072429_REBASE_03_left_maskC3_raw.csv,824.6,bench\rebaseline_out\REBASE_03_thorlabs.csv,dropout_check_failed
