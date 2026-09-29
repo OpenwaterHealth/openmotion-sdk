@@ -1804,6 +1804,24 @@ class MotionSensor(SignalWrapper):
         )
         return r.packetType not in _ERROR_TYPES
 
+    def image_mode_exit_status(self) -> dict | None:
+        """Exit drip-scan image mode (idempotent) and return the firmware's
+        image_mode_resp_t: ``{"active": bool, "mask": int, "gap_count":
+        [8 x int]}``. gap_count = lost-line events per camera since the last
+        enter (line timeouts / ring resyncs, USB drops, link errors). Returns
+        None on error or when the reply is too short."""
+        if self.demo_mode:
+            return {"active": False, "mask": 0, "gap_count": [0] * 8}
+        r = self._send(packetType=OW_CAMERA, command=OW_CAMERA_IMAGE_MODE,
+                       reserved=0, data=bytes([0x01]), timeout=1.5)
+        if r is None or r.packetType in _ERROR_TYPES:
+            return None
+        d = bytes(r.data[: r.data_len]) if r.data else b""
+        if len(d) < 36:
+            return None
+        return {"active": bool(d[0]), "mask": d[1],
+                "gap_count": list(struct.unpack_from("<8I", d, 4))}
+
     def enable_camera_fsin_ext(self) -> bool:
         """Enable external frame-sync input."""
         if self.demo_mode:

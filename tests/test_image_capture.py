@@ -420,10 +420,16 @@ def test_fpga_regs_v2_sweep_arm():
     assert r.check_id() is True
     assert r.check_version() is True
 
+    s.ops.clear()
     r.arm_sweep(start_line=0x2A5)
-    assert ("wr", 3, 0x04, 0xA5) in s.ops          # LINE_L
-    assert ("wr", 3, 0x05, 0x02) in s.ops          # LINE_H (line[11:8])
-    assert s.ops[-1] == ("wr", 3, 0x03, CTRL_IMAGE_MODE | CTRL_SWEEP)
+    # Park the target out of reach, set the sweep bit, THEN lower the start
+    # line: in single-line mode a frame between the two would push the
+    # target line as a legacy packet and auto-increment the target.
+    assert s.ops == [
+        ("wr", 3, 0x04, 0xFF), ("wr", 3, 0x05, 0x0F),       # target 4095
+        ("wr", 3, 0x03, CTRL_IMAGE_MODE | CTRL_SWEEP),
+        ("wr", 3, 0x04, 0xA5), ("wr", 3, 0x05, 0x02),       # start line 0x2A5
+    ]
 
     r.stop_sweep()
     assert s.ops[-1] == ("wr", 3, 0x03, CTRL_IMAGE_MODE)

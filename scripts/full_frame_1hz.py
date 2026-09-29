@@ -37,7 +37,8 @@ def _preview(img: np.ndarray) -> np.ndarray:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--side", choices=("left", "right"), default="left")
-    ap.add_argument("--cam", type=int, default=0, help="camera index 0-7")
+    ap.add_argument("--cam", type=int, nargs="+", default=[0],
+                    help="camera index/indices 0-7 (several = concurrent)")
     ap.add_argument("--frames", type=int, default=5)
     ap.add_argument("--out", default="full_frame_out")
     ap.add_argument("--no-laser", action="store_true", help="TA trigger off (dark / ambient)")
@@ -78,21 +79,21 @@ def main() -> int:
     t0 = time.monotonic()
 
     def on_frame(f):
-        k = len(meta)
-        stem = f"{a.side}_cam{a.cam}_{k:03d}"
+        k = sum(1 for m in meta if m["cam"] == f.cam_id)
+        stem = f"{a.side}_cam{f.cam_id}_{k:03d}"
         np.save(out / f"{stem}.npy", f.image)
         if Image is not None:
             Image.fromarray(f.image).save(out / f"{stem}_raw16.png")
             # 8-bit contrast-stretched copy for eyeballing ONLY -- not data.
             Image.fromarray(_preview(f.image)).save(out / f"{stem}_preview8.png")
-        meta.append({"file": stem, "t_s": round(f.t_last - t0, 3),
+        meta.append({"file": stem, "cam": f.cam_id, "t_s": round(f.t_last - t0, 3),
                      "frame_cnts": f.frame_cnts, "lines": f.lines,
                      "overrun": f.overrun, "mean": float(f.image.mean()),
                      "std": float(f.image.std())})
-        print(f"[{f.t_last - t0:7.3f}s] frame {k}: {f.lines} lines from "
+        print(f"[{f.t_last - t0:7.3f}s] cam{f.cam_id} frame {k}: {f.lines} lines from "
               f"{len(f.frame_cnts)} exposures, mean {f.image.mean():.1f}"
               f"{'  OVERRUN' if f.overrun else ''}", flush=True)
-        if im is not None:
+        if im is not None and f.cam_id == a.cam[0]:
             im.set_data(_preview(f.image))
             fig.canvas.draw_idle()
             fig.canvas.flush_events()
@@ -113,10 +114,13 @@ def main() -> int:
              "frames": meta},
             indent=2))
         iface.stop()
-    if len(meta) > 1:
-        dt = np.diff([m["t_s"] for m in meta])
-        print(f"{len(meta)} frames, period {dt.mean():.3f} s (min {dt.min():.3f}, max {dt.max():.3f})")
-    return 0 if len(meta) == a.frames else 2
+    for c in a.cam:
+        ts = [m["t_s"] for m in meta if m["cam"] == c]
+        if len(ts) > 1:
+            dt = np.diff(ts)
+            print(f"cam{c}: {len(ts)} frames, period {dt.mean():.3f} s "
+                  f"(min {dt.min():.3f}, max {dt.max():.3f})")
+    return 0 if len(meta) == a.frames * len(a.cam) else 2
 
 
 if __name__ == "__main__":

@@ -377,11 +377,23 @@ class FpgaRegs:
         self.write(REG_LINE_H, (line >> 8) & 0x0F)
 
     def arm_sweep(self, start_line: int = 0) -> None:
-        """Program the start line, then set CTRL = image|sweep. The FPGA
-        samples CTRL at the frame-valid boundary and clears the overrun latch
-        on arm; every subsequent frame pushes all lines >= start_line."""
-        self.set_start_line(start_line)
+        """Arm the sweep at ``start_line``. The FPGA samples CTRL at the
+        frame-valid boundary and clears the overrun latch on arm; every
+        subsequent frame pushes all lines >= start_line (every STRIDE-th in
+        map v3 stride mode).
+
+        Order matters (bench 2026-09-29): in SINGLE-line image mode the FPGA
+        captures its target line each frame, pushes a 4100-B legacy packet
+        and auto-increments the target. Writing the start line first and the
+        sweep bit ~20-50 ms later let a frame slip in between: line 0 got
+        pushed as a legacy packet (costing the firmware's line ring a
+        resync), the target became 1, and the sweep then never captured row
+        0 for the whole session. So: park the target out of reach (4095),
+        set the sweep bit -- in sweep mode the target never auto-increments
+        -- and only then lower the start line."""
+        self.set_start_line(4095)
         self.write(REG_CTRL, CTRL_IMAGE_MODE | CTRL_SWEEP)
+        self.set_start_line(start_line)
 
     def stop_sweep(self) -> None:
         """Stop sweeping but stay in image mode (no further line pushes)."""
@@ -798,6 +810,7 @@ class CompositeFrame:
     """One assembled full frame. ``frame_cnts`` are the FPGA frame counters
     (8-bit) of the exposures it was built from; with an intact stream that is
     exactly ``stride`` consecutive frames."""
+    cam_id: int
     image: np.ndarray               # uint16[1280, 1920], raw 10-bit values
     t_first: float                  # host monotonic time of the first line
     t_last: float                   # ... and of the line that completed it
@@ -849,7 +862,7 @@ class CompositeAssembler:
         self._filled[line.line] = True
         if not self._filled.all():
             return None
-        out = CompositeFrame(image=self._img.copy(), t_first=self._t_first,
+        out = CompositeFrame(cam_id=line.cam_id, image=self._img.copy(), t_first=self._t_first,
                              t_last=t, frame_cnts=list(self._frame_cnts),
                              overrun=self._overrun, lines=self._lines)
         self._reset_cycle()
@@ -885,7 +898,7 @@ def force_load_fpga(sensor, camera_mask: int, timeout: int = 120) -> bool:
 def capture_composite_frames(
     sensor,
     console,
-    cam: int,
+    cams,
     n_frames: int = 5,
     laser: bool = True,
     stride: int | None = None,
@@ -893,24 +906,29 @@ def capture_composite_frames(
     on_frame=None,
     timeout_s: float | None = None,
 ) -> list[CompositeFrame]:
-    """Stream ~1 Hz full-frame composites from one camera.
+    """Stream ~1 Hz full-frame composites from one or more cameras on one
+    sensor module (``cams``: an index 0-7 or an iterable of them).
 
     Bring-up order (bench-proven 2026-09-29; each step matters):
       1. camera power, optional forced FPGA SRAM load, production sensor
          config;
       2. trigger config = DEFAULT_TRIGGER_CONFIG at 40 Hz with dark-frame
          skipping off (every frame lit) and TA per ``laser``; SyncOut on;
-      3. histogram streaming reader with an image queue, camera stream on;
+      3. histogram streaming reader with an image queue, camera streams on;
       4. firmware image mode BEFORE FSIN starts -- in histogram mode the
          firmware's stall detector rail-cycles a camera after 3 missed
          frames, which SPI overruns at scan start can trigger;
-      5. FPGA quiet (no pushes), trigger start, then the composite timing
-         (VTS before HTS), then STRIDE, then arm the sweep at line 0.
+      5. FPGAs quiet (no pushes), trigger start, then the composite timing
+         (VTS before HTS), then STRIDE, then arm the sweeps at line 0.
 
-    ``on_frame(CompositeFrame)`` is called for each composite as it completes
-    (from this thread). Returns the composites. When ``laser`` is set the
-    caller applies laser power first (MotionInterface.apply_laser_power --
-    the driver registers are cleared by a console power cycle).
+    Collects until every camera has produced ``n_frames`` composites (or the
+    timeout). ``on_frame(CompositeFrame)`` is called for each composite as it
+    completes (from this thread; ``frame.cam_id`` says which camera). Returns
+    all composites in completion order. When ``laser`` is set the caller
+    applies laser power first (MotionInterface.apply_laser_power -- the
+    driver registers are cleared by a console power cycle). Keep the sensor's
+    DEBUG_FLAG_USB_PRINTF off: firmware printf over USB during an image
+    stream wedges the COMM endpoint (bench 2026-09-29).
     """
     from omotion.config import (
         COMPOSITE_RESTORE_PROFILE,
@@ -918,12 +936,17 @@ def capture_composite_frames(
         COMPOSITE_TIMING_PROFILE,
         DEFAULT_TRIGGER_CONFIG,
     )
+    cams = sorted({int(cams)} if isinstance(cams, int) else {int(c) for c in cams})
+    if not cams or any(not 0 <= c <= 7 for c in cams):
+        raise ValueError(f"cams must be camera indices 0-7, got {cams}")
     stride = COMPOSITE_STRIDE if stride is None else stride
-    mask = 1 << cam
+    mask = 0
+    for c in cams:
+        mask |= 1 << c
     histo_if = sensor.uart.histo
     image_q: _queue.Queue = _queue.Queue()
     discard_q: _queue.Queue = _queue.Queue()
-    regs = FpgaRegs(sensor, cam)
+    regs = {c: FpgaRegs(sensor, c) for c in cams}
     frames: list[CompositeFrame] = []
     saved_trigger = console.get_trigger_json()
     if isinstance(saved_trigger, str):
@@ -934,12 +957,16 @@ def capture_composite_frames(
     streaming = trigger_started = image_mode_on = retimed = False
     try:
         if not sensor.enable_camera_power(mask):
-            raise RuntimeError(f"cam{cam}: camera power-on failed")
+            raise RuntimeError(f"camera power-on failed (mask 0x{mask:02X})")
         time.sleep(0.3)
-        if load_fpga and not force_load_fpga(sensor, mask):
-            raise RuntimeError(f"cam{cam}: forced FPGA SRAM load failed")
+        # One camera per command: a multi-camera load blocks the firmware
+        # for ~10 s per camera and a 2-camera (~20 s) load lost the COMM
+        # pipe on the bench; single-camera loads are proven.
+        for c in cams if load_fpga else ():
+            if not force_load_fpga(sensor, 1 << c):
+                raise RuntimeError(f"cam{c}: forced FPGA SRAM load failed")
         if not sensor.camera_configure_registers(mask):
-            raise RuntimeError(f"cam{cam}: sensor configuration failed")
+            raise RuntimeError(f"sensor configuration failed (mask 0x{mask:02X})")
 
         cfg = dict(DEFAULT_TRIGGER_CONFIG)
         cfg.update(TriggerFrequencyHz=40.0, LaserPulseSkipInterval=0,
@@ -953,33 +980,39 @@ def capture_composite_frames(
         histo_if.start_streaming(discard_q, _STREAM_READ_SIZE, image_queue=image_q)
         streaming = True
         if not sensor.enable_camera(mask):
-            raise RuntimeError(f"cam{cam}: enable_camera failed")
+            raise RuntimeError(f"enable_camera failed (mask 0x{mask:02X})")
         time.sleep(0.5)
         if not sensor.set_camera_image_mode(True, mask):
             raise RuntimeError("OW_CAMERA_IMAGE_MODE enable failed")
         image_mode_on = True
         time.sleep(0.2)
-        if not regs.check_id():
-            raise RuntimeError(f"cam{cam}: FPGA control plane not answering")
-        if not regs.stride_capable():
-            raise RuntimeError(f"cam{cam}: FPGA register map < v3 (no STRIDE)")
-        regs.quiet()
+        for c, r in regs.items():
+            if not r.check_id():
+                raise RuntimeError(f"cam{c}: FPGA control plane not answering")
+            if not r.stride_capable():
+                raise RuntimeError(f"cam{c}: FPGA register map < v3 (no STRIDE)")
+            r.quiet()
         if not console.start_trigger():
             raise RuntimeError("start_trigger failed")
         trigger_started = True
         time.sleep(0.3)
         retimed = True
-        if not write_register_sequence(sensor, cam, COMPOSITE_TIMING_PROFILE):
-            raise RuntimeError(f"cam{cam}: composite retiming failed")
+        for c in cams:
+            if not write_register_sequence(sensor, c, COMPOSITE_TIMING_PROFILE):
+                raise RuntimeError(f"cam{c}: composite retiming failed")
         time.sleep(0.1)
-        regs.set_stride(stride)
+        for r in regs.values():
+            r.set_stride(stride)
         while not image_q.empty():          # nothing from before the arm
             image_q.get_nowait()
-        regs.arm_sweep(0)
+        for r in regs.values():
+            r.arm_sweep(0)
 
-        asm = CompositeAssembler()
+        asms = {c: CompositeAssembler() for c in cams}
+        counts = {c: 0 for c in cams}
+        lines_rx = {c: 0 for c in cams}
         t_end = time.monotonic() + timeout_s
-        while len(frames) < n_frames and time.monotonic() < t_end:
+        while min(counts.values()) < n_frames and time.monotonic() < t_end:
             try:
                 pkt = image_q.get(timeout=0.25)
             except _queue.Empty:
@@ -988,47 +1021,61 @@ def capture_composite_frames(
             try:
                 line = parse_image_packet(pkt)
             except ImageLineError as exc:
-                logger.warning("cam%d: dropping bad image packet: %s", cam, exc)
+                logger.warning("dropping bad image packet: %s", exc)
                 continue
-            if line.cam_id != cam:
+            asm = asms.get(line.cam_id)
+            if asm is None or counts[line.cam_id] >= n_frames:
                 continue
+            lines_rx[line.cam_id] += 1
             done = asm.add(line, t)
             if done is not None:
+                counts[line.cam_id] += 1
                 frames.append(done)
                 if on_frame is not None:
                     on_frame(done)
-        if len(frames) < n_frames:
-            logger.error("cam%d: only %d/%d composites within %.1f s",
-                         cam, len(frames), n_frames, timeout_s)
+        short = {c: n for c, n in counts.items() if n < n_frames}
+        if short:
+            logger.error("composites short of %d within %.1f s: %s "
+                         "(lines received per camera: %s)",
+                         n_frames, timeout_s, short, lines_rx)
     finally:
         # Every restore step independently; a dead transport must not orphan
         # the reader thread (same policy as capture_full_frames).
-        try:
-            regs.set_stride(0)
-            regs.stop_sweep()
-        except Exception:
-            logger.exception("cam%d: FPGA sweep stop failed", cam)
+        for c, r in regs.items():
+            try:
+                r.set_stride(0)
+                r.stop_sweep()
+            except Exception:
+                logger.exception("cam%d: FPGA sweep stop failed", c)
         if trigger_started:
             try:
                 console.stop_trigger()
             except Exception:
                 logger.exception("stop_trigger failed")
         if retimed:
+            for c in cams:
+                try:
+                    write_register_sequence(sensor, c, COMPOSITE_RESTORE_PROFILE)
+                except Exception:
+                    logger.exception("cam%d: timing restore failed", c)
+        for r in regs.values():
             try:
-                write_register_sequence(sensor, cam, COMPOSITE_RESTORE_PROFILE)
+                r.exit_image_mode()
             except Exception:
-                logger.exception("cam%d: timing restore failed", cam)
-        try:
-            regs.exit_image_mode()
-        except Exception:
-            pass
+                pass
         try:
             console.set_trigger_json(data=saved_trigger)
         except Exception:
             logger.exception("restoring trigger config failed")
         if image_mode_on:
             try:
-                sensor.set_camera_image_mode(False, mask)
+                st = sensor.image_mode_exit_status()
+                if st is None:
+                    logger.error("image mode exit failed")
+                else:
+                    gaps = {c: st["gap_count"][c] for c in cams}
+                    (logger.warning if any(gaps.values()) else logger.info)(
+                        "image mode off; firmware lost-line events per camera: %s", gaps)
             except Exception:
                 logger.exception("image mode exit failed")
         for fn in (sensor.disable_camera_fsin_ext,
@@ -1036,7 +1083,7 @@ def capture_composite_frames(
             try:
                 fn()
             except Exception:
-                logger.exception("cam%d: teardown step failed", cam)
+                logger.exception("teardown step failed (mask 0x%02X)", mask)
         if streaming:
             try:
                 histo_if.stop_streaming()
