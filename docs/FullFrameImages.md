@@ -18,7 +18,8 @@ branches (nothing merged). Hub for history and evidence: epic
 | 2 cameras | `--cam A B` | Mostly 1 Hz; occasional extra second when USB saturates |
 | 8 cameras, one module | `--cam 0 1 2 3 4 5 6 7 --stride 255` | A frame per camera every ~6.4 s; cameras 1-3 sometimes need an extra cycle |
 | All 16 cameras | one module at a time | Verified laser-lit on both modules: mean 183-355 DN (dark 128), speckle K 0.36-0.58 |
-| Single exposure, 1 camera | `scripts/full_frame_bench/single_exposure.py` | One laser pulse per image at 1 Hz. After matched-dark subtraction, noise and speckle contrast match the composite (see below) |
+| Single exposure, 1 camera | `scripts/full_frame_bench/single_exposure.py --cam N` | One laser pulse per image at 1 Hz. After matched-dark subtraction, noise and speckle contrast match the composite (see below) |
+| Single exposure, all 16 cameras | `single_exposure.py --cam 0 7 1 6 2 5 3 4 --warmup-s 30`, one module at a time | All 16 laser-lit. **12 of 16 match the composite; idx 6 and 7 on both modules saturate** (see below) |
 
 Images are saved losslessly: `*_raw16.png` (16-bit PNG, raw 10-bit values
 0..1023, unscaled) and `*.npy` (uint16 1280×1920), bit-exact. `*_preview8.png`
@@ -83,6 +84,35 @@ rows:
 | Speckle K | 0.55 | 0.57 | 0.410 | 0.405-0.410 |
 | Saturated pixels | 0.17% | 0% | 2.1% (5% in bottom rows) | 0% |
 
+**All 16 cameras** (single_exposure.py, cameras in turn, one camera streaming
+at a time since USB carries ~1,850 rows/s per sensor; about 27 s per camera
+after a shared warm-up):
+
+| Module | idx (gain) | 0 (16×) | 1 (4×) | 2 (2×) | 3 (1×) | 4 (1×) | 5 (2×) | 6 (4×) | 7 (16×) |
+|---|---|---|---|---|---|---|---|---|---|
+| Left | K single / composite | 0.44 / 0.41 | 0.37 / 0.37 | 0.50 / 0.50 | 0.57 / 0.58 | 0.55 / 0.58 | 0.53 / 0.50 | **0.71 / 0.38** | **1.26 / 0.42** |
+| Left | saturated | 3.3% | 3.1% | 1.2% | 0.5% | 0.9% | 3.0% | **18.5%** | **28.3%** |
+| Right | K single / composite | 0.43 / 0.45 | 0.35 / 0.36 | 0.47 / 0.50 | 0.53 / 0.57 | 0.55 / 0.57 | 0.49 / 0.50 | **0.51 / 0.37** | **0.62 / 0.50** |
+| Right | saturated | 1.0% | 0.2% | 0.0% | 0.2% | 0.1% | 0.2% | **4.5%** | **6.9%** |
+
+On every camera the residual after dark subtraction sits within ~10% of that
+camera's frame-to-frame noise.
+
+**idx 6 and 7 fail on saturation.** At the BLC-off pedestal (~500-550 DN at
+4×/16×), their storage dark pattern overflows 10 bits, and a pixel saturated
+in both lit and dark frames subtracts to 0. Two things drive it:
+- **Position:** idx 6/7 carry a 1.5-2× larger storage pattern than idx 0/1
+  at the same gain and similar time into the run (on both modules). That
+  looks like those positions running warmer; not confirmed.
+- **Warm-up time:** the pattern grows as the module warms.
+  - Left run: 90 s warm-up, idx 6/7 captured last (~6 min in): 18-28%
+    saturated.
+  - Right run: 30 s warm-up, high-gain cameras first, idx 7 second: 5-7%.
+  - Capture order matters, but reordering alone doesn't fix it.
+
+Single-exposure K runs ~2-8% below the composite on the unsaturated cameras,
+consistent with the 1 Hz pulse difference below.
+
 Caveats:
 - **The laser differs at 1 Hz.** Pulses at a 1 Hz rep rate are ~13% brighter
   and the speckle pattern differs from 40 Hz: captures on either side of a
@@ -93,7 +123,8 @@ Caveats:
 - **Free-run mode doesn't work for lit frames.** The exposure register doesn't
   behave as rows there: 25 ms and 250 ms exposures caught no 40 Hz laser pulse,
   1 s saturated.
-- **Tested so far:** one camera at a time, left module only.
+- **Tested so far:** all 16 cameras, one camera streaming at a time. Frames
+  within one camera are 1 s apart; cameras are ~27 s apart.
 
 ## Pieces
 
@@ -209,10 +240,13 @@ Caveats:
 5. **Single exposure: from bench script to product.**
    - An SDK API that keeps a rolling dark reference: periodic dark frames,
      after a warm-up of ~2 min.
-   - Multi-camera runs.
-   - A lower pedestal for the 16× cameras (BLC on with a low target plus
-     per-frame offset correction, or reduced gain) to avoid the ~2% saturation.
-   - The right module.
+   - Fix saturation on idx 6/7 (and the few % on idx 0/1/5). Options:
+     - A lower pedestal: BLC on with a low target, plus per-frame offset
+       correction or frozen BLC offsets.
+     - Reduced gain for those positions in this mode.
+     - Shorter storage time, i.e. a faster link.
+     - Checking whether those positions really run warmer (camera
+       temperature telemetry).
    - Deciding whether the 1 Hz laser rep rate is acceptable for the images'
      purpose.
 
