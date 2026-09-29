@@ -21,17 +21,31 @@ is an 8-bit contrast-stretched copy for viewing only.
 
 ## How it works: stride composite
 
-A single-exposure readout (the original "drip-scan") cannot work at usable
-image quality. The FPGA→MCU link drains one 2408-B line in ~0.69 ms, so a
-single-exposure readout needs ≥0.7 ms rows. At that row time the sensor's
-pixel noise is ~8× production. Measured dark std at a constant 650 µs
-exposure:
+A single-exposure readout (the original "drip-scan") was set aside, not ruled
+out. The FPGA→MCU link drains one 2408-B line in ~0.69 ms, so a
+single-exposure readout needs ≥0.7 ms rows. At long row times the dark frame's
+whole-frame std grows. Measured at a constant 650 µs exposure on camera 0
+(16× analog gain):
 
 | Row time (µs) | 9 | 18 | 27 | 42 | 84 | 167 | 335 | 836 |
 |---|---|---|---|---|---|---|---|---|
 | Pixel std (DN) | 17.0 | 17.3 | 17.8 | 19.0 | 23.3 | 50 | 86 | ~140, 20% clipped |
 
-Instead the camera runs production-quality 40 Hz, laser-synced frames with
+**Re-analysis (2026-09-29): that excess is almost entirely a fixed per-pixel
+pattern.** Two dark frames at identical 836 µs timing correlate r = 0.99 and
+differ by only ~16-18 DN, which is production-level temporal noise. So
+subtracting a matched dark frame might bring a single exposure back to
+production quality. This is untested, and three obstacles are known:
+- Pixels clipped at 0 can't be recovered, so the black level would need
+  raising.
+- The pattern shifted between two runs 15 s apart at different exposure
+  settings, so the dark frame must match the image's settings and be taken
+  beside it.
+- Only the 16× camera was measured.
+
+See "Open work".
+
+The stride composite instead runs production-quality 40 Hz, laser-synced frames with
 18 µs rows (HTS 866 × VTS 1380, 36-row exposure). The camera FPGA's **STRIDE**
 register makes frame *k* send only lines `(k mod STRIDE) + j·STRIDE`, and the
 phase advances by one line per frame. So STRIDE consecutive frames cover every
@@ -144,6 +158,11 @@ Pieces:
 3. **Console firmware.** Make `LaserPulseSkipInterval = 0` mean "no dark
    frames", and reject laser one-shots longer than the FSIN period.
 4. **App integration** (none yet): a viewer or export in bloodflow-app.
+5. **Single exposure with matched dark subtraction.** The test: on a 1× gain
+   camera at ≥0.7 ms rows, capture dark and laser-lit single exposures back to
+   back at identical settings, then compare the dark-subtracted noise and
+   speckle contrast against the stride composite. If it holds up, every image
+   comes from one exposure (still ~1 s per frame and the same USB ceiling).
 
 Bench data and the experiment scripts from 2026-09-29 are archived in
 `Projects/investigations/full_frame_1hz_2026-09-29/` on the bench PC.
