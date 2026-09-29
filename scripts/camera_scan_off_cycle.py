@@ -191,6 +191,10 @@ def parse_args():
                              "(default: 5..55 sweep in 10-minute steps)")
     parser.add_argument("--mask", type=lambda x: int(x, 0), default=0x0F,
                         help="camera bitmask applied to BOTH sensors (default 0x0F)")
+    parser.add_argument("--sensors", type=int, default=2,
+                        help="number of sensor modules that must be connected before "
+                             "scanning (default 2; use 1 for a single-module bench). "
+                             "The scan runs on whichever sensors are present.")
     parser.add_argument("--subject", default="OFFSWEEP",
                         help="subject-id prefix; cycle number is appended (default OFFSWEEP)")
     parser.add_argument("--data-dir", default="scan_off_cycle_data",
@@ -217,6 +221,8 @@ def parse_args():
         args.cycles = len(args.off_minutes) + 1
     if args.cycles < 1:
         parser.error("--cycles must be >= 1")
+    if not (1 <= args.sensors <= 2):
+        parser.error("--sensors must be 1 or 2")
     return args
 
 
@@ -413,18 +419,18 @@ def main() -> int:
     iface.start()
     outcomes: dict[int, str] = {}
     try:
-        if not iface.wait_for_ready(console=True, sensors=2, timeout=20.0):
+        if not iface.wait_for_ready(console=True, sensors=args.sensors, timeout=20.0):
             console_ok, left_ok, right_ok = iface.is_device_connected()
-            log.error("System not ready (console=%s left=%s right=%s) — aborting. "
-                      "Close the app first: USB access is exclusive.",
-                      console_ok, left_ok, right_ok)
+            log.error("System not ready (console=%s left=%s right=%s, need %d sensor(s)) "
+                      "— aborting. Close the app first: USB access is exclusive.",
+                      console_ok, left_ok, right_ok, args.sensors)
             return 1
         log.info("Console + both sensors connected.")
 
         for cycle in range(1, args.cycles + 1):
             log.info("=== Cycle %d/%d ===", cycle, args.cycles)
             try:
-                if not iface.wait_for_ready(console=True, sensors=2,
+                if not iface.wait_for_ready(console=True, sensors=args.sensors,
                                             timeout=RECONNECT_GRACE_S):
                     raise RuntimeError(
                         "devices not connected (console/left/right = "
