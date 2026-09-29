@@ -1819,8 +1819,14 @@ class MotionSensor(SignalWrapper):
         d = bytes(r.data[: r.data_len]) if r.data else b""
         if len(d) < 36:
             return None
-        return {"active": bool(d[0]), "mask": d[1],
-                "gap_count": list(struct.unpack_from("<8I", d, 4))}
+        out = {"active": bool(d[0]), "mask": d[1],
+               "gap_count": list(struct.unpack_from("<8I", d, 4))}
+        # Loss breakdown appended by sensor-fw feature/99 (196-B reply).
+        if len(d) >= 196:
+            for k, name in enumerate(("link_err", "bad_magic", "resync",
+                                      "stage_full", "lines_ok")):
+                out[name] = list(struct.unpack_from("<8I", d, 36 + 32 * k))
+        return out
 
     def enable_camera_fsin_ext(self) -> bool:
         """Enable external frame-sync input."""

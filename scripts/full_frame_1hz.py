@@ -45,6 +45,10 @@ def main() -> int:
     ap.add_argument("--no-fpga-load", action="store_true",
                     help="skip the forced FPGA SRAM load (already loaded this power cycle)")
     ap.add_argument("--live", action="store_true", help="show each frame in a window")
+    ap.add_argument("--stride", type=int, default=None,
+                    help="FPGA STRIDE (default config.COMPOSITE_STRIDE = 40 -> 1 Hz). "
+                         "One sensor's USB moves ~1850 lines/s (~1.4 cameras at 40); "
+                         "for all 8 cameras use 255 (a frame per camera every ~6.4 s)")
     ap.add_argument("--laser-delay", type=int, default=None,
                     help="LaserPulseDelayUsec override (us after FSIN); default = production")
     a = ap.parse_args()
@@ -68,8 +72,16 @@ def main() -> int:
     iface = MotionInterface(data_dir=str(out / "sdk"))
     iface.start(wait=True, wait_timeout=3.0)
     iface.wait_for_ready(console=True, sensors=1, timeout=20)
+    # wait_for_ready(sensors=1) returns on the FIRST sensor; the requested
+    # side may still be enumerating.
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        sensor = getattr(iface, a.side)
+        if sensor is not None and sensor.uart is not None and sensor.is_connected():
+            break
+        time.sleep(0.2)
     sensor = getattr(iface, a.side)
-    if sensor is None or sensor.uart is None:
+    if sensor is None or sensor.uart is None or not sensor.is_connected():
         print(f"{a.side} sensor not connected")
         return 1
     laser = not a.no_laser
@@ -103,10 +115,12 @@ def main() -> int:
     try:
         capture_composite_frames(sensor, iface.console, a.cam, n_frames=a.frames,
                                  laser=laser, load_fpga=not a.no_fpga_load,
-                                 on_frame=on_frame, laser_delay_us=a.laser_delay)
+                                 on_frame=on_frame, laser_delay_us=a.laser_delay,
+                                 stride=a.stride)
     finally:
         (out / "meta.json").write_text(json.dumps(
             {"side": a.side, "cam": a.cam, "laser": laser, "laser_delay_us": a.laser_delay,
+             "stride": a.stride,
              "formats": {
                  "*_raw16.png": "lossless 16-bit greyscale PNG of the raw sensor "
                                 "values (10-bit, 0..1023, unscaled)",

@@ -165,3 +165,15 @@ def test_composite_assembler_ignores_out_of_range():
 
     asm = CompositeAssembler()
     assert asm.add(_mk_line(1280, 1), 0.0) is None
+
+
+def test_composite_assembler_skips_warmup_exposures():
+    """The first N exposures are ignored; their rows fill from the next
+    cycle, so the first composite has no warm-up (dark) rows."""
+    from omotion.ImageCapture import CompositeAssembler
+
+    asm = CompositeAssembler(skip_exposures=3)
+    out = [f for line, t in _stride_stream(4, 3) if (f := asm.add(line, t))]
+    assert len(out) == 2
+    assert 7 not in out[0].frame_cnts and 9 not in out[0].frame_cnts   # fc 7..9 skipped
+    assert out[0].frame_cnts[0] == 10
