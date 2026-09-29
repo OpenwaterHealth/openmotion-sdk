@@ -934,8 +934,12 @@ def capture_composite_frames(
       4. firmware image mode BEFORE FSIN starts -- in histogram mode the
          firmware's stall detector rail-cycles a camera after 3 missed
          frames, which SPI overruns at scan start can trigger;
-      5. FPGAs quiet (no pushes), trigger start, then the composite timing
-         (VTS before HTS), then STRIDE, then arm the sweeps at line 0.
+      5. with FSIN still stopped (no frames, so no line pushes): FPGAs
+         quiet, composite timing (VTS before HTS), STRIDE, sweeps armed at
+         line 0; only then the trigger starts, so every camera arms on the
+         same first frame and no COMM command runs against a live stream.
+         The first ``warmup_exposures`` exposures (laser warm-up) are
+         ignored. Teardown stops the trigger before touching the sensor.
 
     Collects until every camera has produced ``n_frames`` composites (or the
     timeout). ``on_frame(CompositeFrame)`` is called for each composite as it
