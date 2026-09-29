@@ -1,7 +1,11 @@
 # Full-frame camera images (parked 2026-09-29)
 
 **Status: working, parked.** Complete 1920×1280 RAW10 images from the
-OX02C1B cameras, laser-lit, at 1 Hz per camera. Everything below is in pushed
+OX02C1B cameras, laser-lit, at 1 Hz per camera, two ways:
+- **Stride composite** (the SDK API): 40 production exposures interleaved row
+  by row.
+- **Single exposure** (bench script, tested 2026-09-29): the whole image from
+  one laser pulse, with a matched dark frame subtracted. Everything below is in pushed
 branches (nothing merged). Hub for history and evidence: epic
 [openmotion-bloodflow-app#480](https://github.com/OpenwaterHealth/openmotion-bloodflow-app/issues/480)
 (the checkpoint comments dated 2026-09-29 have the full measurements).
@@ -14,6 +18,7 @@ branches (nothing merged). Hub for history and evidence: epic
 | 2 cameras | `--cam A B` | Mostly 1 Hz; occasional extra second when USB saturates |
 | 8 cameras, one module | `--cam 0 1 2 3 4 5 6 7 --stride 255` | A frame per camera every ~6.4 s; cameras 1-3 sometimes need an extra cycle |
 | All 16 cameras | one module at a time | Verified laser-lit on both modules: mean 183-355 DN (dark 128), speckle K 0.36-0.58 |
+| Single exposure, 1 camera | `scripts/full_frame_bench/single_exposure.py` | One laser pulse per image at 1 Hz. After matched-dark subtraction, noise and speckle contrast match the composite (see below) |
 
 Images are saved losslessly: `*_raw16.png` (16-bit PNG, raw 10-bit values
 0..1023, unscaled) and `*.npy` (uint16 1280×1920), bit-exact. `*_preview8.png`
@@ -21,31 +26,13 @@ is an 8-bit contrast-stretched copy for viewing only.
 
 ## How it works: stride composite
 
-A single-exposure readout (the original "drip-scan") was set aside, not ruled
-out. The FPGA→MCU link drains one 2408-B line in ~0.69 ms, so a
-single-exposure readout needs ≥0.7 ms rows. At long row times the dark frame's
-whole-frame std grows. Measured at a constant 650 µs exposure on camera 0
-(16× analog gain):
+Why not simply read one exposure out slowly? The FPGA→MCU link drains one
+2408-B line in ~0.69 ms, so a single-exposure readout needs ≥0.7 ms rows,
+and at those row times the raw frame carries a large dark pattern (next
+section). The stride composite avoids that; the single-exposure mode
+subtracts it.
 
-| Row time (µs) | 9 | 18 | 27 | 42 | 84 | 167 | 335 | 836 |
-|---|---|---|---|---|---|---|---|---|
-| Pixel std (DN) | 17.0 | 17.3 | 17.8 | 19.0 | 23.3 | 50 | 86 | ~140, 20% clipped |
-
-**Re-analysis (2026-09-29): that excess is almost entirely a fixed per-pixel
-pattern.** Two dark frames at identical 836 µs timing correlate r = 0.99 and
-differ by only ~16-18 DN, which is production-level temporal noise. So
-subtracting a matched dark frame might bring a single exposure back to
-production quality. This is untested, and three obstacles are known:
-- Pixels clipped at 0 can't be recovered, so the black level would need
-  raising.
-- The pattern shifted between two runs 15 s apart at different exposure
-  settings, so the dark frame must match the image's settings and be taken
-  beside it.
-- Only the 16× camera was measured.
-
-See "Open work".
-
-The stride composite instead runs production-quality 40 Hz, laser-synced frames with
+The stride composite runs production-quality 40 Hz, laser-synced frames with
 18 µs rows (HTS 866 × VTS 1380, 36-row exposure). The camera FPGA's **STRIDE**
 register makes frame *k* send only lines `(k mod STRIDE) + j·STRIDE`, and the
 phase advances by one line per frame. So STRIDE consecutive frames cover every
@@ -54,7 +41,61 @@ from 40 exposures 25 ms apart. On a static phantom this is indistinguishable
 from a single exposure: speckle autocorrelation is isotropic, with no row
 artifacts. On a moving target, adjacent rows come from different exposures.
 
-Pieces:
+## Single exposure with matched dark subtraction (tested 2026-09-29)
+
+Every image comes from one laser pulse. Bench script:
+`scripts/full_frame_bench/single_exposure.py`. Analysis:
+`single_exposure_analyze.py`.
+
+**Recipe:**
+- **Trigger mode** at the console's 1.0 Hz floor.
+- **Timing:** HTS 34300 × VTS 1378 (the sensor minimum) → 717 µs rows (4% over
+  the line drain) and a 0.988 s frame, inside the 1 s FSIN period.
+- **Exposure:** 8 rows.
+- **Laser:** `LaserPulseDelayUsec` 8300. The exposure opens ~10 rows after
+  FSIN, which is ~90 µs at production row time but ~7 ms here. The fully lit
+  plateau is a 7.5-9.0 ms delay; outside ~7.0-9.5 ms the frame is dark.
+- **BLC off** (`0x4001 = 0x00`): a fixed pedestal (255 DN at 1×, 489 at 16×).
+  With BLC on, the servo shifts the whole frame by up to 40 DN between frames.
+- **Dark reference:** in the same stream, laser toggled on the console only
+  (between frames), dark phases before and after the lit phase, interpolated
+  per pixel in time.
+
+**What the raw frame carries:** a storage-node dark signal. Charge waits in
+each pixel's storage node until its row is read, up to ~1 s for the last
+rows:
+- It scales with row index: pattern std ~21 → 90 DN (1×) and 61 → 211 DN (16×)
+  from the top rows to the bottom rows.
+- It grows as the sensor warms after timing starts: ~4× over the first
+  ~2 minutes, then levels off.
+- It is the same pixels throughout (r 0.91 between early and late darks), so it
+  subtracts cleanly.
+
+(Checkpoint 1's "independent of row index" was wrong.)
+
+**Results** (left module, static phantom):
+
+| | Camera 3 (1×) single | Camera 3 composite | Camera 0 (16×) single | Camera 0 composite |
+|---|---|---|---|---|
+| Frame-to-frame noise | 1.8 DN | 1.2 DN | 15.8 DN | 15.2 DN |
+| Residual after dark subtraction (held-out darks) | 2.0-2.1 DN | n/a | 16.4 DN | n/a |
+| Laser signal | 210 DN | 185 DN | 125 DN | 113 DN |
+| Speckle K | 0.55 | 0.57 | 0.410 | 0.405-0.410 |
+| Saturated pixels | 0.17% | 0% | 2.1% (5% in bottom rows) | 0% |
+
+Caveats:
+- **The laser differs at 1 Hz.** Pulses at a 1 Hz rep rate are ~13% brighter
+  and the speckle pattern differs from 40 Hz: captures on either side of a
+  rep-rate switch don't correlate, and even two composites 2.5 min apart gave
+  r 0.02. Within a 1 Hz run, consecutive frames correlate r 0.98 (1×).
+- **16× cameras lose ~2% of pixels to saturation** (pedestal + storage pattern
+  > 1023).
+- **Free-run mode doesn't work for lit frames.** The exposure register doesn't
+  behave as rows there: 25 ms and 250 ms exposures caught no 40 Hz laser pulse,
+  1 s saturated.
+- **Tested so far:** one camera at a time, left module only.
+
+## Pieces
 
 - **camera-fpga** `feature/8-drip-scan-single-frame` @ `64f9216` (RTL
   `68c9972`, no PR): register map v3.
@@ -71,7 +112,7 @@ Pieces:
   - Includes the #96 DIEPEMPMSK race fix.
   - The exit reply carries a per-camera loss breakdown.
   - Draft PR #100.
-- **SDK** `feature/167-drip-scan-capture` @ `ee6ae7d` (this branch):
+- **SDK** `feature/167-drip-scan-capture` (this branch):
   - `omotion.ImageCapture.capture_composite_frames()`, `CompositeAssembler`.
   - Composite timing profiles in `config.py`.
   - CLI `scripts/full_frame_1hz.py`.
@@ -138,6 +179,13 @@ Pieces:
   `util_crc16` and 80× faster. The pure-Python CRC starved the USB reader.
 - **0x5000.** Its power-up value is 0x34 (defect-pixel correction and white
   balance off), not the datasheet's 0x3E. Writing 0x3E turns on DPC.
+- **Single exposure: laser delay.** The exposure opens ~10 rows after FSIN.
+  At 717 µs rows that is ~7 ms, so the production 100 µs laser delay lands
+  before the exposure and every frame is dark. Use ~8.3 ms. An exposure of 1
+  row has almost no window at all (the length looks like ~N−4 rows).
+- **Single exposure: teardown order.** Stop the trigger, let the frame in
+  flight drain (~1 s), then send sensor commands. Restoring registers while
+  lines stream wedged COMM (reproduced 2026-09-29; Shelly recovered it).
 - **Diamond license.** A silent ~49 s `pnmainc` exit means the Diamond license
   has expired. It was renewed 2026-09-29.
 
@@ -158,11 +206,16 @@ Pieces:
 3. **Console firmware.** Make `LaserPulseSkipInterval = 0` mean "no dark
    frames", and reject laser one-shots longer than the FSIN period.
 4. **App integration** (none yet): a viewer or export in bloodflow-app.
-5. **Single exposure with matched dark subtraction.** The test: on a 1× gain
-   camera at ≥0.7 ms rows, capture dark and laser-lit single exposures back to
-   back at identical settings, then compare the dark-subtracted noise and
-   speckle contrast against the stride composite. If it holds up, every image
-   comes from one exposure (still ~1 s per frame and the same USB ceiling).
+5. **Single exposure: from bench script to product.**
+   - An SDK API that keeps a rolling dark reference: periodic dark frames,
+     after a warm-up of ~2 min.
+   - Multi-camera runs.
+   - A lower pedestal for the 16× cameras (BLC on with a low target plus
+     per-frame offset correction, or reduced gain) to avoid the ~2% saturation.
+   - The right module.
+   - Deciding whether the 1 Hz laser rep rate is acceptable for the images'
+     purpose.
 
 Bench data and the experiment scripts from 2026-09-29 are archived in
-`Projects/investigations/full_frame_1hz_2026-09-29/` on the bench PC.
+`Projects/investigations/full_frame_1hz_2026-09-29/` on the bench PC (single-exposure
+test data and the comparison figure under `single_exposure_test/`).

@@ -17,5 +17,7 @@ For normal captures use `scripts/full_frame_1hz.py`.
 | `assemble.py` | Assemble complete single-exposure frames from an `ff_run.py` run. | |
 | `histocheck.py` | Production histogram path, laser off vs on, per-camera mean level (`histocheck.py <left\|right> 0xFF`). | "Does any camera see the laser?" |
 | `laserdiag.py` | Console laser/safety/TEC/PDC readout while the TA trigger runs. | |
+| `single_exposure.py` | Single-exposure full frames: 1 Hz trigger mode, 717 µs rows, laser at an 8.3 ms delay, BLC optional off. One continuous stream in phases (`--phases DDDDLD`, or `--delays` for a laser-delay sweep); the laser is toggled on the console between frames only. Saves each complete frame + `phases.json`. | Final test: `--cam 3 --expo 8 --laser-delay 8300 --blc off --phases DDDDDDLLD --phase-s 20` |
+| `single_exposure_analyze.py` | Matched-dark subtraction (time-interpolated before/after darks), held-out dark residual, speckle K and correlation vs a `full_frame_1hz.py` composite. | `single_exposure_analyze.py <run> <composite_dir>` |
 
 Output directories and the SDK log land in the current directory.
