@@ -421,3 +421,45 @@ VTS=1312) gives a 0.987 s frame readout, inside the 1.000 s period."""
 
 PRODUCTION_FSIN_HZ: float = 40.0
 """Normal histogram-mode FSIN rate (DEFAULT_TRIGGER_CONFIG TriggerFrequencyHz)."""
+
+# ---------------------------------------------------------------------------
+# 1 Hz full frames by stride composite (camera-fpga map v3, bench 2026-09-29,
+# epic OpenwaterHealth/openmotion-bloodflow-app#480).
+#
+# Single-exposure drip-scan needs rows >= ~0.7 ms to drain each line over the
+# FPGA->MCU link, and at that row time the OX02C1B's pixel noise is ~8x
+# production (dark std ~140 DN vs 17, ~20% of pixels clipped to 0; measured
+# std vs row time: 17 DN up to 27 us, 19 @ 42, 23 @ 84, 50 @ 167, 86 @ 335).
+# The composite keeps production-quality 18 us rows and 40 Hz laser-synced
+# frames; the FPGA's STRIDE register captures every COMPOSITE_STRIDE-th line
+# with the phase advancing one line per frame, so COMPOSITE_STRIDE frames
+# (1.000 s at 40 Hz) yield one complete 1920x1280 frame.
+# ---------------------------------------------------------------------------
+OX02C1B_MIN_VTS: int = 1378
+"""Smallest VTS the sensor frames at (the datasheet default 0x562). Below it
+the sensor stops producing frames in every mode (bench: 1360 stalls, 1378
+runs) -- the real reason the original 1312-row sweep profile "stopped
+framing" in trigger mode."""
+
+COMPOSITE_STRIDE: int = 40
+"""FPGA STRIDE for the 1 Hz composite: 40 x 18.1 us = 725 us between
+captured lines, above the ~688 us line drain; 32 lines per frame."""
+
+COMPOSITE_TIMING_PROFILE: tuple = (
+    (0x380E, 0x05), (0x380F, 0x64),   # VTS = 1380 FIRST (see note)
+    (0x380C, 0x03), (0x380D, 0x62),   # HTS = 866 (18.1 us rows; frame 24.98 ms < 25 ms FSIN)
+    (0x3501, 0x00), (0x3502, 0x24),   # exposure = 36 rows (~650 us, as production)
+    (0x3881, 0x00), (0x3882, 0x05), (0x3883, 0x64),   # max_expo_a = VTS (production keeps them equal)
+)
+"""Composite retiming, written register by register IN THIS ORDER (no group
+hold). In trigger mode a frame longer than the FSIN period wedges framing, so
+VTS must shrink before HTS grows: jumping straight from production passes
+through HTS 866 x VTS 2768 = 50 ms and the sensor stops (bench-verified)."""
+
+COMPOSITE_RESTORE_PROFILE: tuple = (
+    (0x380C, 0x01), (0x380D, 0xB0),   # HTS = 432 FIRST (432 x 1380 fits the period)
+    (0x380E, 0x0A), (0x380F, 0xD0),   # VTS = 2768
+    (0x3501, 0x00), (0x3502, 0x48),   # exposure = 72 rows
+    (0x3881, 0x00), (0x3882, 0x0A), (0x3883, 0xD0),   # max_expo_a = 2768
+)
+"""Back to the shipped timing (X02C1B_Sensor_Config.h), in the safe order."""
