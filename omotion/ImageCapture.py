@@ -817,6 +817,12 @@ class CompositeFrame:
     frame_cnts: list[int]
     overrun: bool
     lines: int                      # line pushes consumed (1280 when clean)
+    # Per-row provenance: the FPGA frame counter (8-bit) and host arrival
+    # time of the push that supplied each row. Rows of one exposure share a
+    # counter; a scheduled dark frame shows up as its rows (see
+    # classify_dark_rows).
+    row_fc: np.ndarray | None = None    # int16[1280]
+    row_t: np.ndarray | None = None     # float64[1280], host monotonic s
 
 
 class CompositeAssembler:
@@ -840,6 +846,8 @@ class CompositeAssembler:
         self.width = width
         self._img = np.zeros((height, width), dtype=np.uint16)
         self._filled = np.zeros(height, dtype=bool)
+        self._row_fc = np.full(height, -1, dtype=np.int16)
+        self._row_t = np.zeros(height, dtype=np.float64)
         self._skip_left = int(skip_exposures)
         self._skip_fc: int | None = None
         self._reset_cycle()
@@ -874,13 +882,338 @@ class CompositeAssembler:
         self._lines += 1
         self._img[line.line] = line.pixels
         self._filled[line.line] = True
+        self._row_fc[line.line] = line.frame_cnt
+        self._row_t[line.line] = t
         if not self._filled.all():
             return None
         out = CompositeFrame(cam_id=line.cam_id, image=self._img.copy(), t_first=self._t_first,
                              t_last=t, frame_cnts=list(self._frame_cnts),
-                             overrun=self._overrun, lines=self._lines)
+                             overrun=self._overrun, lines=self._lines,
+                             row_fc=self._row_fc.copy(), row_t=self._row_t.copy())
         self._reset_cycle()
         return out
+
+
+# ---------------------------------------------------------------------------
+# Long-running composite capture (thermal soak, openmotion-sdk#296)
+# ---------------------------------------------------------------------------
+
+def composite_stride(n_cams: int, row_s: float, *, drain_s: float | None = None,
+                     burst_lines_per_s: float | None = None) -> int:
+    """Smallest FPGA STRIDE that keeps ``n_cams`` cameras on one sensor loss-free.
+
+    Two limits: captured lines of one camera must be spaced wider than a line
+    drain over the FPGA->MCU link (x1.03), and while a frame's rows are read
+    out the cameras together must stay under the sensor's USB burst budget
+    (config.COMPOSITE_BURST_BUDGET_LINES_PER_S). Raises ValueError when no
+    8-bit stride satisfies both."""
+    from omotion.config import COMPOSITE_BURST_BUDGET_LINES_PER_S, COMPOSITE_LINE_DRAIN_S
+    drain_s = COMPOSITE_LINE_DRAIN_S if drain_s is None else drain_s
+    budget = COMPOSITE_BURST_BUDGET_LINES_PER_S if burst_lines_per_s is None else burst_lines_per_s
+    if n_cams < 1:
+        raise ValueError("n_cams must be >= 1")
+    by_drain = drain_s * 1.03 / row_s
+    by_burst = n_cams / (budget * row_s)
+    stride = int(np.ceil(max(by_drain, by_burst) - 1e-9))
+    if stride > 255:
+        raise ValueError(f"{n_cams} cameras need STRIDE {stride} (> 255) at {row_s * 1e6:.1f} us rows")
+    return max(stride, 2)
+
+
+def classify_dark_rows(frame: "CompositeFrame", pedestal: float = 128.0,
+                       min_signal: float = 20.0, frac: float = 0.35):
+    """Find the rows of a composite that came from unlit exposures.
+
+    With the production laser schedule the console skips the laser on every
+    LaserPulseSkipInterval-th frame (a scheduled dark frame), so the rows that
+    exposure contributed are dark. Each exposure's rows are averaged; an
+    exposure is dark when its mean is below ``pedestal + frac * (median -
+    pedestal)``. Composites whose median signal is under ``min_signal`` DN
+    above the pedestal are not classified (nothing to tell apart).
+
+    Returns ``(dark_rows bool[H], exposure_means {fc: mean}, dark_fcs list)``.
+    """
+    h = frame.image.shape[0]
+    dark = np.zeros(h, dtype=bool)
+    if frame.row_fc is None:
+        return dark, {}, []
+    row_means = frame.image.mean(axis=1)
+    means = {}
+    for fc in np.unique(frame.row_fc):
+        if fc < 0:
+            continue
+        means[int(fc)] = float(row_means[frame.row_fc == fc].mean())
+    if not means:
+        return dark, means, []
+    med = float(np.median(list(means.values())))
+    if med - pedestal < min_signal:
+        return dark, means, []
+    cut = pedestal + frac * (med - pedestal)
+    dark_fcs = sorted(fc for fc, m in means.items() if m < cut)
+    for fc in dark_fcs:
+        dark |= frame.row_fc == fc
+    return dark, means, dark_fcs
+
+
+COMPOSITE_ROI = (slice(160, 1120), slice(240, 1680))
+"""Central region for speckle statistics, away from the image edges."""
+
+
+def composite_stats(frame: "CompositeFrame", pedestal: float = 128.0,
+                    roi=COMPOSITE_ROI, bands: int = 4) -> dict:
+    """Summary statistics of one composite for long-run logging.
+
+    Lit-row statistics exclude rows from scheduled dark exposures (see
+    classify_dark_rows); those rows are summarized separately, which gives a
+    dark-level reference every time a dark frame lands in a composite. K is
+    std/mean of (image - pedestal) over the lit rows of ``roi``."""
+    img = frame.image
+    h = img.shape[0]
+    dark, _, dark_fcs = classify_dark_rows(frame, pedestal)
+    lit = ~dark
+    x = img.astype(np.float64)
+    rows = np.arange(h)
+    roi_rows = lit & (rows >= roi[0].start) & (rows < roi[0].stop)
+    sub = x[roi_rows][:, roi[1]] - pedestal
+    out = {
+        "n_exposures": len(frame.frame_cnts),
+        "fc_first": frame.frame_cnts[0] if frame.frame_cnts else -1,
+        "fc_last": frame.frame_cnts[-1] if frame.frame_cnts else -1,
+        "lines": frame.lines,
+        "overrun": bool(frame.overrun),
+        "dark_exposures": len(dark_fcs),
+        "dark_rows": int(dark.sum()),
+        "lit_mean": float(x[lit].mean()) if lit.any() else float("nan"),
+        "lit_std": float(x[lit].std()) if lit.any() else float("nan"),
+        "K": float(sub.std() / sub.mean()) if sub.size and sub.mean() > 0 else float("nan"),
+        "sat_frac": float(np.mean(img >= 1023)),
+        "zero_frac": float(np.mean(img == 0)),
+        "dark_mean": float(x[dark].mean()) if dark.any() else float("nan"),
+        "dark_std": float(x[dark].std()) if dark.any() else float("nan"),
+    }
+    edges = np.linspace(0, h, bands + 1).astype(int)
+    for i in range(bands):
+        sel = lit.copy()
+        sel[:edges[i]] = False
+        sel[edges[i + 1]:] = False
+        out[f"band{i}_mean"] = float(x[sel].mean()) if sel.any() else float("nan")
+    return out
+
+
+class CompositeSession:
+    """Sensor-side half of a long composite capture (hours).
+
+    Unlike capture_composite_frames, the session does not own the console
+    trigger: the caller starts and stops FSIN, so one console can drive
+    several sensors and camera groups can be rotated. Rule for the caller:
+    open(), arm(), disarm() and close() send sensor COMM commands, so the
+    trigger must be stopped and the last frame drained (drain()) first --
+    sensor COMM against a live line stream can wedge the COMM endpoint
+    (bench 2026-09-29). Reading camera telemetry while lines stream is fine
+    (17/17 reads, bench 2026-09-29).
+
+    To keep the module's thermal load as in a normal scan, every camera in
+    ``power_mask`` is powered, configured and triggered, and runs the map-v3
+    bitstream. The cameras not being imaged are either left computing
+    histograms exactly as in a scan (``idle_fpga="histogram"``; the firmware
+    is in image mode for the imaged cameras only, so it does not receive
+    them) or silenced (``idle_fpga="quiet"``).
+
+    ``timing="production"`` leaves the sensor registers untouched (HTS 432 x
+    VTS 2768, 72-row exposure): the exposure, laser overlap and the time rows
+    wait for readout are exactly as in a normal scan. ``timing="composite"``
+    retimes every powered camera to COMPOSITE_TIMING_PROFILE (18 us rows),
+    which allows STRIDE 40 (1 Hz) but doubles the readout wait and captured
+    ~87% of the laser pulse on the bench (2026-09-29).
+    """
+
+    def __init__(self, sensor, *, timing: str = "production", power_mask: int = 0xFF,
+                 idle_fpga: str = "histogram", load_fpga: bool = True,
+                 warmup_exposures: int = 3):
+        from omotion.config import OX02C1B_ROW_S_PER_HTS
+        if timing not in ("production", "composite"):
+            raise ValueError(f"timing must be 'production' or 'composite', got {timing!r}")
+        if idle_fpga not in ("histogram", "quiet"):
+            raise ValueError(f"idle_fpga must be 'histogram' or 'quiet', got {idle_fpga!r}")
+        self.sensor = sensor
+        self.timing = timing
+        self.power_mask = int(power_mask) & 0xFF
+        self.cams = [c for c in range(8) if self.power_mask & (1 << c)]
+        self.idle_fpga = idle_fpga
+        self.load_fpga = load_fpga
+        self.warmup_exposures = warmup_exposures
+        self.row_s = (432 if timing == "production" else 866) * OX02C1B_ROW_S_PER_HTS
+        self.regs = {c: FpgaRegs(sensor, c) for c in self.cams}
+        self.image_q: _queue.Queue = _queue.Queue()
+        self._discard_q: _queue.Queue = _queue.Queue()
+        self.armed: list[int] = []
+        self.stride = 0
+        self._asm: dict[int, CompositeAssembler] = {}
+        self.last_line_t: dict[int, float] = {}
+        self.lines_rx: dict[int, int] = {c: 0 for c in self.cams}
+        self.bad_packets = 0
+        self._streaming = self._fw_image = self._retimed = self._opened = False
+
+    # -- lifecycle (trigger stopped) ------------------------------------
+    def open(self, log=logger.info) -> None:
+        s, mask = self.sensor, self.power_mask
+        if not s.enable_camera_power(mask):
+            raise RuntimeError(f"camera power-on failed (mask 0x{mask:02X})")
+        time.sleep(0.5)
+        if self.load_fpga:
+            for c in self.cams:           # one camera per command (a 2-camera load lost COMM)
+                t = time.monotonic()
+                if not force_load_fpga(s, 1 << c):
+                    raise RuntimeError(f"cam{c}: forced FPGA SRAM load failed")
+                log(f"cam{c}: map-v3 bitstream loaded in {time.monotonic() - t:.1f} s")
+        if not s.camera_configure_registers(mask):
+            raise RuntimeError(f"sensor configuration failed (mask 0x{mask:02X})")
+        if not s.enable_camera_fsin_ext():
+            raise RuntimeError("enable_camera_fsin_ext failed")
+        histo = s.uart.histo
+        histo.flush_stale_data(expected_size=_STREAM_READ_SIZE)
+        histo.start_streaming(self._discard_q, _STREAM_READ_SIZE, image_queue=self.image_q)
+        self._streaming = True
+        if not s.enable_camera(mask):
+            raise RuntimeError(f"enable_camera failed (mask 0x{mask:02X})")
+        time.sleep(0.5)
+        for c, r in self.regs.items():
+            if not r.check_id():
+                raise RuntimeError(f"cam{c}: FPGA control plane not answering")
+            if not r.stride_capable():
+                raise RuntimeError(f"cam{c}: FPGA register map < v3 (no STRIDE)")
+            r.set_stride(0)
+            r.exit_image_mode()           # histogram mode: as in a scan
+        if self.timing == "composite":
+            from omotion.config import COMPOSITE_TIMING_PROFILE
+            self._retimed = True
+            for c in self.cams:
+                if not write_register_sequence(s, c, COMPOSITE_TIMING_PROFILE):
+                    raise RuntimeError(f"cam{c}: composite retiming failed")
+        self._opened = True
+
+    def arm(self, cams, stride: int) -> None:
+        """Image ``cams`` from the next frame on (trigger must be stopped)."""
+        cams = sorted({int(c) for c in cams})
+        if not set(cams) <= set(self.cams):
+            raise ValueError(f"cams {cams} not all powered (mask 0x{self.power_mask:02X})")
+        if self.armed:
+            self.disarm()
+        fw_mask = 0
+        for c in (cams if self.idle_fpga == "histogram" else self.cams):
+            fw_mask |= 1 << c
+        if not self.sensor.set_camera_image_mode(True, fw_mask):
+            raise RuntimeError("OW_CAMERA_IMAGE_MODE enable failed")
+        self._fw_image = True
+        time.sleep(0.2)
+        for c, r in self.regs.items():
+            if c in cams or self.idle_fpga == "quiet":
+                r.quiet()
+        for c in cams:
+            self.regs[c].set_stride(int(stride))
+            self.regs[c].arm_sweep(0)
+        while not self.image_q.empty():   # nothing from before the arm
+            self.image_q.get_nowait()
+        self.armed, self.stride = cams, int(stride)
+        now = time.monotonic()
+        self._asm = {c: CompositeAssembler(skip_exposures=self.warmup_exposures) for c in cams}
+        self.last_line_t = {c: now for c in cams}
+
+    def disarm(self) -> dict | None:
+        """Stop imaging (trigger stopped, drained). Returns the firmware's
+        image-mode exit breakdown for the segment (per-camera losses)."""
+        for c in self.armed:
+            r = self.regs[c]
+            r.set_stride(0)
+            if self.idle_fpga == "quiet":
+                r.quiet()
+            else:
+                r.exit_image_mode()
+        st = None
+        if self._fw_image:
+            st = self.sensor.image_mode_exit_status()
+            self._fw_image = False
+        self.armed, self._asm = [], {}
+        return st
+
+    def close(self) -> None:
+        """Best-effort teardown (trigger stopped). Cameras stay powered."""
+        s = self.sensor
+        steps = []
+        if self.armed:
+            steps.append(("disarm", self.disarm))
+        for c, r in self.regs.items():
+            steps.append((f"cam{c} histogram mode", lambda r=r: (r.set_stride(0), r.exit_image_mode())))
+        if self._retimed:
+            from omotion.config import COMPOSITE_RESTORE_PROFILE
+            for c in self.cams:
+                steps.append((f"cam{c} timing restore",
+                              lambda c=c: write_register_sequence(s, c, COMPOSITE_RESTORE_PROFILE)))
+        if self._fw_image:
+            steps.append(("image mode exit", s.image_mode_exit_status))
+        steps += [("fsin off", s.disable_camera_fsin_ext),
+                  ("cameras off", lambda: s.disable_camera(self.power_mask))]
+        for name, fn in steps:
+            try:
+                fn()
+            except Exception:
+                logger.exception("CompositeSession.close: %s failed", name)
+        self._fw_image = self._retimed = False
+        if self._streaming:
+            try:
+                s.uart.histo.stop_streaming()
+                s.uart.histo.drain_final(expected_size=_STREAM_READ_SIZE)
+            except Exception:
+                logger.exception("CompositeSession.close: stop_streaming failed")
+            self._streaming = False
+        self._opened = False
+
+    # -- streaming (any time) --------------------------------------------
+    def poll(self, timeout: float = 0.1, max_packets: int = 4000) -> list[CompositeFrame]:
+        """Consume queued line pushes; return the composites they completed."""
+        done: list[CompositeFrame] = []
+        t_end = time.monotonic() + timeout
+        n = 0
+        while n < max_packets:
+            left = t_end - time.monotonic()
+            try:
+                pkt = self.image_q.get(timeout=max(left, 0.0)) if left > 0 else self.image_q.get_nowait()
+            except _queue.Empty:
+                break
+            n += 1
+            t = time.monotonic()
+            try:
+                line = parse_image_packet(pkt)
+            except ImageLineError:
+                self.bad_packets += 1
+                continue
+            asm = self._asm.get(line.cam_id)
+            if asm is None:
+                continue
+            self.lines_rx[line.cam_id] = self.lines_rx.get(line.cam_id, 0) + 1
+            self.last_line_t[line.cam_id] = t
+            f = asm.add(line, t)
+            if f is not None:
+                done.append(f)
+        # discard histogram packets (none expected in image mode)
+        while not self._discard_q.empty():
+            self._discard_q.get_nowait()
+        return done
+
+    def drain(self, quiet_s: float = 0.3, max_s: float = 3.0) -> list[CompositeFrame]:
+        """After the trigger stopped: consume until the stream is quiet."""
+        done: list[CompositeFrame] = []
+        t_end = time.monotonic() + max_s
+        while time.monotonic() < t_end:
+            n0 = sum(self.lines_rx.values()) + self.bad_packets
+            done += self.poll(timeout=quiet_s)
+            if sum(self.lines_rx.values()) + self.bad_packets == n0 and self.image_q.empty():
+                break
+        return done
+
+    def line_age(self, cam: int) -> float:
+        """Seconds since the last line from an armed camera."""
+        return time.monotonic() - self.last_line_t.get(cam, time.monotonic())
 
 
 def write_register_sequence(sensor, cam: int, seq,
