@@ -45,6 +45,8 @@ def main() -> int:
     ap.add_argument("--no-fpga-load", action="store_true",
                     help="skip the forced FPGA SRAM load (already loaded this power cycle)")
     ap.add_argument("--live", action="store_true", help="show each frame in a window")
+    ap.add_argument("--laser-delay", type=int, default=None,
+                    help="LaserPulseDelayUsec override (us after FSIN); default = production")
     a = ap.parse_args()
 
     logging.basicConfig(level=logging.WARNING)
@@ -101,10 +103,10 @@ def main() -> int:
     try:
         capture_composite_frames(sensor, iface.console, a.cam, n_frames=a.frames,
                                  laser=laser, load_fpga=not a.no_fpga_load,
-                                 on_frame=on_frame)
+                                 on_frame=on_frame, laser_delay_us=a.laser_delay)
     finally:
         (out / "meta.json").write_text(json.dumps(
-            {"side": a.side, "cam": a.cam, "laser": laser,
+            {"side": a.side, "cam": a.cam, "laser": laser, "laser_delay_us": a.laser_delay,
              "formats": {
                  "*_raw16.png": "lossless 16-bit greyscale PNG of the raw sensor "
                                 "values (10-bit, 0..1023, unscaled)",

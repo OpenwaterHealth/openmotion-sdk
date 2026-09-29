@@ -905,6 +905,7 @@ def capture_composite_frames(
     load_fpga: bool = True,
     on_frame=None,
     timeout_s: float | None = None,
+    laser_delay_us: int | None = None,
 ) -> list[CompositeFrame]:
     """Stream ~1 Hz full-frame composites from one or more cameras on one
     sensor module (``cams``: an index 0-7 or an iterable of them).
@@ -929,6 +930,10 @@ def capture_composite_frames(
     driver registers are cleared by a console power cycle). Keep the sensor's
     DEBUG_FLAG_USB_PRINTF off: firmware printf over USB during an image
     stream wedges the COMM endpoint (bench 2026-09-29).
+
+    ``laser_delay_us`` overrides the console's LaserPulseDelayUsec (FSIN edge
+    to laser pulse); None keeps DEFAULT_TRIGGER_CONFIG's production value,
+    which lands the pulse inside the ~650 us exposure.
     """
     from omotion.config import (
         COMPOSITE_RESTORE_PROFILE,
@@ -969,8 +974,17 @@ def capture_composite_frames(
             raise RuntimeError(f"sensor configuration failed (mask 0x{mask:02X})")
 
         cfg = dict(DEFAULT_TRIGGER_CONFIG)
+        # Every frame lit: skip interval 0 AND skip delay 0. Console fw never
+        # leaves its initial "dark" laser slot when LaserPulseSkipInterval is
+        # 0, and that slot fires at delay + LaserPulseSkipDelayUsec (1800 us
+        # by default: outside the exposure, and a 25.7 ms one-shot that
+        # swallows every other FSIN). Zeroing the skip delay makes the dark
+        # slot identical to the lit one (bench 2026-09-29).
         cfg.update(TriggerFrequencyHz=40.0, LaserPulseSkipInterval=0,
+                   LaserPulseSkipDelayUsec=0,
                    EnableSyncOut=True, EnableTaTrigger=bool(laser))
+        if laser_delay_us is not None:
+            cfg["LaserPulseDelayUsec"] = int(laser_delay_us)
         if not console.set_trigger_json(data=cfg):
             raise RuntimeError("set_trigger_json failed")
         if not sensor.enable_camera_fsin_ext():
