@@ -56,14 +56,19 @@ camera for `--dwell-s` (default 120 s, i.e. ~58 images), then the next.
 ## Setting up the test rig
 
 1. **Sensor firmware:** `openmotion-sensor-fw` `feature/99-drip-scan-image-mode`
-   @ `252042d`, built bare-metal Debug with the map-v3 bitstream merged. Steps
-   are in `docs/FullFrameImages.md` → "Resuming on a bench":
-   - copy the bitstream to `fpga/openmotion-camera-fpga.bin`;
-   - `cmake --preset Debug -DBARE_METAL=ON ; cmake --build build\Debug`;
-   - `deploy.py`.
+   @ `252042d`, built bare-metal Debug with the map-v3 bitstream merged. The
+   exact commands are in `docs/FullFrameSequences_AgentBrief.md` step 3 (also
+   `docs/FullFrameImages.md` → "Resuming on a bench"):
+   1. `cmake --preset Debug -DBARE_METAL=ON`, FIRST: configure downloads the
+      release bitstream over `fpga/openmotion-camera-fpga.bin`;
+   2. copy the map-v3 bitstream over that file;
+   3. `cmake --build build\Debug --clean-first`;
+   4. `scripts/check_fw_bitstream.py` must print OK;
+   5. `deploy.py --no-build`.
 
    **Secure-bootloader sensors cannot take this build** (anti-rollback floor).
-   Check first with `MotionSensor.get_boot_mode()`.
+   `scripts/rig_info.py` (read-only) shows each sensor's boot mode and whether
+   its firmware supports image mode.
 2. **Console:** any production console firmware (only the trigger and laser are
    used).
 3. **Host:** Python 3.12+, this SDK branch installed or on `PYTHONPATH`, plus
