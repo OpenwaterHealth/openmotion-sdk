@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Overlay new cold-start dip runs on the Jul-Aug 2026 control band.
 
-Per camera: dark-corrected mean (mean_dc), 120-frame rolling median, divided by
-the run's own plateau (median 600-1500 s) -> % of plateau. Same smoothing and
-plateau window as dip_from_meandc.py.
+Per camera: frame mean u1 minus the dark pedestal taken from the scheduled dark
+windows (see curves()), 120-frame rolling median, divided by the run's own
+plateau (median 600-1500 s) -> % of plateau. Same smoothing, plateau and dip
+windows as dip_from_meandc.py; the dip (min over 60-420 s) is printed and shown
+in each panel.
 
 SOURCE-STEP MASK: the illumination source sometimes comes back from a dark
 window ~5% brighter or dimmer and holds that level for exactly one dark-window
@@ -66,17 +68,30 @@ def step_intervals(df: pd.DataFrame) -> set:
 
 
 def curves(path: Path):
-    df = pd.read_csv(path, usecols=["cam_id", "timestamp_s", "is_dark", "mean_dc", "photodiode_w"])
+    """Per camera: % of plateau, dark-corrected from the dark-window SCHEDULE.
+
+    signal = u1 - pedestal, pedestal = median u1 over the middle (0.3-0.8 s) of
+    every scheduled dark window; light frames exclude +-1.6 s around each window.
+    Deliberately not analyze_drift_scan's mean_dc: its content-resolved dark
+    classification drops whole early intervals on dim cameras (~10 DN above
+    pedestal) -- exactly the dip window. On bright cameras both methods agree
+    (REBASE_01/02 cam 7: 13.0 / 10.6 % either way).
+    """
+    df = pd.read_csv(path, usecols=["cam_id", "timestamp_s", "is_dark", "u1", "photodiode_w"])
     bad = step_intervals(df)
+    ph = df.timestamp_s % DARK_INTERVAL_S
+    in_dark = (df.timestamp_s > 50) & (ph > 0.3) & (ph < 0.8)
+    light = df[(df.timestamp_s > 3) & ~((ph < 1.6) | (ph > DARK_INTERVAL_S - 0.3))]
     out = {}
-    for cam, g in df[~df.is_dark].dropna(subset=["mean_dc"]).groupby("cam_id"):
-        s = g.sort_values("timestamp_s").set_index("timestamp_s").mean_dc
+    for cam, g in light.groupby("cam_id"):
+        ped = df[in_dark & (df.cam_id == cam)].u1.median()
+        s = g.sort_values("timestamp_s").set_index("timestamp_s").u1 - ped
         stepped = (s.index // DARK_INTERVAL_S).astype(int).isin(bad)
         s[stepped] = np.nan                     # mask BEFORE smoothing so no edge bleed
         s = s.rolling(120, center=True, min_periods=15).median()
         s[stepped] = np.nan                     # keep the masked span as a visible gap
         plat = s[(s.index >= 600) & (s.index <= 1500)].median()
-        if plat and plat > 0:
+        if np.isfinite(plat) and plat >= 3:     # < 3 DN above pedestal = all-dark camera
             s = 100 * s / plat
             out[cam] = s[s.index <= T_MAX].iloc[::10]
     return out, bad
@@ -107,6 +122,7 @@ def main():
             for cam, c in cs.items():
                 if cam in axes:
                     axes[cam].plot(c.index, c.values, color=HIST_GREY, lw=1, alpha=0.7, zorder=1)
+    dip_text = {cam: [] for cam in cams}
     for i, r in enumerate(runs):
         cs, bad = curves(data_dir / f"{r}_analysis.csv")
         if bad:
@@ -114,16 +130,17 @@ def main():
         for cam, c in cs.items():
             if cam not in axes:
                 continue
-            ax = axes[cam]
-            ax.plot(c.index, c.values, color=SERIES[i % len(SERIES)], lw=2, zorder=3, label=r)
+            axes[cam].plot(c.index, c.values, color=SERIES[i % len(SERIES)], lw=2, zorder=3, label=r)
             body = c[(c.index >= 60) & (c.index <= 420)].dropna()
-            if body.empty:
-                continue
-            tmin = body.idxmin()
-            if 100 - body[tmin] >= 2.0:   # label real dips only (dip_from_meandc threshold)
-                ax.annotate(f"{100 - body[tmin]:.1f}%", (tmin, body[tmin]), xytext=(8 + 34 * i, -14),
-                            textcoords="offset points", color=INK, fontsize=8)
+            if not body.empty:
+                dip = 100 - body.min()
+                dip_text[cam].append(f"{r}: {dip:.1f}% @ {body.idxmin():.0f}s" if dip >= 2.0
+                                     else f"{r}: no dip")
+                print(f"{r} cam{cam + 1}: dip {dip:.1f}% @ {body.idxmin():.0f}s")
     for cam, ax in axes.items():
+        if dip_text[cam]:   # dip table in the panel corner (ink, not series colour)
+            ax.text(0.98, 0.04, "\n".join(dip_text[cam]), transform=ax.transAxes,
+                    ha="right", va="bottom", color=INK, fontsize=7.5, linespacing=1.4)
         if not ax.lines:   # all-dark camera: analyze_drift_scan yields no mean_dc
             ax.text(0.5, 0.5, "no signal (all-dark)", transform=ax.transAxes,
                     ha="center", va="center", color=INK2, fontsize=9)
