@@ -157,13 +157,27 @@ Caveats:
    sensor-fw CI, and CI signs branch builds as FwVersion 1, below the units'
    anti-rollback floor. A bootloader bench needs a signed build at the current
    FwVersion first.
-2. **Build the sensor firmware with the map-v3 bitstream:**
+2. **Build the sensor firmware with the map-v3 bitstream.** Order matters:
+   - A bare-metal configure always downloads the latest *release* bitstream
+     over `fpga/openmotion-camera-fpga.bin`, so copy map v3 in AFTER
+     configuring.
+   - The merge into the flash image is a post-link step, so build from
+     clean.
    ```powershell
    cd openmotion-sensor-fw   # on feature/99-drip-scan-image-mode
+   cmake --preset Debug -DBARE_METAL=ON     # configures build\Debug; downloads the release bitstream
    copy ..\openmotion-camera-fpga\tools\full_frame_capture\validated_bitstream\HistoFPGAFw_impl1_2026-09-29_map-v3-stride.bit fpga\openmotion-camera-fpga.bin
-   cmake --preset Debug -DBARE_METAL=ON ; cmake --build build\Debug   # bare-metal Debug: deploy.py reads build\Debug; Release does not boot
-   python scripts\deploy.py --device left --no-confirm --power-cycle-cmd "python ..\openmotion-bloodflow-app\tests\shelly.py cycle"
+   cmake --build build\Debug --clean-first
+   python ..\openmotion-sdk\scripts\check_fw_bitstream.py build\Debug\motion-sensor-fw.bin ..\openmotion-camera-fpga\tools\full_frame_capture\validated_bitstream\HistoFPGAFw_impl1_2026-09-29_map-v3-stride.bit
+   python scripts\deploy.py --device left --no-build --no-confirm --power-cycle-cmd "python ..\openmotion-bloodflow-app\tests\shelly.py cycle"
    ```
+   - Use the `Debug` preset with `-DBARE_METAL=ON`. `deploy.py` only knows
+     `build\Debug` / `build\Release`, and Release does not boot.
+   - `check_fw_bitstream.py` (SDK `feature/296-composite-thermal-soak`)
+     compares the bytes at flash offset 0x1A0000 with the map-v3 file.
+   - A wrong bitstream shows up at capture time as
+     `FPGA register map < v3 (no STRIDE)`.
+
    Flash the full image, not `--fw-only`, the first time: the capture
    force-loads the bitstream from sensor flash (`0x081A0000`) into each
    camera's FPGA SRAM (~10 s per camera, volatile).
