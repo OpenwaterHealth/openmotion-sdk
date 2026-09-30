@@ -166,6 +166,13 @@ The console and sensor modules use entirely separate transport stacks. They shar
 
 **Console transport — `MotionUart`** — communicates with the console over a USB virtual COM port using pyserial. Frames messages as `UartPacket` (start byte, ID, type, command, data, CRC-16, end byte). Supports sync mode (blocking read) and async mode (background read thread with per-ID response queues). Connection lifecycle is driven by `ConnectionMonitor`.
 
+Histogram reads need not end at packet boundaries. The stream parser buffers
+a partial packet with a valid, bounded header until its declared bytes arrive;
+it does not scan the incomplete payload for another header. Corrupt headers
+and invalid complete packets still enter CRC-checked resynchronization. At
+stream end, the final pass can recover a complete later packet from a buffer
+whose leading packet was truncated.
+
 **Sensor transport — `USBInterfaceBase`** — base class that claims a USB bulk interface and locates its endpoints. `CommInterface` and `StreamInterface` both subclass it. Used exclusively by the sensor path.
 
 **`CommInterface`** — bidirectional command/response over a sensor USB bulk interface (interface 0). Maintains a read thread and a contiguous `_read_buffer`. Supports two modes:
