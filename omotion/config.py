@@ -445,6 +445,22 @@ COMPOSITE_STRIDE: int = 40
 """FPGA STRIDE for the 1 Hz composite: 40 x 18.1 us = 725 us between
 captured lines, above the ~688 us line drain; 32 lines per frame."""
 
+OX02C1B_ROW_S_PER_HTS: float = 9.032e-6 / 432
+"""Row time per HTS unit (production HTS 432 -> 9.032 us rows)."""
+
+COMPOSITE_LINE_DRAIN_S: float = 0.69e-3
+"""One 2408-B line push over the FPGA->MCU link (~286 ns/byte). Captured lines
+must be spaced at least ~3% more than this or the FPGA line buffer overruns."""
+
+COMPOSITE_BURST_BUDGET_LINES_PER_S: float = 1400.0
+"""Line rate one sensor's USB path sustains without dropping at the firmware's
+staging buffer, with margin (measured ceiling ~1,850 lines/s, bench
+2026-09-29). What counts is the rate WHILE a frame's rows are read out, not the
+per-frame average: at production timing (HTS 432 x VTS 2768) the 1280 active
+rows stream in the first 11.6 ms of each 25 ms frame, so two cameras at STRIDE
+80 burst at ~2,770 lines/s and lost ~3% of lines (bench 2026-09-29) although
+their average was only 1,280 lines/s."""
+
 COMPOSITE_TIMING_PROFILE: tuple = (
     (0x380E, 0x05), (0x380F, 0x64),   # VTS = 1380 FIRST (see note)
     (0x380C, 0x03), (0x380D, 0x62),   # HTS = 866 (18.1 us rows; frame 24.98 ms < 25 ms FSIN)
