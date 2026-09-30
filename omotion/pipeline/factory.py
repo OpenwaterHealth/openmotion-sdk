@@ -33,7 +33,8 @@ def default_pipeline(*,
                      dark_interval: int = 600,
                      realtime_dark_history_size: int = 4,
                      raw_save_max_duration_s: Optional[float] = None,
-                     telemetry: Optional[Any] = None) -> Pipeline:
+                     telemetry: Optional[Any] = None,
+                     camera_dropout_abort_s: Optional[float] = None) -> Pipeline:
     """Build the canonical pipeline. See SciencePipeline.md for the algorithm.
 
     Args:
@@ -45,6 +46,10 @@ def default_pipeline(*,
             raw tee) so every frame — including the raw CSV record — carries
             the pdc/tcm/tcl context at its capture time. None (default)
             omits the stage (replay sources, tests, no console telemetry).
+        camera_dropout_abort_s: Seconds of device time a mask camera may be
+            missing from its side's packets before the classifier emits
+            CameraDropoutTimeout (sdk#298). None (default) disables it;
+            ScanWorkflow passes ScanRequest.camera_dropout_abort_s.
     """
 
     def not_warmup_or_stale(frame_type: str) -> bool:
@@ -58,6 +63,7 @@ def default_pipeline(*,
                 metadata.left_camera_mask,
                 metadata.right_camera_mask,
             ),
+            camera_dropout_abort_s=camera_dropout_abort_s,
         ),
     ]
 

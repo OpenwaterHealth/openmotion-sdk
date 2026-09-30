@@ -12,7 +12,7 @@ import csv
 import logging
 import os
 from dataclasses import asdict, dataclass
-from typing import Any, Optional, Protocol, runtime_checkable
+from typing import Any, Callable, Optional, Protocol, runtime_checkable
 
 from omotion.config import HISTO_SIZE_WORDS
 
@@ -587,6 +587,38 @@ class DiagnosticsLogSink:
                 self._scan_id,
                 ", ".join(f"{k}×{v}" for k, v in sorted(self._counts.items())),
             )
+
+
+class CameraDropoutWatchdogSink:
+    """Turns the first CameraDropoutTimeout of a scan into a callback
+    (sdk#298). ScanWorkflow injects one per scan when
+    ``ScanRequest.camera_dropout_abort_s`` is set and aborts the scan from
+    the callback. Runs on the runner thread, so the callback must only
+    signal (set an event), never block or join. Later timeouts in the same
+    scan are ignored: the scan is already stopping.
+    """
+
+    channels = {"diagnostics"}
+
+    def __init__(self, on_timeout: Callable[[Any], None]) -> None:
+        self._on_timeout = on_timeout
+        self._fired = False
+
+    def on_scan_start(self, meta: ScanMetadata) -> None:
+        self._fired = False
+
+    def consume(self, channel: str, event: Any) -> None:
+        from .batch import CameraDropoutTimeout
+        if self._fired or not isinstance(event, CameraDropoutTimeout):
+            return
+        self._fired = True
+        try:
+            self._on_timeout(event)
+        except Exception:
+            logger.exception("camera dropout callback raised")
+
+    def on_complete(self) -> None:
+        pass
 
 
 class ScanDBSink:

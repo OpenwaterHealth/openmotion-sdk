@@ -211,8 +211,10 @@ class SideAverageStage:
         delivered. None until each mask-enabled camera has closed at least
         one interval — flushing earlier would emit partial averages and
         re-emit (duplicate) the frame when the late camera caught up.
-        A mask-enabled camera that never streams stalls the corrected side
-        average until on_scan_stop, which flushes everything regardless."""
+        A mask-enabled camera that never streams (or dies) stalls the
+        corrected side average until on_scan_stop, which flushes everything
+        regardless. ScanWorkflow bounds that stall by aborting the scan on
+        CameraDropoutTimeout (ScanRequest.camera_dropout_abort_s, sdk#298)."""
         cams = self._cams[side]
         if len(cams) == 0:
             return None

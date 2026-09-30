@@ -117,6 +117,27 @@ class _TelemetryCsvWriter:
             pass
 
 
+class CameraDropoutError(RuntimeError):
+    """The scan was aborted because a mask-enabled camera delivered no frames
+    for ``ScanRequest.camera_dropout_abort_s`` while its side kept streaming
+    (sdk#298). Reported via ``last_scan_error`` and ``ScanRequest.on_error``.
+    Everything up to the abort is flushed and persisted as usual."""
+
+    def __init__(self, *, side: str, cam_id: int, never_delivered: bool,
+                 silent_s: float, threshold_s: float):
+        self.side = side
+        self.cam_id = int(cam_id)
+        self.never_delivered = bool(never_delivered)
+        self.silent_s = float(silent_s)
+        self.threshold_s = float(threshold_s)
+        what = ("never delivered a frame" if never_delivered
+                else "stopped delivering frames")
+        super().__init__(
+            f"{side} camera {cam_id} {what} ({silent_s:.1f} s, "
+            f"limit {threshold_s:.1f} s); scan aborted"
+        )
+
+
 @dataclass
 class ScanRequest:
     subject_id: str
@@ -168,6 +189,15 @@ class ScanRequest:
     # value can no longer carry. Fires on the worker thread, so the handler
     # must be thread-safe. See bloodflow-app issue #213.
     on_error: Callable[[BaseException], None] | None = None
+    # Abort the scan when a mask-enabled camera is missing from its side's
+    # packets for this many seconds of device time (never started, or died
+    # mid-scan) — sdk#298. Without it the reduced-mode side average, the
+    # only clinical record, stalls in memory until stop. The abort surfaces
+    # as a CameraDropoutError via last_scan_error / on_error; data up to the
+    # abort is kept. None disables it (run_collection_scan does, since its
+    # collectors judge each camera themselves). A whole side going silent is
+    # not covered here (#192).
+    camera_dropout_abort_s: float | None = 5.0
 
 
 @dataclass
@@ -225,6 +255,9 @@ def run_collection_scan(
         reduced_mode=reduced_mode,
         sinks=[collector],
         skip_default_storage=True,
+        # Collectors judge each camera themselves (a dead camera fails their
+        # verdict); aborting mid-collection would only lose that verdict.
+        camera_dropout_abort_s=None,
     )
     started = scan_workflow.start_scan(request)
     if raise_on_error and not started:
@@ -272,6 +305,9 @@ class ScanWorkflow:
         self._scan_subs: list[tuple] = []  # (signal, handler) pairs
         self._scan_active_handles: list = []
         self._scan_abort_reason: str | None = None
+        # Set by _on_camera_dropout; the worker raises it after teardown so
+        # it lands in last_scan_error / on_error (sdk#298).
+        self._scan_dropout_error: CameraDropoutError | None = None
 
         # Per-scan active (side, mask, sensor) tuples, snapshotted by the
         # worker once it resolves the request. cancel_scan reads this to
@@ -420,6 +456,7 @@ class ScanWorkflow:
 
         logger.info("start_scan: building pipeline for new scan")
         self._stop_evt = threading.Event()
+        self._scan_dropout_error = None
 
         # ── Build ScanMetadata ────────────────────────────────────────────
         _now = datetime.datetime.now(datetime.timezone.utc)
@@ -479,6 +516,7 @@ class ScanWorkflow:
             pedestals=pedestals,
             raw_save_max_duration_s=request.raw_save_max_duration_s,
             telemetry=telemetry_aggregator,
+            camera_dropout_abort_s=request.camera_dropout_abort_s,
         )
 
         # ── Auto-inject default sinks ──────────────────────────────────────
@@ -486,6 +524,9 @@ class ScanWorkflow:
         # correction-integrity events that would otherwise vanish; the DB
         # sink persists the matching summary when a DB is configured).
         default_sinks: list = [DiagnosticsLogSink()]
+        if request.camera_dropout_abort_s is not None:
+            from omotion.pipeline.sinks import CameraDropoutWatchdogSink
+            default_sinks.append(CameraDropoutWatchdogSink(self._on_camera_dropout))
         telemetry_writer: Optional[_TelemetryCsvWriter] = None
         camera_telemetry_logger = None  # CameraTelemetryCsvLogger, opt-in (#162)
         if not request.skip_default_storage:
@@ -787,6 +828,11 @@ class ScanWorkflow:
                                 )
                             except Exception:
                                 pass
+
+                # Raised after the normal teardown so the partial scan is
+                # flushed and persisted first (sdk#298).
+                if self._scan_dropout_error is not None:
+                    raise self._scan_dropout_error
             except Exception as e:
                 logger.exception("ScanWorkflow worker raised")
                 self._last_scan_error = str(e) or type(e).__name__
@@ -825,6 +871,26 @@ class ScanWorkflow:
         )
         self._thread.start()
         return True
+
+    def _on_camera_dropout(self, event) -> None:
+        """CameraDropoutWatchdogSink callback (runner thread): abort the scan
+        through the same _stop_evt path as a mid-scan disconnect. Only
+        signals — the duration guard runs the normal teardown, and the
+        worker raises the stored error once the runner has drained."""
+        if not self.running or self._stop_evt.is_set():
+            return
+        side = {0: "left", 1: "right"}.get(int(event.side), str(event.side))
+        err = CameraDropoutError(
+            side=side,
+            cam_id=event.cam_id,
+            never_delivered=event.never_delivered,
+            silent_s=event.silent_s,
+            threshold_s=event.threshold_s,
+        )
+        logger.error("scan: %s", err)
+        self._scan_dropout_error = err
+        self._scan_abort_reason = str(err)
+        self._stop_evt.set()
 
     def _emit_trigger_event(self, state: str) -> None:
         """Push a TriggerStateEvent to the current runner's diagnostics channel.
