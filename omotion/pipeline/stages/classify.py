@@ -27,7 +27,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from ..batch import (
-    CameraStreamGap, FrameBatch, FrameIdConsensusCorrection,
+    CameraDropoutTimeout, CameraStreamGap, FrameBatch, FrameIdConsensusCorrection,
     FrameIdPacketAnomaly, FrameQuarantined,
 )
 
@@ -67,6 +67,7 @@ class _CameraGapState:
     first_packet_id: int | None
     first_timestamp_s: float
     alerted: bool = False
+    timed_out: bool = False
 
 
 class _FrameUnwrapper:
@@ -290,8 +291,16 @@ class FrameClassificationStage:
         discard_count: int = 9,
         dark_interval: int = 600,
         expected_camera_masks: tuple[int, int] | None = None,
+        camera_dropout_abort_s: float | None = None,
     ):
         self.discard_count = int(discard_count)
+        # Device-time silence after which a missing expected camera raises
+        # CameraDropoutTimeout (sdk#298). None or <= 0 disables it.
+        self.camera_dropout_abort_s = (
+            float(camera_dropout_abort_s)
+            if camera_dropout_abort_s is not None and camera_dropout_abort_s > 0
+            else None
+        )
         self.dark_interval = int(dark_interval)
         self._unwrappers: dict[tuple[int, int], _FrameUnwrapper] = {}
         masks = expected_camera_masks or (0, 0)
@@ -302,6 +311,9 @@ class FrameClassificationStage:
             for side, mask in enumerate(masks)
         }
         self._camera_gaps: dict[tuple[int, int], _CameraGapState] = {}
+        # (side, cam) pairs that have delivered at least one packet, so a
+        # dropout timeout can say "never started" vs "stopped".
+        self._cameras_seen: set[tuple[int, int]] = set()
         # A non-zero quarantine count is a hardware-health signal. Log one
         # example per reason live, then report reason totals at scan stop.
         self._quarantine_counts: dict[str, int] = {}
@@ -455,6 +467,7 @@ class FrameClassificationStage:
         packet_id: int | None,
         timestamp_s: float,
     ) -> None:
+        self._cameras_seen.add(key)
         gap = self._camera_gaps.pop(key, None)
         if gap is None or not gap.alerted:
             return
@@ -491,6 +504,8 @@ class FrameClassificationStage:
         else:
             gap.missing_frames += 1
 
+        if gap.alerted:
+            self._check_camera_timeout(batch, key, gap, packet_id, timestamp_s)
         if gap.missing_frames != _CAMERA_GAP_ALERT_FRAMES + 1:
             return
         gap.alerted = True
@@ -512,6 +527,47 @@ class FrameClassificationStage:
             "current_timestamp=%.6f; prolonged-loss handling remains active",
             self._side_name(side), side, cam_id, gap.missing_frames,
             gap.first_packet_id, packet_id, gap.first_timestamp_s, timestamp_s,
+        )
+
+    def _check_camera_timeout(
+        self,
+        batch: FrameBatch,
+        key: tuple[int, int],
+        gap: _CameraGapState,
+        packet_id: int | None,
+        timestamp_s: float,
+    ) -> None:
+        """Raise CameraDropoutTimeout once when an already-alerted gap has
+        lasted ``camera_dropout_abort_s`` of device time. Timed on packet
+        timestamps rather than a frame count so the limit holds at any
+        trigger rate; only checked after the 9-packet alert so a single
+        timestamp glitch cannot fire it on a camera that just blinked."""
+        limit = self.camera_dropout_abort_s
+        if limit is None or gap.timed_out:
+            return
+        silent_s = timestamp_s - gap.first_timestamp_s
+        if silent_s < limit:
+            return
+        gap.timed_out = True
+        side, cam_id = key
+        never = key not in self._cameras_seen
+        batch.events.append(CameraDropoutTimeout(
+            side=side,
+            cam_id=cam_id,
+            never_delivered=never,
+            silent_s=silent_s,
+            threshold_s=limit,
+            packet_id=packet_id,
+            timestamp_s=timestamp_s,
+            first_missing_packet_id=gap.first_packet_id,
+            first_missing_timestamp_s=gap.first_timestamp_s,
+        ))
+        logger.error(
+            "CAMERA DROPOUT TIMEOUT: side=%s(%d) cam_id=%d %s for %.2f s "
+            "(limit %.2f s); first_missing_packet=%s current_packet=%s",
+            self._side_name(side), side, cam_id,
+            "never delivered" if never else "silent",
+            silent_s, limit, gap.first_packet_id, packet_id,
         )
 
     @staticmethod
@@ -557,3 +613,4 @@ class FrameClassificationStage:
         self._quarantine_counts.clear()
         self._quarantine_logged.clear()
         self._camera_gaps.clear()
+        self._cameras_seen.clear()

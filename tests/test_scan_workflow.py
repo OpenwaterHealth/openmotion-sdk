@@ -797,3 +797,102 @@ def test_configure_failure_skips_security_uid_refresh():
 
     assert not result.ok
     sensor.refresh_id_cache.assert_not_called()
+
+
+# ── Camera-dropout abort (#298) ──────────────────────────────────────────
+
+def _dropout_event(side=0, cam=3, never_delivered=True):
+    from omotion.pipeline.batch import CameraDropoutTimeout
+    return CameraDropoutTimeout(
+        side=side, cam_id=cam, never_delivered=never_delivered, silent_s=5.0,
+        threshold_s=5.0, packet_id=201, timestamp_s=5.0,
+        first_missing_packet_id=1, first_missing_timestamp_s=0.0,
+    )
+
+
+def _start_blocking_scan(motion, request):
+    captured = {}
+
+    def _factory(*, console, left, right, batch_size_frames, metadata):
+        src = _MockSource(metadata=metadata)
+        captured["src"] = src
+        return src
+
+    patcher = mock.patch("omotion.pipeline.sources.LiveUsbSource", _factory)
+    patcher.start()
+    assert motion.scan_workflow.start_scan(request)
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and "src" not in captured:
+        time.sleep(0.01)
+    assert "src" in captured, "mock source was not constructed"
+    return patcher
+
+
+def test_scan_request_camera_dropout_abort_defaults_to_5s():
+    req = ScanRequest(subject_id="x", duration_sec=1,
+                      left_camera_mask=1, right_camera_mask=0)
+    assert req.camera_dropout_abort_s == 5.0
+
+
+def test_camera_dropout_timeout_aborts_scan_with_error():
+    """A CameraDropoutTimeout on the diagnostics channel stops the scan well
+    before its duration and reports the camera through last_scan_error and
+    on_error. It is an error, not a user cancel."""
+    from omotion.ScanWorkflow import CameraDropoutError
+
+    motion = _build_motion_with_data_dir(None)
+    errors = []
+    request = ScanRequest(
+        subject_id="x", duration_sec=30,
+        left_camera_mask=0xFF, right_camera_mask=0, reduced_mode=True,
+        skip_default_storage=True, on_error=errors.append,
+    )
+    wf = motion.scan_workflow
+    patcher = _start_blocking_scan(motion, request)
+    try:
+        wf._runner.dispatch_event(_dropout_event(side=0, cam=3))
+        assert wf._stop_evt.is_set(), "dropout timeout did not abort the scan"
+        wf.await_complete(timeout_sec=10.0)
+        assert not wf.running, "scan did not finish after dropout abort"
+    finally:
+        patcher.stop()
+
+    assert wf.last_scan_error is not None
+    assert "left" in wf.last_scan_error and "camera 3" in wf.last_scan_error
+    assert wf.last_scan_canceled is False
+    assert len(errors) == 1 and isinstance(errors[0], CameraDropoutError)
+    assert (errors[0].side, errors[0].cam_id) == ("left", 3)
+    assert errors[0].never_delivered is True
+
+
+def test_camera_dropout_abort_disabled_when_none():
+    motion = _build_motion_with_data_dir(None)
+    request = ScanRequest(
+        subject_id="x", duration_sec=30,
+        left_camera_mask=0xFF, right_camera_mask=0,
+        skip_default_storage=True, camera_dropout_abort_s=None,
+    )
+    wf = motion.scan_workflow
+    patcher = _start_blocking_scan(motion, request)
+    try:
+        wf._runner.dispatch_event(_dropout_event())
+        assert not wf._stop_evt.is_set(), "disabled watchdog aborted the scan"
+        classify = wf._runner.pipeline.stages[0]
+        assert classify.camera_dropout_abort_s is None
+        wf.cancel_scan(join_timeout=5.0)
+    finally:
+        patcher.stop()
+    assert wf.last_scan_error is None
+
+
+def test_camera_dropout_threshold_reaches_classifier():
+    motion = _build_motion_with_data_dir(None)
+    request = ScanRequest(
+        subject_id="x", duration_sec=1,
+        left_camera_mask=0xFF, right_camera_mask=0,
+        camera_dropout_abort_s=7.5,
+    )
+    motion.scan_workflow.start_scan(request)
+    classify = motion.scan_workflow._runner.pipeline.stages[0]
+    assert classify.camera_dropout_abort_s == 7.5
+    motion.scan_workflow.await_complete(timeout_sec=10.0)

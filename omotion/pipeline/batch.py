@@ -168,8 +168,8 @@ class CameraStreamGap(BatchEvent):
     """An expected camera disappeared from source packets for >8 captures.
 
     One ``state="missing"`` event is emitted when the threshold is crossed,
-    and one ``state="resumed"`` event when that camera next appears.  The
-    prolonged-loss watchdog remains responsible for stopping the scan; this
+    and one ``state="resumed"`` event when that camera next appears.
+    Stopping the scan on prolonged loss is CameraDropoutTimeout's job; this
     event supplies the early warning and durable packet evidence needed to
     diagnose an intermittent camera after the scan.
     """
@@ -182,6 +182,29 @@ class CameraStreamGap(BatchEvent):
     first_missing_packet_id:    Optional[int]
     first_missing_timestamp_s:  float
     reason:                      str = "camera_missing_from_source_packets"
+
+
+@dataclass
+class CameraDropoutTimeout(BatchEvent):
+    """An expected camera has been missing from its side's packets for at
+    least ``threshold_s`` of device time while that side kept streaming
+    (sdk#298). Emitted at most once per camera per scan.
+
+    ``never_delivered`` distinguishes a camera that never produced a frame
+    this scan from one that stopped mid-scan. ScanWorkflow aborts the scan
+    on this event (CameraDropoutWatchdogSink): a mask camera that stays
+    silent otherwise stalls the reduced-mode side average until stop.
+    A whole side going silent produces no packets and so no event (#192).
+    """
+    side:                       int
+    cam_id:                     int
+    never_delivered:            bool
+    silent_s:                   float
+    threshold_s:                float
+    packet_id:                  Optional[int]
+    timestamp_s:                float
+    first_missing_packet_id:    Optional[int]
+    first_missing_timestamp_s:  float
 
 
 @dataclass

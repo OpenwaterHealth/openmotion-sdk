@@ -222,6 +222,7 @@ class ScanRequest:
     raw_save_max_duration_s: float | None = None     # cap raw output; 0 = no raw
     batch_size_frames: int = 10
     trigger_config: dict | None = None               # override; None = interface default
+    camera_dropout_abort_s: float | None = 5.0       # abort if a mask camera is silent this long; None = off
 ```
 
 `start_scan` (re)sends the resolved trigger config before starting the trigger,
@@ -256,6 +257,18 @@ reason is on `scan_workflow.last_scan_error`.
 | `last_scan_error` (str \| None) | Error from the most recent scan, else `None`. |
 | `last_scan_canceled` (bool) | True if the most recent scan was user-canceled. |
 | `current_scan_label` (str \| None) | `"{scan_id}_{subject_id}"` of the most recent scan — the DB `session_label`, valid as soon as `start_scan` returns. |
+
+**Camera dropout abort.** With `camera_dropout_abort_s` set (default 5 s), a
+mask-enabled camera that is missing from its side's packets for that long, in
+device time, stops the scan. This covers a camera that never starts and one that
+dies mid-scan. The normal teardown runs, data up to the abort is flushed and
+persisted, and the scan ends with `last_scan_error` set (not
+`last_scan_canceled`). `request.on_error` receives a
+`omotion.ScanWorkflow.CameraDropoutError` carrying `side`, `cam_id`,
+`never_delivered`, `silent_s` and `threshold_s`. Without the abort, the
+reduced-mode side average (the only clinical DB record) would sit in memory
+until stop. `run_collection_scan` (calibration and contact-quality) turns it
+off. A whole side going silent is not covered here (#192).
 
 `ScanResult` (the per-scan outcome object, surfaced via the legacy callback path
 and the calibration workflow) carries `ok`, `error`, `canceled`,
