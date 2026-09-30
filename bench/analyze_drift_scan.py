@@ -149,12 +149,19 @@ def main() -> int:
         # bimodal u1 levels (per camera) -- self-aligning, and pedestal-agnostic (works
         # at BLC's 128 and at RAW mode's ~507 alike).
         SKEW_MARGIN_S = 1.5
-        MIN_CONTRAST_DN = 10.0
+        # Minimum p95-p5 u1 spread for a window to count as light/dark for a camera.
+        # Separates "no usable light" from "dim": unlit cameras (FFBASE cams 4/5) show
+        # 1.0-1.6 DN of stray-light contrast, dim-but-real ones (cams 3/6) 8.6-10.7 DN,
+        # sagging to the low end during the warm-up dip; dark-frame noise is ~0.01 DN.
+        # The former 10 DN gate sat inside the dim range and silently dropped every
+        # early window on cams 3/6 -> mean_dc NaN over the whole dip.
+        MIN_CONTRAST_DN = 4.0
         ts_arr = frames["timestamp_s"].to_numpy()
         u1_arr = frames["u1"].to_numpy()
         cam_arr = frames["cam_id"].to_numpy()
         is_dark = np.zeros(len(frames), dtype=bool)
         n_resolved = 0
+        unresolved = {cam: [] for cam in range(N_CAMERAS)}   # cam -> window off-times skipped
         for ev in events_timed:
             off = float(ev["elapsed_off_sec"])
             on = ev.get("elapsed_on_sec")
@@ -169,6 +176,7 @@ def main() -> int:
                     continue
                 lo, hi_v = np.percentile(vals, 5), np.percentile(vals, 95)
                 if hi_v - lo < MIN_CONTRAST_DN:
+                    unresolved[int(cam_id)].append(off)
                     continue  # window has no light/dark contrast for this camera
                 thresh = lo + 0.35 * (hi_v - lo)
                 is_dark |= m & (u1_arr < thresh)
@@ -177,6 +185,14 @@ def main() -> int:
         frames["is_dark"] = is_dark
         print(f"[*] Dark classification: schedule-located + content-resolved "
               f"({n_resolved}/{len(events_timed)} windows resolved)")
+        for cam_id, skipped in unresolved.items():
+            # A camera with SOME resolved windows but not all has holes in its dark
+            # reference; light frames not bracketed by two resolved windows get no
+            # mean_dc. Say so -- a silent gap reads downstream as "no dip".
+            if skipped and len(skipped) < len(events_timed):
+                shown = ", ".join(f"{t:.0f}" for t in skipped[:8]) + (" ..." if len(skipped) > 8 else "")
+                print(f"[!] cam {cam_id + 1}: {len(skipped)}/{len(events_timed)} dark windows below "
+                      f"{MIN_CONTRAST_DN:.0f} DN contrast, skipped (t = {shown} s) -- mean_dc has gaps there")
     else:
         frames["is_dark"] = frames["u1"] <= DARK_THRESHOLD_DN
         print("[*] Dark classification: value-threshold fallback (no timed dark events in meta)")
@@ -189,6 +205,9 @@ def main() -> int:
         dark_df = cam_df.loc[cam_df["is_dark"]]
         if len(dark_df) == len(cam_df):
             print(f"  cam {cam_id + 1}: never exceeds {DARK_THRESHOLD_DN:.0f} DN -- all-dark (no usable signal)")
+            continue
+        if len(dark_df) == 0:
+            print(f"  cam {cam_id + 1}: no light/dark contrast in any window -- no usable signal")
             continue
 
         events = cluster_dark_events(dark_df["timestamp_s"].to_numpy(), DARK_EVENT_GAP_S)

@@ -26,6 +26,7 @@ import pandas as pd
 PLATEAU_LO, PLATEAU_HI = 600.0, 1500.0
 DIP_LO, DIP_HI = 60.0, 420.0
 PD_TOL_PCT = 1.5   # allowed |photodiode(dip) - photodiode(plateau)| for a CONFIRMED dip
+MIN_COVERAGE = 0.8  # fraction of dip-window light frames that must have a mean_dc
 
 
 def main():
@@ -47,6 +48,15 @@ def main():
             s = gd.set_index("timestamp_s").mean_dc.rolling(120, center=True, min_periods=15).median()
             plat = s[(s.index >= PLATEAU_LO) & (s.index <= PLATEAU_HI)].median()
             body = s[(s.index >= DIP_LO) & (s.index <= DIP_HI)]
+            # Coverage of the dip window: light frames there that actually have a
+            # mean_dc. analyze_drift_scan leaves gaps where it could not resolve a
+            # dark window; a min over a half-empty window is not a dip measurement.
+            in_win = g[(g.timestamp_s >= DIP_LO) & (g.timestamp_s <= DIP_HI)]
+            coverage = in_win.mean_dc.notna().mean() if len(in_win) else 0.0
+            if coverage < MIN_COVERAGE:
+                print(f"{subj:>14} {cam+1:>3}  dip window only {100 * coverage:.0f}% covered by mean_dc "
+                      f"-- {'INSUFFICIENT-COVERAGE':>16}")
+                continue
             if body.empty or not np.isfinite(plat) or plat <= 0:
                 continue
             dmin = body.min(); tmin = body.idxmin()

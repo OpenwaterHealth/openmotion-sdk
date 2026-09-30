@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Overlay new cold-start dip runs on the Jul-Aug 2026 control band.
 
-Per camera: frame mean u1 minus the dark pedestal taken from the scheduled dark
-windows (see curves()), 120-frame rolling median, divided by the run's own
-plateau (median 600-1500 s) -> % of plateau. Same smoothing, plateau and dip
+Per camera: dark-corrected mean (mean_dc), 120-frame rolling median, divided by
+the run's own plateau (median 600-1500 s) -> % of plateau. Same smoothing, plateau and dip
 windows as dip_from_meandc.py; the dip (min over 60-420 s) is printed and shown
 in each panel.
 
@@ -68,30 +67,21 @@ def step_intervals(df: pd.DataFrame) -> set:
 
 
 def curves(path: Path):
-    """Per camera: % of plateau, dark-corrected from the dark-window SCHEDULE.
-
-    signal = u1 - pedestal, pedestal = median u1 over the middle (0.3-0.8 s) of
-    every scheduled dark window; light frames exclude +-1.6 s around each window.
-    Deliberately not analyze_drift_scan's mean_dc: its content-resolved dark
-    classification drops whole early intervals on dim cameras (~10 DN above
-    pedestal) -- exactly the dip window. On bright cameras both methods agree
-    (REBASE_01/02 cam 7: 13.0 / 10.6 % either way).
-    """
-    df = pd.read_csv(path, usecols=["cam_id", "timestamp_s", "is_dark", "u1", "photodiode_w"])
+    """Per camera: dark-corrected mean (mean_dc, analyze_drift_scan's per-window
+    interpolated pedestal) as % of its own plateau. Analysis CSVs made before the
+    2026-09-30 dim-camera fix can have mean_dc gaps over the dip window on cameras
+    ~10 DN above pedestal -- re-run analyze_drift_scan.py on those runs."""
+    df = pd.read_csv(path, usecols=["cam_id", "timestamp_s", "is_dark", "mean_dc", "photodiode_w"])
     bad = step_intervals(df)
-    ph = df.timestamp_s % DARK_INTERVAL_S
-    in_dark = (df.timestamp_s > 50) & (ph > 0.3) & (ph < 0.8)
-    light = df[(df.timestamp_s > 3) & ~((ph < 1.6) | (ph > DARK_INTERVAL_S - 0.3))]
     out = {}
-    for cam, g in light.groupby("cam_id"):
-        ped = df[in_dark & (df.cam_id == cam)].u1.median()
-        s = g.sort_values("timestamp_s").set_index("timestamp_s").u1 - ped
+    for cam, g in df[~df.is_dark].dropna(subset=["mean_dc"]).groupby("cam_id"):
+        s = g.sort_values("timestamp_s").set_index("timestamp_s").mean_dc
         stepped = (s.index // DARK_INTERVAL_S).astype(int).isin(bad)
         s[stepped] = np.nan                     # mask BEFORE smoothing so no edge bleed
         s = s.rolling(120, center=True, min_periods=15).median()
         s[stepped] = np.nan                     # keep the masked span as a visible gap
         plat = s[(s.index >= 600) & (s.index <= 1500)].median()
-        if np.isfinite(plat) and plat >= 3:     # < 3 DN above pedestal = all-dark camera
+        if np.isfinite(plat) and plat > 0:
             s = 100 * s / plat
             out[cam] = s[s.index <= T_MAX].iloc[::10]
     return out, bad
