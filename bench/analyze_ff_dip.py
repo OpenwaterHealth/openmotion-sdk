@@ -6,11 +6,18 @@ Input: a step directory written by bench/ff_dip_capture.py
 dark_events.csv, thorlabs.csv).
 
 Per imaged camera:
-  * Dark rows = composite rows whose arrival time falls inside a logged
-    Keysight source-off span (validated to line up within <0.05 s). They are
-    excluded from the lit signal and give the dark pedestal: per-window median
-    of the dark rows' means, linearly interpolated in time (the histogram
-    analysis's method); windows with < MIN_DARK_ROWS rows are skipped.
+  * Rows are classified by CONTENT, not arrival time: a row's npz timestamp is
+    its USB arrival time, which lags exposure by a variable 0.2-3 s under load
+    (FFDIP_01; FFVAL_02 happened to line up). Each row is compared with the same
+    row's typical lit level (median over all composites, so vignetting cancels):
+    fraction f = (row - PED_GUESS) / (typical - PED_GUESS); dark if f < DARK_F,
+    lit if f >= LIT_F, otherwise a partly lit turn-on/off exposure (dropped).
+    LIT_F leaves room for a 15-20 % dip.
+  * Pedestal: dark rows are assigned to the logged window they follow (arrival
+    within DARK_ASSIGN_S after its source-off); per-window median, linearly
+    interpolated in time (the histogram analysis's method); windows with
+    < MIN_DARK_ROWS rows are skipped. The run's arrival lag (median dark-row
+    arrival minus window centre) is subtracted from composite times.
   * Lit signal per composite = mean over lit rows of (row mean - pedestal(t)),
     central columns only (COL_LO:COL_HI); timestamped at the median lit-row time
     relative to imaging start (t0). Composites overlapping a source step
@@ -43,9 +50,9 @@ import pandas as pd
 
 COL_LO, COL_HI = 200, 1720          # central columns for the trace (avoid edge vignetting)
 MIN_DARK_ROWS = 20
-DARK_PRE_S = 0.05                   # before a logged source-off
-DARK_POST_S = 0.20                  # after a logged source-on: exposures integrating across the turn-on are
-                                    # only partly lit (thin dark lines every STRIDE rows otherwise)
+PED_GUESS = 127.0                   # BLC black level, for classification only (measured pedestal is used after)
+DARK_F, LIT_F = 0.15, 0.60          # row fraction of its typical lit level: dark below, lit at/above
+DARK_ASSIGN_S = 8.0                 # dark rows arriving up to this long after a logged source-off belong to it
 STEP_TOL_PCT = 2.0
 TROUGH_HALF_S = 20.0
 BLOCK = 32
@@ -103,53 +110,63 @@ def source_factor(pd_log: pd.DataFrame | None, darks: pd.DataFrame, t0: float, p
     return factor, tab
 
 
+def classify(rm, ref):
+    """Per row: 0 = lit, 1 = dark, 2 = partly lit (dropped). ref = typical lit row means."""
+    f = (rm - PED_GUESS) / np.maximum(ref - PED_GUESS, 1.0)
+    return np.where(f < DARK_F, 1, np.where(f >= LIT_F, 0, 2))
+
+
 def analyze_cam(files, start, t0, darks, factor):
-    in_dark_span = lambda t: np.any([(t >= r.off_epoch - DARK_PRE_S) & (t <= r.on_epoch + DARK_POST_S)
-                                     for r in darks.itertuples()], axis=0)
-    comps = []           # per composite: epoch times, row means, dark mask, image path
+    comps = []           # per composite: path, arrival epochs, central-column row means
     for f in files:
         z = np.load(f)
-        t = start + z["row_t_s"]
-        rm = z["image"][:, COL_LO:COL_HI].astype(np.float32).mean(axis=1)
-        comps.append((f, t, rm, in_dark_span(t)))
-    # pedestal per dark window from the dark rows of every composite
-    ped = []
-    for r in darks.itertuples():
-        vals = np.concatenate([rm[(t >= r.off_epoch) & (t <= min(r.on_epoch, r.off_epoch + 5)) & dk]
-                               for _, t, rm, dk in comps]) if comps else np.array([])
-        vals = vals[vals < np.median(vals) + 20] if vals.size else vals   # drop stray lit edge rows
+        comps.append((f, start + z["row_t_s"], z["image"][:, COL_LO:COL_HI].astype(np.float32).mean(axis=1)))
+    ref = np.median(np.stack([rm for _, _, rm in comps]), axis=0)      # typical lit level per row
+    cls = [classify(rm, ref) for _, _, rm in comps]
+    # pedestal per logged dark window, from the dark rows that arrive after its source-off
+    offs = darks.off_epoch.to_numpy()
+    ped, lags = [], []
+    for i, r in enumerate(darks.itertuples()):
+        vals, ts = [], []
+        for (_, t, rm), c in zip(comps, cls):
+            m = (c == 1) & (t >= r.off_epoch) & (t < r.off_epoch + DARK_ASSIGN_S)
+            vals.append(rm[m]); ts.append(t[m])
+        vals, ts = np.concatenate(vals), np.concatenate(ts)
         if vals.size >= MIN_DARK_ROWS:
             ped.append((r.off_epoch + 0.5, float(np.median(vals)), int(vals.size)))
+            if r.kind == "window":
+                lags.append(float(np.median(ts)) - (r.off_epoch + 0.5 * (r.on_epoch - r.off_epoch)))
     ped = pd.DataFrame(ped, columns=["epoch", "pedestal", "n_rows"])
     if ped.empty:
         raise RuntimeError("no dark window captured enough dark rows for a pedestal")
+    lag = float(np.median(lags)) if lags else 0.0
 
     def pedestal(t):
         return np.interp(t, ped.epoch, ped.pedestal)          # flat extrapolation at the ends
 
     rows = []
-    for f, t, rm, dk in comps:
-        lit = ~dk
+    for (f, t, rm), c in zip(comps, cls):
+        lit = c == 0
         if lit.sum() < 400:
             continue
-        tc = float(np.median(t[lit]))
+        te = t[lit] - lag                                      # back onto the exposure clock
+        tc = float(np.median(te))
         k = factor(tc)
-        rows.append({"file": f, "t_s": tc - t0, "lit_dc": float(np.mean(rm[lit] - pedestal(t[lit]))) / k,
-                     "n_lit_rows": int(lit.sum()), "n_dark_rows": int(dk.sum()), "source_factor": k})
-    return pd.DataFrame(rows).sort_values("t_s"), ped, pedestal
+        rows.append({"file": f, "t_s": tc - t0, "lit_dc": float(np.mean(rm[lit] - pedestal(te))) / k,
+                     "n_lit_rows": int(lit.sum()), "n_dark_rows": int((c == 1).sum()),
+                     "n_partial_rows": int((c == 2).sum()), "source_factor": k})
+    return pd.DataFrame(rows).sort_values("t_s"), ped, pedestal, ref, lag
 
 
-def mean_image(files_t, pedestal, start, darks, factor):
-    """Mean dark-corrected image over composites, dark rows excluded (NaN) -> nanmean."""
+def mean_image(files_t, pedestal, start, ref, lag, factor):
+    """Mean dark-corrected image over composites; non-lit rows excluded (NaN) -> nanmean."""
     acc, n = None, None
     for f in files_t:
         z = np.load(f)
-        t = start + z["row_t_s"]
-        img = z["image"].astype(np.float32) - pedestal(t)[:, None]
-        img /= factor(float(np.median(t)))
-        dk = np.any([(t >= r.off_epoch - DARK_PRE_S) & (t <= r.on_epoch + DARK_POST_S)
-                     for r in darks.itertuples()], axis=0)
-        img[dk, :] = np.nan
+        t = start + z["row_t_s"] - lag
+        raw = z["image"].astype(np.float32)
+        img = (raw - pedestal(t)[:, None]) / factor(float(np.median(t)))
+        img[classify(raw[:, COL_LO:COL_HI].mean(axis=1), ref) != 0, :] = np.nan
         ok = ~np.isnan(img)
         acc = np.where(ok, img, 0.0) if acc is None else acc + np.where(ok, img, 0.0)
         n = ok.astype(np.float32) if n is None else n + ok
@@ -180,7 +197,7 @@ def main():
         if not files:
             print(f"cam {cam + 1}: no images")
             continue
-        tr, ped, pedestal = analyze_cam(files, start, t0, darks, factor)
+        tr, ped, pedestal, ref, lag = analyze_cam(files, start, t0, darks, factor)
         good = tr.set_index("t_s")
         smooth = good.lit_dc.rolling(3, center=True, min_periods=1).median()
         plat = smooth[(smooth.index >= a.plateau[0]) & (smooth.index <= a.plateau[1])].median()
@@ -190,14 +207,14 @@ def main():
         # spatial: trough composites vs plateau composites
         tro_f = tr[tr.t_s.between(t_min - TROUGH_HALF_S, t_min + TROUGH_HALF_S)].file
         pla_f = tr[tr.t_s.between(*a.plateau)].file
-        img_tro = mean_image(tro_f, pedestal, start, darks, factor)
-        img_pla = mean_image(pla_f, pedestal, start, darks, factor)
+        img_tro = mean_image(tro_f, pedestal, start, ref, lag, factor)
+        img_pla = mean_image(pla_f, pedestal, start, ref, lag, factor)
         ratio = block_mean(img_tro) / block_mean(img_pla)
         loss = 100 * (1 - ratio)
         core = loss[2:-2, 2:-2]
         summary.append({"cam": cam + 1, "plateau_dc": round(plat, 2), "dip_pct": round(dip, 2), "t_min_s": round(t_min),
                         "n_composites": len(tr), "n_trough_comps": len(tro_f), "n_plateau_comps": len(pla_f),
-                        "pedestal_median": round(ped.pedestal.median(), 2), "n_dark_windows_used": len(ped),
+                        "pedestal_median": round(ped.pedestal.median(), 2), "n_dark_windows_used": len(ped), "arrival_lag_s": round(lag, 2),
                         "loss_map_p5": round(float(np.nanpercentile(core, 5)), 2),
                         "loss_map_p95": round(float(np.nanpercentile(core, 95)), 2),
                         "loss_map_std": round(float(np.nanstd(core)), 2)})
@@ -240,7 +257,7 @@ def main():
         fig.savefig(out / f"ff_dip_cam{cam + 1}.png", dpi=110)
         plt.close(fig)
         print(f"cam {cam + 1}: dip {dip:.1f}% @ {t_min:.0f}s, plateau {plat:.1f} DN, {len(tr)} composites, "
-              f"pedestal {ped.pedestal.median():.2f} from {len(ped)} windows; loss map p5-p95 "
+              f"pedestal {ped.pedestal.median():.2f} from {len(ped)} windows, lag {lag:.2f} s; loss map p5-p95 "
               f"{np.nanpercentile(core, 5):.1f}-{np.nanpercentile(core, 95):.1f}%")
     pd.DataFrame(summary).to_csv(out / "ff_dip_summary.csv", index=False)
     print("wrote", out)
