@@ -80,7 +80,9 @@ def parse_args():
     ap.add_argument("--setup-margin-s", type=float, default=90.0,
                     help="added to --capture-min for thermal_soak's --duration-h, which also counts "
                          "connect + camera power-on + FPGA load before imaging starts")
-    ap.add_argument("--telemetry-s", type=float, default=1.0)
+    # 10 s = thermal_soak default. 1 s polling stalled the sensor COMM endpoint ~3 min into imaging
+    # (FFDIP_01, USBTimeoutError 10060, cf. sensor-fw #96) -- and the --max-die-c stop needs telemetry.
+    ap.add_argument("--telemetry-s", type=float, default=10.0)
     ap.add_argument("--out", required=True)
     ap.add_argument("--prefix", default="FFDIP")
     ap.add_argument("--start-index", type=int, default=1)
