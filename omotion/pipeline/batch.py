@@ -275,6 +275,14 @@ class SideAverageSample:
     contrast:  Optional[float] = None
 
 
+# Per-frame quality labels, least to most suspect. A consumer that merges
+# several frames into one (the side average, the dark-frame row) keeps the
+# highest-ranked label. "dark_held" ranks highest: a nan_filled camera drops
+# out of an average on its own, but a dark_held one contributes real-looking
+# numbers computed against a substituted dark (#292).
+QUALITY_RANK = {"ok": 0, "ts_corrected": 1, "nan_filled": 2, "dark_held": 3}
+
+
 @dataclass
 class FrameBatch:
     """N frames worth of data, two sides, 8 cameras each.
@@ -443,6 +451,8 @@ class FrameBatch:
     # "ok" = device timestamp passed through unchanged
     # "ts_corrected" = timestamp replaced by re-anchoring interpolation
     # "nan_filled" = synthetic row for a missing frame (zero histogram)
+    # (DarkCorrectionStage adds "dark_held" on corrected frames; see
+    # QUALITY_RANK below.)
     quality:        Optional[np.ndarray] = None
 
     # ── Event queue ──────────────────────────────────────────────────────
