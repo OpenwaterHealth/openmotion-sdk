@@ -8,25 +8,23 @@ sequence one 16-byte page at a time over the UART link.
 
 Usage::
 
-    from transport import SerialTransport
-    from api import HardwareAPI, FpgaPageProgrammer
+    from omotion.FPGAProgrammer import FpgaPageProgrammer
+    from omotion.config import MuxChannel
 
-    with SerialTransport("/dev/ttyACM0", timeout=5.0) as transport:
-        hw   = HardwareAPI(transport)
-        prog = FpgaPageProgrammer(hw)
-        prog.program_from_jedec("my_design.jed")
+    prog = FpgaPageProgrammer(console)  # console: a connected MotionConsole
+    prog.program_from_jedec(MuxChannel.FPGA_TA, "my_design.jed")
 """
 
 from __future__ import annotations
 
 import logging
-import sys
 import os
 from pathlib import Path
 import time
 from typing import Callable, Optional
 from omotion import _log_root
 from omotion.CommandError import CommandError
+from omotion.jedecParser import parse_jedec_file
 from omotion.MotionConsole import MotionConsole
 from omotion.config import (
     XO2_FLASH_PAGE_SIZE,
@@ -37,15 +35,6 @@ from omotion.config import (
 
 
 logger = logging.getLogger(f"{_log_root}.FPGAProgrammer" if _log_root else "FPGAProgrammer")
-
-# --------------------------------------------------------------------------- #
-# Make the project-root jedec_parser importable from the py-demo subtree
-# --------------------------------------------------------------------------- #
-_REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
-
-from omotion.jedecParser import parse_jedec_file  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -157,8 +146,8 @@ class FpgaPageProgrammer:
     Parameters
     ----------
     api:
-        An initialised :class:`~api.commands.HardwareAPI` instance whose
-        transport is already open.
+        An initialised :class:`~omotion.MotionConsole.MotionConsole`
+        instance whose UART transport is already open.
     verify:
         If True, read back each sector after writing and compare with the
         written data.  Adds one round-trip per page.  Default True.
