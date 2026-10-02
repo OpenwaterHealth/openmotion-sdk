@@ -17,7 +17,10 @@ from typing import Any, Deque, Optional
 
 import numpy as np
 
-from ..batch import DarkIntegrityWarning, FrameBatch, IntervalClosed, TerminalDarkResult
+from ..batch import (
+    DarkIntegrityWarning, FrameBatch, IntervalClosed, MissedDarkWarning,
+    TerminalDarkResult,
+)
 from ..pedestal import SensorPedestals
 
 
@@ -31,6 +34,22 @@ logger = logging.getLogger("openmotion.sdk.pipeline.stages.dark")
 # older than the count stopped delivering before scan end (dropout); the
 # flush logs that and falls back to content-based detection per camera.
 _TERMINAL_FSYNC_ABS_OFFSET = 0
+
+
+def scheduled_darks_between(left_abs: int, right_abs: int,
+                            dark_interval: int) -> list[int]:
+    """Scheduled dark abs_ids strictly between two interval boundaries.
+
+    After the first dark (discard_count + 1), the classifier types a frame
+    dark when (abs_id - 1) % dark_interval == 0 (classify._is_dark). An
+    interval's left edge is always a dark, so it sits at or after the first
+    dark and that rule alone covers everything inside the interval. A
+    non-empty result means those darks never arrived (issue #175).
+    """
+    if dark_interval <= 0:
+        return []
+    first = left_abs + 1 + (-left_abs) % dark_interval
+    return list(range(first, right_abs, dark_interval))
 
 
 @dataclass(frozen=True)
@@ -402,8 +421,12 @@ class DarkCorrectionStage:
                  batch_estimator: LinearInterpolation,
                  pedestals: Optional[SensorPedestals] = None,
                  realtime_history_size: int = 4,
-                 integrity_max_above_pedestal: float = 5.0):
+                 integrity_max_above_pedestal: float = 5.0,
+                 dark_interval: int = 600):
         self._realtime = realtime_estimator
+        # Same value the classifier schedules darks with; used only to spot
+        # an interval that spans a missed dark (_flag_missed_darks).
+        self._dark_interval = int(dark_interval)
         self._batch = batch_estimator
         self._pedestals = pedestals or SensorPedestals(left=64.0, right=64.0)
         self._history = DarkHistory(max_darks=realtime_history_size)
@@ -438,9 +461,51 @@ class DarkCorrectionStage:
         quadratic stencil.
         """
         side, cam_id = key
+        self._flag_missed_darks(key, interval, events)
         corrected = self._batch.correct_interval(interval, side=side, cam_id=cam_id)
         corrected.left_t = interval.left.obs.t
         events.append(IntervalClosed(corrected_batch=corrected))
+
+    def _flag_missed_darks(
+        self,
+        key: "tuple[str, int]",
+        interval: "Interval",
+        events: list,
+    ) -> None:
+        """Detect and flag an interval that spans a missed scheduled dark.
+
+        A dark goes missing when its frame is dropped, the camera drops out,
+        or the frame is rejected as stale. Its row then never reaches this
+        stage typed "dark" (a gap-fill row is typed "light" and carries NaN
+        stats), so the interval stays open until the next dark that does
+        arrive. The baseline is then interpolated across the wider span.
+        The interval is kept, not discarded: its light frames are flagged
+        "wide_interval" and a MissedDarkWarning is emitted. Synthetic
+        nan_filled rows keep their own flag, which consumers use to
+        recognise them as placeholders.
+        """
+        missed = scheduled_darks_between(
+            interval.left_abs, interval.right_abs, self._dark_interval,
+        )
+        if not missed:
+            return
+        side, cam_id = key
+        logger.warning(
+            "missed scheduled dark: side=%s cam_id=%d expected abs_id %s; "
+            "dark correction interpolated across [%d, %d] (%d frames instead "
+            "of <= %d); flagging its frames wide_interval",
+            side, cam_id, ", ".join(str(a) for a in missed),
+            interval.left_abs, interval.right_abs,
+            interval.right_abs - interval.left_abs, self._dark_interval,
+        )
+        events.append(MissedDarkWarning(
+            side=side, cam_id=cam_id,
+            left_abs=interval.left_abs, right_abs=interval.right_abs,
+            missed_abs_ids=tuple(missed),
+        ))
+        for lf in interval.light_frames:
+            if lf.quality != "nan_filled":
+                lf.quality = "wide_interval"
 
     def process(self, batch: FrameBatch) -> FrameBatch:
         n = batch.frame_ids.shape[0]
