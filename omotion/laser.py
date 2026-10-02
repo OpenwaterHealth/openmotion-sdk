@@ -110,6 +110,7 @@ def apply_laser_power(
     fpga_map: Optional[FpgaMap] = None,
     force_fault: bool = False,
     lock: Optional[Any] = None,
+    trigger_freq_hz: Optional[float] = None,
 ) -> bool:
     """Write the laser-driver configuration to ``console`` over I2C.
 
@@ -137,6 +138,13 @@ def apply_laser_power(
             w.r.t. other console access. Pass the app's console mutex when
             delegating from a multithreaded context; ``None`` = no external
             lock (the console serializes individual packets itself).
+        trigger_freq_hz: the trigger frequency the system will run at. The
+            bundled ``EE_RATE_LL``/``OPT_RATE_LL`` payloads encode the
+            minimum inter-pulse period for 40 Hz (22.5 ms = 0.9 x period);
+            at other rates the floor is rescaled by ``40 / trigger_freq_hz``
+            so the safety margin stays proportional (sdk#129 — 60 Hz mode).
+            ``None`` or 40 leaves the baseline values untouched. An explicit
+            per-key user-config override still wins.
     """
     if laser_params is None:
         laser_params = load_laser_params(force_fault=force_fault)
@@ -187,6 +195,33 @@ def apply_laser_power(
     # here and rewritten from user config below.
     skip_entries -= faulted_coords
 
+    # Laser-safety limit scaling for non-baseline rates (sdk#129).
+    # RATE_LL (min inter-pulse period) and PULSE_WIDTH_UL (max gate width)
+    # both scale by baseline/rate: the period shrinks with the rate, and
+    # the pulse width shrinks with it to hold the IEC 60825 duty cycle at
+    # the 40 Hz-validated 2.0% (per the "Ultrasound & Laser Safety Limits
+    # Calculator" AEL sheet: λ=795 nm, 500 µs @ 40 Hz, T=300 s, 3 mm beam
+    # — the average-power AEL rows scale as 1/rate, so constant duty
+    # preserves them exactly while the per-pulse t^0.75 AEL margin only
+    # improves). Scaling the UL means the interlock ENFORCES the shorter
+    # 60 Hz pulse rather than merely permitting it.
+    # Fail-loud bookkeeping: if scaling is needed, every expected entry
+    # must actually be found and rescaled — a silently-unscaled floor at
+    # 60 Hz means the interlock trips on every pulse (dark laser, no
+    # error); a silently-unscaled width ceiling means 60825 headroom
+    # assumed by the app isn't enforced.
+    from omotion.config import DEFAULT_TRIGGER_CONFIG
+    _RATE_SCALED_PARAMS = frozenset({
+        "EE_RATE_LL", "OPT_RATE_LL",
+        "EE_PULSE_WIDTH_UL", "OPT_PULSE_WIDTH_UL",
+    })
+    _baseline_freq_hz = float(DEFAULT_TRIGGER_CONFIG["TriggerFrequencyHz"])
+    _rate_scale_needed = (
+        trigger_freq_hz is not None
+        and float(trigger_freq_hz) != _baseline_freq_hz
+    )
+    rate_scaled_names: set = set()
+
     if lock is not None:
         lock.lock()
     try:
@@ -204,6 +239,26 @@ def apply_laser_power(
             offset = fpga_entry["start_address"]
 
             data_to_send = bytearray(laser_param["dataToSend"])
+
+            if (
+                _rate_scale_needed
+                and friendly_name in _RATE_SCALED_PARAMS
+            ):
+                # Rescale the baseline min-period floor to the requested
+                # rate, preserving the proportional margin (sdk#129).
+                baseline_raw = int.from_bytes(data_to_send, "little")
+                scaled_raw = int(round(
+                    baseline_raw * _baseline_freq_hz / trigger_freq_hz
+                ))
+                data_to_send = bytearray(
+                    scaled_raw.to_bytes(len(data_to_send), "little")
+                )
+                rate_scaled_names.add(friendly_name)
+                logger.info(
+                    "Rescaled %s for %.4g Hz trigger: raw %d -> %d (%.0f us)",
+                    friendly_name, trigger_freq_hz, baseline_raw, scaled_raw,
+                    scaled_raw * 0.32,
+                )
 
             if (channel, offset) in skip_entries:
                 logger.info(
@@ -225,6 +280,18 @@ def apply_laser_power(
                     raw_int = float(override_val)
                     if scale:
                         raw_int = raw_int / scale
+                    if _rate_scale_needed and friendly_name in _RATE_SCALED_PARAMS:
+                        # A stored per-key RATE_LL override is calibrated
+                        # for the 40 Hz baseline; written verbatim at 60 Hz
+                        # it would EXCEED the pulse period and trip the
+                        # interlock on every pulse. Rescale it exactly like
+                        # the bundled baseline (sdk#129).
+                        raw_int = raw_int * _baseline_freq_hz / float(trigger_freq_hz)
+                        rate_scaled_names.add(friendly_name)
+                        logger.info(
+                            "Rescaled user-config %s for %.4g Hz trigger",
+                            friendly_name, trigger_freq_hz,
+                        )
                     max_val = (1 << (num_bytes * 8)) - 1
                     raw_int = max(0, min(max_val, int(round(raw_int))))
                     byteorder = "big" if fpga_entry.get("isMsbFirst", False) else "little"
@@ -251,6 +318,17 @@ def apply_laser_power(
             ):
                 logger.error(
                     "Failed to set laser power (muxIdx=%d, channel=%d)", mux_idx, channel
+                )
+                return False
+
+        if _rate_scale_needed:
+            missing = _RATE_SCALED_PARAMS - rate_scaled_names
+            if missing:
+                logger.error(
+                    "apply_laser_power: %.4g Hz trigger requested but "
+                    "RATE_LL entries %s were not found in laser_params — "
+                    "safety floor NOT scaled; refusing to continue",
+                    trigger_freq_hz, sorted(missing),
                 )
                 return False
 

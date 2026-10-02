@@ -176,3 +176,29 @@ def test_facade_connects_to_full_rig(motion, console, sensor_left, sensor_right)
     # connection-state machine.
     version = console.get_version()
     assert re.match(r"\d+\.\d+\.\d+", version), f"bad version: {version!r}"
+
+
+def test_set_capture_rate_updates_default_and_restores_on_switch_back():
+    """Live rate switch (sdk#129): 60 Hz installs the scaled trigger keys;
+    switching back to 40 restores every rate-managed key to baseline —
+    including LaserPulseDelayUsec, which a naive merge would leave at the
+    60 Hz value."""
+    motion = MotionInterface(demo_mode=True)
+    assert motion.set_capture_rate(60) is True
+    cfg = motion.default_trigger_config
+    assert cfg["TriggerFrequencyHz"] == 60
+    assert cfg["LaserPulseSkipDelayUsec"] == 1200
+    assert cfg["LaserPulseDelayUsec"] == 8436
+    assert motion.set_capture_rate(40) is True
+    cfg = motion.default_trigger_config
+    assert cfg["TriggerFrequencyHz"] == 40
+    assert cfg["LaserPulseSkipDelayUsec"] == 1800
+    assert cfg["LaserPulseDelayUsec"] == 100
+
+
+def test_set_capture_rate_rejects_unsupported():
+    import pytest
+
+    motion = MotionInterface(demo_mode=True)
+    with pytest.raises(ValueError):
+        motion.set_capture_rate(50)

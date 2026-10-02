@@ -627,9 +627,19 @@ class ScanWorkflow:
                     )
                 else:
                     if not request.disable_laser:
+                        # Cameras must be retimed to the trigger rate this
+                        # scan runs at (VTS follows the FSIN period,
+                        # sensor-fw#78/#80); the enable's reserved byte
+                        # carries it. 40 encodes as the legacy value so
+                        # older firmware keeps working.
+                        _fsin_rate = self._interface.resolve_trigger_config(
+                            request.trigger_config
+                        ).get("TriggerFrequencyHz", 40)
                         for side, _, _ in active_sides:
                             res = self._interface.run_on_sensors(
-                                "enable_camera_fsin_ext", target=side
+                                "enable_camera_fsin_ext",
+                                rate_hz=int(_fsin_rate),
+                                target=side,
                             )
                             if not self._ok_from_result(res, side):
                                 logger.error(
