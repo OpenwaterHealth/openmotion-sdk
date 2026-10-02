@@ -27,6 +27,7 @@ from typing import Optional
 
 import numpy as np
 
+from ... import correction_status
 from ..batch import FrameBatch, IntervalClosed, LiveEmit, SideAverageSample
 from .dark import EnrichedCorrectedFrame, EnrichedCorrectedInterval
 
@@ -34,9 +35,6 @@ from .dark import EnrichedCorrectedFrame, EnrichedCorrectedInterval
 _SIDE_STR_TO_INT = {"left": 0, "right": 1}
 _SIDE_INT_TO_STR = ("left", "right")
 
-# Higher rank = worse quality; the side average inherits the worst quality
-# of any camera that contributed to it. Mirrors sinks._QUALITY_RANK.
-_QUALITY_RANK = {"ok": 0, "ts_corrected": 1, "nan_filled": 2}
 
 
 def _mask_to_cam_indices(mask: int) -> np.ndarray:
@@ -241,16 +239,18 @@ class SideAverageStage:
                 "t": float(getattr(f, "t", 0.0)),
                 "bfi": np.full(8, np.nan), "bvi": np.full(8, np.nan),
                 "mean": np.full(8, np.nan), "contrast": np.full(8, np.nan),
-                "quality": "ok",
+                # Camera-tagged correction list (l3:ts_corrected,...): the
+                # side average carries every contributing camera's status,
+                # not just the worst one (bloodflow-app#589).
+                "quality": [],
             }
             self._frames[side][fid] = rec
         rec["bfi"][cam] = float(getattr(f, "bfi", np.nan))
         rec["bvi"][cam] = float(getattr(f, "bvi", np.nan))
         rec["mean"][cam] = float(getattr(f, "mean", np.nan))
         rec["contrast"][cam] = float(getattr(f, "contrast", np.nan))
-        fq = str(getattr(f, "quality", "ok") or "ok")
-        if _QUALITY_RANK.get(fq, 0) > _QUALITY_RANK.get(rec["quality"], 0):
-            rec["quality"] = fq
+        rec["quality"].extend(correction_status.tagged(
+            correction_status.cam_tag(side, cam), getattr(f, "quality", None)))
 
     def _emit_frames(self, side: int, fids: list, batch: FrameBatch,
                      *, right_abs: int) -> None:
@@ -270,7 +270,7 @@ class SideAverageStage:
                 contrast=spatial_side_average(rec["contrast"], cams),
                 bfi=spatial_side_average(rec["bfi"], cams),
                 bvi=spatial_side_average(rec["bvi"], cams),
-                quality=rec["quality"],
+                quality=correction_status.join(rec["quality"]),
             ))
         if avg_frames:
             batch.events.append(IntervalClosed(

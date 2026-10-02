@@ -578,6 +578,17 @@ class ScanWorkflow:
                         logger.exception("failed to start camera telemetry CSVs")
                         camera_telemetry_logger = None
         all_sinks = default_sinks + list(request.sinks)
+        # Persist the live contact-quality verdicts alongside the corrected
+        # record when the caller attached a monitor (bloodflow-app#589).
+        from omotion.contact_quality import ContactQualityMonitor
+        cq_monitor = next(
+            (s for s in request.sinks if isinstance(s, ContactQualityMonitor)),
+            None,
+        )
+        if cq_monitor is not None:
+            for s in default_sinks:
+                if isinstance(s, ScanDBSink):
+                    s.cq_source = cq_monitor
 
         # ── Build source + runner (set self._runner synchronously) ─────────
         # self._interface.left / .right are permanent MotionSensor objects

@@ -14,6 +14,7 @@ import os
 from dataclasses import asdict, dataclass
 from typing import Any, Optional, Protocol, runtime_checkable
 
+from omotion import correction_status
 from omotion.config import HISTO_SIZE_WORDS
 
 logger = logging.getLogger("openmotion.sdk.pipeline.sinks")
@@ -610,6 +611,16 @@ class ScanDBSink:
     CSVs written by CsvSink (fed by Tee("raw")) are the only raw record.
     Consequence: corrected rows trail the scan by up to one dark interval
     (~15 s), and an unclean shutdown loses that tail.
+
+    Each row's ``correction_status`` is the pipeline's correction list for
+    that sample (see :mod:`omotion.correction_status`). ``contact_quality``
+    is the verdict ``cq_source`` (a
+    :class:`~omotion.contact_quality.ContactQualityMonitor`, wired in by
+    ScanWorkflow when the request attaches one) had latched for the camera
+    at that frame; NULL without a source. The live channel reaches the
+    monitor *after* the final channel reaches this sink within a batch
+    (``Tee("live")`` is the last stage), so a row is held until the monitor
+    has observed its frame and only then stamped and buffered.
     """
 
     channels = {"final", "diagnostics"}
@@ -620,9 +631,13 @@ class ScanDBSink:
 
     _SIDE_STR_TO_INT = {"left": 0, "right": 1}
 
-    def __init__(self, db_path: str, *, batch_size: int = 200) -> None:
+    def __init__(self, db_path: str, *, batch_size: int = 200,
+                 cq_source=None) -> None:
         self._db_path = db_path
         self._batch_size = max(1, int(batch_size))
+        self.cq_source = cq_source
+        # Rows waiting for cq_source to observe their frame.
+        self._cq_pending: list = []
         self._db = None
         self._session_id: Optional[int] = None
         self._meta: Optional[ScanMetadata] = None
@@ -639,6 +654,7 @@ class ScanDBSink:
         self._closed = False
         self._diag = {}
         self._rows_written = 0
+        self._cq_pending = []
         label = f"{meta.scan_id}_{meta.subject_id}"
         self._db = ScanDatabase(db_path=self._db_path)
         # data_semantics distinguishes final-branch sessions from legacy
@@ -676,6 +692,7 @@ class ScanDBSink:
         self._closed = True
         import time
         try:
+            self._drain_cq_pending(final=True)
             self._flush()
             if self._db is not None and self._session_id is not None:
                 if self._rows_written == 0:
@@ -785,7 +802,7 @@ class ScanDBSink:
             contrast_v = _round(getattr(f, "contrast", None))
             if bfi is None and bvi is None and mean_v is None and contrast_v is None:
                 continue  # nothing finite to record for this frame
-            self._buffer.append({
+            self._cq_pending.append({
                 "session_id": self._session_id,
                 "cam_id": cam_id,
                 "side": side_int,
@@ -796,11 +813,60 @@ class ScanDBSink:
                 "mean": mean_v,
                 "contrast": contrast_v,
                 "temp": _round(getattr(f, "temp_c", None)),
-                "quality": str(getattr(f, "quality", "ok") or "ok"),
+                "correction_status": correction_status.join(
+                    [getattr(f, "quality", None) or ""]),
             })
 
+        self._drain_cq_pending()
         if len(self._buffer) >= self._batch_size:
             self._flush()
+
+    def _drain_cq_pending(self, *, final: bool = False) -> None:
+        """Stamp ``contact_quality`` on held rows the CQ source has observed
+        (all of them when ``final``) and move them to the insert buffer."""
+        rows = self._cq_pending
+        if not rows:
+            return
+        src = self.cq_source
+        if src is None:
+            self._buffer.extend(rows)
+            self._cq_pending = []
+            return
+        through = src.observed_through()
+        keep = []
+        for row in rows:
+            if not final and row["frame_id"] > through:
+                keep.append(row)
+                continue
+            row["contact_quality"] = self._cq_for_row(src, row)
+            self._buffer.append(row)
+        self._cq_pending = keep
+
+    def _cq_for_row(self, src, row):
+        side = "left" if row["side"] == 0 else "right"
+        fid = row["frame_id"]
+        cam_id = row["cam_id"]
+        try:
+            if cam_id >= 0:
+                return src.verdict_at(side, cam_id, fid)
+            # Side-average row: camera-tagged list of the non-ok cameras
+            # (empty = every monitored camera ok).
+            mask = 0
+            if self._meta is not None:
+                mask = int(getattr(self._meta, f"{side}_camera_mask", 0) or 0)
+            entries = []
+            for cam in range(8):
+                if not mask & (1 << cam):
+                    continue
+                verdict = src.verdict_at(side, cam, fid)
+                if verdict is None or verdict == "ok":
+                    continue
+                entries.extend(correction_status.tagged(
+                    correction_status.cam_tag(side, cam), verdict))
+            return correction_status.join(entries)
+        except Exception:
+            logger.exception("ScanDBSink: contact-quality lookup failed")
+            return None
 
     def _flush(self) -> None:
         if not self._buffer or self._db is None:
