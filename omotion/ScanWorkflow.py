@@ -1027,20 +1027,24 @@ class ScanWorkflow:
                 # power_off_unused_cameras flag must NOT gate this power-on — it only
                 # controls whether the OTHER (unused) cameras get powered down.
                 _emit_log("Powering on cameras before programming FPGAs...")
+                needs_settle = False
                 for side, mask, sensor in active:
                     try:
                         on_mask = mask & 0xFF
                         off_mask = 0
+                        # One round-trip reads all 8 power states. A failed
+                        # read reports all-off, which only costs the settle
+                        # sleep below — never a skipped power-on.
+                        power_status = sensor.get_camera_power_status()
+                        if not power_status or len(power_status) != 8:
+                            _emit_log(f"{side}: could not get camera power status")
+                            power_status = [False] * 8
                         if request.power_off_unused_cameras:
-                            power_status = sensor.get_camera_power_status()
-                            if power_status and len(power_status) == 8:
-                                off_mask = sum(
-                                    1 << i
-                                    for i in range(8)
-                                    if power_status[i] and not (mask & (1 << i))
-                                )
-                            else:
-                                _emit_log(f"{side}: could not get camera power status")
+                            off_mask = sum(
+                                1 << i
+                                for i in range(8)
+                                if power_status[i] and not (mask & (1 << i))
+                            )
                         if off_mask:
                             if sensor.disable_camera_power(off_mask):
                                 _emit_log(
@@ -1052,14 +1056,28 @@ class ScanWorkflow:
                                 raise RuntimeError(
                                     f"Failed to power on cameras on {side} (mask 0x{on_mask:02X})."
                                 )
-                            _emit_log(
-                                f"{side}: powered on cameras (mask 0x{on_mask:02X})"
-                            )
-                            time.sleep(0.5)
+                            if all(
+                                power_status[i]
+                                for i in range(8)
+                                if on_mask & (1 << i)
+                            ):
+                                _emit_log(
+                                    f"{side}: cameras already powered (mask 0x{on_mask:02X})"
+                                )
+                            else:
+                                _emit_log(
+                                    f"{side}: powered on cameras (mask 0x{on_mask:02X})"
+                                )
+                                needs_settle = True
                     except Exception as e:
                         raise RuntimeError(
                             f"Error setting camera power for {side}: {e}"
                         ) from e
+                # Rail/FPGA-boot settle, needed only after a real off->on
+                # transition; the sides share one sleep (they settle
+                # concurrently, not one after the other).
+                if needs_settle:
+                    time.sleep(0.5)
 
                 side_positions: dict[str, list[int]] = {}
                 side_sensors: dict = {}
@@ -1080,6 +1098,25 @@ class ScanWorkflow:
 
                 def _configure_side(side: str) -> None:
                     sensor = side_sensors[side]
+                    side_mask = sum(1 << p for p in side_positions[side])
+
+                    # One status round-trip covers every camera on the side.
+                    # Status bits (firmware get_camera_status): 0 = peripheral
+                    # READY, 1 = FPGA programmed, 2 = registers configured.
+                    # The firmware clears bits 1+2 whenever the camera loses
+                    # power (explicit power-off, CRESETB reset, stall-recovery
+                    # rail-cycle), so they are trustworthy skip signals. It
+                    # also skips the work itself when they are set
+                    # (isProgrammed/isConfigured short-circuit), so skipping
+                    # here changes nothing on the sensor — it only drops the
+                    # no-op round-trips and sleeps that dominated warm scan
+                    # starts (issue #272).
+                    status_map = sensor.get_camera_status(side_mask)
+                    if not status_map:
+                        raise RuntimeError(
+                            f"Failed to read camera status for {side} sensor."
+                        )
+
                     for pos in side_positions[side]:
                         if self._config_stop_evt.is_set():
                             raise RuntimeError("Canceled")
@@ -1092,8 +1129,7 @@ class ScanWorkflow:
                         cam_mask_single = 1 << pos
                         pos1 = pos + 1
 
-                        status_map = sensor.get_camera_status(cam_mask_single)
-                        if not status_map or pos not in status_map:
+                        if pos not in status_map:
                             raise RuntimeError(
                                 f"Failed to read camera status for {side} camera {pos1}."
                             )
@@ -1102,17 +1138,25 @@ class ScanWorkflow:
                             raise RuntimeError(
                                 f"{side} camera {pos1} not READY for FPGA/config."
                             )
+                        programmed = bool(status & (1 << 1))
+                        configured = bool(status & (1 << 2))
 
-                        _emit_log(
-                            f"Programming {side} camera FPGA at position {pos1} "
-                            f"(mask 0x{cam_mask_single:02X})..."
-                        )
-                        if not sensor.program_fpga(
-                            camera_position=cam_mask_single, manual_process=False
-                        ):
-                            raise RuntimeError(
-                                f"Failed to program FPGA on {side} sensor (pos {pos1})."
+                        if programmed:
+                            _emit_log(
+                                f"{side} camera {pos1} FPGA already programmed "
+                                "- skipping"
                             )
+                        else:
+                            _emit_log(
+                                f"Programming {side} camera FPGA at position {pos1} "
+                                f"(mask 0x{cam_mask_single:02X})..."
+                            )
+                            if not sensor.program_fpga(
+                                camera_position=cam_mask_single, manual_process=False
+                            ):
+                                raise RuntimeError(
+                                    f"Failed to program FPGA on {side} sensor (pos {pos1})."
+                                )
                         with done_lock:
                             done[0] += 1
                             _emit_progress(int((done[0] / total) * 100))
@@ -1120,18 +1164,27 @@ class ScanWorkflow:
                         if self._config_stop_evt.is_set():
                             raise RuntimeError("Canceled")
 
-                        time.sleep(0.1)
-                        _emit_log(
-                            f"Configuring {side} camera sensor registers "
-                            f"at position {pos1}..."
-                        )
-                        if not sensor.camera_configure_registers(
-                            camera_position=cam_mask_single
-                        ):
-                            raise RuntimeError(
-                                f"camera_configure_registers failed on {side} "
-                                f"at position {pos1}."
+                        if programmed and configured:
+                            _emit_log(
+                                f"{side} camera {pos1} registers already "
+                                "configured - skipping"
                             )
+                        else:
+                            if not programmed:
+                                # Post-load settle before touching the camera
+                                # through the freshly booted FPGA.
+                                time.sleep(0.1)
+                            _emit_log(
+                                f"Configuring {side} camera sensor registers "
+                                f"at position {pos1}..."
+                            )
+                            if not sensor.camera_configure_registers(
+                                camera_position=cam_mask_single
+                            ):
+                                raise RuntimeError(
+                                    f"camera_configure_registers failed on {side} "
+                                    f"at position {pos1}."
+                                )
                         with done_lock:
                             done[0] += 1
                             _emit_progress(int((done[0] / total) * 100))
