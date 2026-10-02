@@ -152,14 +152,6 @@ Writes a known byte to a scratch register on a known I2C device. Reads it back. 
 **`test_i2c_read_bad_address`**
 Calls `read_i2c_packet` with a non-existent I2C address. Asserts that `CommandError` or `ValueError` is raised (graceful error propagation).
 
-### 2.5 GPIO and ADC
-
-**`test_read_gpio`**
-Calls `read_gpio_value()`. Asserts the returned value is a float.
-
-**`test_read_adc`**
-Calls `read_adc_value()`. Asserts the returned float is in [0.0, 3.3].
-
 ### 2.6 Fan control
 
 **`test_fan_set_and_get`**

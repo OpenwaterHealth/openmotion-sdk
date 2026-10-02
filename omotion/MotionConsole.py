@@ -64,8 +64,6 @@ from omotion.config import (
     OW_CTRL_I2C_STATUS,
     OW_CTRL_I2C_WR,
     OW_CTRL_PDUMON,
-    OW_CTRL_READ_ADC,
-    OW_CTRL_READ_GPIO,
     OW_CTRL_SET_IND,
     OW_CTRL_SET_TRIG,
     OW_CTRL_START_TRIG,
@@ -1642,84 +1640,6 @@ class MotionConsole(SignalWrapper):
         except Exception as e:
             self._log_command_error("reset_odometer", e)
             return False
-
-    def read_gpio_value(self) -> int:
-        """
-        Read GPIO value.
-
-        Returns:
-            int: The GPIO register value (4-byte unsigned integer).
-
-        Raises:
-            ValueError: If the UART is not connected or the firmware returns
-                an unexpected response.
-            Exception: If an error occurs during communication.
-        """
-        try:
-            if self.uart.demo_mode:
-                return 0
-
-            if not self.is_connected():
-                raise ValueError("Console controller not connected")
-
-            r = self.uart.send_packet(
-                id=None, packetType=OW_CONTROLLER, command=OW_CTRL_READ_GPIO, data=None
-            )
-            self.uart.clear_buffer()
-            if r.packetType == OW_ERROR:
-                raise ValueError("Device returned an error for OW_CTRL_READ_GPIO")
-            if r.data_len == 4:
-                return struct.unpack("<I", r.data)[0]
-            raise ValueError(
-                f"Unexpected data length for GPIO read: got {r.data_len}, expected 4"
-            )
-
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise
-
-        except Exception as e:
-            self._log_command_error("read_gpio_value", e)
-            raise
-
-    def read_adc_value(self) -> float:
-        """
-        Read ADC value.
-
-        Returns:
-            float: The ADC reading as a 32-bit float.
-
-        Raises:
-            ValueError: If the UART is not connected or the firmware returns
-                an unexpected response.
-            Exception: If an error occurs during communication.
-        """
-        try:
-            if self.uart.demo_mode:
-                return 0.0
-
-            if not self.is_connected():
-                raise ValueError("Console controller not connected")
-
-            r = self.uart.send_packet(
-                id=None, packetType=OW_CONTROLLER, command=OW_CTRL_READ_ADC, data=None
-            )
-            self.uart.clear_buffer()
-            if r.packetType == OW_ERROR:
-                raise ValueError("Device returned an error for OW_CTRL_READ_ADC")
-            if r.data_len == 4:
-                return struct.unpack("<f", r.data)[0]
-            raise ValueError(
-                f"Unexpected data length for ADC read: got {r.data_len}, expected 4"
-            )
-
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise
-
-        except Exception as e:
-            self._log_command_error("read_adc_value", e)
-            raise
 
     def get_temperatures(self, return_all: bool = False) -> tuple[float, float, float]:
         """
