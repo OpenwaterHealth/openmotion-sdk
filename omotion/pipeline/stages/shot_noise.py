@@ -5,7 +5,8 @@ Operates on two paths:
   Batch:    IntervalClosed events carrying CorrectedInterval — mutates each
             CorrectedFrame's std in place and sets its contrast field.
 
-See docs/SciencePipeline.md §8.3.
+See docs/SciencePipeline.md §5.9 ShotNoiseCorrectionStage (batch-path
+math: §5.8.5).
 """
 
 from __future__ import annotations
