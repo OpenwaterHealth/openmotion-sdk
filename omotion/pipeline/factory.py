@@ -86,6 +86,7 @@ def default_pipeline(*,
             batch_estimator=LinearInterpolation(),
             pedestals=pedestals,
             realtime_history_size=realtime_dark_history_size,
+            dark_interval=dark_interval,
         ),
 
         ShotNoiseCorrectionStage(pedestals=pedestals, camera_gain_map=CAMERA_GAIN_MAP),

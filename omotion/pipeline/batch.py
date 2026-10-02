@@ -54,6 +54,20 @@ class DarkIntegrityWarning(BatchEvent):
 
 
 @dataclass
+class MissedDarkWarning(BatchEvent):
+    """One or more scheduled dark frames never arrived for a camera, so its
+    dark-correction interval spans from the dark before the gap to the dark
+    after it (issue #175). The interval is still corrected, by interpolating
+    the baseline across the wider span; its light frames carry
+    quality == "wide_interval". Diagnostic, not a drop signal."""
+    side: str
+    cam_id: int
+    left_abs: int
+    right_abs: int
+    missed_abs_ids: tuple[int, ...]
+
+
+@dataclass
 class StencilFallback(BatchEvent):
     """The 4-point dark-frame quadratic stencil fell back to a simpler scheme
     because some neighbours were unavailable. Diagnostic, not an error."""
@@ -443,6 +457,8 @@ class FrameBatch:
     # "ok" = device timestamp passed through unchanged
     # "ts_corrected" = timestamp replaced by re-anchoring interpolation
     # "nan_filled" = synthetic row for a missing frame (zero histogram)
+    # DarkCorrectionStage later sets "wide_interval" on the corrected light
+    # frames of an interval that spans a missed scheduled dark (#175).
     quality:        Optional[np.ndarray] = None
 
     # ── Event queue ──────────────────────────────────────────────────────
