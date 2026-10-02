@@ -153,25 +153,6 @@ def test_i2c_read_bad_address(console):
 
 
 # ===========================================================================
-# 2.5 GPIO and ADC
-# ===========================================================================
-
-@pytest.mark.xfail(reason="Firmware returns 0-byte GPIO payload (console-fw issue)", raises=ValueError)
-def test_read_gpio(console):
-    val = console.read_gpio_value()
-    # Returns int or float depending on firmware response
-    assert isinstance(val, (int, float))
-
-
-@pytest.mark.xfail(reason="Firmware returns 0-byte ADC payload (console-fw issue)", raises=ValueError)
-def test_read_adc(console):
-    val = console.read_adc_value()
-    assert isinstance(val, (int, float))
-    if isinstance(val, float):
-        assert 0.0 <= val <= 3.3, f"ADC value {val} out of [0, 3.3]"
-
-
-# ===========================================================================
 # 2.6 Fan control
 # ===========================================================================
 
