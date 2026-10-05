@@ -406,6 +406,16 @@ class ScanWorkflow:
         # a pre-flight failure) never reports a stale error from an earlier run.
         self._last_scan_error = None
 
+        # Laser safety limits (sdk#310): refuse a laser scan while the last
+        # read-back after apply_laser_power failed. A laser-off scan never
+        # starts the trigger, so it is allowed. None = no load has run yet.
+        limits = getattr(getattr(self._interface, "console", None),
+                         "laser_limits_check", None)
+        if not request.disable_laser and limits is not None and not limits.ok:
+            logger.error("start_scan refused: %s", limits.describe())
+            self._last_scan_error = limits.describe()
+            return False
+
         with self._lock:
             if self._running or (self._thread and self._thread.is_alive()):
                 logger.warning(

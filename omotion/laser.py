@@ -21,12 +21,20 @@ shipped application carries no editable data file):
 
 This is laser-sensitive: editing the bundled values risks wrong pulse widths
 or tripping the safety interlock. Treat them as locked baseline data.
+
+Every load ends by reading back the limit registers it wrote on the Safety
+EE and OPT FPGAs (sdk#310). The result, a :class:`LaserLimitCheck`, is
+latched on the console as ``console.laser_limits_check``; while it is failed,
+``ScanWorkflow.start_scan`` refuses laser scans and
+``MotionConsole.start_trigger`` raises :class:`LaserSafetyLimitError`. Only a
+later load that verifies clean replaces it.
 """
 
 from __future__ import annotations
 
 import copy
 import logging
+from dataclasses import dataclass
 from typing import Any, Optional
 
 from omotion.data.fpga_model import FPGA_MODEL
@@ -34,6 +42,117 @@ from omotion.data.laser_params import LASER_PARAMS
 from omotion.data.laser_params_fault import LASER_PARAMS_FAULT
 
 logger = logging.getLogger("openmotion.sdk.laser")
+
+# FPGAs whose written registers are safety limits and get read back after
+# every load. Every register the load writes on them is a limit (the two
+# CURRENT registers are the PWM/CW current limits in the safety FPGA RTL).
+SAFETY_FPGA_LABELS = ("Safety EE", "Safety OPT")
+
+# Read attempts per register before an unreadable or mismatching read is
+# final, so one transient I2C failure does not latch a refusal.
+_READBACK_ATTEMPTS = 3
+
+
+class LaserSafetyLimitError(RuntimeError):
+    """Raised when the laser trigger is started while the last read-back of
+    the laser safety limits failed."""
+
+
+@dataclass(frozen=True)
+class LimitReadback:
+    """One safety-limit register: the bytes the load wrote and the bytes
+    read back (``actual`` is None when every read failed)."""
+
+    name: str
+    expected: bytes
+    actual: Optional[bytes]
+    scale: Optional[float] = None
+    unit: Optional[str] = None
+    byteorder: str = "little"
+
+    @property
+    def ok(self) -> bool:
+        return self.actual == self.expected
+
+    def _value(self, data: bytes) -> str:
+        raw = int.from_bytes(data, byteorder=self.byteorder)
+        if not self.scale:
+            return str(raw)
+        unit = f" {self.unit}" if self.unit else ""
+        return f"{raw} ({raw * self.scale:.1f}{unit})"
+
+    def describe(self) -> str:
+        expected = self._value(self.expected)
+        if self.actual is None:
+            return f"{self.name}: expected {expected}, unreadable"
+        return f"{self.name}: expected {expected}, read {self._value(self.actual)}"
+
+
+@dataclass(frozen=True)
+class LaserLimitCheck:
+    """Outcome of verifying the laser safety limits after a load.
+
+    ``error`` is set when the load itself did not complete (a write failed,
+    nothing to apply, an exception), in which case the registers were never
+    confirmed and the check fails whatever ``readbacks`` holds.
+    """
+
+    readbacks: tuple = ()
+    error: str = ""
+
+    @property
+    def mismatches(self) -> tuple:
+        return tuple(r for r in self.readbacks if not r.ok)
+
+    @property
+    def ok(self) -> bool:
+        return not self.error and not self.mismatches
+
+    def describe(self) -> str:
+        if self.error:
+            return f"Laser safety limits not verified: {self.error}"
+        if self.ok:
+            return f"Laser safety limits verified ({len(self.readbacks)} registers)"
+        return "Laser safety limit mismatch: " + "; ".join(
+            r.describe() for r in self.mismatches
+        )
+
+
+def _record_check(console: Any, check: LaserLimitCheck) -> None:
+    """Latch ``check`` on the console for the scan pre-flight and the
+    trigger-start guard."""
+    try:
+        console.laser_limits_check = check
+    except Exception:
+        logger.warning("Could not record the laser safety limit check", exc_info=True)
+
+
+def _read_back(console: Any, name: str, entry: dict, expected: bytes) -> LimitReadback:
+    actual: Optional[bytes] = None
+    for _ in range(_READBACK_ATTEMPTS):
+        try:
+            data, length = console.read_i2c_packet(
+                mux_index=entry["mux_idx"],
+                channel=entry["channel"],
+                device_addr=entry["i2c_addr"],
+                reg_addr=entry["start_address"],
+                read_len=len(expected),
+            )
+        except Exception as e:
+            logger.warning("Read-back of %s raised: %s", name, e)
+            continue
+        if isinstance(data, (bytes, bytearray)) and len(data) == len(expected):
+            actual = bytes(data)
+            if actual == expected:
+                break
+    return LimitReadback(
+        name=name,
+        expected=expected,
+        actual=actual,
+        scale=entry.get("scale"),
+        unit=entry.get("unit"),
+        byteorder="big" if entry.get("isMsbFirst", False) else "little",
+    )
 
 
 class FpgaMap:
@@ -54,7 +173,7 @@ class FpgaMap:
         """Return the I2C location + format for ``friendly_name`` or None.
 
         Keys: label, mux_idx, channel, i2c_addr, isMsbFirst, start_address,
-        data_size, scale (scale may be None).
+        data_size, scale, unit (scale and unit may be None).
         """
         for fpga in self._model:
             for fn in fpga.get("functions", []):
@@ -68,6 +187,7 @@ class FpgaMap:
                         "start_address": fn.get("start_address"),
                         "data_size": fn.get("data_size"),
                         "scale": fn.get("scale"),
+                        "unit": fn.get("unit"),
                     }
         return None
 
@@ -111,11 +231,17 @@ def apply_laser_power(
     force_fault: bool = False,
     lock: Optional[Any] = None,
 ) -> bool:
-    """Write the laser-driver configuration to ``console`` over I2C.
+    """Write the laser-driver configuration to ``console`` over I2C, then
+    read back the safety limits it wrote.
 
     Reads user overrides from ``console.read_config()`` and applies the
     ``laser_params`` list, honoring per-key overrides and the safety DRIVE CL
-    values. Returns True on success, False if any I2C write fails.
+    values. Every register written on the Safety EE/OPT FPGAs is then read
+    back and compared with the bytes written (sdk#310), and the resulting
+    :class:`LaserLimitCheck` is latched as ``console.laser_limits_check``.
+    Returns True only when every write succeeded and every limit read back
+    as written; False on a write failure, an unreadable limit register or a
+    mismatch, with the failing registers named in the log and the latch.
 
     ``force_fault`` additionally exempts the deliberately-faulted registers
     (the fault file's diff vs the baseline) from every user-config override
@@ -142,11 +268,39 @@ def apply_laser_power(
         laser_params = load_laser_params(force_fault=force_fault)
     if fpga_map is None:
         fpga_map = FpgaMap()
+
+    # Nothing is confirmed until the read-back completes: an exception
+    # leaves this failed check latched.
+    check = LaserLimitCheck(error="laser power load did not complete")
+    try:
+        check = _load_and_verify(console, laser_params, fpga_map, force_fault, lock)
+    finally:
+        _record_check(console, check)
+    if check.ok:
+        logger.info("Laser power set successfully. %s", check.describe())
+    else:
+        logger.error("%s", check.describe())
+    return check.ok
+
+
+def _load_and_verify(
+    console: Any,
+    laser_params: list,
+    fpga_map: FpgaMap,
+    force_fault: bool,
+    lock: Optional[Any],
+) -> LaserLimitCheck:
+    """The body of :func:`apply_laser_power`: write every register, then
+    read back the ones written on the safety FPGAs."""
     if not laser_params:
         logger.error("apply_laser_power: no laser parameters to apply")
-        return False
+        return LaserLimitCheck(error="no laser parameters to apply")
 
     logger.info("Setting laser power from config...")
+
+    # friendlyName -> (FPGA map entry, bytes last written) for every
+    # safety-FPGA register this load writes; the read-back source of truth.
+    intended: dict = {}
 
     faulted_names: set = set()
     faulted_coords: set = set()
@@ -252,11 +406,13 @@ def apply_laser_power(
                 logger.error(
                     "Failed to set laser power (muxIdx=%d, channel=%d)", mux_idx, channel
                 )
-                return False
+                return LaserLimitCheck(error=f"I2C write of {friendly_name} failed")
+            if fpga_entry.get("label") in SAFETY_FPGA_LABELS:
+                intended[friendly_name] = (fpga_entry, bytes(data_to_send))
 
         # User-config safety DRIVE CL overrides, written after the JSON pass.
         # 16-bit LSB-first uint16 raw register value (isMsbFirst=false).
-        def _write_drive_cl(ch: int, thresh, gain, label: str) -> bool:
+        def _write_drive_cl(name: str, ch: int, thresh, gain, label: str) -> bool:
             if thresh is None:
                 return True
             set_value = thresh
@@ -266,23 +422,32 @@ def apply_laser_power(
             raw = max(0, min(0xFFFF, int(round(set_value))))
             data = bytearray([raw & 0xFF, (raw >> 8) & 0xFF])
             logger.info("Writing user-config %s DRIVE CL: raw=%d, gain=%s", label, raw, gain_f)
-            return console.write_i2c_packet(
+            if not console.write_i2c_packet(
                 mux_index=1, channel=ch, device_addr=0x41, reg_addr=0x10, data=data
-            )
+            ):
+                return False
+            entry = fpga_map.get_entry_by_friendly_name(name)
+            if entry is not None:
+                intended[name] = (entry, bytes(data))
+            return True
 
         if _EE_DRIVE_CL in faulted_coords:
             logger.info("force_fault: Safety EE DRIVE CL kept at fault value")
-        elif not _write_drive_cl(6, ee_thresh, ee_gain, "Safety EE"):
+        elif not _write_drive_cl("EE_DRIVE_CL", 6, ee_thresh, ee_gain, "Safety EE"):
             logger.error("Failed to write user-config Safety EE DRIVE CL")
-            return False
+            return LaserLimitCheck(error="I2C write of user-config EE_DRIVE_CL failed")
         if _OPT_DRIVE_CL in faulted_coords:
             logger.info("force_fault: Safety OPT DRIVE CL kept at fault value")
-        elif not _write_drive_cl(7, opt_thresh, opt_gain, "Safety OPT"):
+        elif not _write_drive_cl("OPT_DRIVE_CL", 7, opt_thresh, opt_gain, "Safety OPT"):
             logger.error("Failed to write user-config Safety OPT DRIVE CL")
-            return False
+            return LaserLimitCheck(error="I2C write of user-config OPT_DRIVE_CL failed")
 
-        logger.info("Laser power set successfully.")
-        return True
+        # Read back every safety limit written above, still under the
+        # caller's lock (if any), so the check covers this load's writes.
+        return LaserLimitCheck(readbacks=tuple(
+            _read_back(console, name, entry, expected)
+            for name, (entry, expected) in intended.items()
+        ))
     finally:
         if lock is not None:
             lock.unlock()
