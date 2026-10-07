@@ -73,7 +73,7 @@ Three things characterise this design and make it auditable:
 | `tcl` | `(N,)` int64 \| None | TelemetryIngestStage (or replay source) | Laser trigger counter |
 | `abs_frame_ids` | `(N,)` int64 | FrameClassificationStage | Monotonic unwrapped frame counter |
 | `frame_type` | `(N,)` `<U8` | FrameClassificationStage | One of `"warmup"`, `"dark"`, `"light"`, `"stale"` |
-| `quality` | `(N,)` `<U14` | TimestampRepairStage | `"ok"`, `"ts_corrected"` (timestamp rewritten), or `"nan_filled"` (synthetic gap placeholder) — see §5.4 |
+| `quality` | `(N,)` `<U14` | TimestampRepairStage | `"ok"`, `"ts_corrected"` (timestamp rewritten), or `"nan_filled"` (synthetic gap placeholder) — see §5.4. Corrected frames can also carry `"dark_held"` (corrected against a substituted dark, §5.8.1). Anything that merges frames keeps the highest-ranked label (`batch.QUALITY_RANK`: ok < ts_corrected < nan_filled < dark_held). |
 | `mean_raw` | `(N, 2, 8)` float32 | MomentsStage | First moment μ₁ of raw histogram (NaN where count == 0) |
 | `std_raw` | `(N, 2, 8)` float32 | MomentsStage | √(μ₂ − μ₁²) of raw histogram |
 | `contrast_raw` | always `None` | MomentsStage | Reserved; pedestal-subtracted contrast is computed downstream |
@@ -424,7 +424,14 @@ The realtime predictor and the batched corrector share one `DarkHistory` (a per-
 
 #### 5.8.1 DarkIntegrityGuard (dark frames)
 
-A genuine dark frame's μ₁ should be within ~5 DN of the sensor pedestal. Any higher and the laser likely wasn't actually off (firmware off-by-one, unwrapper alignment quirk). The guard appends a `DarkIntegrityWarning(side, cam_id, abs_frame_id, u1, pedestal, threshold)` event — a diagnostic, not a drop signal. The frame is still appended to history and used downstream.
+A genuine dark frame's μ₁ should be within ~5 DN of the sensor pedestal. Any higher and the laser likely wasn't actually off (firmware off-by-one, unwrapper alignment quirk). The guard appends a `DarkIntegrityWarning(side, cam_id, abs_frame_id, u1, pedestal, threshold)` event, and the stage never uses the flagged frame as a dark reference (#292). The frame keeps its place in the dark schedule, so intervals still close on time, but:
+
+- it is not added to the realtime dark history;
+- as an interval boundary it takes the level and noise of the last clean dark for that camera, keeping its own timestamp;
+- before the first clean dark it takes the other boundary's level when that one is clean, else the sensor pedestal;
+- every frame corrected against such a boundary gets `quality = "dark_held"`, and so does the stencilled dark row built from them.
+
+The dark level drifts slowly, so holding a clean dark for one interval costs far less than subtracting a lit frame. Seen in practice when frame numbering is off (the #286 lockout) and on scans with exposures long enough to catch the displaced laser pulse.
 
 #### 5.8.2 HybridRealtimePredictor — realtime baseline
 
@@ -883,7 +890,7 @@ After the scan, `result()` evaluates per camera: `no_signal` if no light samples
 
 **The light path is a three-way read, not a two-way one.** A finite `mean_dc_rt` is thresholded normally — rolling-window average against `is_poor_contact`, same as the one-shot check. A non-finite `mean_dc_rt` means one of two structurally different things, and `DarkCorrectionStage` tells them apart via `batch.low_light_rt`:
 
-- **No dark observed yet for this camera** (`low_light_rt = False`) — the realtime predictor has no history to predict from (or the row is warmup/stale and never reaches this code at all), so there is no baseline to subtract and no measurement exists. This is frame/history loss, not a contact-quality condition; the row is skipped and left to the consumer's camera-dropout watchdog.
+- **No dark observed yet for this camera** (`low_light_rt = False`) — the realtime predictor has no history to predict from (or the row is warmup/stale and never reaches this code at all), so there is no baseline to subtract and no measurement exists. This is frame/history loss, not a contact-quality condition; the row is skipped and left to the consumer's camera-dropout watchdog. (Once a dark position has passed but none was clean, the realtime path subtracts the pedestal instead, §5.8.1.)
 - **The frame arrived and was unlit** (`low_light_rt = True`) — `DarkCorrectionStage` classifies a light-typed frame as `dark_like` when `u1 <= pedestal + max_above_pedestal` (the same guard `DarkIntegrityGuard` applies to actual dark frames, §5.8.1), and when that holds it never calls the realtime predictor at all — `mean_dc_rt` stays at its NaN fill by construction, not by a per-frame decision. A covered sensor, a lifted sensor, or a decoupled fiber all present this way. The monitor reports it as `poor_contact` unconditionally.
 
 Treating the two alike inverts the detection window this feature exists for: a signal that's merely weak (still finite, still run through the threshold) would warn, while a signal that's completely gone (`low_light_rt = True`, the strictly worse case) would fall through the same silent-skip branch as a frame that hasn't arrived yet. That gap was a real defect caught in review against bloodflow-app #364 — the disconnected-fiber report this distinction exists to catch. The two cases can't be confused with each other because `dark_like` (stored as `low_light_rt`) is computed from the frame's own raw `u1` *before* the predictor is ever consulted, and it's that same flag which gates whether the predictor runs (`if not dark_like: pred = self._realtime.predict(...)`). A frame with no dark history yet still carries a real, measured `u1` — unless that reading happens to be dark-like on its own terms, `low_light_rt` for it reads `False`.

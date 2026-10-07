@@ -5,6 +5,7 @@ import logging
 import numpy as np
 import pytest
 from omotion.pipeline.batch import FrameBatch, IntervalClosed
+from omotion.pipeline.pedestal import SensorPedestals
 from omotion.pipeline.stages.dark import (
     DarkCorrectionStage, HybridRealtimePredictor, LinearInterpolation,
     CorrectedFrame, CorrectedInterval,
@@ -77,9 +78,12 @@ def test_realtime_dark_frame_reuses_previous_live_corrected_values():
     batch = _batch(n, ["dark", "light", "dark"], [10, 11, 12],
                    mean_raw=mean.astype(np.float32), std_raw=std.astype(np.float32))
 
+    # Pedestal 100 keeps both darks (100, 105) within the integrity guard's
+    # pedestal+5, so they are genuine dark references here.
     stage = DarkCorrectionStage(
         realtime_estimator=HybridRealtimePredictor(),
         batch_estimator=LinearInterpolation(),
+        pedestals=SensorPedestals(left=100.0, right=100.0),
     )
     stage.process(batch)
 

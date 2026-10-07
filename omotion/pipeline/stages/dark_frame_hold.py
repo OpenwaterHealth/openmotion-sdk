@@ -24,7 +24,7 @@ from typing import Optional
 
 import numpy as np
 
-from ..batch import FrameBatch, IntervalClosed
+from ..batch import QUALITY_RANK, FrameBatch, IntervalClosed
 from .dark import (
     DarkFrameQuadraticStencil,
     EnrichedCorrectedFrame, EnrichedCorrectedInterval,
@@ -170,6 +170,12 @@ class DarkFrameHoldStage:
             )
 
         temp_c = _interp("temp_c") if right1.temp_c is not None else None
+        # The row is built from its neighbours, so it is only as trustworthy
+        # as the worst of them (e.g. dark_held when this dark was held, #292).
+        quality = max(
+            (n.quality for n in (left2, left1, right1, right2) if n is not None),
+            key=lambda q: QUALITY_RANK.get(q, 0),
+        )
 
         return EnrichedCorrectedFrame(
             abs_frame_id=d_prev_abs,
@@ -181,7 +187,7 @@ class DarkFrameHoldStage:
             contrast=_interp("contrast"),
             bfi=_interp("bfi"),
             bvi=_interp("bvi"),
-            quality="ok",
+            quality=quality,
             temp_c=temp_c,
         )
 

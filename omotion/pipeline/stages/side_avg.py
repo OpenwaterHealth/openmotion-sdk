@@ -27,7 +27,7 @@ from typing import Optional
 
 import numpy as np
 
-from ..batch import FrameBatch, IntervalClosed, LiveEmit, SideAverageSample
+from ..batch import QUALITY_RANK, FrameBatch, IntervalClosed, LiveEmit, SideAverageSample
 from .dark import EnrichedCorrectedFrame, EnrichedCorrectedInterval
 
 
@@ -35,8 +35,8 @@ _SIDE_STR_TO_INT = {"left": 0, "right": 1}
 _SIDE_INT_TO_STR = ("left", "right")
 
 # Higher rank = worse quality; the side average inherits the worst quality
-# of any camera that contributed to it. Mirrors sinks._QUALITY_RANK.
-_QUALITY_RANK = {"ok": 0, "ts_corrected": 1, "nan_filled": 2}
+# of any camera that contributed to it.
+_QUALITY_RANK = QUALITY_RANK
 
 
 def _mask_to_cam_indices(mask: int) -> np.ndarray:
