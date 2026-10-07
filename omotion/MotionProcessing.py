@@ -675,6 +675,13 @@ def parse_histogram_stream(
         while offset + MIN_PACKET_ENVELOPE_SIZE <= len(buffer_accumulator):
             try:
                 pkt_view = memoryview(buffer_accumulator[offset:])
+                sof, pkt_type, pkt_len = _HDR.unpack_from(pkt_view)
+                if (sof == SOF
+                        and _candidate_packet_size_ok(pkt_type, pkt_len)
+                        and pkt_len > len(pkt_view)):
+                    # A USB read can end inside a valid packet. Wait for its
+                    # remaining bytes; payload bytes are not resync evidence.
+                    break
                 packet = parse_histogram_packet_structured(
                     pkt_view, expected_row_sum=expected_row_sum
                 )
