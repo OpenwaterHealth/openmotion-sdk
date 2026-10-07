@@ -139,3 +139,19 @@ def test_stencilled_dark_row_temp_none_when_neighbour_unstamped():
     assert dark_row.abs_frame_id == 10
     assert dark_row.temp_c is None
     assert dark_row.bfi == pytest.approx(4.0)  # other metrics still stencil
+
+
+
+def test_stencilled_dark_row_inherits_wide_interval_flag():
+    """The dark row is fabricated from its neighbours, so it is flagged
+    when any neighbour comes from an interval that spans a missed dark
+    (issue #175), and stays "ok" otherwise."""
+    flagged = _enriched_light(12, 0.300, 36.8)
+    flagged.quality = "wide_interval"
+    eci = _stencil_one_interval([_enriched_light(11, 0.275, 36.7), flagged])
+    assert eci.frames[0].abs_frame_id == 10
+    assert eci.frames[0].quality == "wide_interval"
+
+    eci = _stencil_one_interval(
+        [_enriched_light(11, 0.275, 36.7), _enriched_light(12, 0.300, 36.8)])
+    assert eci.frames[0].quality == "ok"

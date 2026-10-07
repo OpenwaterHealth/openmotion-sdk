@@ -25,6 +25,7 @@ from .batch import (
     IntervalClosed,
     LiveEmit,
     DarkIntegrityWarning,
+    MissedDarkWarning,
     StencilFallback,
     TerminalDarkResult,
     PipelineError,
@@ -44,7 +45,8 @@ from .telemetry import (
 
 __all__ = [
     "FrameBatch", "BatchEvent", "IntervalClosed", "LiveEmit",
-    "DarkIntegrityWarning", "StencilFallback", "TerminalDarkResult",
+    "DarkIntegrityWarning", "MissedDarkWarning", "StencilFallback",
+    "TerminalDarkResult",
     "PipelineError", "TimestampMisalignmentWindow",
     "Pipeline", "Stage", "Tee",
     "ScanRunner", "CriticalSinkError",
