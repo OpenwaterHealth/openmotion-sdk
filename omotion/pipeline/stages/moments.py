@@ -1,11 +1,11 @@
 """MomentsStage — vectorized first/second moment + std.
 
-See docs/SciencePipeline.md §6.
+See docs/SciencePipeline.md §5.6 MomentsStage.
 
-Note: contrast_raw is intentionally NOT computed here. Spec §7.1 defines
-K = std / (u1 - pedestal), i.e. pedestal-subtracted mean, but MomentsStage
-has no pedestal. Pedestal-subtracted contrast is computed downstream in
-BfiBviStage. contrast_raw is left as None.
+Note: contrast_raw is intentionally NOT computed here. SciencePipeline §5.6
+defines K = std / (u1 - pedestal), i.e. pedestal-subtracted mean, but
+MomentsStage has no pedestal. Contrast is computed downstream by
+ShotNoiseCorrectionStage. contrast_raw is left as None.
 """
 
 from __future__ import annotations
