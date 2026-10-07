@@ -188,12 +188,11 @@ class MotionConsole(SignalWrapper):
         # then, or if the device firmware predates the I2C-status command).
         self._i2c_health: Optional[dict] = None
 
-        # Read-back of the laser safety limits from the last
-        # omotion.laser.apply_laser_power (sdk#310); None until a load runs.
-        # Deliberately kept across disconnects: only a later load that
-        # verifies clean replaces a failed check, and while it is failed
-        # start_trigger refuses to fire the laser.
-        self.laser_limits_check = None
+        # Why the laser safety limits are not verified, set and cleared by
+        # omotion.laser.apply_laser_power (sdk#310); None = verified, or no
+        # load has run. Kept across disconnects: only a later load that
+        # verifies clean clears it, and while it is set start_trigger refuses.
+        self.laser_limits_error: Optional[str] = None
 
     # ──────────────────────────────────────────────────────────────────
     # State (read-only from outside)
@@ -1416,15 +1415,14 @@ class MotionConsole(SignalWrapper):
             bool: True if the trigger was started successfully, False otherwise.
 
         Raises:
-            LaserSafetyLimitError: If the last read-back of the laser safety
-                limits failed (sdk#310); nothing is sent to the console.
+            LaserSafetyLimitError: While ``laser_limits_error`` is set
+                (sdk#310); nothing is sent to the console.
             ValueError: If the UART is not connected.
             Exception: If an error occurs while starting the trigger.
         """
-        check = self.laser_limits_check
-        if check is not None and not check.ok:
-            logger.error("start_trigger refused: %s", check.describe())
-            raise LaserSafetyLimitError(check.describe())
+        if self.laser_limits_error:
+            logger.error("start_trigger refused: %s", self.laser_limits_error)
+            raise LaserSafetyLimitError(self.laser_limits_error)
         try:
             if self.uart.demo_mode:
                 return True

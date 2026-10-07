@@ -9,7 +9,6 @@ from omotion.data.laser_params import LASER_PARAMS
 from omotion.data.laser_params_fault import LASER_PARAMS_FAULT
 from omotion.laser import (
     FpgaMap,
-    LaserLimitCheck,
     LaserSafetyLimitError,
     apply_laser_power,
     load_laser_params,
@@ -27,19 +26,17 @@ class _FakeConsole:
     stored, so the read-back after a load sees the values it wrote.
 
     ``stuck`` maps (channel, offset) to the bytes that register reads as,
-    whatever was written; ``unreadable`` lists (channel, offset) whose reads
-    always fail; ``fail_reads`` maps (channel, offset) to a count of reads
-    that fail before the register answers. read_config returns no overrides.
+    whatever was written; reads of a (channel, offset) in ``unreadable``
+    fail. read_config returns no user overrides.
     """
 
-    def __init__(self, write_ok=True, stuck=None, unreadable=(), fail_reads=None):
+    def __init__(self, write_ok=True, stuck=None, unreadable=()):
         self.writes = []
         self.reads = []
         self._write_ok = write_ok
         self._regs = {}
         self._stuck = dict(stuck or {})
         self._unreadable = set(unreadable)
-        self._fail_reads = dict(fail_reads or {})
 
     def read_config(self):
         return None
@@ -52,20 +49,15 @@ class _FakeConsole:
 
     def read_i2c_packet(self, *, mux_index, channel, device_addr, reg_addr, read_len):
         self.reads.append((mux_index, channel, device_addr, reg_addr, read_len))
-        key = (channel, reg_addr)
-        if key in self._unreadable:
+        if (channel, reg_addr) in self._unreadable:
             return None, None
-        if self._fail_reads.get(key, 0) > 0:
-            self._fail_reads[key] -= 1
-            return None, None
-        if key in self._stuck:
-            data = self._stuck[key]
-        else:
-            data = self._regs.get((mux_index, channel, device_addr, reg_addr))
+        data = self._stuck.get(
+            (channel, reg_addr),
+            self._regs.get((mux_index, channel, device_addr, reg_addr)),
+        )
         if data is None:
             return None, None
-        data = data[:read_len]
-        return data, len(data)
+        return data[:read_len], len(data[:read_len])
 
 
 class _ConfigConsole(_FakeConsole):
@@ -304,78 +296,53 @@ def test_force_fault_keeps_trailing_drive_cl_write_when_not_faulted():
 #
 # Nothing used to read the EE/OPT limit registers back after the load, so a
 # register that did not take the intended value went unnoticed. Every load
-# now verifies them and latches the result on the console, and a failed
-# check blocks the trigger until a later load passes.
+# now verifies them; until one passes, console.laser_limits_error holds the
+# reason and the trigger stays blocked. The fake reads back what was
+# written, so a load that expected anything other than the bytes it last
+# wrote to a register fails these tests.
 
-_SAFETY_NAMES = {
-    p["friendlyName"] for p in LASER_PARAMS
+_SAFETY_LOCS = {
+    _loc(p["friendlyName"]) for p in LASER_PARAMS
     if p["friendlyName"].startswith(("EE_", "OPT_"))
 }
 
 
-def test_load_verifies_every_safety_limit_it_writes():
+def test_load_reads_back_every_safety_limit_it_wrote():
     console = _FakeConsole()
 
     assert apply_laser_power(console) is True
-
-    check = console.laser_limits_check
-    assert isinstance(check, LaserLimitCheck)
-    assert check.ok
-    assert {r.name for r in check.readbacks} == _SAFETY_NAMES
-    # Read-back covers the two safety FPGAs only (TA/seed hold no limits).
-    assert {r[1] for r in console.reads} == {6, 7}
+    assert console.laser_limits_error is None
+    # All 12 EE/OPT registers, and nothing on the TA/seed FPGAs.
+    assert {(r[1], r[3]) for r in console.reads} == _SAFETY_LOCS
+    assert len(console.reads) == len(_SAFETY_LOCS) == 12
 
 
 def test_mismatch_fails_the_load_and_names_the_register():
     console = _FakeConsole(stuck={_loc("EE_RATE_LL"): bytes(4)})
 
     assert apply_laser_power(console) is False
-
-    check = console.laser_limits_check
-    assert not check.ok
-    assert [r.name for r in check.mismatches] == ["EE_RATE_LL"]
-    text = check.describe()
-    assert "EE_RATE_LL" in text
-    assert "70313" in text   # expected raw, [169, 18, 1, 0] little-endian
-    assert "read 0" in text
+    # 70313 = [169, 18, 1, 0] little-endian, the bundled value.
+    assert console.laser_limits_error == (
+        "Laser safety limit mismatch: EE_RATE_LL: expected 70313, read 0"
+    )
 
 
 def test_unreadable_limit_register_fails_the_load():
     console = _FakeConsole(unreadable={_loc("OPT_PULSE_WIDTH_UL")})
 
     assert apply_laser_power(console) is False
-
-    check = console.laser_limits_check
-    assert [r.name for r in check.mismatches] == ["OPT_PULSE_WIDTH_UL"]
-    assert check.mismatches[0].actual is None
-    assert "unreadable" in check.describe()
+    assert "OPT_PULSE_WIDTH_UL: expected" in console.laser_limits_error
+    assert "unreadable" in console.laser_limits_error
 
 
-def test_a_transient_read_failure_is_retried():
-    console = _FakeConsole(fail_reads={_loc("EE_DRIVE_CL"): 2})
-
-    assert apply_laser_power(console) is True
-    assert console.laser_limits_check.ok
-
-
-def test_user_config_override_is_the_expected_value():
-    # 550 us at 0.32 us/tick is raw 1719; the read-back must expect that,
-    # not the bundled 1000 us.
-    console = _ConfigConsole({"EE_PULSE_WIDTH_UL": 550})
+def test_user_config_overrides_are_the_expected_values():
+    # EE_PULSE_WIDTH_UL overrides a JSON entry; EE_THRESH/EE_GAIN replace the
+    # JSON DRIVE CL with a trailing write. Both must be read back as written.
+    console = _ConfigConsole({"EE_PULSE_WIDTH_UL": 550, "EE_THRESH": 1000, "EE_GAIN": 2})
 
     assert apply_laser_power(console) is True
-
-    rb = {r.name: r for r in console.laser_limits_check.readbacks}
-    assert rb["EE_PULSE_WIDTH_UL"].expected == (1719).to_bytes(4, "little")
-
-
-def test_drive_cl_user_override_is_the_expected_value():
-    console = _ConfigConsole({"EE_THRESH": 1000, "EE_GAIN": 2})
-
-    assert apply_laser_power(console) is True
-
-    rb = {r.name: r for r in console.laser_limits_check.readbacks}
-    assert rb["EE_DRIVE_CL"].expected == bytes([0xF4, 0x01])
+    assert console.laser_limits_error is None
+    assert [(r[1], r[3]) for r in console.reads].count(_loc("EE_DRIVE_CL")) == 1
 
 
 def test_force_fault_value_is_the_expected_value():
@@ -384,28 +351,14 @@ def test_force_fault_value_is_the_expected_value():
     console = _FakeConsole()
 
     assert apply_laser_power(console, force_fault=True) is True
-
-    rb = {r.name: r for r in console.laser_limits_check.readbacks}
-    fault = {p["friendlyName"]: p["dataToSend"] for p in LASER_PARAMS_FAULT}
-    assert rb["EE_PULSE_WIDTH_UL"].expected == bytes(fault["EE_PULSE_WIDTH_UL"])
-    assert console.laser_limits_check.ok
+    assert console.laser_limits_error is None
 
 
-def test_write_failure_latches_a_failed_check():
+def test_write_failure_leaves_the_limits_unverified():
     console = _FakeConsole(write_ok=False)
 
     assert apply_laser_power(console) is False
-
-    check = console.laser_limits_check
-    assert not check.ok
-    assert "write" in check.describe().lower()
-
-
-def test_empty_parameter_set_latches_a_failed_check():
-    console = _FakeConsole()
-
-    assert apply_laser_power(console, laser_params=[]) is False
-    assert not console.laser_limits_check.ok
+    assert "did not complete" in console.laser_limits_error
 
 
 def test_a_passing_load_clears_an_earlier_failure():
@@ -413,11 +366,10 @@ def test_a_passing_load_clears_an_earlier_failure():
     # reconnect) clears the condition.
     console = _FakeConsole(stuck={_loc("OPT_RATE_LL"): bytes(4)})
     assert apply_laser_power(console) is False
-    assert not console.laser_limits_check.ok
 
     console._stuck.clear()
     assert apply_laser_power(console) is True
-    assert console.laser_limits_check.ok
+    assert console.laser_limits_error is None
 
 
 def test_read_back_happens_while_the_lock_is_held():
@@ -434,13 +386,7 @@ def test_read_back_happens_while_the_lock_is_held():
     assert lk.locked == 1 and lk.unlocked == 1
 
 
-def _failed_check():
-    console = _FakeConsole(stuck={_loc("EE_RATE_LL"): bytes(4)})
-    apply_laser_power(console)
-    return console.laser_limits_check
-
-
-def test_start_trigger_refused_while_the_check_is_failed():
+def test_start_trigger_refused_while_the_limits_are_unverified():
     from omotion.MotionConsole import MotionConsole
 
     sent = []
@@ -450,18 +396,18 @@ def test_start_trigger_refused_while_the_check_is_failed():
         send_packet=lambda **kw: sent.append(kw),
         clear_buffer=lambda: None,
     )
-    console.laser_limits_check = _failed_check()
+    console.laser_limits_error = "Laser safety limit mismatch: EE_RATE_LL: expected 70313, read 0"
 
     with pytest.raises(LaserSafetyLimitError, match="EE_RATE_LL"):
         console.start_trigger()
     assert sent == []   # nothing reached the console
 
 
-def test_start_trigger_unaffected_without_a_failed_check():
+def test_start_trigger_unaffected_when_no_load_has_run():
     from omotion.MotionConsole import MotionConsole
 
     console = MotionConsole(vid=0x0483, pid=0xA53E)
-    assert console.laser_limits_check is None
+    assert console.laser_limits_error is None
     # Not connected: the usual refusal, not the limits one.
     with pytest.raises(ValueError):
         console.start_trigger()

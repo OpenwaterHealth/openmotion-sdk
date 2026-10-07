@@ -486,20 +486,15 @@ def test_start_scan_aborts_synchronously_when_scan_db_readonly(tmp_path):
         os.chmod(db_path, stat.S_IWRITE)
 
 
-def _failed_limits_check():
-    from omotion.laser import LaserLimitCheck, LimitReadback
-    return LaserLimitCheck(readbacks=(
-        LimitReadback(name="EE_RATE_LL", expected=bytes([169, 18, 1, 0]),
-                      actual=bytes(4)),
-    ))
+_LIMITS_ERROR = "Laser safety limit mismatch: EE_RATE_LL: expected 70313, read 0"
 
 
-def test_start_scan_refuses_a_laser_scan_while_the_limits_check_is_failed():
-    """sdk#310: a failed read-back of the laser safety limits refuses the
-    scan in the synchronous pre-flight, naming the register, before any
-    worker (and so any trigger start) exists."""
+def test_start_scan_refuses_a_laser_scan_while_the_limits_are_unverified():
+    """sdk#310: an unverified laser safety limit refuses the scan in the
+    synchronous pre-flight, naming the register, before any worker (and so
+    any trigger start) exists."""
     motion = _build_motion_with_data_dir(None)
-    motion.console.laser_limits_check = _failed_limits_check()
+    motion.console.laser_limits_error = _LIMITS_ERROR
     request = ScanRequest(
         subject_id="x", duration_sec=1,
         left_camera_mask=0xFF, right_camera_mask=0, reduced_mode=False,
@@ -508,13 +503,12 @@ def test_start_scan_refuses_a_laser_scan_while_the_limits_check_is_failed():
     assert motion.scan_workflow.start_scan(request) is False
     assert motion.scan_workflow._thread is None
     assert motion.scan_workflow.running is False
-    err = motion.scan_workflow.last_scan_error
-    assert err is not None and "EE_RATE_LL" in err
+    assert motion.scan_workflow.last_scan_error == _LIMITS_ERROR
 
 
-def test_start_scan_allows_a_laser_off_scan_while_the_limits_check_is_failed():
+def test_start_scan_allows_a_laser_off_scan_while_the_limits_are_unverified():
     motion = _build_motion_with_data_dir(None)
-    motion.console.laser_limits_check = _failed_limits_check()
+    motion.console.laser_limits_error = _LIMITS_ERROR
     request = ScanRequest(
         subject_id="x", duration_sec=1,
         left_camera_mask=0xFF, right_camera_mask=0, reduced_mode=False,
@@ -523,14 +517,6 @@ def test_start_scan_allows_a_laser_off_scan_while_the_limits_check_is_failed():
 
     assert motion.scan_workflow.start_scan(request) is True
     motion.scan_workflow.await_complete(timeout_sec=5)
-
-
-def test_interface_exposes_the_latched_limits_check():
-    motion = _build_motion_with_data_dir(None)
-    assert motion.laser_limits_check is None
-    check = _failed_limits_check()
-    motion.console.laser_limits_check = check
-    assert motion.laser_limits_check is check
 
 
 def test_worker_invokes_on_error_when_scan_aborts(tmp_path):

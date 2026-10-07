@@ -414,25 +414,11 @@ class MotionInterface:
         laser params (see :mod:`omotion.laser`); ``force_fault=True`` loads the
         safety-trip set for exercising the interlock. ``lock`` (anything with
         ``lock()``/``unlock()``) is held for the duration of the writes — pass
-        a console mutex when calling from a multithreaded context.
-
-        The safety limits written on the EE/OPT FPGAs are then read back
-        (sdk#310). Returns True only when every write succeeded and every
-        limit read back as written; on False, :attr:`laser_limits_check`
-        names the failing registers, and laser scans are refused until a
-        later call verifies clean.
+        a console mutex when calling from a multithreaded context. Returns True
+        on success.
         """
         from omotion.laser import apply_laser_power as _apply
         return _apply(self.console, force_fault=force_fault, lock=lock)
-
-    @property
-    def laser_limits_check(self):
-        """The :class:`omotion.laser.LaserLimitCheck` latched by the last
-        :meth:`apply_laser_power` (None before the first). While it is not
-        ``ok``, ``start_scan`` refuses laser scans and the console refuses
-        to start the trigger; ``describe()`` names the failing registers
-        with their expected and actual values."""
-        return getattr(self.console, "laser_limits_check", None)
 
     # ──────────────────────────────────────────────────────────────────
     # Logging helpers
