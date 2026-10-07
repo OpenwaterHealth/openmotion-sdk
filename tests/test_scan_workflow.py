@@ -486,6 +486,39 @@ def test_start_scan_aborts_synchronously_when_scan_db_readonly(tmp_path):
         os.chmod(db_path, stat.S_IWRITE)
 
 
+_LIMITS_ERROR = "Laser safety limit mismatch: EE_RATE_LL: expected 70313, read 0"
+
+
+def test_start_scan_refuses_a_laser_scan_while_the_limits_are_unverified():
+    """sdk#310: an unverified laser safety limit refuses the scan in the
+    synchronous pre-flight, naming the register, before any worker (and so
+    any trigger start) exists."""
+    motion = _build_motion_with_data_dir(None)
+    motion.console.laser_limits_error = _LIMITS_ERROR
+    request = ScanRequest(
+        subject_id="x", duration_sec=1,
+        left_camera_mask=0xFF, right_camera_mask=0, reduced_mode=False,
+    )
+
+    assert motion.scan_workflow.start_scan(request) is False
+    assert motion.scan_workflow._thread is None
+    assert motion.scan_workflow.running is False
+    assert motion.scan_workflow.last_scan_error == _LIMITS_ERROR
+
+
+def test_start_scan_allows_a_laser_off_scan_while_the_limits_are_unverified():
+    motion = _build_motion_with_data_dir(None)
+    motion.console.laser_limits_error = _LIMITS_ERROR
+    request = ScanRequest(
+        subject_id="x", duration_sec=1,
+        left_camera_mask=0xFF, right_camera_mask=0, reduced_mode=False,
+        disable_laser=True, skip_default_storage=True,
+    )
+
+    assert motion.scan_workflow.start_scan(request) is True
+    motion.scan_workflow.await_complete(timeout_sec=5)
+
+
 def test_worker_invokes_on_error_when_scan_aborts(tmp_path):
     """A scan failure that surfaces only in the worker thread (e.g. the scan DB
     becoming unwritable in the race window after the synchronous preflight

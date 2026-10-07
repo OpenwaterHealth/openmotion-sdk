@@ -176,7 +176,7 @@ below.
 | `cancel_scan(**kw)` | Stop the running scan. |
 | `start_configure_camera_sensors(request) -> bool` | Program/enable cameras (see §4). |
 | `start_calibration(request) -> bool` / `start_test_scan(request)` | Calibration / validation (see §4). |
-| `apply_laser_power(*, force_fault=False) -> bool` | Write laser-driver config over I2C — a **cold-start prerequisite** for any laser scan (see §3). |
+| `apply_laser_power(*, force_fault=False) -> bool` | Write laser-driver config over I2C — a **cold-start prerequisite** for any laser scan (see §3) — then read back the safety limits; `False` on a failed write or a mismatch. |
 | `get_single_histogram(side, camera_id, test_pattern_id=4, auto_upload=True)` | One-shot histogram grab. |
 | `scan_workflow` | The `ScanWorkflow` instance (lazy). |
 | `calibration_workflow` / `contact_quality_workflow` | The other workflows (lazy; CQ shares the scan workflow). |
@@ -239,10 +239,24 @@ ok = iface.start_scan(request)   # -> bool
 ```
 
 Returns `False` (scan refused, never started) when a previous scan is still
-running **or** the configured scan DB fails its pre-flight open. When the DB is
-the only record (corrected CSV opt-in/off), this refusal is deliberate — it
-aborts before the laser fires rather than run a scan whose data is lost. The
-reason is on `scan_workflow.last_scan_error`.
+running, **or** the configured scan DB fails its pre-flight open, **or** the
+last laser safety-limit read-back failed (laser scans only; see below). When
+the DB is the only record (corrected CSV opt-in/off), the DB refusal is
+deliberate — it aborts before the laser fires rather than run a scan whose
+data is lost. The reason is on `scan_workflow.last_scan_error`.
+
+**Laser safety-limit read-back (sdk#310).** `apply_laser_power()` reads back
+every limit register it wrote on the Safety EE and OPT FPGAs and returns
+`False` if any write failed, any register is unreadable, or any value differs
+from what was written. The reason is left on `iface.console.laser_limits_error`
+(a string naming each failing register with its expected and read values;
+`None` once a load verifies clean). While it is set, `start_scan` refuses every
+scan with `disable_laser=False` (which includes contact-quality and calibration
+sub-scans), and `console.start_trigger()` raises `LaserSafetyLimitError`
+without sending anything. Disconnecting does not clear it; only a later
+`apply_laser_power()` that verifies clean does (in practice, the next
+reconnect once the register is fixed). Callers that never call
+`apply_laser_power()` are unaffected.
 
 ### Observing & finishing
 

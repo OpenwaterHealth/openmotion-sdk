@@ -87,6 +87,7 @@ from omotion.Calibration import (
     CALIBRATION_JSON_KEY,
 )
 from omotion.CommandError import CommandError
+from omotion.laser import LaserSafetyLimitError
 
 logger = logging.getLogger(f"{_log_root}.Console" if _log_root else "Console")
 
@@ -186,6 +187,12 @@ class MotionConsole(SignalWrapper):
         # Boot-time I2C health snapshot, populated at connection (None until
         # then, or if the device firmware predates the I2C-status command).
         self._i2c_health: Optional[dict] = None
+
+        # Why the laser safety limits are not verified, set and cleared by
+        # omotion.laser.apply_laser_power (sdk#310); None = verified, or no
+        # load has run. Kept across disconnects: only a later load that
+        # verifies clean clears it, and while it is set start_trigger refuses.
+        self.laser_limits_error: Optional[str] = None
 
     # ──────────────────────────────────────────────────────────────────
     # State (read-only from outside)
@@ -1408,9 +1415,14 @@ class MotionConsole(SignalWrapper):
             bool: True if the trigger was started successfully, False otherwise.
 
         Raises:
+            LaserSafetyLimitError: While ``laser_limits_error`` is set
+                (sdk#310); nothing is sent to the console.
             ValueError: If the UART is not connected.
             Exception: If an error occurs while starting the trigger.
         """
+        if self.laser_limits_error:
+            logger.error("start_trigger refused: %s", self.laser_limits_error)
+            raise LaserSafetyLimitError(self.laser_limits_error)
         try:
             if self.uart.demo_mode:
                 return True
