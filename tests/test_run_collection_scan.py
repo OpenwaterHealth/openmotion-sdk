@@ -88,3 +88,12 @@ def test_does_not_raise_on_refused_start_without_raise_on_error():
     run_collection_scan(sw, object(), subject_id="s", duration_sec=1,
                         left_camera_mask=1, right_camera_mask=0)  # no raise
     assert sw.await_timeouts  # still awaited
+
+
+def test_collection_scans_disable_camera_dropout_abort():
+    """Calibration and contact-quality sub-scans judge each camera
+    themselves, so the clinical dropout abort (#298) is off for them."""
+    sw = _FakeScanWorkflow()
+    run_collection_scan(sw, object(), subject_id="s", duration_sec=1,
+                        left_camera_mask=0x0F, right_camera_mask=0)
+    assert sw.requests[0].camera_dropout_abort_s is None

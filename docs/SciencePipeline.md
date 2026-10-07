@@ -103,6 +103,7 @@ Stages produce events when something doesn't fit cleanly into per-frame arrays. 
 | `FrameIdPacketAnomaly(...)` | `FrameClassificationStage` — packet frame_ids disagree with no strict majority; the inconsistent frames are quarantined per camera (§5.1) | `"diagnostics"` |
 | `FrameQuarantined(...)` | `FrameClassificationStage` — one row failed the counter/clock adjudication; includes packet, wire, prior absolute frame/clock anchor, step, elapsed-time, and reason evidence (§5.1) | `"diagnostics"` |
 | `CameraStreamGap(...)` | `FrameClassificationStage` — an enabled camera was absent from more than eight source packets, or subsequently resumed; includes side/camera, packet/timestamp bounds, state, and missed count (§5.1) | `"diagnostics"` |
+| `CameraDropoutTimeout(...)` | `FrameClassificationStage` — an enabled camera has been missing for `camera_dropout_abort_s` of packet time; once per camera per scan; ScanWorkflow aborts on it (§5.1) | `"diagnostics"` |
 | `TimestampRepairInputAnomaly(...)` | `TimestampRepairStage` — a packet timestamp was reused across captures (frozen clock); one event per (side, value) (§5.4) | `"diagnostics"` |
 | `FrameGapFillAnomaly(...)` | `TimestampRepairStage` — a per-camera abs_frame_id gap was back-filled with `nan_filled` placeholders (§5.4) | `"diagnostics"` |
 | `TerminalDarkResult(...)` | `DarkCorrectionStage.on_scan_stop` | `"diagnostics"` |
@@ -246,8 +247,18 @@ rows to that side's enabled mask. Eight consecutive missing captures produce
 no alert; the ninth emits one error-level log and a `CameraStreamGap` event
 with `state="missing"`. Continued absence is coalesced. The next row from that camera
 emits one recovery log and `CameraStreamGap(state="resumed")` with the total
-missed count. These are early observability signals only: the existing
-prolonged-loss/disconnect path remains responsible for halting the scan.
+missed count. These are observability signals only.
+
+**Camera dropout timeout (sdk#298).** When the factory is given
+`camera_dropout_abort_s` (ScanWorkflow passes `ScanRequest.camera_dropout_abort_s`,
+default 5 s), an alerted gap that has lasted that long in packet time
+(`timestamp_s - first_missing_timestamp_s`, not a frame count, so it holds at any
+trigger rate) emits one `CameraDropoutTimeout`. `never_delivered` says whether the
+camera produced any frame this scan. `CameraDropoutWatchdogSink` turns the first
+timeout into a scan abort. The reason is the corrected side average: its
+cross-camera watermark (§16) cannot advance past a silent camera, so without the
+abort every later side-average frame waits in memory until stop. A whole side
+going silent produces no packets and therefore no timeout (#192).
 
 Every rejection emits `FrameQuarantined`, is counted by reason (first example
 logged live, totals summarised at scan stop), and is labelled `"stale"`.
