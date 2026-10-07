@@ -271,7 +271,8 @@ class ScanDatabase:
         contrast: Optional[float] = None,
         mean: Optional[float] = None,
         temp: Optional[float] = None,
-        quality: str = "ok",
+        correction_status: str = "",
+        contact_quality: Optional[str] = None,
     ) -> int:
         # frame_id defaults to the "unknown" sentinel (-1) so callers from
         # before #92 Step F still work; new callers (ScanDBSink) pass the
@@ -282,9 +283,10 @@ class ScanDatabase:
             """
             INSERT INTO session_data (
                 session_id, cam_id, side,
-                frame_id, timestamp_s, bfi, bvi, contrast, mean, temp, quality
+                frame_id, timestamp_s, bfi, bvi, contrast, mean, temp,
+                correction_status, contact_quality
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 session_id,
@@ -297,7 +299,8 @@ class ScanDatabase:
                 contrast,
                 mean,
                 temp,
-                quality,
+                correction_status,
+                contact_quality,
             ),
         )
         self._connection().commit()
@@ -319,7 +322,8 @@ class ScanDatabase:
                     row.get("contrast"),
                     row.get("mean"),
                     row.get("temp"),
-                    row.get("quality", "ok"),
+                    row.get("correction_status", ""),
+                    row.get("contact_quality"),
                 )
             )
 
@@ -327,9 +331,10 @@ class ScanDatabase:
             """
             INSERT INTO session_data (
                 session_id, cam_id, side,
-                frame_id, timestamp_s, bfi, bvi, contrast, mean, temp, quality
+                frame_id, timestamp_s, bfi, bvi, contrast, mean, temp,
+                correction_status, contact_quality
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             params,
         )

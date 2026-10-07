@@ -210,14 +210,35 @@ def test_on_scan_stop_flushes_buffered_captures():
     assert frames[0].bfi == pytest.approx(4.0)  # both cams contributed
 
 
-def test_worst_contributing_quality_propagates():
+def test_contributing_correction_statuses_propagate_camera_tagged():
+    """The side average carries every contributing camera's correction,
+    tagged with the camera (bloodflow-app#589) — not just the worst one."""
     stage = _stage()
     good = _ef(12, 5.0, "left", 0, 2.0, 20.0)
     bad = _ef(12, 5.0, "left", 1, 6.0, 60.0)
     bad.quality = "nan_filled"
     b = _batch([_interval(10, 20, [good]), _interval(10, 20, [bad])])
     stage.process(b)
-    assert _avg_frames(b)[0].quality == "nan_filled"
+    assert _avg_frames(b)[0].quality == "l2:nan_filled"
+
+
+def test_clean_side_average_has_empty_correction_status():
+    stage = _stage()
+    b = _batch([_interval(10, 20, [_ef(12, 5.0, "left", 0, 2.0, 20.0)]),
+                _interval(10, 20, [_ef(12, 5.0, "left", 1, 6.0, 60.0)])])
+    stage.process(b)
+    assert _avg_frames(b)[0].quality == ""
+
+
+def test_side_average_lists_several_corrections():
+    stage = _stage()
+    a = _ef(12, 5.0, "left", 0, 2.0, 20.0)
+    a.quality = "ts_corrected"
+    c = _ef(12, 5.0, "left", 1, 6.0, 60.0)
+    c.quality = "nan_filled"
+    b = _batch([_interval(10, 20, [a]), _interval(10, 20, [c])])
+    stage.process(b)
+    assert _avg_frames(b)[0].quality == "l1:ts_corrected,l2:nan_filled"
 
 
 def test_reset_clears_pending_window():

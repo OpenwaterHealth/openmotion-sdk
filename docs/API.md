@@ -85,7 +85,8 @@ under a temp directory printed at connect time.)
 To view a finished scan, [`scripts/visualize_scan.py`](../scripts/visualize_scan.py)
 writes a single self-contained interactive HTML page — BFI / BVI / mean /
 contrast / temperature per camera with the per-side average overlaid, plus a
-quality flag on hover when the CSV carries one. Every panel shares one time
+per-camera status (contact quality and any corrections) on hover when the
+CSV carries it. Every panel shares one time
 axis, so zooming any panel moves them all, and clicking a camera in the legend
 hides it everywhere at once.
 
