@@ -152,6 +152,10 @@ OW_CMD_USR_CFG = 0x0A
 OW_CMD_DFU = 0x0D
 OW_CMD_NOP = 0x0E
 OW_CMD_RESET = 0x0F
+# Sensor-module persistent reset record: how the previous session ended (power
+# off, host reset, watchdog, fault ...), boots since power-on, uptime. Parsed by
+# omotion/reset_history.py. See openmotion-sensor-fw #137.
+OW_CMD_RESET_HISTORY = 0x10
 OW_CMD_I2C_BROADCAST = 0x06
 OW_CMD_DEBUG_FLAGS = 0x0C
 OW_CMD_I2C_STATUS = 0x0B
