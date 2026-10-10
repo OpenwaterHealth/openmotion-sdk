@@ -125,4 +125,4 @@ python -c "import usb, omotion.usb_backend as ub; print(ub.get_libusb1_backend()
 
 ## License
 
-AGPL-3.0.
+Apache-2.0.
