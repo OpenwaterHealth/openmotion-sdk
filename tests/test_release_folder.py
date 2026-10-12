@@ -99,6 +99,15 @@ def test_a_production_image_for_another_application_is_rejected(release, tmp_pat
         describe_images("console", release["console"]["app"], production=other)
 
 
+def test_a_damaged_application_is_reported_as_damaged_not_as_wrongly_signed(release):
+    path = release["sensor"]["app"]
+    data = bytearray(path.read_bytes())
+    data[0x400 + 10] ^= 0x01
+    path.write_bytes(bytes(data))
+    with pytest.raises(ImageRejectedError, match="FwTag"):
+        describe_images("sensor", path)
+
+
 def test_a_legacy_key_application_is_described_as_such(tmp_path, keys):
     app = tmp_path / "old-signed.bin"
     app.write_bytes(keys.signed("sensor", legacy=True, fw_version=10801))

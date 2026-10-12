@@ -1086,12 +1086,14 @@ def describe_images(kind, app: Path, updater: Path | None = None,
         out["app"] = "bare-metal image (not signed; only for a unit without a bootloader)"
     else:
         try:
-            info = verify_image(signed, public_key_pem(kind, legacy=False))
-            out["app"] = f"FwVersion {info.version_str}, signed for bootloader 1.2.0 or newer"
-        except ImageVerificationError:
-            info = verified(signed, True, Path(app).name)
+            info = verify_image(signed, public_key_pem(kind, legacy=True))
             out["app"] = (f"FwVersion {info.version_str}, signed for a bootloader older "
                           "than 1.2.0")
+        except ImageVerificationError:
+            # Not an old-bootloader image, so it has to be a good current one;
+            # its failure (wrong key, damaged body, ...) is the one to report.
+            info = verified(signed, False, Path(app).name)
+            out["app"] = f"FwVersion {info.version_str}, signed for bootloader 1.2.0 or newer"
 
     updater_bytes = None
     if updater is not None:
