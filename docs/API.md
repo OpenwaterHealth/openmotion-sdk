@@ -23,6 +23,7 @@ science of the pipeline) see [Architecture.md](./Architecture.md),
 7. [Signals & threading](#7-signals--threading)
 8. [Constants — `omotion.config`](#8-constants--omotionconfig)
 9. [Logging & versioning](#9-logging--versioning)
+10. [Firmware update](#10-firmware-update)
 
 ---
 
@@ -474,3 +475,59 @@ Debug flags are pushed to firmware with `MotionSensor.set_debug_flags(...)`.
 - `omotion.set_log_root("MyApp")` prefixes every SDK logger name (e.g.
   `MyApp.Console`). Call it before `start()`.
 - `omotion.__version__` is derived from git tags (`setuptools_scm`) — never hand-edited.
+
+---
+
+## 10. Firmware update
+
+`FirmwareUpdater.update()` is the one entry point. It asks the unit into DFU,
+works out what it is running, verifies every image on the host, and only then
+writes. It blocks until the application is back on USB (minutes on the
+bootloader paths), so call it from a worker thread with reconnection handling
+paused.
+
+```python
+from omotion import FirmwareUpdater, FirmwareKind, BootloaderChangeRequired
+
+updater = FirmwareUpdater()
+try:
+    result = updater.update(iface.console, "motion-console-fw-signed.bin",
+                            progress_cb=lambda p: print(p.phase, p.percent, p.message),
+                            kind=FirmwareKind.CONSOLE)
+except BootloaderChangeRequired as e:
+    print(e, e.needs)           # e.g. ("updater_image", "acknowledge_irreversible")
+```
+
+| Unit has | Default | With `acknowledge_irreversible=True` |
+|---|---|---|
+| Bootloader 1.2.0 or newer | Signed application into the slot (`0x08020000`). | Same. |
+| Older bootloader (console 1.0.0, sensor 1.0.0/1.1.0) | A signed application the old bootloader accepts (legacy key). A current application raises `BootloaderChangeRequired`. | With `updater_image`: installs the bootloader updater, waits for bootloader 1.2.0, then installs the application. |
+| No bootloader (STM32 ROM loader) | Bare-metal application at `0x08000000`. A signed application raises `BootloaderChangeRequired`. | With `production_image`: writes bootloader + application. |
+| Unrecognised DFU device or bootloader version | Refuses; nothing is written. | Same. |
+
+- **Images are paths you supply.** The firmware releases the SDK downloads
+  (`check_latest` / `download_firmware`) hold the application images. The
+  bootloader updater is not in those releases; obtain it from the firmware
+  team's artifact store. For the console, the `1.8.99` updater build in the
+  bucket is broken: use `1.8.98`.
+- **Replacing or installing a bootloader cannot be undone over USB.** The unit
+  must stay powered and plugged in while it runs; a failure while sector 0 is
+  rewritten needs bench recovery (SWD). Afterwards the unit only accepts images
+  signed for bootloader 1.2.0. An application that must never do this (the
+  bloodflow app) simply never passes `acknowledge_irreversible`.
+- **`kind`** selects which product's keys the images are checked against. It is
+  inferred from a downloaded file or the device handle; pass it for a file you
+  picked yourself.
+- **`handle=None`** resumes a unit that is already in DFU after an interrupted
+  run. Otherwise exactly one DFU device may be attached.
+- The result is a `FirmwareUpdateResult`: `action` (`UpdateAction`), bootloader
+  versions before and after, `app_reenumerated`, and `needs_power_cycle` (a
+  sensor without a bootloader can hang after the ROM loader's jump until it is
+  power-cycled).
+- Windows needs the DFU device (`0483:DF11`) bound to WinUSB, as before; see
+  `winusb-driver/`.
+- From the command line: `python scripts/update_firmware.py <console|left|right>
+  --release-dir <folder>` picks the signed application, the bootloader updater
+  and the production image for the device out of a release folder by name and
+  runs the update. Add `--acknowledge-irreversible` to allow a bootloader to be
+  installed or replaced.

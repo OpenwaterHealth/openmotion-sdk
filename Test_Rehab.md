@@ -83,7 +83,7 @@ The stage-based BFI/BVI computation engine.
 
 ### 11. Programming / Firmware Update
 - **`FPGAProgrammer.py`** — Page-by-page Lattice XO2 flash over I2C.
-- **`DFUProgrammer.py`** — STM32 DFU over USB (uses vendored `dfu-util`).
+- **`dfu/`** — STM32 DFU over USB in pure Python (pyusb): DfuSe protocol, signed-image pre-flight, bootloader migration steps. Driven by `firmware_update.py`.
 - **`jedecParser.py`** — JEDEC file parser for FPGA bitstreams.
 
 ### 12. Storage / Playback
@@ -133,7 +133,7 @@ The stage-based BFI/BVI computation engine.
 | `test_reduced_mode.py` | Reduced mode | Yes |
 | `test_run_collection_scan.py` | Scan workflow | Yes |
 | `test_sequences.py` | Sequences | Yes |
-| `test_wheel_dfu.py` | DFU/packaging | No |
+| `test_dfu_*.py`, `test_firmware_update*.py`, `test_no_dfu_util.py` | DFU / firmware update | No |
 | `test_zz_dfu.py` | DFU | Yes |
 | `test_pipeline/` (28 files) | Pipeline (all stages, sinks, sources, runner, factory) | No |
 

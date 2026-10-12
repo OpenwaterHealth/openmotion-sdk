@@ -19,8 +19,9 @@ macOS provides native support for the OpenMotion hardware through IOKit:
     No driver needed — macOS includes a built-in CDC/ACM driver.
 
   DFU Bootloader (VID 0x0483, PID 0xDF11)
-    Standard STM32 DFU mode. Use dfu-util for firmware updates:
-      brew install dfu-util
+    Standard STM32 DFU mode. Firmware updates go through the SDK
+    (omotion.FirmwareUpdater), which needs libusb:
+      brew install libusb
 
 Application Data
 ----------------
