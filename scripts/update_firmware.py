@@ -138,6 +138,13 @@ def parse_cli() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _quiet_connection_warnings() -> None:
+    """The connection monitor reports every device that drops off USB while the
+    target (and, for the console, both sensors with it) restarts. Expected
+    here, and it buries the progress lines."""
+    logging.getLogger().setLevel(logging.ERROR)
+
+
 def _wait_connected(handle, timeout_s: float) -> bool:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -192,9 +199,7 @@ def main() -> int:
         print(f"[FAIL]  Cannot enumerate USB: {exc}")
         return 1
 
-    # The connection monitor reports every device that drops off USB while the
-    # target (and, for the console, both sensors with it) restarts.
-    logging.getLogger().setLevel(logging.ERROR)
+    _quiet_connection_warnings()
 
     print("[*] Starting MOTION interface ...")
     interface = MotionInterface()

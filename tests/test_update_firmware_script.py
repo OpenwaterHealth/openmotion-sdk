@@ -153,6 +153,8 @@ def run(monkeypatch, release_dir):
     monkeypatch.setattr(mod.STM32DFU, "list_devices", classmethod(lambda cls: []))
     monkeypatch.setattr(mod, "stlink_probes", lambda: 0)
     monkeypatch.setattr(mod.time, "sleep", lambda s: None)
+    # main() lowers the root log level for the run; not in the test process.
+    monkeypatch.setattr(mod, "_quiet_connection_warnings", lambda: None)
 
     def _run(*argv, probes=0, dfu_devices=()):
         monkeypatch.setattr(mod, "stlink_probes", lambda: probes)
