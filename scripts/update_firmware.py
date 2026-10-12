@@ -37,6 +37,7 @@ from omotion import (
     MotionInterface,
 )
 from omotion.dfu import STM32DFU, DFUProgress
+from omotion.firmware_update import find_release_images, stlink_probes
 
 # Devices enumerate asynchronously after MotionInterface.start(); how long to
 # wait before declaring the target absent.
@@ -45,8 +46,8 @@ STARTUP_TIMEOUT_S = 20.0
 # has seen it back on USB.
 RECONNECT_TIMEOUT_S = 45.0
 
-# What each image is called in a release folder: (role, word in the file name).
-_ROLES = (("app", "signed"), ("updater", "updater"), ("production", "production"))
+# The images an update can use, in the order they are listed.
+_ROLES = ("app", "updater", "production")
 
 # update() argument -> the flag that supplies it.
 _FLAG_FOR = {
@@ -55,58 +56,10 @@ _FLAG_FOR = {
     "acknowledge_irreversible": "--acknowledge-irreversible",
 }
 
-# ST-LINK debug probes (VID 0483). One wired to the board can disturb a
-# bootloader rewrite, so the irreversible paths refuse to start with one on USB.
-_STLINK_PIDS = frozenset(
-    {0x3744, 0x3748, 0x374A, 0x374B, 0x374D, 0x374E, 0x374F, 0x3752, 0x3753, 0x3754, 0x3757}
-)
-
 
 def product_of(device: str) -> str:
     """ "console" for the console, "sensor" for either sensor."""
     return "console" if device == "console" else "sensor"
-
-
-def find_release_images(release_dir: Path, product: str) -> dict:
-    """The images for ``product`` in ``release_dir``: role -> path.
-
-    A file belongs to a role when its name carries the product and the role's
-    word (signed / updater / production). Raises ``ValueError`` when a role
-    matches more than one file: guessing between two images is not acceptable
-    for a step that cannot be undone.
-    """
-    found = {}
-    for role, word in _ROLES:
-        matches = sorted(
-            p for p in Path(release_dir).glob("*.bin")
-            if product in p.name.lower() and word in p.name.lower()
-            # An updater is a signed image too; it is not the application.
-            and not (role == "app" and "updater" in p.name.lower())
-        )
-        if len(matches) > 1:
-            raise ValueError(
-                f"{release_dir} holds {len(matches)} {product} {word} images: "
-                + ", ".join(p.name for p in matches)
-            )
-        if matches:
-            found[role] = matches[0]
-    return found
-
-
-def stlink_probes() -> int:
-    """How many ST-LINK probes are on USB (0 if USB cannot be enumerated)."""
-    try:
-        import usb.core
-
-        from omotion.usb_backend import get_libusb1_backend
-
-        return sum(
-            1 for d in usb.core.find(find_all=True, idVendor=0x0483,
-                                     backend=get_libusb1_backend()) or []
-            if d.idProduct in _STLINK_PIDS
-        )
-    except Exception:
-        return 0
 
 
 class _Status:
@@ -222,7 +175,7 @@ def main() -> int:
         return 1
 
     print(f"[*] Updating the {label}")
-    for role, _word in _ROLES:
+    for role in _ROLES:
         print(f"      {role:10s}: {images.get(role, '-')}")
     print(f"      bootloader changes allowed: {'YES' if args.acknowledge_irreversible else 'no'}")
 

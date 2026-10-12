@@ -1006,3 +1006,130 @@ def _starts_with_sfu_magic(path: Path) -> bool:
             return f.read(4) == SFUMAGIC
     except OSError:
         return False
+
+
+# ---------------------------------------------------------------------------
+# Release folders
+#
+# The images for one update, picked out of a folder and checked on the host.
+# Shared by scripts/update_firmware.py and the test app, so that both pick the
+# same files and say the same things about them before anything is flashed.
+# ---------------------------------------------------------------------------
+
+# What each image is called in a release folder: (role, word in the file name).
+_RELEASE_ROLES = (("app", "signed"), ("updater", "updater"), ("production", "production"))
+
+# ST-LINK debug probes (VID 0483). One wired to the board can disturb a
+# bootloader rewrite.
+_STLINK_PIDS = frozenset(
+    {0x3744, 0x3748, 0x374A, 0x374B, 0x374D, 0x374E, 0x374F, 0x3752, 0x3753, 0x3754, 0x3757}
+)
+
+
+def find_release_images(release_dir: Path, kind) -> dict[str, Path]:
+    """The images for ``kind`` in ``release_dir``, as ``{"app": ..., "updater":
+    ..., "production": ...}`` with absent roles left out.
+
+    A ``.bin`` belongs to a role when its name carries the product (console /
+    sensor) and the role's word: ``signed`` for the application, ``updater``
+    for the bootloader updater, ``production`` for the bootloader + application
+    image. Raises ``ValueError`` when a role matches more than one file:
+    guessing between two images is not acceptable for a step that cannot be
+    undone.
+    """
+    product = FirmwareKind(getattr(kind, "value", kind)).value
+    found: dict[str, Path] = {}
+    for role, word in _RELEASE_ROLES:
+        matches = sorted(
+            p for p in Path(release_dir).glob("*.bin")
+            if product in p.name.lower() and word in p.name.lower()
+            # An updater is a signed image too; it is not the application.
+            and not (role == "app" and "updater" in p.name.lower())
+        )
+        if len(matches) > 1:
+            raise ValueError(
+                f"{release_dir} holds {len(matches)} {product} {word} images: "
+                + ", ".join(p.name for p in matches)
+            )
+        if matches:
+            found[role] = matches[0]
+    return found
+
+
+def describe_images(kind, app: Path, updater: Path | None = None,
+                    production: Path | None = None) -> dict[str, str]:
+    """Check one update's images on the host and say what each one is.
+
+    Returns ``{role: description}`` for the images given, e.g. ``"FwVersion
+    10802 (1.8.2), signed for bootloader 1.2.0 or newer"``. Raises
+    :class:`ImageRejectedError` for an image that is for another product, is
+    signed for the wrong bootloader generation, is damaged, or does not belong
+    with the others. Touches no device: this is what a UI shows the operator
+    before asking for confirmation. :meth:`FirmwareUpdater.update` repeats the
+    checks before it writes.
+    """
+    kind = FirmwareKind(getattr(kind, "value", kind))
+    out: dict[str, str] = {}
+
+    def verified(image: bytes, legacy: bool, what: str):
+        try:
+            return verify_image(image, public_key_pem(kind, legacy=legacy))
+        except ImageVerificationError as e:
+            hint = FirmwareUpdater._signed_for(image, exclude=(kind, legacy))
+            raise ImageRejectedError(
+                f"{what} rejected: {e}" + (f" (it is signed for {hint})" if hint else "")
+            ) from e
+
+    app_bytes = _read_image(app, "application image")
+    signed = app_bytes if app_bytes[:4] == SFUMAGIC else None
+    if signed is None:
+        out["app"] = "bare-metal image (not signed; only for a unit without a bootloader)"
+    else:
+        try:
+            info = verify_image(signed, public_key_pem(kind, legacy=False))
+            out["app"] = f"FwVersion {info.version_str}, signed for bootloader 1.2.0 or newer"
+        except ImageVerificationError:
+            info = verified(signed, True, Path(app).name)
+            out["app"] = (f"FwVersion {info.version_str}, signed for a bootloader older "
+                          "than 1.2.0")
+
+    updater_bytes = None
+    if updater is not None:
+        updater_bytes = _read_image(updater, "updater image")
+        info = verified(updater_bytes, True, f"updater image {Path(updater).name}")
+        out["updater"] = (f"FwVersion {info.version_str}, signed for a bootloader older "
+                          "than 1.2.0 (which runs it)")
+
+    if production is not None:
+        production_bytes = _read_image(production, "production image")
+        try:
+            bootloader = migration.check_production_image(
+                production_bytes, signed=signed, updater=updater_bytes)
+        except ImageVerificationError as e:
+            raise ImageRejectedError(f"{Path(production).name} rejected: {e}") from e
+        info = verified(production_bytes[migration.BOOTLOADER_LEN:], False,
+                        f"application in {Path(production).name}")
+        out["production"] = (f"bootloader ({len(bootloader)} B) + application FwVersion "
+                             f"{info.version_str}")
+    return out
+
+
+def stlink_probes() -> int:
+    """How many ST-LINK debug probes are on USB; 0 if USB cannot be enumerated.
+
+    A probe wired to the board must be unplugged while a bootloader is
+    installed or replaced. This cannot tell which board a probe is wired to, so
+    callers refuse on any.
+    """
+    try:
+        import usb.core
+
+        from omotion.usb_backend import get_libusb1_backend
+
+        return sum(
+            1 for d in usb.core.find(find_all=True, idVendor=_ST_VID,
+                                     backend=get_libusb1_backend()) or []
+            if d.idProduct in _STLINK_PIDS
+        )
+    except Exception:
+        return 0
