@@ -508,8 +508,9 @@ except BootloaderChangeRequired as e:
 - **Images are paths you supply.** The firmware releases the SDK downloads
   (`check_latest` / `download_firmware`) hold the application images. The
   bootloader updater is not in those releases; obtain it from the firmware
-  team's artifact store. For the console, the `1.8.99` updater build in the
-  bucket is broken: use `1.8.98`.
+  team's artifact store. Use the `1.8.97` build for both the console and the
+  sensor: it embeds the released bootloader 1.2.0. The `1.8.98` and `1.8.99`
+  builds in the bucket embed bootloader 1.2.0-rc.1 and must not be used.
 - **Replacing or installing a bootloader cannot be undone over USB.** The unit
   must stay powered and plugged in while it runs; a failure while sector 0 is
   rewritten needs bench recovery (SWD). Afterwards the unit only accepts images
