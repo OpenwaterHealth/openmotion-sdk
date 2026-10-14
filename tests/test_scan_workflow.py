@@ -707,6 +707,108 @@ def test_console_disconnect_mid_scan_emits_trigger_off():
         wf.cancel_scan(join_timeout=5.0)
 
 
+# ---------------------------------------------------------------------------
+# Stop during the worker's pre-flight (sdk#318)
+# ---------------------------------------------------------------------------
+#
+# The app's Stop calls cancel_scan() while the scan worker may still be in its
+# pre-flight. cancel_scan's stop_trigger used to reach the console BEFORE the
+# worker's start_trigger, so the trigger and laser ran on after Stop and the
+# terminal fsync count named a lit frame (bloodflow-app#726).
+
+def _trigger_states(collector):
+    from omotion.pipeline.batch import TriggerStateEvent
+    return [e.state for e in collector.events
+            if isinstance(e, TriggerStateEvent)]
+
+
+def _stop_during_preflight(motion, collector, *, hold_in):
+    """Start a scan through the active-sensor pre-flight with the hardware
+    stubbed, and call cancel_scan() while the worker is held inside
+    `hold_in` ("enable_camera" or "start_trigger") until the cancel has been
+    requested. Returns the order in which "start", "stop" and "fsync" (the
+    terminal count read) reached the console."""
+    wf = motion.scan_workflow
+    calls = []
+    reached = threading.Event()
+
+    def _hold(name):
+        if name != hold_in:
+            return
+        reached.set()
+        deadline = time.monotonic() + 5.0
+        while not wf._cancel_requested and time.monotonic() < deadline:
+            time.sleep(0.005)
+        if name == "start_trigger":
+            # Stay in the call long enough for cancel_scan to reach its
+            # stop_trigger; before sdk#318 it went straight to the console.
+            time.sleep(0.1)
+
+    def _run_on_sensors(cmd, *args, **kwargs):
+        _hold(cmd)
+        return True
+
+    def _start_trigger(*args, **kwargs):
+        _hold("start_trigger")
+        calls.append("start")
+
+    def _fsync_count():
+        calls.append("fsync")
+        return 14
+
+    def _factory(*, console, left, right, batch_size_frames, metadata):
+        return _MockSource(metadata=metadata)
+
+    request = ScanRequest(
+        subject_id="x", duration_sec=30,
+        left_camera_mask=0xFF, right_camera_mask=0, reduced_mode=False,
+        skip_default_storage=True, sinks=[collector],
+    )
+    fake_side = ("left", 0xFF, mock.MagicMock())
+    with mock.patch("omotion.pipeline.sources.LiveUsbSource", _factory), \
+         mock.patch.object(wf, "_resolve_active_sides", return_value=[fake_side]), \
+         mock.patch.object(wf, "_scan_subscribe_state", lambda handles: None), \
+         mock.patch.object(motion, "run_on_sensors", side_effect=_run_on_sensors), \
+         mock.patch.object(motion.console, "set_trigger_json", return_value=True), \
+         mock.patch.object(motion.console, "start_trigger", side_effect=_start_trigger), \
+         mock.patch.object(motion.console, "stop_trigger",
+                           side_effect=lambda *a, **k: calls.append("stop")), \
+         mock.patch.object(motion.console, "get_fsync_pulsecount",
+                           side_effect=_fsync_count):
+        assert wf.start_scan(request)
+        assert reached.wait(5.0), f"worker never reached {hold_in}"
+        wf.cancel_scan(join_timeout=5.0)
+        assert not wf.running, "worker did not finish after cancel"
+    return calls
+
+
+def test_stop_during_preflight_never_starts_the_trigger():
+    """A Stop while the worker is still enabling cameras must end the scan
+    before the trigger starts."""
+    motion = _build_motion_with_data_dir(None)
+    collector = _DiagnosticsCollector()
+
+    calls = _stop_during_preflight(motion, collector, hold_in="enable_camera")
+
+    assert "start" not in calls, f"trigger started after Stop: {calls}"
+    states = _trigger_states(collector)
+    assert "ON" not in states
+    assert states[-1] == "OFF"
+
+
+def test_stop_while_the_trigger_starts_stops_it_afterwards():
+    """A Stop that arrives while start_trigger is in flight must wait for it,
+    then stop the trigger, and read the terminal count after that stop."""
+    motion = _build_motion_with_data_dir(None)
+    collector = _DiagnosticsCollector()
+
+    calls = _stop_during_preflight(motion, collector, hold_in="start_trigger")
+
+    assert calls.index("start") < calls.index("stop") < calls.index("fsync"), \
+        f"stop did not follow the trigger start: {calls}"
+    assert _trigger_states(collector)[-1] == "OFF"
+
+
 def test_telemetry_csv_logs_converted_tec_engineering_units():
     """The per-scan telemetry CSV records converted TEC engineering units
     (measured/setpoint temperature in °C, current in A, voltage in V) alongside
