@@ -4,6 +4,7 @@ import numpy as np
 
 CSV_FILE = "histogram.csv"
 NUM_BINS = 1024
+BIN_COLS = [str(i) for i in range(NUM_BINS)]
 GRID_ROWS = 4
 GRID_COLS = 2
 
@@ -22,7 +23,7 @@ def plot_histogram_spectrograms(df):
         cam_df = df[df['cam_id'] == cam_id].sort_values("frame_id")
 
         # Extract just the bin data into a 2D array: rows = frames, cols = bins
-        histo_matrix = cam_df.iloc[:, 2:2+NUM_BINS].to_numpy()
+        histo_matrix = cam_df[BIN_COLS].to_numpy()
 
         # Plot as spectrogram-like image
         im = ax.imshow(

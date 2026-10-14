@@ -208,16 +208,25 @@ next clock anchor. Each frame's
    step (slack: 12 ms or 10 % of the claimed duration, whichever is larger).
    This admits bounded real packet loss but rejects a shared off-by-one frame
    id whose timestamp stayed on the ordinary cadence.
-4. **Forward step > 8** → the first returning row is quarantined even if its
-   timestamp agrees, and is held only as an isolated resynchronization
-   candidate only when the source-packet delivery monitor independently saw
-   that enabled camera disappear for more than eight captures and then
-   return. If the next row advances by exactly one frame and 25 ms, the pair
-   supplies enough evidence to re-anchor the resumed camera. Otherwise
-   the candidate is discarded and the prior accepted state remains intact.
-   This prevents one jointly corrupted counter/timestamp pair (for example
-   `frame_id +64`, `timestamp +1.6 s`) from shifting the epoch permanently,
-   while allowing a real camera outage to recover without wedging the scan.
+4. **Forward step > 8, or any step the clock contradicts** → quarantined. If
+   the device clock places the frame at an absolute id whose low byte is its
+   wire id (`clock_abs + round(elapsed / 25 ms)`, ±1 for crystal drift over
+   long gaps), that id is held as a resynchronization candidate. If the next
+   row advances by exactly one frame and 25 ms, the stream re-anchors there
+   with the epoch taken from the clock; otherwise the candidate is discarded
+   and the prior accepted state remains intact. A corrupted frame id fails the
+   first test (its low byte won't match the clock); one jointly corrupted
+   counter/timestamp pair (for example `frame_id +64`, `timestamp +1.6 s`)
+   fails the second, because the next clean row doesn't continue it. A real
+   gap of any length, one camera or a whole module, passes both, and only
+   its first resumed row is lost. Before #286 this path also required the
+   source-packet delivery monitor to have seen that camera go missing, which
+   a whole-module gap never shows (there are no packets at all), so a
+   module-wide skip of more than eight frames locked the side out until the
+   8-bit id wrapped (6.4 s) and left its absolute ids 256 low for the rest of
+   the scan. The epoch also comes from the clock for gaps past 127 frames,
+   which the 8-bit id alone cannot express (a gap of 256·n + 1 frames reads
+   as a single +1 step).
 
 There is an unavoidable boundary: a small counter jump (2–8) accompanied by
 the exactly matching clock jump is indistinguishable from real bounded packet
@@ -670,6 +679,8 @@ The runner consumes `for batch in source`, so any object that yields `FrameBatch
 
 Per-side packet queues feed per-side reader threads that run `omotion.MotionProcessing.parse_histogram_stream`. Its packet callback assigns one per-side packet ordinal to all samples in the parsed packet. Complete packets accumulate into `FrameBatch`es (default `batch_size_frames=10`, with a `flush_interval_s=0.25` time-based flush) and are pushed to a shared batch queue that the runner iterates; a batch boundary never splits a packet.
 
+The runner runs every stage and sink inline, so while it is busy (a dark-interval close with its DB writes, a GC pause, a slow disk) nothing drains the queues behind it. Each per-side packet queue therefore holds `PACKET_BUFFER_SECONDS` (10 s) of raw USB reads, sized for uncompressed packets, so a stall backs up there instead of stopping the USB reads; the sensor itself buffers only ~5 frames. Each side logs the queue's high-water mark when streaming stops and warns once it passed half full (#116).
+
 `close()` follows a strict shutdown sequence to avoid losing the firmware's terminal dark frame:
 
 1. `stop_streaming()` + `drain_final()` on each side's `StreamInterface`. Drained chunks are pushed into the per-side packet queue while the parser thread is still running, so the parser consumes them on its next iteration.
@@ -679,7 +690,7 @@ Per-side packet queues feed per-side reader threads that run `omotion.MotionProc
 
 ### 7.2 CsvReplaySource
 
-**Used by:** offline analysis, regression testing, the `view_corrected_scan.py` script.
+**Used by:** offline analysis and regression testing. (To *look at* a scan rather than re-run the pipeline over it, use `scripts/visualize_scan.py`, which reads the finished CSVs directly.)
 
 Replays a raw-histogram CSV produced by `CsvSink` (one CSV per side, optionally one or both). Schema: `cam_id, frame_id, timestamp_s, type, 0..1023, temperature, sum, tcm, tcl, pdc`. Yields `FrameBatch`es of `batch_size_frames` (default 100) per side, in order. Because the legacy schema has no packet-id column, replay reconstructs packet boundaries in row order: a timestamp change or repeated camera starts the next packet. The repeated-camera rule preserves boundaries during a timestamp freeze.
 

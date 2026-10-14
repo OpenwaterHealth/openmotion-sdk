@@ -82,13 +82,27 @@ python scripts/sdk_examples.py                  # all of the above, one connecti
 hardware. `--duration` (seconds) applies to `scan` / `test-scan`. Output lands
 under a temp directory printed at connect time.)
 
-To plot a finished scan, [`scripts/visualize_scan.py`](../scripts/visualize_scan.py)
-renders BFI / BVI / mean / contrast over time (16 cameras, per-side average bold)
-from the corrected CSV the `scan` example writes:
+To view a finished scan, [`scripts/visualize_scan.py`](../scripts/visualize_scan.py)
+writes a single self-contained interactive HTML page — BFI / BVI / mean /
+contrast / temperature per camera with the per-side average overlaid, plus a
+quality flag on hover when the CSV carries one. Every panel shares one time
+axis, so zooming any panel moves them all, and clicking a camera in the legend
+hides it everywhere at once.
+
+It accepts any CSV the current app writes — the corrected CSV the `scan`
+example produces, a History → Export CSV, a reduced (clinical side-average)
+CSV, a raw-histogram CSV (reduced to per-camera image mean and standard
+deviation), and the console telemetry CSV. Pass more than one to overlay them
+on the same axis:
 
 ```
-python scripts/visualize_scan.py --csv <scan_id>_<subject>.csv   # -> <stem>_viz.png
+python scripts/visualize_scan.py <scan_id>_<subject>.csv          # -> <stem>_viz.html
+python scripts/visualize_scan.py <scan>.csv <scan>_telemetry.csv  # overlaid
+python scripts/visualize_scan.py <folder>                         # newest of each kind
 ```
+
+Requires the `viz` extra (`pip install -e ".[viz]"`). Legacy CSV layouts that
+predate the current pipeline are rejected by name rather than mis-parsed.
 
 ---
 
@@ -162,7 +176,7 @@ below.
 | `cancel_scan(**kw)` | Stop the running scan. |
 | `start_configure_camera_sensors(request) -> bool` | Program/enable cameras (see §4). |
 | `start_calibration(request) -> bool` / `start_test_scan(request)` | Calibration / validation (see §4). |
-| `apply_laser_power(*, force_fault=False) -> bool` | Write laser-driver config over I2C — a **cold-start prerequisite** for any laser scan (see §3). |
+| `apply_laser_power(*, force_fault=False) -> bool` | Write laser-driver config over I2C — a **cold-start prerequisite** for any laser scan (see §3) — then read back the safety limits; `False` on a failed write or a mismatch. |
 | `get_single_histogram(side, camera_id, test_pattern_id=4, auto_upload=True)` | One-shot histogram grab. |
 | `scan_workflow` | The `ScanWorkflow` instance (lazy). |
 | `calibration_workflow` / `contact_quality_workflow` | The other workflows (lazy; CQ shares the scan workflow). |
@@ -225,10 +239,24 @@ ok = iface.start_scan(request)   # -> bool
 ```
 
 Returns `False` (scan refused, never started) when a previous scan is still
-running **or** the configured scan DB fails its pre-flight open. When the DB is
-the only record (corrected CSV opt-in/off), this refusal is deliberate — it
-aborts before the laser fires rather than run a scan whose data is lost. The
-reason is on `scan_workflow.last_scan_error`.
+running, **or** the configured scan DB fails its pre-flight open, **or** the
+last laser safety-limit read-back failed (laser scans only; see below). When
+the DB is the only record (corrected CSV opt-in/off), the DB refusal is
+deliberate — it aborts before the laser fires rather than run a scan whose
+data is lost. The reason is on `scan_workflow.last_scan_error`.
+
+**Laser safety-limit read-back (sdk#310).** `apply_laser_power()` reads back
+every limit register it wrote on the Safety EE and OPT FPGAs and returns
+`False` if any write failed, any register is unreadable, or any value differs
+from what was written. The reason is left on `iface.console.laser_limits_error`
+(a string naming each failing register with its expected and read values;
+`None` once a load verifies clean). While it is set, `start_scan` refuses every
+scan with `disable_laser=False` (which includes contact-quality and calibration
+sub-scans), and `console.start_trigger()` raises `LaserSafetyLimitError`
+without sending anything. Disconnecting does not clear it; only a later
+`apply_laser_power()` that verifies clean does (in practice, the next
+reconnect once the register is fixed). Callers that never call
+`apply_laser_power()` are unaffected.
 
 ### Observing & finishing
 
@@ -336,7 +364,9 @@ Key read methods:
 | `iter_sessions()` / `stream_sessions(batch_size=100)` | All sessions, oldest first. |
 | `get_session(id)` / `get_session_by_label(label)` | One session. |
 | `iter_session_data(session_id, side=None, cam_id=None, t_lo=None, t_hi=None)` | Per-frame BFI/BVI/mean/contrast/temp; optional side/camera/time-range filters. |
-| `iter_raw_frames(...)` / `get_raw_frame(id)` | Raw histograms (only if `write_raw_to_db`). |
+
+Raw histograms are not stored in `ScanDatabase`; the raw CSVs written by
+`CsvSink` from the pipeline's `Tee("raw")` are the only raw record.
 
 **`session_data` layout:** `cam_id` 0..7 are per-camera rows (normal mode);
 `cam_id = -1` is the reduced-mode dark-corrected **per-side average** (one per

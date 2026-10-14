@@ -22,6 +22,7 @@ pytest tests/test_pipeline/                          # pure-software pipeline te
 - Python **3.12+**. Version is computed from git tags via `setuptools_scm` — never edit a version string by hand. To cut a release, tag and push. Tags use **semantic versioning** (`MAJOR.MINOR.PATCH`, e.g. `1.6.0`, `1.6.0-rc.1`).
 - No Makefile, no pre-commit, no lint/format/type-check configured. If you reach for `black`/`ruff`/`mypy`, they aren't wired up here.
 - `dfu-util` binaries are vendored under `omotion/dfu-util/` and shipped with the wheel (see `pyproject.toml` `[tool.setuptools.package-data]`).
+- **libusb ships as exactly four DLLs, all libusb ≥ 1.0.30** (#305): `omotion/_vendor/libusb/windows/{x64,x86}` (VS2022 builds, loaded by pyusb) and `omotion/dfu-util/{win64,win32}` (MinGW builds, loaded by `dfu-util.exe` from its own directory). Source and update steps: `omotion/_vendor/libusb/README.txt`. `tests/test_vendored_libusb.py` fails on an older DLL or on any other libusb binary (static lib, `*-static` tool, dylib) in the package. The macOS `dfu-util` links Homebrew's libusb by absolute path.
 - The laser-driver register baseline (`LASER_PARAMS`, `LASER_PARAMS_FAULT`) and the FPGA register map (`FPGA_MODEL`) are **Python modules** under `omotion/data/`, not data files (#278: nothing editable ships next to the compiled app). `omotion.laser.load_laser_params()` / `FpgaMap()` return deep copies. Locked baseline — loop in the firmware/laser owners before changing a value.
 
 ## Layout
@@ -63,7 +64,7 @@ Signals are `pyqtSignal` when PyQt is importable, otherwise a fallback `MotionSi
 
 - `MotionInterface(demo_mode=True)` **or** `OPENMOTION_DEMO=1` — skips device discovery, generates fake data. The first thing to reach for if a script is hanging on enumeration. (Note: the *new pipeline* scan path does not yet support demo mode end-to-end — demo sensors have no real `uart`, so a full `start_scan` in demo mode will not stream. Demo mode is for discovery/connection-level work.)
 - Pure-software tests that run anywhere: the entire `tests/test_pipeline/` suite, plus `test_calibration_workflow_compute.py`, `test_contact_quality_workflow.py`, `test_scan_database.py`, `test_console_telemetry_unit.py`, `test_pedestal_height.py`. Run them with `pytest -m "not console and not sensor and not destructive"`.
-- Pure-software scripts: `scripts/test_jed_parser.py`, `scripts/test_github_release.py`, `scripts/run_pipeline_csv_tests.py`, `scripts/plot_telemetry.py`, `scripts/view_corrected_scan.py`.
+- Pure-software scripts: `scripts/test_jed_parser.py`, `scripts/test_github_release.py`, `scripts/run_pipeline_csv_tests.py`, `scripts/visualize_scan.py` (the one scan/telemetry CSV viewer — needs the `viz` extra), `scripts/plot_dark_drift.py`.
 
 ## Running a scan end-to-end (headless)
 

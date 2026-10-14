@@ -40,7 +40,8 @@ ELECTRON_WELL_CAPACITY: int = 11_000
 # Per-camera analog gain for the 8 cameras in a sensor module, indexed by
 # cam_id % 8. Outer positions (0, 7) use higher gain to compensate for the
 # reduced illumination at the array periphery. Used by ShotNoiseCorrectionStage
-# and DarkCorrectionStage's enrichment path; see SciencePipeline.md §8.3.
+# on both the realtime and batched (interval) paths; see SciencePipeline.md
+# §5.8.5 (batched enrichment) and §5.9 ShotNoiseCorrectionStage.
 CAMERA_GAIN_MAP: np.ndarray = np.array(
     [16, 4, 2, 1, 1, 2, 4, 16], dtype=np.float32
 )
@@ -152,6 +153,10 @@ OW_CMD_USR_CFG = 0x0A
 OW_CMD_DFU = 0x0D
 OW_CMD_NOP = 0x0E
 OW_CMD_RESET = 0x0F
+# Sensor-module persistent reset record: how the previous session ended (power
+# off, host reset, watchdog, fault ...), boots since power-on, uptime. Parsed by
+# omotion/reset_history.py. See openmotion-sensor-fw #137.
+OW_CMD_RESET_HISTORY = 0x10
 OW_CMD_I2C_BROADCAST = 0x06
 OW_CMD_DEBUG_FLAGS = 0x0C
 OW_CMD_I2C_STATUS = 0x0B
@@ -195,8 +200,6 @@ OW_CTRL_I2C_WR = 0x1A
 OW_CTRL_GET_FSYNC = 0x1B
 OW_CTRL_GET_LSYNC = 0x1C
 OW_CTRL_TEC_DAC = 0x1D
-OW_CTRL_READ_ADC = 0x1E
-OW_CTRL_READ_GPIO = 0x1F
 OW_CTRL_GET_TEMPS = 0x20
 OW_CTRL_TECADC = 0x21
 OW_CTRL_TEC_STATUS = 0x22
