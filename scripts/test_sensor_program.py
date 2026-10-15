@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
-"""Put a MOTION sensor STM32 into DFU mode and flash a .bin file.
+"""Update the firmware of a MOTION sensor module over USB DFU.
 
-Uses the vendored dfu-util via :class:`omotion.DFUProgrammer.DFUProgrammer`.
+Uses :class:`omotion.FirmwareUpdater`, which works out what the sensor is
+running and flashes accordingly: a signed image into the bootloader's slot, or
+a bare-metal image on a unit without a bootloader.
+
+Installing or replacing the bootloader is irreversible over USB and is only
+done with --acknowledge-irreversible plus the image the unit needs
+(--updater for a bootloader older than 1.2.0, --production for a unit without
+one). Bench units only.
 
 Usage
 -----
@@ -13,15 +20,28 @@ import sys
 import time
 from pathlib import Path
 
-from omotion import MotionInterface
-from omotion.DFUProgrammer import DFUProgrammer, DFUProgress
+from omotion import (
+    BootloaderChangeRequired,
+    FirmwareKind,
+    FirmwareUpdateError,
+    FirmwareUpdater,
+    MotionInterface,
+)
+from omotion.dfu import DFUProgress
 
 # Sensors enumerate asynchronously after MotionInterface.start(); how long to
 # wait before declaring them absent.
 STARTUP_TIMEOUT_S = 20.0
-# How long the flashed sensor gets to re-enumerate after the DFU bootloader
-# leaves. It occasionally never comes back without a DUT mains power-cycle.
+# How long the connection monitor gets to reconnect the sensor once update()
+# has seen it back on USB.
 REENUM_TIMEOUT_S = 30.0
+
+# update() argument -> the flag that supplies it.
+_FLAG_FOR = {
+    "updater_image": "--updater",
+    "production_image": "--production",
+    "acknowledge_irreversible": "--acknowledge-irreversible",
+}
 
 
 class _LiveStatus:
@@ -40,6 +60,13 @@ class _LiveStatus:
         sys.stderr.flush()
 
     def update(self, p: DFUProgress) -> None:
+        if p.percent is None and p.message:
+            # A step announcement or an operator instruction: always shown.
+            self.clear()
+            print("   [i] ", p.message)
+            self._last_render = 0.0
+            self._percent = None
+
         if not self.enabled:
             return
 
@@ -47,6 +74,8 @@ class _LiveStatus:
             self._phase = "erasing"
         elif p.phase == "download":
             self._phase = "downloading"
+        elif p.phase in ("wait", "power_cycle"):
+            self._phase = "waiting"
 
         if p.percent is not None:
             self._percent = p.percent
@@ -65,23 +94,18 @@ class _LiveStatus:
 
 def parse_cli() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Put the MOTION STM32 into DFU mode and flash a .bin file."
+        description="Update the firmware of a MOTION sensor module over USB DFU."
     )
     parser.add_argument(
         "bin_file",
         type=Path,
-        help="Path to bin file that shall be programmed onto the STM32.",
+        help="Application image: a signed .bin for a unit with the bootloader, "
+             "a bare-metal .bin for a unit without one.",
     )
     parser.add_argument(
         "--no-confirm",
         action="store_true",
         help="Skip the interactive confirmation before entering DFU mode.",
-    )
-    parser.add_argument(
-        "--wait",
-        type=float,
-        default=5.0,
-        help="Seconds to wait after issuing the DFU command before polling for the USB device.",
     )
     parser.add_argument(
         "--timeout",
@@ -90,26 +114,24 @@ def parse_cli() -> argparse.Namespace:
         help="Seconds to wait for DFU device to appear.",
     )
     parser.add_argument(
-        "--vidpid",
-        default="0483:df11",
-        help="VID:PID for the DFU device (default 0483:df11).",
+        "--updater",
+        type=Path,
+        default=None,
+        help="Signed bootloader-updater image, for a sensor whose bootloader is "
+             "older than 1.2.0. Used only with --acknowledge-irreversible.",
     )
     parser.add_argument(
-        "--addr",
-        default=DFUProgrammer.DEFAULT_ADDRESS,
-        help="Flash start address (default 0x08000000).",
+        "--production",
+        type=Path,
+        default=None,
+        help="Production image (bootloader + application), for a sensor without "
+             "a bootloader. Used only with --acknowledge-irreversible.",
     )
     parser.add_argument(
-        "--alt",
-        type=int,
-        default=0,
-        help="DFU alt setting (default 0).",
-    )
-    parser.add_argument(
-        "--dfu-verbose",
-        action="count",
-        default=0,
-        help="Pass -v to dfu-util (repeat for more verbosity).",
+        "--acknowledge-irreversible",
+        action="store_true",
+        help="Allow installing or replacing the bootloader. Cannot be undone over "
+             "USB; the unit must not lose power while it runs.",
     )
     parser.add_argument(
         "--no-spinner",
@@ -197,7 +219,6 @@ def main() -> int:
             print("[FAIL]  Sensor module not connected - cannot continue.")
             return 1
 
-        dfu = DFUProgrammer(vidpid=args.vidpid)
         status = _LiveStatus(enabled=not args.no_spinner)
 
         if not args.no_confirm:
@@ -206,74 +227,49 @@ def main() -> int:
                 print("Aborted by user.")
                 return 0
 
-        print("\n[+] Requesting DFU mode from the Sensor module ...")
+        print("\n[+] Updating the Sensor module ...")
+        updater = FirmwareUpdater(dfu_wait_timeout_s=args.timeout)
         try:
-            ok = selected_sensor.enter_dfu()
-        except Exception as exc:  # pragma: no cover
-            print(f"   [FAIL]  Exception while calling enter_dfu(): {exc}")
-            ok = False
-
-        if ok:
-            print("   [OK]  Sensor module reported success.")
-        else:
-            print("   [FAIL]  Sensor module reported failure.")
-            print("[FAIL]  Failed to request DFU mode - aborting.")
-            return 1
-
-        print(f"\n[*] Sleeping {args.wait:.1f}s to give the bootloader time to re-enumerate ...")
-        time.sleep(args.wait)
-
-        print(f"[+] Waiting up to {args.timeout:.0f}s for DFU device ...")
-        if not dfu.wait_for_dfu_device(timeout_s=args.timeout):
-            print("[FAIL]  DFU device never appeared - aborting.")
-            return 1
-        print("   [OK]  DFU device detected.")
-
-        def on_line(line: str) -> None:
-            # Ensure the status line doesn't collide with printed output.
+            result = updater.update(
+                selected_sensor,
+                args.bin_file,
+                status.update,
+                kind=FirmwareKind.SENSOR,
+                updater_image=args.updater,
+                production_image=args.production,
+                acknowledge_irreversible=args.acknowledge_irreversible,
+            )
+        except BootloaderChangeRequired as exc:
             status.clear()
-            print("   |", line)
-            status._last_render = 0.0
-
-        print("\n[+] Flashing with dfu-util ...")
-        result = dfu.flash_bin(
-            args.bin_file,
-            address=args.addr,
-            alt=args.alt,
-            verbose=args.dfu_verbose,
-            normalize_dfu_suffix=True,
-            progress=status.update,
-            line_callback=on_line,
-            echo_output=False,
-            echo_progress_lines=False,
-        )
+            print(f"[FAIL]  {exc}")
+            print("        Missing: " + ", ".join(_FLAG_FOR.get(n, n) for n in exc.needs))
+            return 1
+        except FirmwareUpdateError as exc:
+            status.clear()
+            print(f"[FAIL]  {exc}")
+            return 1
 
         status.clear()
-        if not result.success:
-            print(f"[FAIL]  Flash failed (exit code {result.returncode}).")
-            # Print any non-progress lines from captured stdout for debugging.
-            for ln in (result.stdout or "").splitlines():
-                t = ln.strip()
-                if (t.startswith("Erase") or t.startswith("Download")) and "%" in t:
-                    continue
-                print("   |", ln)
-            return 1
-
-        print("   [OK]  Flash successful.")
-        print("   [i]  DFU bootloader already left - device should be running now.")
+        print(f"   [OK]  {result.message}.")
+        if updater.last_bootloader_version:
+            print(f"   [i]  Bootloader {updater.last_bootloader_version}.")
 
         side_label = selected_side.upper()
-        print(f"\n[+] Waiting up to {REENUM_TIMEOUT_S:.0f}s for the {side_label} sensor to re-enumerate ...")
+        if result.needs_power_cycle:
+            print(f"   [WARN]  The {side_label} sensor did not come back on USB.")
+            print("           Power-cycle the DUT mains supply (known STM32 ROM-loader")
+            print("           quirk), then check the device re-appears.")
+            return 0
+
+        print(f"\n[+] Waiting up to {REENUM_TIMEOUT_S:.0f}s for the {side_label} sensor to reconnect ...")
         if _wait_for_sensor(interface, selected_side, REENUM_TIMEOUT_S):
             try:
                 version = selected_sensor.get_version()
                 print(f"   [OK]  {side_label} sensor is back on USB, firmware version {version}.")
             except Exception as exc:
-                print(f"   [WARN]  {side_label} sensor re-enumerated but get_version() failed: {exc}")
+                print(f"   [WARN]  {side_label} sensor reconnected but get_version() failed: {exc}")
         else:
-            print(f"   [WARN]  {side_label} sensor did not re-enumerate within {REENUM_TIMEOUT_S:.0f}s.")
-            print("           If it stays missing from USB, power-cycle the DUT mains supply")
-            print("           (known STM32 DFU-leave quirk), then check the device re-appears.")
+            print(f"   [WARN]  {side_label} sensor did not reconnect within {REENUM_TIMEOUT_S:.0f}s.")
 
         print("\n[OK]  All done! The STM32 should now be running the newly-flashed firmware.\n")
         return 0

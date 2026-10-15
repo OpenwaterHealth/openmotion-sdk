@@ -306,7 +306,8 @@ Fallback (zero span): identity scaling, `BFI = K × 10`, `BVI = μ₁ × 10`. Ca
 
 | Module | Mechanism |
 |---|---|
-| `DFUProgrammer` | Spawns `dfu-util` subprocess; parses progress output; reports phase and percent via callback |
+| `dfu.STM32DFU` | Pure-Python DfuSe over pyusb (ported from the bootloader repo's `py-tools`): sector erase, block download/upload, bootloader version read; progress via callback |
+| `firmware_update.FirmwareUpdater` | Enters DFU, detects ROM loader / old bootloader / bootloader 1.2.0+, verifies images on the host (`dfu.image`), then runs the matching `dfu.migration` sequence |
 | `FPGAProgrammer` | Page-by-page FPGA flash over the console UART; erases, writes CFG pages in 32-page batches, optionally verifies, writes feature row, refreshes |
 | `jedecParser` | Parses JEDEC ASCII fuse files into `JedecImage` (rows × 16 bytes) + extra feature row data |
 | `GitHubReleases` | GitHub Releases API client; lists, fetches, and downloads release assets |
@@ -389,7 +390,9 @@ The SDK uses a layered catch-log-reraise pattern: each layer catches hardware ex
 | `usb.core.USBError` | `CommInterface`, `StreamInterface` | USB communication error |
 | `JedecError` | `jedecParser` | JEDEC file format violation |
 | `FpgaUpdateError` | `FPGAProgrammer` | FPGA programming sequence failure |
-| `FileNotFoundError` | `DFUProgrammer`, `usb_backend` | Missing dfu-util binary or libusb DLL |
+| `FileNotFoundError` | `usb_backend` | Missing libusb DLL |
+| `FirmwareUpdateError` | `FirmwareUpdater` | Update refused or failed; subclasses `BootloaderChangeRequired`, `ImageRejectedError`, `UpdaterRefusedError` |
+| `DFUError` | `dfu.STM32DFU` | DFU protocol or USB failure (re-raised as `FirmwareUpdateError` by `FirmwareUpdater`) |
 
 USB timeout errnos (110 on Linux, 10060 on Windows) are suppressed inside read loops and treated as normal idle conditions. Errno 32 (broken pipe) and 19/5 (IO/no-device) trigger disconnect callbacks.
 
@@ -437,4 +440,5 @@ application UI be developed and tested without physical hardware.
 | `TelemetrySample` | `Console` | Timestamped temperature + TEC ADC snapshot |
 | `ScanRequest` / `ScanResult` | `ScanWorkflow` | Scan parameters and outcome |
 | `JedecImage` | `jedecParser` | Parsed FPGA bitstream rows |
-| `DFUProgress` / `DFUResult` | `DFUProgrammer` | Firmware flash progress and result |
+| `DFUProgress` | `dfu` | Firmware flash progress (phase, percent, message) |
+| `FirmwareUpdateResult` | `firmware_update` | What an update did (`UpdateAction`), bootloader versions, whether the unit needs a power cycle |

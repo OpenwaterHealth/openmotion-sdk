@@ -1,0 +1,71 @@
+omotion/dfu - provenance
+========================
+
+The DFU protocol, image pre-flight and migration sequences in this package are
+ported from the bootloader repository's py-tools, the tooling of record for the
+bootloader 1.2.0 migration (bench runs of 2026-10-08).
+
+Source
+------
+Repository : OpenwaterHealth/open-motion-console-bl
+Tag        : 1.2.0
+Commit     : 34178cd04f0d28a8e2a09bf1cdb2354f7e1ab51e
+Directory  : py-tools/
+
+The open-motion-sensor-bl py-tools at its tag 1.2.0 (commit 5362c02) are
+byte-identical apart from the README and the public key.
+
+  stm32dfu.py      <- py-tools/stm32dfu.py
+  image.py         <- py-tools/verify_firmware.py (without the CLI), plus the
+                      SBSFU header constants and unpack_semver from
+                      py-tools/sign_firmware.py
+  migration.py     <- py-tools/migrate.py (cmd_migrate, _preflight,
+                      _path_bootloader_10x) and the downgrade pre-check of
+                      py-tools/flash_firmware.py (cmd_flash)
+
+Not ported: sign_firmware.py (signing is a CI job), console_cdc.py and
+sensor_usb.py (the SDK has its own command channel), the argparse front ends.
+
+Local changes
+-------------
+stm32dfu.py
+  1. The libusb backend comes from omotion.usb_backend.get_libusb1_backend()
+     (the vendored DLL on Windows). The STM32CubeProgrammer DLL probe is gone.
+     A missing backend raises DFUBackendError.
+  2. print() replaced by logging.
+  3. usb.core.USBError from control transfers and enumeration is re-raised as
+     DFUError; the builtin TimeoutError of _poll_idle is DFUTimeoutError.
+     DFUError derives from RuntimeError.
+  4. connect() without a serial refuses when more than one DFU device is
+     attached (DFUAmbiguousDeviceError), and the reopen after a USB bus reset
+     looks for the same device (serial, else port path) instead of the first
+     one found.
+  5. verify() fails on a short read-back instead of comparing a prefix.
+
+migration.py
+  6. check_production_image() refuses a production image longer than the
+     0xC0000 bytes erased for it (FLASH_BASE..ROM_ERASE_END); upstream writes
+     with pre_erased=True and no length check.
+  7. SystemExit and console output replaced by exceptions and the progress
+     callback. Entering DFU and waiting for the application use the SDK's
+     device handles (omotion.firmware_update).
+  8. install_bare_metal_app() is new: the SDK's update for units without a
+     bootloader, previously done with dfu-util.
+
+image.py
+  9. cryptography is imported inside verify_image().
+
+Everything else, including erase ranges, step order and timeouts, is as tested.
+
+Public keys (keys/)
+-------------------
+Taken with `git show <ref>:py-tools/keys/ecdsa_public.pem`; SHA-256 of the file:
+
+  console_bl_1.2.pem            open-motion-console-bl  1.2.0
+      6a5c192f97009714df50ccfdd7130e18c32f5a99be31d00bf56b8742059a919c
+  console_bl_legacy_1.0.0.pem   open-motion-console-bl  1.0.0
+      b50fa2ea068dc41f95baef5773f87322c5b417e7c0b33267ff1785870df36d4c
+  sensor_bl_1.2.pem             open-motion-sensor-bl   1.2.0
+      3f9ddfd47302357f61a8148f80cabe904e12689e0ca1893e19b57aed0453c056
+  sensor_bl_legacy_1.1.0.pem    open-motion-sensor-bl   1.1.0 (also trusted by 1.0.0)
+      2c0c991f11cb04fcee45ba42cc0d97519eb1fbf4ffde5a13bd1b33c18599f9ca
