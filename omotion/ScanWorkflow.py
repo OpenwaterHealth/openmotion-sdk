@@ -159,7 +159,7 @@ class ScanRequest:
     # classification — without this the boundary dark frame can land on a
     # laser-on frame and corrupt dark correction. None -> the interface's
     # resolved default (DEFAULT_TRIGGER_CONFIG ⊕ constructor override). A dict
-    # here is shallow-merged on top (e.g. {"TriggerFrequencyHz": 20}).
+    # here is shallow-merged on top (e.g. {"TriggerFrequencyHz": 30}).
     trigger_config: dict | None = None
     # Called (with the exception) when the scan worker thread aborts AFTER
     # start_scan returned True — e.g. a critical sink failing in on_scan_start
@@ -628,6 +628,7 @@ class ScanWorkflow:
 
         # ── Spawn worker thread ────────────────────────────────────────────
         def _worker():
+            trigger_error = None  # why the trigger did not start, if it did not
             try:
                 # ── Pre-flight hardware setup ─────────────────────────────
                 active_sides = self._resolve_active_sides(
@@ -706,12 +707,29 @@ class ScanWorkflow:
                             trigger_cfg = self._interface.resolve_trigger_config(
                                 request.trigger_config
                             )
-                            self._interface.console.set_trigger_json(data=trigger_cfg)
-                            self._interface.console.start_trigger()
-                            self._emit_trigger_event("ON")
+                            console = self._interface.console
+                            # A rejected config or a refused start ends the
+                            # scan through the normal teardown below, then
+                            # reports the reason as the scan error.
+                            try:
+                                applied = console.set_trigger_json(data=trigger_cfg)
+                            except ValueError as e:
+                                trigger_error = f"trigger configuration rejected: {e}"
+                            else:
+                                if applied is None and not console.uart.demo_mode:
+                                    trigger_error = (
+                                        "console rejected the trigger configuration"
+                                    )
+                                elif not console.start_trigger():
+                                    trigger_error = (
+                                        "console refused to start the trigger: "
+                                        f"{console.last_start_refusal_reason}"
+                                    )
+                                else:
+                                    self._emit_trigger_event("ON")
 
                 # ── Duration gate: stop the source when time is up ────────
-                stop_after = float(request.duration_sec)
+                stop_after = 0.0 if trigger_error else float(request.duration_sec)
 
                 def _duration_guard():
                     deadline = time.monotonic() + stop_after
@@ -812,6 +830,9 @@ class ScanWorkflow:
                                 )
                             except Exception:
                                 pass
+
+                if trigger_error:
+                    raise RuntimeError(trigger_error)
             except Exception as e:
                 logger.exception("ScanWorkflow worker raised")
                 self._last_scan_error = str(e) or type(e).__name__
