@@ -1328,9 +1328,11 @@ class MotionConsole(SignalWrapper):
             data (dict): A dictionary containing the trigger configuration.
 
         The configuration is checked against the console limits first
-        (``omotion.config.validate_trigger_config``): 1..40 Hz, laser gate
+        (``omotion.config.validate_trigger_config``): 1..100 Hz, laser gate
         20..2200 us, and the laser delay, gate and skip delay inside one
-        frame. The console enforces the same limits and keeps its previous
+        frame. A Release console accepts 40 Hz only and answers any other
+        rate with OW_ERROR (this method then returns None); Debug consoles
+        accept 1..100 Hz. The console enforces its limits and keeps its previous
         configuration when it rejects one; a rejected configuration sent
         while the trigger runs leaves it running.
 

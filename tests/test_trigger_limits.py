@@ -45,12 +45,20 @@ def _cfg(**over):
     [
         {},
         {"TriggerFrequencyHz": 1},
+        {"TriggerFrequencyHz": 30},
         {"TriggerFrequencyHz": 40},
+        {"TriggerFrequencyHz": 60},
+        {"TriggerFrequencyHz": 100},
         {"LaserPulseWidthUsec": 20},
         {"LaserPulseWidthUsec": 2200},
         {"TriggerPulseWidthUsec": 24999},
         {"LaserPulseDelayUsec": 100, "LaserPulseWidthUsec": 2200, "LaserPulseSkipDelayUsec": 22699},
+        {"TriggerFrequencyHz": 30, "LaserPulseSkipDelayUsec": 32700},
         {"TriggerFrequencyHz": 1, "LaserPulseSkipDelayUsec": 999000},
+        {"TriggerFrequencyHz": 100, "LaserPulseDelayUsec": 100, "LaserPulseWidthUsec": 2200,
+         "LaserPulseSkipDelayUsec": 7699},
+        {"TriggerFrequencyHz": 60, "LaserPulseDelayUsec": 100, "LaserPulseWidthUsec": 2200,
+         "LaserPulseSkipDelayUsec": 14366},
     ],
 )
 def test_valid_configs_pass(over):
@@ -60,10 +68,11 @@ def test_valid_configs_pass(over):
 @pytest.mark.parametrize(
     ("over", "field"),
     [
-        ({"TriggerFrequencyHz": 41}, "TriggerFrequencyHz"),
-        ({"TriggerFrequencyHz": 40.01}, "TriggerFrequencyHz"),
-        ({"TriggerFrequencyHz": 100}, "TriggerFrequencyHz"),
+        ({"TriggerFrequencyHz": 101}, "TriggerFrequencyHz"),
+        ({"TriggerFrequencyHz": 100.01}, "TriggerFrequencyHz"),
+        ({"TriggerFrequencyHz": 0.99}, "TriggerFrequencyHz"),
         ({"TriggerFrequencyHz": 0.5}, "TriggerFrequencyHz"),
+        ({"TriggerFrequencyHz": 0}, "TriggerFrequencyHz"),
         ({"TriggerFrequencyHz": float("nan")}, "TriggerFrequencyHz"),
         ({"TriggerFrequencyHz": "40"}, "TriggerFrequencyHz"),
         ({"LaserPulseWidthUsec": 19}, "LaserPulseWidthUsec"),
@@ -74,6 +83,17 @@ def test_valid_configs_pass(over):
         ({"TriggerPulseWidthUsec": 25000}, "TriggerPulseWidthUsec"),
         (
             {"LaserPulseDelayUsec": 100, "LaserPulseWidthUsec": 2200, "LaserPulseSkipDelayUsec": 22700},
+            "LaserPulseSkipDelayUsec",
+        ),
+        (
+            {"TriggerFrequencyHz": 60, "LaserPulseDelayUsec": 100, "LaserPulseWidthUsec": 2200,
+             "LaserPulseSkipDelayUsec": 14367},
+            "LaserPulseSkipDelayUsec",
+        ),
+        ({"TriggerFrequencyHz": 60, "TriggerPulseWidthUsec": 16667}, "TriggerPulseWidthUsec"),
+        (
+            {"TriggerFrequencyHz": 100, "LaserPulseDelayUsec": 100, "LaserPulseWidthUsec": 2200,
+             "LaserPulseSkipDelayUsec": 7700},
             "LaserPulseSkipDelayUsec",
         ),
         ({"LaserPulseDelayUsec": 0xFFFFFFFF}, "LaserPulseDelayUsec"),
@@ -146,7 +166,7 @@ def test_set_trigger_json_sends_compact_json():
 def test_set_trigger_json_refuses_out_of_range_before_sending():
     console = _console(_resp(OW_RESP))
     with pytest.raises(ValueError, match="TriggerFrequencyHz"):
-        console.set_trigger_json(_cfg(TriggerFrequencyHz=100))
+        console.set_trigger_json(_cfg(TriggerFrequencyHz=101))
     assert console.uart.sent == []
 
 

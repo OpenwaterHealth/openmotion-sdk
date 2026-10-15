@@ -159,7 +159,7 @@ class ScanRequest:
     # classification — without this the boundary dark frame can land on a
     # laser-on frame and corrupt dark correction. None -> the interface's
     # resolved default (DEFAULT_TRIGGER_CONFIG ⊕ constructor override). A dict
-    # here is shallow-merged on top (e.g. {"TriggerFrequencyHz": 20}).
+    # here is shallow-merged on top (e.g. {"TriggerFrequencyHz": 30}).
     trigger_config: dict | None = None
     # Called (with the exception) when the scan worker thread aborts AFTER
     # start_scan returned True — e.g. a critical sink failing in on_scan_start

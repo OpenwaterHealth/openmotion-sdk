@@ -384,8 +384,14 @@ def merge_trigger_config(*overrides) -> dict:
 TRIGGER_JSON_MAX: int = 511
 """Longest trigger JSON the console accepts, in bytes (console-fw NEW-1)."""
 
+# Frequency: the widest range any console build accepts. The firmware range
+# depends on its build type (Release, including every clinical image: 40 Hz
+# only; Debug and *-dev.* builds: 1..100 Hz), and the SDK cannot tell which
+# build it is talking to. So the SDK refuses only what no build accepts; a
+# Release console answers any rate other than 40 Hz with OW_ERROR, and
+# set_trigger_json then returns None.
 TRIGGER_FREQ_MIN_HZ: float = 1.0
-TRIGGER_FREQ_MAX_HZ: float = 40.0
+TRIGGER_FREQ_MAX_HZ: float = 100.0
 TRIGGER_LASER_WIDTH_MIN_US: int = 20
 TRIGGER_LASER_WIDTH_MAX_US: int = 2200
 
@@ -437,7 +443,7 @@ def validate_trigger_config(cfg: dict) -> None:
     """Raise ``ValueError`` naming the first field outside the console limits.
 
     Mirrors ``trigger_validate`` in console-fw ``Core/Src/trigger.c``:
-    frequency 1..40 Hz, trigger pulse width 1..period-1 us, laser gate
+    frequency 1..100 Hz (Release consoles accept 40 Hz only), trigger pulse width 1..period-1 us, laser gate
     20..2200 us, and delay + gate + skip delay < period. The console merges a
     partial dict onto its current configuration, so an absent field is not
     checked, and the per-frame checks need ``TriggerFrequencyHz`` present.

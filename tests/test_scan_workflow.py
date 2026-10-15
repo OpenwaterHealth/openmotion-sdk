@@ -477,7 +477,7 @@ def test_trigger_failure_ends_the_scan_with_the_reason(failure):
 
     def _set(**kw):
         if failure == "config_invalid":
-            raise ValueError("TriggerFrequencyHz 100 outside 1..40 Hz")
+            raise ValueError("TriggerFrequencyHz 101 outside 1..100 Hz")
         return None if failure == "config_rejected" else kw.get("data")
 
     def _start(*a, **k):
