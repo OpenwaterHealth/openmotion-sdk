@@ -84,10 +84,12 @@ class ConsoleTelemetry:
     # TecStats.tec_status from console FW — the TEC over-temp TRIP result, NOT
     # the TMPGD comparator pin this comment used to claim. tec_trip_evaluate()
     # (console-fw Core/Src/uart_comms.c) is the only writer of that field: it
-    # clears the bit when the TEC sense voltage crosses TEC_TRIP_VALUE, calls
-    # Trigger_Safety_Disconnect(), and re-arms only after 200 consecutive clean
-    # polls. So False means the console has tripped and shut the laser down —
-    # a safety event, not "temperature has not settled to setpoint yet".
+    # clears the bit when the TEC sense voltage crosses TEC_TRIP_VALUE and
+    # calls Trigger_Safety_Disconnect(). So False means the console has tripped
+    # and shut the laser down — a safety event, not "temperature has not
+    # settled to setpoint yet". The bit returns to True on the first clean
+    # poll; the trigger interlock clears only after 200 consecutive clean polls
+    # (about 5 s), so a start can still be refused while tec_good is True.
     # Only meaningful when tec_known is True. Caveat: the trip is disarmed when
     # TEC_TRIP_VALUE == 0.0 (settings never applied), and firmware then always
     # reports True — a steady True is not proof the trip is armed. See #206.

@@ -423,9 +423,10 @@ def _run_scan_capturing_trigger(motion, request):
                            lambda handles: None), \
          mock.patch.object(motion, "run_on_sensors", return_value=True), \
          mock.patch.object(motion.console, "set_trigger_json",
-                           side_effect=lambda **kw: calls.append(("set", kw.get("data")))), \
+                           side_effect=lambda **kw: calls.append(("set", kw.get("data")))
+                           or kw.get("data")), \
          mock.patch.object(motion.console, "start_trigger",
-                           side_effect=lambda *a, **k: calls.append(("start", None))):
+                           side_effect=lambda *a, **k: calls.append(("start", None)) or True):
         assert motion.scan_workflow.start_scan(request)
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline and not any(c[0] == "start" for c in calls):
@@ -455,6 +456,73 @@ def test_start_scan_sends_trigger_config_before_start_trigger():
         "set_trigger_json must be sent before start_trigger"
     sent = next(payload for kind, payload in calls if kind == "set")
     assert sent == expected_cfg
+
+
+@pytest.mark.parametrize("failure", ["start_refused", "config_rejected", "config_invalid"])
+def test_trigger_failure_ends_the_scan_with_the_reason(failure):
+    """A refused START_TRIG (console interlock, console-fw CFW-06) or a
+    rejected trigger config must not leave a scan running with no trigger:
+    the worker runs the normal teardown (stop_trigger, disable_camera) at
+    once and reports the console's reason through on_error."""
+    motion = _build_motion_with_data_dir(None)
+    errors = []
+    done = threading.Event()
+
+    def on_error(exc):
+        errors.append(exc)
+        done.set()
+
+    def _factory(*, console, left, right, batch_size_frames, metadata):
+        return _MockSource(metadata=metadata)
+
+    def _set(**kw):
+        if failure == "config_invalid":
+            raise ValueError("TriggerFrequencyHz 101 outside 1..100 Hz")
+        return None if failure == "config_rejected" else kw.get("data")
+
+    def _start(*a, **k):
+        motion.console.last_start_refusal_reason = "TEC thermal trip"
+        return False
+
+    sensor_calls = []
+
+    def _run_on_sensors(name, *a, **k):
+        sensor_calls.append(name)
+        return True
+
+    fake_side = ("left", 0xFF, mock.MagicMock())
+    request = ScanRequest(
+        subject_id="x", duration_sec=30,
+        left_camera_mask=0xFF, right_camera_mask=0, reduced_mode=False,
+        skip_default_storage=True, on_error=on_error,
+    )
+    with mock.patch("omotion.pipeline.sources.LiveUsbSource", _factory), \
+         mock.patch.object(motion.scan_workflow, "_resolve_active_sides",
+                           return_value=[fake_side]), \
+         mock.patch.object(motion.scan_workflow, "_scan_subscribe_state",
+                           lambda handles: None), \
+         mock.patch.object(motion.scan_workflow, "_scan_unsubscribe_state",
+                           lambda: None), \
+         mock.patch.object(motion, "run_on_sensors", side_effect=_run_on_sensors), \
+         mock.patch.object(motion.console.uart, "demo_mode", False), \
+         mock.patch.object(motion.console, "set_trigger_json", side_effect=_set), \
+         mock.patch.object(motion.console, "start_trigger", side_effect=_start) as start, \
+         mock.patch.object(motion.console, "stop_trigger", return_value=True) as stop:
+        assert motion.scan_workflow.start_scan(request)
+        # duration_sec=30: only the failure path finishes in time.
+        assert done.wait(timeout=10.0), "on_error was never invoked"
+        motion.scan_workflow.await_complete(timeout_sec=10.0)
+
+    expected = {
+        "start_refused": "TEC thermal trip",
+        "config_rejected": "rejected the trigger configuration",
+        "config_invalid": "TriggerFrequencyHz",
+    }[failure]
+    assert expected in str(errors[0])
+    assert expected in motion.scan_workflow.last_scan_error
+    assert start.called == (failure == "start_refused")
+    assert stop.called
+    assert "disable_camera" in sensor_calls
 
 
 def test_start_scan_aborts_synchronously_when_scan_db_readonly(tmp_path):

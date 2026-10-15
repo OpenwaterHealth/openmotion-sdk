@@ -110,7 +110,8 @@ pip install --force-reinstall dist/openmotion_sdk-*.whl
 - **Python 3.12+.** Version is computed from git tags via `setuptools_scm` —
   never edit a version string by hand; tag and push to release.
 - **Windows USB:** sensors need WinUSB via Zadig (`pyusb` + `libusb`); the
-  console uses the OS VCP driver. `dfu-util` is vendored under `omotion/dfu-util/`.
+  console uses the OS VCP driver. Firmware update is pure Python (`omotion/dfu/`)
+  and needs the DFU device (`0483:DF11`) on WinUSB too; `winusb-driver/` installs that.
 
 ```powershell
 # quick runtime check (device bound to WinUSB/libusbK)

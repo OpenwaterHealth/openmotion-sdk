@@ -1,11 +1,9 @@
 """Every libusb copy the package ships is libusb 1.0.30 or newer (#305).
 
 1.0.30 fixes denial-of-service bugs a malicious USB device can trigger with
-malformed descriptors. The package carries libusb in exactly four DLLs: the
-pyusb backend's (``_vendor``) and the one the Windows ``dfu-util.exe`` loads
-from its own directory, each for x64 and x86. Static libraries, statically
-linked tools and the macOS dylib that dfu-util never loaded were removed
-instead of kept current, so nothing else may reappear.
+malformed descriptors. The package carries libusb in exactly two DLLs: the
+pyusb backend's (``_vendor``), for x64 and x86. Firmware update goes through
+the same backend (``omotion.dfu``), so no other copy may reappear.
 
 Reads the files in this checkout, not the installed ``omotion``. Needs no
 hardware.
@@ -23,8 +21,6 @@ MIN_LIBUSB = (1, 0, 30)
 SHIPPED_DLLS = {
     "_vendor/libusb/windows/x64/libusb-1.0.dll",
     "_vendor/libusb/windows/x86/libusb-1.0.dll",
-    "dfu-util/win64/libusb-1.0.dll",
-    "dfu-util/win32/libusb-1.0.dll",
 }
 
 
