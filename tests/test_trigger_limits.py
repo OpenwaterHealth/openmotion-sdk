@@ -20,6 +20,7 @@ from omotion.config import (
     DEFAULT_TRIGGER_CONFIG,
     OW_ERROR,
     OW_RESP,
+    TRIG_INTERLOCK_CONFIG,
     TRIG_INTERLOCK_LASER_SAFETY,
     TRIG_INTERLOCK_TEC,
     TRIG_START_TIMER_FAILED,
@@ -121,6 +122,8 @@ def test_describe_trigger_refusal():
     both = describe_trigger_refusal(TRIG_INTERLOCK_TEC | TRIG_INTERLOCK_LASER_SAFETY)
     assert "TEC" in both and "laser-safety" in both
     assert "timer" in describe_trigger_refusal(TRIG_START_TIMER_FAILED)
+    assert "config invalid or missing" in describe_trigger_refusal(TRIG_INTERLOCK_CONFIG)
+    assert "unknown" not in describe_trigger_refusal(TRIG_INTERLOCK_CONFIG | TRIG_INTERLOCK_TEC)
     assert "0x10" in describe_trigger_refusal(0x10)
     assert "no status byte" in describe_trigger_refusal(None)
 

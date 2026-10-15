@@ -400,12 +400,16 @@ TRIGGER_LASER_WIDTH_MAX_US: int = 2200
 TRIG_INTERLOCK_HOST_LOSS: int = 0x01
 TRIG_INTERLOCK_LASER_SAFETY: int = 0x02
 TRIG_INTERLOCK_TEC: int = 0x04
+# Console running on its built-in default config because no valid stored
+# record was found (console-fw CFW-03). Cleared by writing a config.
+TRIG_INTERLOCK_CONFIG: int = 0x08
 TRIG_START_TIMER_FAILED: int = 0x80
 
 _TRIG_REFUSAL_REASONS = (
     (TRIG_INTERLOCK_HOST_LOSS, "host connection lost (USB disconnect or port closed)"),
     (TRIG_INTERLOCK_LASER_SAFETY, "laser-safety fault latched (EE/OPT safety FPGA)"),
     (TRIG_INTERLOCK_TEC, "TEC thermal trip (clears about 5 s after the TEC recovers)"),
+    (TRIG_INTERLOCK_CONFIG, "console user config invalid or missing; running on defaults until a config is written"),
     (TRIG_START_TIMER_FAILED, "FSYNC timer failed to start"),
 )
 
