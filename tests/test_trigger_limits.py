@@ -23,6 +23,7 @@ from omotion.config import (
     TRIG_INTERLOCK_CONFIG,
     TRIG_INTERLOCK_LASER_SAFETY,
     TRIG_INTERLOCK_SAFETY_UNKNOWN,
+    TRIG_INTERLOCK_LIMITS,
     TRIG_INTERLOCK_TEC,
     TRIG_START_TIMER_FAILED,
     TRIGGER_JSON_MAX,
@@ -126,7 +127,8 @@ def test_describe_trigger_refusal():
     assert "config invalid or missing" in describe_trigger_refusal(TRIG_INTERLOCK_CONFIG)
     assert "unknown" not in describe_trigger_refusal(TRIG_INTERLOCK_CONFIG | TRIG_INTERLOCK_TEC)
     assert "unreadable" in describe_trigger_refusal(TRIG_INTERLOCK_SAFETY_UNKNOWN)
-    assert "0x20" in describe_trigger_refusal(0x20)
+    assert "safety limit" in describe_trigger_refusal(TRIG_INTERLOCK_LIMITS)
+    assert "0x40" in describe_trigger_refusal(0x40)
     assert "no status byte" in describe_trigger_refusal(None)
 
 
