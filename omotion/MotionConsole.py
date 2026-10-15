@@ -2282,7 +2282,13 @@ class MotionConsole(SignalWrapper):
             self.uart.clear_buffer()
 
             if r.packetType == OW_ERROR:
-                logger.error("Error writing config to device")
+                # Console firmware with the strict-config check refuses a
+                # config that is not a strict JSON object or does not fit the
+                # page, and keeps the stored one.
+                logger.error(
+                    "Console refused the config write (not strict JSON, or too "
+                    "long); the stored config is unchanged"
+                )
                 return None
 
             # The firmware write ACK returns only the updated 16-byte header
