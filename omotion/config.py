@@ -1,5 +1,6 @@
 import re
 from enum import IntEnum
+from typing import Optional
 
 import numpy as np
 
@@ -273,6 +274,14 @@ COMMAND_MAX_SIZE: int = 4096
 MAX_DATA_PER_FRAME: int = COMMAND_MAX_SIZE - 12
 """Max payload bytes per frame (total - framing overhead)."""
 
+CONSOLE_COMMAND_MAX_SIZE: int = 2048
+"""Console firmware ``COMMAND_MAX_SIZE`` (console-fw ``Core/Inc/common.h``)."""
+
+CONSOLE_MAX_PAYLOAD: int = CONSOLE_COMMAND_MAX_SIZE - 12
+"""Largest payload the console accepts (firmware ``OW_MAX_PAYLOAD``, 2036 bytes).
+The console NAKs a frame whose length field is larger (console-fw NEW-2), so
+``MotionUart.send_packet`` refuses to send one."""
+
 # ---------------------------------------------------------------------------
 # Hardware geometry — shared by Calibration, ScanWorkflow, CalibrationWorkflow.
 # ---------------------------------------------------------------------------
@@ -363,3 +372,109 @@ def merge_trigger_config(*overrides) -> dict:
         if override:
             out.update(override)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Console trigger limits (console-fw ``Core/Inc/trigger.h``)
+#
+# The console rejects an OW_CTRL_SET_TRIG outside these limits with OW_ERROR
+# and keeps its previous configuration (console-fw CFW-05). The SDK checks the
+# same limits before sending so the caller learns which field is wrong.
+# ---------------------------------------------------------------------------
+TRIGGER_JSON_MAX: int = 511
+"""Longest trigger JSON the console accepts, in bytes (console-fw NEW-1)."""
+
+TRIGGER_FREQ_MIN_HZ: float = 1.0
+TRIGGER_FREQ_MAX_HZ: float = 40.0
+TRIGGER_LASER_WIDTH_MIN_US: int = 20
+TRIGGER_LASER_WIDTH_MAX_US: int = 2200
+
+# Status byte of a refused OW_CTRL_START_TRIG (OW_ERROR, one data byte). The
+# interlock bits can combine; TRIG_START_TIMER_FAILED is sent alone.
+TRIG_INTERLOCK_HOST_LOSS: int = 0x01
+TRIG_INTERLOCK_LASER_SAFETY: int = 0x02
+TRIG_INTERLOCK_TEC: int = 0x04
+TRIG_START_TIMER_FAILED: int = 0x80
+
+_TRIG_REFUSAL_REASONS = (
+    (TRIG_INTERLOCK_HOST_LOSS, "host connection lost (USB disconnect or port closed)"),
+    (TRIG_INTERLOCK_LASER_SAFETY, "laser-safety fault latched (EE/OPT safety FPGA)"),
+    (TRIG_INTERLOCK_TEC, "TEC thermal trip (clears about 5 s after the TEC recovers)"),
+    (TRIG_START_TIMER_FAILED, "FSYNC timer failed to start"),
+)
+
+
+def describe_trigger_refusal(status: Optional[int]) -> str:
+    """Describe the status byte of a refused OW_CTRL_START_TRIG.
+
+    ``None`` means the console sent no status byte (firmware older than the
+    console-fw CFW-06 fix).
+    """
+    if status is None:
+        return "console refused the start (no status byte)"
+    reasons = [text for bit, text in _TRIG_REFUSAL_REASONS if status & bit]
+    unknown = status & ~sum(bit for bit, _ in _TRIG_REFUSAL_REASONS)
+    if unknown:
+        reasons.append(f"unknown status bits 0x{unknown:02X}")
+    return "; ".join(reasons) or "console refused the start (status 0x00)"
+
+
+def _trigger_uint(cfg: dict, key: str) -> Optional[int]:
+    """The console parses these fields with strtoul: a negative or fractional
+    value would be wrapped or truncated, so reject it here."""
+    if key not in cfg:
+        return None
+    v = cfg[key]
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v != int(v):
+        raise ValueError(f"{key} must be a whole number of microseconds, got {v!r}")
+    v = int(v)
+    if not 0 <= v <= 0xFFFFFFFF:
+        raise ValueError(f"{key} out of range: {v}")
+    return v
+
+
+def validate_trigger_config(cfg: dict) -> None:
+    """Raise ``ValueError`` naming the first field outside the console limits.
+
+    Mirrors ``trigger_validate`` in console-fw ``Core/Src/trigger.c``:
+    frequency 1..40 Hz, trigger pulse width 1..period-1 us, laser gate
+    20..2200 us, and delay + gate + skip delay < period. The console merges a
+    partial dict onto its current configuration, so an absent field is not
+    checked, and the per-frame checks need ``TriggerFrequencyHz`` present.
+    """
+    period = None
+    if "TriggerFrequencyHz" in cfg:
+        f = cfg["TriggerFrequencyHz"]
+        if isinstance(f, bool) or not isinstance(f, (int, float)):
+            raise ValueError(f"TriggerFrequencyHz must be a number, got {f!r}")
+        # Written so that NaN fails.
+        if not (TRIGGER_FREQ_MIN_HZ <= f <= TRIGGER_FREQ_MAX_HZ):
+            raise ValueError(
+                f"TriggerFrequencyHz {f} outside "
+                f"{TRIGGER_FREQ_MIN_HZ:g}..{TRIGGER_FREQ_MAX_HZ:g} Hz"
+            )
+        period = int(1e6 / f + 0.5)  # us, rounded as the firmware does
+
+    pulse = _trigger_uint(cfg, "TriggerPulseWidthUsec")
+    if pulse is not None and (pulse == 0 or (period is not None and pulse >= period)):
+        limit = f"1..{period - 1}" if period is not None else ">= 1"
+        raise ValueError(f"TriggerPulseWidthUsec {pulse} outside {limit} us")
+
+    width = _trigger_uint(cfg, "LaserPulseWidthUsec")
+    if width is not None and not (
+        TRIGGER_LASER_WIDTH_MIN_US <= width <= TRIGGER_LASER_WIDTH_MAX_US
+    ):
+        raise ValueError(
+            f"LaserPulseWidthUsec {width} outside "
+            f"{TRIGGER_LASER_WIDTH_MIN_US}..{TRIGGER_LASER_WIDTH_MAX_US} us"
+        )
+
+    delay = _trigger_uint(cfg, "LaserPulseDelayUsec")
+    skip_delay = _trigger_uint(cfg, "LaserPulseSkipDelayUsec")
+    if None not in (period, delay, width, skip_delay):
+        if delay + width + skip_delay >= period:
+            raise ValueError(
+                "LaserPulseDelayUsec + LaserPulseWidthUsec + LaserPulseSkipDelayUsec "
+                f"({delay} + {width} + {skip_delay}) must be below the "
+                f"{period} us frame period"
+            )

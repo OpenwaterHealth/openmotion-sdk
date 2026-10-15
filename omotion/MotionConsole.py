@@ -75,6 +75,9 @@ from omotion.config import (
     OW_ERROR,
     XO2_FLASH_PAGE_SIZE,
     MuxChannel,
+    TRIGGER_JSON_MAX,
+    describe_trigger_refusal,
+    validate_trigger_config,
 )
 
 from omotion.GitHubReleases import GitHubReleases
@@ -193,6 +196,12 @@ class MotionConsole(SignalWrapper):
         # load has run. Kept across disconnects: only a later load that
         # verifies clean clears it, and while it is set start_trigger refuses.
         self.laser_limits_error: Optional[str] = None
+
+        # Why the console refused the last start_trigger: the status byte
+        # (TRIG_INTERLOCK_* bits, or None if the firmware sent none) and its
+        # description. Both None after a start the console accepted.
+        self.last_start_refusal: Optional[int] = None
+        self.last_start_refusal_reason: Optional[str] = None
 
     # ──────────────────────────────────────────────────────────────────
     # State (read-only from outside)
@@ -1318,11 +1327,21 @@ class MotionConsole(SignalWrapper):
         Args:
             data (dict): A dictionary containing the trigger configuration.
 
+        The configuration is checked against the console limits first
+        (``omotion.config.validate_trigger_config``): 1..40 Hz, laser gate
+        20..2200 us, and the laser delay, gate and skip delay inside one
+        frame. The console enforces the same limits and keeps its previous
+        configuration when it rejects one; a rejected configuration sent
+        while the trigger runs leaves it running.
+
         Returns:
-            dict: JSON response from the device.
+            dict: JSON response from the device, or None if the console
+            rejected the configuration (OW_ERROR).
 
         Raises:
-            ValueError: If `data` is None or the UART is not connected.
+            ValueError: If the UART is not connected, a field is outside the
+                console limits, or the JSON is longer than
+                ``TRIGGER_JSON_MAX`` (511) bytes.
             Exception: If an error occurs while setting the trigger.
         """
         try:
@@ -1337,13 +1356,22 @@ class MotionConsole(SignalWrapper):
             if not self.is_connected():
                 raise ValueError("Console controller not connected")
 
+            validate_trigger_config(data)
+
             try:
-                json_string = json.dumps(data)
-            except json.JSONDecodeError as e:
+                # Compact separators: the console accepts at most
+                # TRIGGER_JSON_MAX bytes of JSON.
+                json_string = json.dumps(data, separators=(",", ":"))
+            except (TypeError, ValueError) as e:
                 logger.error(f"Data must be valid JSON: {e}")
                 return None
 
             payload = json_string.encode("utf-8")
+            if len(payload) > TRIGGER_JSON_MAX:
+                raise ValueError(
+                    f"Trigger JSON is {len(payload)} bytes; the console "
+                    f"accepts at most {TRIGGER_JSON_MAX}"
+                )
 
             r = self.uart.send_packet(
                 id=None,
@@ -1362,6 +1390,10 @@ class MotionConsole(SignalWrapper):
                     logger.error(f"Error decoding JSON: {e}")
                     return None
             else:
+                if r.packetType == OW_ERROR:
+                    logger.error(
+                        "Console rejected the trigger configuration: %s", json_string
+                    )
                 return None
         except ValueError as v:
             logger.error("ValueError: %s", v)
@@ -1411,6 +1443,15 @@ class MotionConsole(SignalWrapper):
         """
         Start the trigger on the Console device.
 
+        The console refuses the start while an interlock is active: host
+        connection lost, a laser-safety fault latched, or a TEC thermal trip.
+        The reason is kept in ``last_start_refusal`` (status byte) and
+        ``last_start_refusal_reason`` (text). A TEC refusal is not a fault:
+        the TEC interlock clears about 5 s after ``tec_status()`` reports
+        ``tec_good`` again, so retry later. Console firmware older than the
+        CFW-06 fix replies OW_RESP to a refused start, so this returns True
+        even though nothing started.
+
         Returns:
             bool: True if the trigger was started successfully, False otherwise.
 
@@ -1436,9 +1477,17 @@ class MotionConsole(SignalWrapper):
             self.uart.clear_buffer()
             # r.print_packet()
             if r.packetType == OW_ERROR:
-                logger.error("Error starting trigger")
+                status = r.data[0] if r.data_len >= 1 else None
+                self.last_start_refusal = status
+                self.last_start_refusal_reason = describe_trigger_refusal(status)
+                logger.error(
+                    "Console refused to start the trigger: %s",
+                    self.last_start_refusal_reason,
+                )
                 return False
             else:
+                self.last_start_refusal = None
+                self.last_start_refusal_reason = None
                 return True
         except ValueError as v:
             logger.error("ValueError: %s", v)
@@ -1863,9 +1912,12 @@ class MotionConsole(SignalWrapper):
         over-temp **trip** result, not a TMPGD "temperature settled" pin.
         ``tec_trip_evaluate()`` (console-fw ``Core/Src/uart_comms.c``) is its
         only writer: it clears the bit when the TEC sense voltage crosses
-        ``TEC_TRIP_VALUE``, opens the safety disconnect, and re-arms only after
-        200 consecutive clean polls. ``False`` therefore means the console has
-        tripped and shut the laser down. Note the trip is disarmed when
+        ``TEC_TRIP_VALUE`` and opens the safety disconnect. ``False``
+        therefore means the console has tripped and shut the laser down.
+        ``tec_good`` returns to ``True`` on the first clean poll, but the
+        trigger interlock clears only after 200 consecutive clean polls
+        (about 5 s): until then ``start_trigger`` is refused with
+        ``TRIG_INTERLOCK_TEC``. Note the trip is disarmed when
         ``TEC_TRIP_VALUE == 0.0``, and firmware then always reports ``True``.
 
         This method raises rather than returning a sentinel on failure, so a
