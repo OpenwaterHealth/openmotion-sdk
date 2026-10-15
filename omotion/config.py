@@ -403,6 +403,9 @@ TRIG_INTERLOCK_TEC: int = 0x04
 # Console running on its built-in default config because no valid stored
 # record was found (console-fw CFW-03). Cleared by writing a config.
 TRIG_INTERLOCK_CONFIG: int = 0x08
+# EE or OPT safety FPGA STATUS could not be read for several polls in a row
+# (console-fw CFW-04). Clears once both read again with no fault.
+TRIG_INTERLOCK_SAFETY_UNKNOWN: int = 0x10
 TRIG_START_TIMER_FAILED: int = 0x80
 
 _TRIG_REFUSAL_REASONS = (
@@ -410,6 +413,7 @@ _TRIG_REFUSAL_REASONS = (
     (TRIG_INTERLOCK_LASER_SAFETY, "laser-safety fault latched (EE/OPT safety FPGA)"),
     (TRIG_INTERLOCK_TEC, "TEC thermal trip (clears about 5 s after the TEC recovers)"),
     (TRIG_INTERLOCK_CONFIG, "console user config invalid or missing; running on defaults until a config is written"),
+    (TRIG_INTERLOCK_SAFETY_UNKNOWN, "laser-safety FPGA status unreadable (EE/OPT not responding)"),
     (TRIG_START_TIMER_FAILED, "FSYNC timer failed to start"),
 )
 
