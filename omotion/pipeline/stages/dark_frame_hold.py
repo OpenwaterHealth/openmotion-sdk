@@ -171,6 +171,13 @@ class DarkFrameHoldStage:
 
         temp_c = _interp("temp_c") if right1.temp_c is not None else None
 
+        # The dark row is built from its neighbours, so a neighbour from an
+        # interval that spans a missed dark (#175) makes it just as suspect.
+        quality = "ok"
+        if any(f is not None and f.quality == "wide_interval"
+               for f in (left2, left1, right1, right2)):
+            quality = "wide_interval"
+
         return EnrichedCorrectedFrame(
             abs_frame_id=d_prev_abs,
             t=d_prev_t,
@@ -181,7 +188,7 @@ class DarkFrameHoldStage:
             contrast=_interp("contrast"),
             bfi=_interp("bfi"),
             bvi=_interp("bvi"),
-            quality="ok",
+            quality=quality,
             temp_c=temp_c,
         )
 

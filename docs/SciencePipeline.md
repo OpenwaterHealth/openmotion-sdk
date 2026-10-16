@@ -73,7 +73,7 @@ Three things characterise this design and make it auditable:
 | `tcl` | `(N,)` int64 \| None | TelemetryIngestStage (or replay source) | Laser trigger counter |
 | `abs_frame_ids` | `(N,)` int64 | FrameClassificationStage | Monotonic unwrapped frame counter |
 | `frame_type` | `(N,)` `<U8` | FrameClassificationStage | One of `"warmup"`, `"dark"`, `"light"`, `"stale"` |
-| `quality` | `(N,)` `<U14` | TimestampRepairStage | `"ok"`, `"ts_corrected"` (timestamp rewritten), or `"nan_filled"` (synthetic gap placeholder) — see §5.4 |
+| `quality` | `(N,)` `<U14` | TimestampRepairStage | `"ok"`, `"ts_corrected"` (timestamp rewritten), or `"nan_filled"` (synthetic gap placeholder) — see §5.4. Corrected frames can also carry `"wide_interval"`, set by DarkCorrectionStage when their interval spans a missed scheduled dark (§5.8.3) |
 | `mean_raw` | `(N, 2, 8)` float32 | MomentsStage | First moment μ₁ of raw histogram (NaN where count == 0) |
 | `std_raw` | `(N, 2, 8)` float32 | MomentsStage | √(μ₂ − μ₁²) of raw histogram |
 | `contrast_raw` | always `None` | MomentsStage | Reserved; pedestal-subtracted contrast is computed downstream |
@@ -96,6 +96,7 @@ Stages produce events when something doesn't fit cleanly into per-frame arrays. 
 | `LiveEmit(channel, payload)` | `Tee` stages, `SideAverageStage` (realtime path, `"live_side"`) | The named channel's sinks |
 | `IntervalClosed(corrected_batch)` | `DarkCorrectionStage` (per-camera; enriched + stencilled downstream), `SideAverageStage` (reduced-mode `cam_id=-1` side averages) | `"final"` channel sinks |
 | `DarkIntegrityWarning(...)` | `DarkIntegrityGuard` (inside DarkCorrectionStage) | `"diagnostics"` |
+| `MissedDarkWarning(side, cam_id, left_abs, right_abs, missed_abs_ids)` | DarkCorrectionStage — an interval closed with one or more scheduled dark positions strictly inside it (§5.8.3) | `"diagnostics"` |
 | `StencilFallback(...)` | `DarkFrameQuadraticStencil` (inside DarkFrameHoldStage) | `"diagnostics"` |
 | `PipelineError(...)` | `ScanRunner` (a stage raised; the batch was dropped, state preserved) | `"diagnostics"` |
 | `TimestampMisalignmentWindow(...)` | `TimestampRepairStage` (per-side coalesced window; the terminal stop-frame artifact — the firmware's laser-off frame fires ~150 ms off-grid at every scan stop — is reclassified at INFO and NOT reported) | `"diagnostics"` |
@@ -479,6 +480,8 @@ For each `(side, cam_id)` the stage holds a `PendingInterval` with:
 On every dark frame: append to history and either set `_left` (first dark) or set `_right` and flush. On every light frame: append to `_light`.
 
 When `_right` is set, `flush()` returns a closed `Interval` and rolls `_left ← _right` for the next pass.
+
+**Missed darks (issue #175).** A scheduled dark that never arrives (dropped frame, camera dropout, stale rejection) leaves no `"dark"` row, so the interval stays open until the next dark that does arrive and is interpolated across the wider span. Before correcting each closed interval (mid-scan and the terminal flush alike), the stage counts the scheduled dark positions strictly inside `[left_abs, right_abs]` — `(abs_id − 1) mod dark_interval == 0`, with `dark_interval` forwarded by the factory. If there are any, the interval is still corrected (keep, not discard), but its light frames get `quality = "wide_interval"` (synthetic `nan_filled` rows keep their own flag), the stencilled dark row inherits that flag from its neighbours, a WARNING is logged, and a `MissedDarkWarning` names the missed abs_ids. `"wide_interval"` ranks worst in the side-average quality, because unlike `nan_filled` it contributes finite but biased values.
 
 #### 5.8.4 LinearInterpolation — batched correction (§8.1, §8.2)
 

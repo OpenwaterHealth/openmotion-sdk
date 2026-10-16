@@ -717,3 +717,115 @@ def test_corrected_frame_quality_defaults_to_ok():
         mean=36.0, std=4.8, contrast=0.13, bfi=5.0, bvi=5.0,
     )
     assert ef.quality == "ok"
+
+
+# ── Missed scheduled darks (issue #175) ────────────────────────────────────
+
+from omotion.pipeline.batch import MissedDarkWarning
+from omotion.pipeline.stages.dark import scheduled_darks_between
+
+
+@pytest.mark.parametrize("left, right, expected", [
+    (10, 601, []),            # first interval: discard+1 -> first scheduled dark
+    (601, 1201, []),          # ordinary interval
+    (10, 1201, [601]),        # first scheduled dark after discard missed
+    (601, 1801, [1201]),
+    (601, 2401, [1201, 1801]),
+    (601, 1500, [1201]),      # terminal boundary off the schedule
+    (601, 1150, []),          # terminal boundary before the next dark
+    (10, 605, [601]),         # terminal just after a missed first dark
+])
+def test_scheduled_darks_between(left, right, expected):
+    assert scheduled_darks_between(left, right, 600) == expected
+
+
+def test_scheduled_darks_between_disabled_without_interval():
+    assert scheduled_darks_between(601, 5000, 0) == []
+
+
+def _missed_dark_batch():
+    """dark@601, lights, a nan_filled placeholder where the dark at 1201
+    should have been, more lights, dark@1801."""
+    abs_ids = [601, 602, 1200, 1201, 1202, 1800, 1801]
+    types = ["dark", "light", "light", "light", "light", "light", "dark"]
+    u1 = [65.0, 500.0, 505.0, np.nan, 510.0, 515.0, 66.0]
+    sd = [3.0, 20.0, 20.0, np.nan, 21.0, 21.0, 3.0]
+    n = len(abs_ids)
+    mean = np.array(u1, dtype=np.float32).reshape(n, 1, 1) * np.ones((1, 2, 8), dtype=np.float32)
+    std = np.array(sd, dtype=np.float32).reshape(n, 1, 1) * np.ones((1, 2, 8), dtype=np.float32)
+    batch = _batch(n, types, abs_ids, mean_raw=mean, std_raw=std)
+    batch.quality = np.array(
+        ["ok", "ok", "ok", "nan_filled", "ok", "ts_corrected", "ok"], dtype="<U14")
+    return batch
+
+
+def _stage(**kw):
+    return DarkCorrectionStage(
+        realtime_estimator=HybridRealtimePredictor(),
+        batch_estimator=LinearInterpolation(),
+        dark_interval=600,
+        **kw,
+    )
+
+
+def test_missed_dark_keeps_interval_and_flags_its_frames(caplog):
+    batch = _missed_dark_batch()
+    with caplog.at_level(logging.WARNING, logger="openmotion.sdk.pipeline.stages.dark"):
+        _stage().process(batch)
+
+    warnings = [e for e in batch.events if isinstance(e, MissedDarkWarning)]
+    assert len(warnings) == 1
+    w = warnings[0]
+    assert (w.side, w.cam_id) == ("left", 0)
+    assert (w.left_abs, w.right_abs) == (601, 1801)
+    assert w.missed_abs_ids == (1201,)
+    assert "missed scheduled dark" in caplog.text
+
+    closed = [e for e in batch.events if isinstance(e, IntervalClosed)]
+    assert len(closed) == 1                      # kept, not discarded
+    by_abs = {f.abs_frame_id: f for f in closed[0].corrected_batch.frames}
+    assert sorted(by_abs) == [602, 1200, 1201, 1202, 1800]
+    # Real frames are flagged, ts_corrected included (wide_interval ranks worse)...
+    for a in (602, 1200, 1202, 1800):
+        assert by_abs[a].quality == "wide_interval"
+        assert np.isfinite(by_abs[a].mean)       # still corrected
+    # ...but the synthetic placeholder keeps the flag consumers key on.
+    assert by_abs[1201].quality == "nan_filled"
+
+
+def test_full_interval_is_not_flagged():
+    abs_ids = [601, 602, 1200, 1201]
+    n = len(abs_ids)
+    mean = np.array([65.0, 500.0, 505.0, 66.0], dtype=np.float32).reshape(n, 1, 1) * np.ones((1, 2, 8), dtype=np.float32)
+    std = np.full((n, 2, 8), 5.0, dtype=np.float32)
+    batch = _batch(n, ["dark", "light", "light", "dark"], abs_ids,
+                   mean_raw=mean, std_raw=std)
+    _stage().process(batch)
+
+    assert not [e for e in batch.events if isinstance(e, MissedDarkWarning)]
+    closed = [e for e in batch.events if isinstance(e, IntervalClosed)]
+    assert [f.quality for f in closed[0].corrected_batch.frames] == ["ok", "ok"]
+
+
+def test_missed_dark_in_terminal_interval_is_flagged():
+    """The scan-stop flush closes [last dark, terminal laser-off frame]; a
+    dark missed inside that span is caught the same way."""
+    abs_ids = [601, 602, 1300, 1500]
+    n = len(abs_ids)
+    # 1500 is the firmware's terminal laser-off frame, typed "light".
+    mean = np.array([65.0, 500.0, 505.0, 66.0], dtype=np.float32).reshape(n, 1, 1) * np.ones((1, 2, 8), dtype=np.float32)
+    std = np.full((n, 2, 8), 5.0, dtype=np.float32)
+    batch = _batch(n, ["dark", "light", "light", "light"], abs_ids,
+                   mean_raw=mean, std_raw=std)
+    stage = _stage()
+    stage.process(batch)
+    assert not [e for e in batch.events if isinstance(e, MissedDarkWarning)]
+
+    flush = _batch(0, [], [], mean_raw=np.zeros((0, 2, 8), np.float32),
+                   std_raw=np.zeros((0, 2, 8), np.float32))
+    stage.on_scan_stop(flush)
+    warnings = [e for e in flush.events if isinstance(e, MissedDarkWarning)]
+    assert len(warnings) == 1
+    assert warnings[0].missed_abs_ids == (1201,)
+    closed = [e for e in flush.events if isinstance(e, IntervalClosed)]
+    assert {f.quality for f in closed[0].corrected_batch.frames} == {"wide_interval"}

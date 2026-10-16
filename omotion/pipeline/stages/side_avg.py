@@ -35,8 +35,11 @@ _SIDE_STR_TO_INT = {"left": 0, "right": 1}
 _SIDE_INT_TO_STR = ("left", "right")
 
 # Higher rank = worse quality; the side average inherits the worst quality
-# of any camera that contributed to it. Mirrors sinks._QUALITY_RANK.
-_QUALITY_RANK = {"ok": 0, "ts_corrected": 1, "nan_filled": 2}
+# of any camera that contributed to it. "wide_interval" (#175) ranks worst:
+# a nan_filled camera is NaN and drops out of the average on its own, but a
+# wide-interval camera contributes finite values built on a stretched dark
+# baseline, so it is the one flag that can bias the average unnoticed.
+_QUALITY_RANK = {"ok": 0, "ts_corrected": 1, "nan_filled": 2, "wide_interval": 3}
 
 
 def _mask_to_cam_indices(mask: int) -> np.ndarray:

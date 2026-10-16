@@ -146,3 +146,22 @@ def test_pipeline_order_raw_tee_before_timestamp_repair():
         f"Tee('raw') at index {raw_tee_idx} must come before "
         f"TimestampRepairStage at index {repair_idx}"
     )
+
+
+
+def test_default_pipeline_forwards_dark_interval_to_dark_correction():
+    """Missed-dark detection (issue #175) must use the classifier's
+    schedule; a non-default value proves it is forwarded, not defaulted."""
+    meta = ScanMetadata(
+        scan_id="x", subject_id="y", operator="z",
+        started_at_iso="2026-05-22T00:00:00Z", duration_sec=60,
+        left_camera_mask=0xFF, right_camera_mask=0xFF, reduced_mode=False,
+    )
+    pipeline = default_pipeline(
+        metadata=meta, calibration=_trivial_calibration(),
+        pedestals=SensorPedestals(left=64.0, right=64.0),
+        dark_interval=123,
+    )
+    stages = {stage.name: stage for stage in pipeline.stages}
+    assert stages["frame_classification"].dark_interval == 123
+    assert stages["dark_correction"]._dark_interval == 123

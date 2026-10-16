@@ -227,3 +227,17 @@ def test_reset_clears_pending_window():
     flush = _batch()
     stage.on_scan_stop(flush)
     assert _avg_frames(flush) == []
+
+
+
+def test_wide_interval_outranks_nan_filled():
+    """A wide-interval camera contributes finite but biased values, so its
+    flag must survive alongside a nan_filled camera (issue #175)."""
+    stage = _stage()
+    filled = _ef(12, 5.0, "left", 0, 2.0, 20.0)
+    filled.quality = "nan_filled"
+    wide = _ef(12, 5.0, "left", 1, 6.0, 60.0)
+    wide.quality = "wide_interval"
+    b = _batch([_interval(10, 20, [filled]), _interval(10, 20, [wide])])
+    stage.process(b)
+    assert _avg_frames(b)[0].quality == "wide_interval"
