@@ -108,6 +108,39 @@ class MotionInterface:
         their request doesn't override."""
         return dict(self._default_trigger_config)
 
+    def set_capture_rate(self, rate_hz: int, *, lock=None) -> bool:
+        """Live-switch the capture rate this interface resolves to (sdk#129).
+
+        Merges :func:`omotion.config.trigger_overrides_for_rate` into the
+        default trigger config and — when a console is connected —
+        immediately re-applies the laser config so the safety ``RATE_LL``
+        floor matches the new rate BEFORE any trigger runs at it (a 60 Hz
+        gate against the 40 Hz floor latches the interlock until
+        power-cycle). On a failed floor re-apply the previous trigger
+        default is restored and False is returned, so the interface never
+        advertises a rate whose safety window isn't programmed. Raises
+        ``ValueError`` for unsupported rates.
+
+        The per-camera VTS retime rides on the next scan start
+        (``enable_camera_fsin_ext`` carries the resolved rate), so no
+        sensor communication happens here.
+        """
+        from omotion.config import trigger_overrides_for_rate
+        overrides = trigger_overrides_for_rate(rate_hz)
+        previous = dict(self._default_trigger_config)
+        self._default_trigger_config = merge_trigger_config(
+            self._default_trigger_config, overrides
+        )
+        try:
+            console_up = self.console is not None and self.console.is_connected()
+        except Exception:
+            console_up = False
+        if console_up:
+            if not self.apply_laser_power(lock=lock):
+                self._default_trigger_config = previous
+                return False
+        return True
+
     def resolve_trigger_config(self, override: Optional[dict] = None) -> dict:
         """Return a complete trigger-config dict — the resolved default
         with ``override`` shallow-merged on top. Callers that know they
@@ -416,9 +449,22 @@ class MotionInterface:
         ``lock()``/``unlock()``) is held for the duration of the writes — pass
         a console mutex when calling from a multithreaded context. Returns True
         on success.
+
+        The laser-safety rate floor (``RATE_LL``) is scaled to this
+        interface's resolved default trigger frequency, so a 60 Hz interface
+        gets a matching safety window (sdk#129). Per-request trigger
+        overrides that change the frequency are NOT reflected here — set the
+        rate at interface construction (``default_trigger_config``).
         """
         from omotion.laser import apply_laser_power as _apply
-        return _apply(self.console, force_fault=force_fault, lock=lock)
+        return _apply(
+            self.console,
+            force_fault=force_fault,
+            lock=lock,
+            trigger_freq_hz=self._default_trigger_config.get(
+                "TriggerFrequencyHz"
+            ),
+        )
 
     # ──────────────────────────────────────────────────────────────────
     # Logging helpers
