@@ -171,11 +171,11 @@ def test_schema_upgrade_adds_columns_on_encrypted_db(clinical, tmp_path):
     db = ScanDatabase(db_path=path)
     try:
         cols = {r[1] for r in db._connection().execute("PRAGMA table_info('session_data')")}
-        assert "frame_id" in cols and "quality" in cols
+        assert "frame_id" in cols and "correction_status" in cols
         row = next(iter(db.iter_session_data(1)))
         assert row["bfi"] == 1.5
         assert row["frame_id"] == -1
-        assert row["quality"] == "ok"
+        assert row["correction_status"] == "ok"
     finally:
         db.close()
 

@@ -883,3 +883,63 @@ def test_shared_evaluator_matches_one_shot_sink_verdicts():
             thresholds=CQThresholds.from_sequences([3.0] * 8, [15.0] * 8),
             cam_id=0,
         )
+
+
+# ---------------------------------------------------------------------------
+# Verdict history — verdict_at / observed_through (bloodflow-app#589)
+# ---------------------------------------------------------------------------
+
+def _fid_batch(first_fid, n_frames, dn_value, frame_types=None):
+    b = _dn_batch(n_frames, dn_value, frame_types)
+    b.abs_frame_ids = np.repeat(
+        np.arange(first_fid, first_fid + n_frames, dtype=np.int64), 16)
+    return b
+
+
+def test_verdict_string_is_ok_or_fixed_order_reasons():
+    from omotion.contact_quality import verdict_string
+    assert verdict_string([]) == "ok"
+    assert verdict_string([REASON_AMBIENT_LIGHT, REASON_POOR_CONTACT]) == \
+        "poor_contact,ambient_light"
+
+
+def test_verdict_at_follows_the_latched_state_by_frame():
+    mon = _monitor([])
+    mon.on_scan_start(_FakeMeta(left_camera_mask=0x01, right_camera_mask=0x00))
+    assert mon.observed_through() == -1
+    mon.consume("live", _fid_batch(100, 1, 60.0))   # healthy
+    mon.consume("live", _fid_batch(101, 1, 2.0))    # latches poor contact
+    mon.consume("live", _fid_batch(102, 1, 60.0))   # clears
+    assert mon.observed_through() == 102
+    assert mon.verdict_at("left", 0, 99) == "ok"
+    assert mon.verdict_at("left", 0, 100) == "ok"
+    assert mon.verdict_at("left", 0, 101) == "poor_contact"
+    assert mon.verdict_at("left", 0, 102) == "ok"
+    assert mon.verdict_at("left", 0, 500) == "ok"
+
+
+def test_verdict_at_combines_simultaneous_conditions():
+    mon = _monitor([])
+    mon.on_scan_start(_FakeMeta(left_camera_mask=0x01, right_camera_mask=0x00))
+    mon.consume("live", _fid_batch(10, 1, 2.0))                 # poor contact
+    mon.consume("live", _fid_batch(11, 1, 50.0, ["dark"]))      # + ambient
+    assert mon.verdict_at("left", 0, 10) == "poor_contact"
+    assert mon.verdict_at("left", 0, 11) == "poor_contact,ambient_light"
+
+
+def test_verdict_at_is_none_outside_the_scan_mask():
+    mon = _monitor([])
+    mon.on_scan_start(_FakeMeta(left_camera_mask=0x01, right_camera_mask=0x00))
+    mon.consume("live", _fid_batch(10, 1, 60.0))
+    assert mon.verdict_at("left", 1, 10) is None
+    assert mon.verdict_at("right", 0, 10) is None
+
+
+def test_history_resets_per_scan():
+    mon = _monitor([])
+    meta = _FakeMeta(left_camera_mask=0x01, right_camera_mask=0x00)
+    mon.on_scan_start(meta)
+    mon.consume("live", _fid_batch(10, 1, 2.0))
+    mon.on_scan_start(meta)
+    assert mon.observed_through() == -1
+    assert mon.verdict_at("left", 0, 10) == "ok"
