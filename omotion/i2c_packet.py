@@ -72,6 +72,7 @@ class I2C_Packet:
         print("\nParsed Packet:")
         new_packet.print_packet()
 
+    @staticmethod
     def read_csv_to_i2c_packets(csv_file_path):
         i2c_packets = []
 

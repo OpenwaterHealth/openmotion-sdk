@@ -13,8 +13,13 @@ Fuse mapping:
 - Row 0, byte 0 = fuses 0..7 (bit0 = fuse0, bit1 = fuse1, ...).
 """
 
+import logging
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
+
+from omotion import _log_root
+
+logger = logging.getLogger(f"{_log_root}.jedecParser" if _log_root else "jedecParser")
 
 
 class JedecError(Exception):
@@ -206,10 +211,12 @@ def parse_jedec_file(path: str) -> Tuple[JedecImage, dict]:
     if fuse_bits is None:
         fuse_bits = [0] * total_fuses
 
-    print(
-        f"[DEBUG] QF={total_fuses}  set_fuses={sum(fuse_bits)}  "
-        f"feature_row={'present' if feature_row else 'absent'}  "
-        f"feabits={'present (' + feabits + ')' if feabits else 'absent'}"
+    logger.debug(
+        "QF=%d set_fuses=%d feature_row=%s feabits=%s",
+        total_fuses,
+        sum(fuse_bits),
+        "present" if feature_row else "absent",
+        f"present ({feabits})" if feabits else "absent",
     )
 
     # Pack into rows × 16 bytes
