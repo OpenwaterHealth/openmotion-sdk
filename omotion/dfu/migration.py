@@ -16,6 +16,9 @@ Starting states:
   STM32 ROM loader (bare-metal unit)  erase sectors 0-5, write the production
                                       image (bootloader + app) at 0x08000000.
 
+The bare-metal application update (:func:`install_bare_metal_app`) is the SDK's
+own, not part of migrate.py. It verifies the write before it leaves DFU.
+
 These functions only drive an already-connected :class:`STM32DFU`. Deciding
 which one applies, verifying the images and asking for consent is
 :class:`omotion.firmware_update.FirmwareUpdater`'s job.
@@ -46,6 +49,8 @@ __all__ = [
     "installed_fw_version",
     "install_production_via_rom",
     "install_bare_metal_app",
+    "write_bare_metal_app",
+    "leave_rom",
     "run_updater",
     "wait_for_new_bootloader",
     "install_signed_app",
@@ -138,20 +143,47 @@ def install_production_via_rom(dfu, production: bytes,
         pass
 
 
-def install_bare_metal_app(dfu, image: bytes,
-                           progress: ProgressCallback | None = None) -> None:
-    """ROM loader: write a bare-metal application at the base of flash.
+def write_bare_metal_app(dfu, image: bytes,
+                         progress: ProgressCallback | None = None) -> None:
+    """ROM loader: write a bare-metal application at the base of flash and read
+    it back. Only the sectors the image covers are erased.
 
-    Not part of migrate.py: this is the SDK's long-standing update for units
-    without a bootloader, formerly ``dfu-util -s 0x08000000:leave -D``. Only the
-    sectors the image covers are erased.
+    Does not leave DFU, whether it returns or raises. The erase destroys the
+    image in sector 0, the unit has no other way back into DFU, and the ROM
+    loader jumps into flash as soon as it manifests. So nothing may start the
+    image until the read-back matches. A failed write leaves the unit in the
+    ROM loader, where the write can be redone. Raises :class:`DFUVerifyError`
+    when the read-back differs, :class:`DFUError` for anything else.
     """
+    t0 = time.monotonic()
     dfu.set_rom_mode()
-    dfu.download(FLASH_BASE, image, progress_cb=progress_adapter(progress, "download"))
+    dfu.download(FLASH_BASE, image, progress_cb=progress_adapter(progress, "download", t0=t0),
+                 manifest=False)
+    dfu.verify(FLASH_BASE, image, progress_cb=progress_adapter(progress, "verify", t0=t0))
+
+
+def leave_rom(dfu) -> None:
+    """ROM loader: start the image at the base of flash. Best effort: a unit
+    that does not hear the request stays in DFU."""
     try:
         dfu.leave_dfu()
     except Exception:
         pass
+
+
+def install_bare_metal_app(dfu, image: bytes,
+                           progress: ProgressCallback | None = None) -> None:
+    """ROM loader: write a bare-metal application at the base of flash, verify
+    it, then start it.
+
+    Not part of migrate.py: this is the SDK's long-standing update for units
+    without a bootloader, formerly ``dfu-util -s 0x08000000:leave -D``. A failed
+    write or read-back raises with the unit still in the ROM loader; see
+    :func:`write_bare_metal_app`. :class:`omotion.firmware_update.FirmwareUpdater`
+    calls the two halves itself so that it can redo the write.
+    """
+    write_bare_metal_app(dfu, image, progress)
+    leave_rom(dfu)
 
 
 def run_updater(dfu, updater: bytes, progress: ProgressCallback | None = None) -> None:

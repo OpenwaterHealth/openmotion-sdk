@@ -24,6 +24,13 @@ _log = logging.getLogger(__name__)
 
 _ST_VID = 0x0483
 
+#: Bare-metal writes (erase, write, read-back) before update() gives up with
+#: UpdateInterruptedError. SDK-local, not from the bootloader tooling.
+ROM_WRITE_ATTEMPTS = 3
+#: How long a ROM loader that dropped off USB during a write gets to come back
+#: before the next attempt.
+T_ROM_REATTACH = 10.0
+
 # ---------------------------------------------------------------------------
 # Version parsing
 # ---------------------------------------------------------------------------
@@ -333,6 +340,35 @@ class UpdaterRefusedError(FirmwareUpdateError):
     still in place."""
 
 
+class UpdateInterruptedError(FirmwareUpdateError):
+    """A bare-metal write failed after the erase, and every retry failed too.
+
+    The unit's flash is incomplete, and a unit without a bootloader can only get
+    back into DFU through its own application. While it stays powered it sits
+    in the STM32 ROM loader and can still be rewritten, but a power cycle starts
+    the half-written image, and then it needs bench recovery. Tell the operator
+    not to power off or unplug it, and offer to retry::
+
+        FirmwareUpdater().update(None, e.image_path, kind=e.kind,
+                                 dfu_serial=e.dfu_serial)
+
+    ``in_dfu`` says whether the unit was still on USB in the ROM loader when
+    update() gave up. If not, it dropped off USB: if it is still powered,
+    reconnecting its USB cable brings the ROM loader back.
+    """
+
+    def __init__(self, message: str, *, image_path: Path, kind: FirmwareKind | None,
+                 dfu_serial: str | None, in_dfu: bool, attempts: int):
+        super().__init__(message)
+        #: The bare-metal image that was being written; retry with this one.
+        self.image_path = image_path
+        self.kind = kind
+        #: USB serial of the ROM loader, to retry on this unit and no other.
+        self.dfu_serial = dfu_serial
+        self.in_dfu = in_dfu
+        self.attempts = attempts
+
+
 # Downloaded-file provenance, so update() can find a sibling asset for whatever
 # boot mode the device turns out to be in. In-process only: callers download and
 # flash within one session. Also the authority on which files count as siblings
@@ -543,6 +579,10 @@ class FirmwareUpdater:
         self.app_wait_timeout_s = migration.T_APP_APPEAR
         #: How long the operator gets to power-cycle a unit that left USB.
         self.power_cycle_timeout_s = migration.T_POWER_CYCLE
+        #: Bare-metal write attempts before UpdateInterruptedError.
+        self.rom_write_attempts = ROM_WRITE_ATTEMPTS
+        #: How long a ROM loader that left USB gets to come back between attempts.
+        self.rom_reattach_timeout_s = T_ROM_REATTACH
         #: Boot mode observed by the most recent :meth:`update` call, or None
         #: if it has not run (or never got as far as detecting). A device is
         #: only classifiable while it sits in DFU, so this is the one chance a
@@ -582,6 +622,14 @@ class FirmwareUpdater:
 
         Raises :class:`FirmwareUpdateError` (or a subclass) on any refusal or
         failure.
+
+        On a unit without a bootloader the application is written, read back,
+        and started only once it matches; a failed write is redone while the
+        unit stays in the ROM loader. If every attempt fails, the unit is left
+        in the ROM loader and :class:`UpdateInterruptedError` is raised: it
+        must not be powered off. Retry by calling ``update(None,
+        e.image_path, kind=e.kind, dfu_serial=e.dfu_serial)``. That is the
+        same resume-from-DFU call as after any other interrupted run.
         """
         if acknowledge_irreversible is not True and acknowledge_irreversible is not False:
             raise FirmwareUpdateError(
@@ -803,8 +851,75 @@ class FirmwareUpdater:
                 boot_mode=BootMode.BARE_METAL, bootloader_version=None, needs=needs,
             )
         job.wrote = True
-        migration.install_bare_metal_app(dfu, image, job.progress_cb)
+        self._write_bare_metal(dfu, job, target, image)
         return UpdateAction.BARE_METAL_APP
+
+    def _write_bare_metal(self, dfu, job: _Job, target: Path, image: bytes) -> None:
+        """Write ``image``, read it back, and start it only once it matches.
+
+        The first erase destroys the image in sector 0. From then on a power
+        cycle starts whatever is in flash, so leaving DFU before the read-back
+        matches would brick the unit. A failed attempt is redone while the
+        unit is still in the ROM loader. When none succeeds the unit is left
+        there and UpdateInterruptedError says so.
+        """
+        serial = job.serial or getattr(dfu, "serial", None)
+        attempts = self.rom_write_attempts
+        last: DFUError | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                if attempt > 1:
+                    job.say("erase", f"The firmware write failed ({last}). Retrying "
+                                     f"({attempt}/{attempts}): do not power off or unplug "
+                                     "the unit.")
+                    if not self._reattach_rom(dfu, serial):
+                        raise self._interrupted(job, target, serial, last, attempt - 1,
+                                                in_dfu=False)
+                migration.write_bare_metal_app(dfu, image, job.progress_cb)
+            except DFUError as e:
+                last = e
+                _log.warning("bare-metal write attempt %d/%d failed: %s", attempt, attempts, e)
+                continue
+            migration.leave_rom(dfu)
+            return
+        # Released first: reading the serial of a device we still hold open can
+        # fail on Windows, which would make the unit look gone.
+        dfu.disconnect()
+        in_dfu = self._dfu.wait_for_device(0.5, present=True, serial=serial)
+        raise self._interrupted(job, target, serial, last, attempts, in_dfu=in_dfu)
+
+    def _reattach_rom(self, dfu, serial: str | None) -> bool:
+        """Reopen the ROM loader for another attempt; False if it is gone from
+        USB. A reopen that fails, or finds something other than the ROM loader,
+        counts as a failed attempt (DFUError)."""
+        dfu.disconnect()
+        if not self._dfu.wait_for_device(self.rom_reattach_timeout_s, present=True,
+                                         serial=serial):
+            return False
+        dfu.connect(serial=serial)
+        if boot_mode_from_dfu(dfu.detect_mode()[0]) is not BootMode.BARE_METAL:
+            raise DFUError("the DFU device that came back is not the STM32 ROM loader")
+        return True
+
+    @staticmethod
+    def _interrupted(job: _Job, target: Path, serial: str | None, last, attempts: int,
+                     *, in_dfu: bool) -> UpdateInterruptedError:
+        if in_dfu:
+            message = (
+                f"the firmware write failed {attempts} time(s) ({last}). The unit is still "
+                "in update mode with incomplete firmware: do NOT power it off or unplug "
+                "it. Retry the update to finish it"
+            )
+        else:
+            message = (
+                f"the unit left update mode during the firmware write ({last}), so its "
+                "firmware is incomplete. If it is still powered, do NOT power it off: "
+                "reconnect its USB cable and retry the update. A unit that lost power "
+                "during the write needs bench recovery"
+            )
+        _log.error("bare-metal update interrupted: %s", message)
+        return UpdateInterruptedError(message, image_path=target, kind=job.kind,
+                                      dfu_serial=serial, in_dfu=in_dfu, attempts=attempts)
 
     # -- unit with a bootloader ---------------------------------------------
 

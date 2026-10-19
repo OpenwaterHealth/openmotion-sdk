@@ -482,6 +482,12 @@ class STM32DFU:
             pass
         return None
 
+    @property
+    def serial(self):
+        """USB serial number of the device connect() opened (None if it has
+        none, or before connect()). Pass it to connect() to reopen that unit."""
+        return self._serial
+
     def disconnect(self):
         """Release the USB interface."""
         if self._dev is not None:
@@ -584,7 +590,7 @@ class STM32DFU:
 
     # ── high-level operations ────────────────────────────────────────────────
 
-    def download(self, address, data, progress_cb=None, pre_erased=False):
+    def download(self, address, data, progress_cb=None, pre_erased=False, manifest=True):
         """
         Erase affected flash sectors and write `data` starting at `address`.
 
@@ -595,9 +601,13 @@ class STM32DFU:
             data:        Bytes-like firmware image (signed .bin for secure boot).
             progress_cb: Optional callable(done: int, total: int, msg: str="").
                          Called after each erased sector and each written block.
+            manifest:    End with the zero-length DNLOAD (DfuSe manifestation).
+                         False leaves the device in DFU after the last block, so
+                         the caller can verify() before it starts the image.
 
-        After the download completes the device issues NVIC_SystemReset(); the
+        After the manifestation the device issues NVIC_SystemReset(); the
         bootloader then verifies the signature and launches the app if valid.
+        The STM32 ROM loader jumps to the image straight away.
         """
         data  = bytes(data)
         total = len(data)
@@ -649,6 +659,9 @@ class STM32DFU:
             if progress_cb:
                 progress_cb(min(offset, total), total)
 
+        if not manifest:
+            return
+
         # ── trigger manifestation (zero-length DNLOAD) ──────────────────────
         # This sends the device into MANIFEST → NVIC_SystemReset()
         self._dnload(0, b'')
@@ -657,9 +670,13 @@ class STM32DFU:
         except Exception:
             pass
 
-    def upload(self, address, length):
+    def upload(self, address, length, progress_cb=None):
         """
         Read `length` bytes from device flash starting at `address`.
+
+        Args:
+            progress_cb: Optional callable(done: int, total: int), called after
+                         each block with the bytes read so far.
 
         Returns:
             bytes
@@ -679,6 +696,8 @@ class STM32DFU:
             result.extend(chunk)
             remaining -= chunk_len
             block_num += 1
+            if progress_cb:
+                progress_cb(len(result), length)
 
         self.abort()    # return to dfuIDLE without resetting
         return bytes(result)
@@ -697,6 +716,10 @@ class STM32DFU:
         """
         Read back the programmed region and compare with `data`.
 
+        Args:
+            progress_cb: Optional callable(done: int, total: int), passed to
+                         upload().
+
         Returns:
             True if every byte matches.
 
@@ -705,7 +728,7 @@ class STM32DFU:
                             (includes offset and values).
         """
         data     = bytes(data)
-        readback = self.upload(address, len(data))
+        readback = self.upload(address, len(data), progress_cb=progress_cb)
 
         if len(readback) != len(data):
             raise DFUVerifyError(
