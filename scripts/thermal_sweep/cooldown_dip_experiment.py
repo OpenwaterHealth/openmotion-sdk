@@ -107,6 +107,7 @@ def source_on() -> None:
 
 
 CAMERA_TELEMETRY = False   # set by main() from --camera-telemetry; passed to every scan
+CAMERA_REG_READS: list = []  # set by main() from --camera-reg-read; passed to every scan
 
 
 def run_scan(rig: ShellyOutlet, fan: ShellyOutlet, subject: str, data_dir: Path,
@@ -138,6 +139,8 @@ def run_scan(rig: ShellyOutlet, fan: ShellyOutlet, subject: str, data_dir: Path,
         cmd += ["--camera-raw"]
     if reg_write:
         cmd += ["--camera-reg", reg_write]
+    for addr in CAMERA_REG_READS:              # every step, so baselines log the default value too
+        cmd += ["--camera-reg-read", addr]
     if CAMERA_TELEMETRY:
         cmd += ["--camera-telemetry"]
     wu = f", sensor-fan-off->{warmup_temp:g}C" if warmup_temp > 0 else ""
@@ -254,7 +257,12 @@ def main() -> int:
     ap.add_argument("--camera-telemetry", action="store_true",
                     help="pass --camera-telemetry to every drift_scan (1 Hz per-camera condition CSVs; "
                          "needs the sensor-fw#94 telemetry firmware).")
+    ap.add_argument("--camera-reg-read", action="append", default=[], metavar="ADDR",
+                    help="pass --camera-reg-read ADDR to every drift_scan (pre-stream register readback on "
+                         "each masked camera; repeatable), e.g. 0x3400 to confirm a vendor register test.")
     args = ap.parse_args()
+    global CAMERA_REG_READS
+    CAMERA_REG_READS = list(args.camera_reg_read)
     global CAMERA_TELEMETRY
     CAMERA_TELEMETRY = args.camera_telemetry
     data_dir = Path(args.data_dir)

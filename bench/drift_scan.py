@@ -69,6 +69,8 @@ CAMERA_MASK = 0xFF
 CAMERA_CROP = False   # set from --camera-crop; crops output to 1720x1280 at configure (sensor-fw#86)
 CAMERA_RAW = False    # set from --camera-raw; disables on-sensor corrections at configure (sensor-fw#89)
 CAMERA_REG_WRITES: list = []  # set from --camera-reg; (addr,val) written to each masked camera AFTER
+CAMERA_REG_READS: list = []   # set from --camera-reg-read; addrs read back from each masked camera pre-stream
+CAMERA_REG_READBACK: dict = {}  # "0xADDR" -> {"cam N": "0xVV" | None}, filled at configure, stored in meta
                               # configure, before streaming (vendor register tests, e.g. 0x4001=0x2b)
 CONFIGURE_TIMEOUT_S = 240.0
 END_MARGIN_S = 5.0  # don't schedule a dark window this close to scan end
@@ -144,6 +146,10 @@ def parse_cli() -> argparse.Namespace:
                         help="Write a camera register to EVERY masked camera AFTER configure, before "
                              "streaming, e.g. --camera-reg 0x4001=0x2b (repeatable). Applied via I2C "
                              "passthrough; use for vendor register-change tests. Read back in telemetry.")
+    parser.add_argument("--camera-reg-read", action="append", default=[], metavar="ADDR",
+                        help="Read a camera register from EVERY masked camera after configure (and after any "
+                             "--camera-reg writes), before streaming; logged and stored in the meta JSON. "
+                             "Repeatable. Confirms a register change without mid-scan telemetry polling.")
     parser.add_argument("--camera-telemetry", action="store_true",
                         help="Log 1 Hz per-camera condition telemetry (sensor-fw#94: on-die rails, dual die "
                              "temps, yavg frame mean, commanded/applied exposure + gains, DCG/BLC/ISP state, "
@@ -246,6 +252,20 @@ def connect_and_configure_sensor(data_dir: Path):
                 _t.sleep(0.05)
             print(f"[+] Camera reg 0x{addr:04X}=0x{val:02X} written to cams "
                   f"{[c + 1 for c in masked]}")
+
+    # Register readback (direct I2C read of the OX02C1B at 0x36 on the camera's mux
+    # channel, 16-bit register address) -- pre-stream, so no COMM traffic mid-scan.
+    for addr in CAMERA_REG_READS:
+        vals = {}
+        for cam_id in [i for i in range(8) if CAMERA_MASK & (1 << i)]:
+            try:
+                r = sensor.i2c_read_register(0x36, addr, read_len=1, reg_addr_size=2, mux_channel=cam_id)
+                vals[f"cam {cam_id + 1}"] = f"0x{r[0]:02X}" if r else None
+            except Exception as exc:
+                vals[f"cam {cam_id + 1}"] = None
+                print(f"[!] Camera reg 0x{addr:04X} read failed on cam {cam_id + 1}: {exc}")
+        CAMERA_REG_READBACK[f"0x{addr:04X}"] = vals
+        print(f"[+] Camera reg 0x{addr:04X} readback: " + ", ".join(f"{k}={v}" for k, v in vals.items()))
 
     # The console's FSYNC trigger needs the laser driver armed to sustain
     # streaming for the full requested duration (see module docstring) --
@@ -420,6 +440,8 @@ def main() -> int:
     for spec in (args.camera_reg or []):
         addr_s, val_s = spec.split("=")
         CAMERA_REG_WRITES.append((int(addr_s, 0), int(val_s, 0)))
+    global CAMERA_REG_READS
+    CAMERA_REG_READS = [int(a, 0) for a in (args.camera_reg_read or [])]
     args.data_dir.mkdir(parents=True, exist_ok=True)
 
     log_path = args.data_dir / f"{args.subject_id}_run.log"
@@ -717,6 +739,7 @@ def main() -> int:
         "camera_crop": CAMERA_CROP,
         "camera_raw": CAMERA_RAW,
         "camera_reg_writes": [f"0x{a:04X}=0x{v:02X}" for a, v in CAMERA_REG_WRITES] or None,
+        "camera_reg_readback": CAMERA_REG_READBACK or None,
     }
     meta_path = args.data_dir / f"{args.subject_id}_drift_meta.json"
     meta_path.write_text(json.dumps(meta, indent=2))
