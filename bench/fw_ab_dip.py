@@ -136,7 +136,14 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data-dir", type=Path, default=WORKTREE / "bench" / "fw_ab_out")
     ap.add_argument("--prefix", default="FWAB")
+    ap.add_argument("--plan", default=None,
+                    help='override PLAN: comma list of suffix:firmware:cooldown_min, e.g. "03:1.8.3-rc.4:120,04:1.8.2:120"')
+    ap.add_argument("--current-fw", default=None, choices=sorted(IMAGES),
+                    help="firmware already on the sensor (skips a redundant first flash)")
     a = ap.parse_args()
+    plan = PLAN if not a.plan else [(x.split(":")[0], x.split(":")[1], float(x.split(":")[2])) for x in a.plan.split(",")]
+    if any(fw not in IMAGES for _, fw, _ in plan):
+        ap.error(f"firmware must be one of {sorted(IMAGES)}")
     a.data_dir.mkdir(parents=True, exist_ok=True)
     stop_file = a.data_dir / "STOP"
     cde.CAMERA_REG_READS = ["0x3400", "0x4001"]       # documents camera init under each firmware
@@ -148,11 +155,11 @@ def main() -> int:
         w = csv.writer(f)
         if new:
             w.writerow(["time", "subject", "firmware", "firmware_verified", "cooldown_min", "drift_scan_rc"])
-    log(f"=== firmware A/B: {len(PLAN)} scans -> {a.data_dir} ===")
+    log(f"=== firmware A/B: {len(plan)} scans -> {a.data_dir} ===")
     cde.source_on()
-    current = None
+    current = a.current_fw
     try:
-        for suffix, fw, cool in PLAN:
+        for suffix, fw, cool in plan:
             if stop_file.exists():
                 log("STOP file present -> ending")
                 break
