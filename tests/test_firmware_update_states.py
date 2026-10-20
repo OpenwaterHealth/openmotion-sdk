@@ -424,7 +424,7 @@ def test_a_failed_write_is_redone_while_the_unit_is_in_the_rom_loader(images):
     assert _steps(unit) == ["download", "download", "verify", "leave"]
     assert unit.downloads == [(BASE, BARE_METAL_IMAGE)] * 2
     assert unit.connects == 2, "the retry reopens the ROM loader"
-    assert any("Retrying (2/3)" in p.message for p in seen)
+    assert any(p.phase == "retry" and "Retrying (2/3)" in p.message for p in seen)
 
 
 def test_a_corrupt_read_back_is_redone_and_never_started(images):

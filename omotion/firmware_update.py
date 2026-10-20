@@ -869,7 +869,7 @@ class FirmwareUpdater:
         for attempt in range(1, attempts + 1):
             try:
                 if attempt > 1:
-                    job.say("erase", f"The firmware write failed ({last}). Retrying "
+                    job.say("retry", f"The firmware write failed ({last}). Retrying "
                                      f"({attempt}/{attempts}): do not power off or unplug "
                                      "the unit.")
                     if not self._reattach_rom(dfu, serial):
