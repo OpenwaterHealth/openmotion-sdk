@@ -511,6 +511,23 @@ except BootloaderChangeRequired as e:
   team's artifact store. Use the `1.8.97` build for both the console and the
   sensor: it embeds the released bootloader 1.2.0. The `1.8.98` and `1.8.99`
   builds in the bucket embed bootloader 1.2.0-rc.1 and must not be used.
+- **A bare-metal write is verified before the unit leaves DFU.** The STM32 ROM
+  loader starts whatever is in flash as soon as it leaves, and a unit without a
+  bootloader has no other way back into DFU. So the application is read back
+  first, and a failed write or read-back is redone (`rom_write_attempts`,
+  default 3) while the unit stays in the ROM loader. If every attempt fails,
+  `update()` raises `UpdateInterruptedError`. The unit is still in update mode
+  with incomplete firmware: it must not be powered off, or it needs bench
+  recovery. Retry from the same state:
+
+  ```python
+  except UpdateInterruptedError as e:
+      # e.in_dfu is False if the unit dropped off USB: reconnect it first.
+      FirmwareUpdater().update(None, e.image_path, kind=e.kind, dfu_serial=e.dfu_serial)
+  ```
+
+  `handle=None` is the general resume-from-DFU call. The production-image path
+  is not retried: its step order is the bench-tested one.
 - **Replacing or installing a bootloader cannot be undone over USB.** The unit
   must stay powered and plugged in while it runs; a failure while sector 0 is
   rewritten needs bench recovery (SWD). Afterwards the unit only accepts images
