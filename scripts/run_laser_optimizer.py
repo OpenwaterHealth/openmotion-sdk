@@ -44,6 +44,8 @@ def parse_args():
     p.add_argument("--right-mask", type=mask, default=0xFF)
     p.add_argument("--duration", type=int, default=10, help="final scan seconds")
     p.add_argument("--target", type=float, default=100.0, help="target mean, DN")
+    p.add_argument("--probe-frames", type=int, default=30,
+                   help="light frames each probe averages")
     p.add_argument("--subject-id", default="laser_optimizer")
     p.add_argument("--data-dir", default="scan_data")
     p.add_argument("--verbose", action="store_true")
@@ -124,7 +126,8 @@ def main() -> int:
         print("Cameras before (cam, exposure rows, gain):",
               read_camera_settings(iface, left, right))
 
-        cfg = OptimizerConfig(target_mean_dn=args.target)
+        cfg = OptimizerConfig(target_mean_dn=args.target,
+                              probe_light_frames=args.probe_frames)
         request = LaserOptimizerRequest(
             final_scan=ScanRequest(
                 subject_id=args.subject_id, duration_sec=args.duration,
