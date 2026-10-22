@@ -46,6 +46,7 @@ from omotion.register_overrides import (
     FW_DEFAULT_EXPOSURE_ROWS,
     TA_PULSE_TICK_US,
     TA_PULSE_TRUNCATION_TICKS,
+    TA_PULSE_WIDTH_MAX_US,
     TA_PULSE_WIDTH_MIN_US,
     emitted_pulse_us,
     exposure_rows_for_us,
@@ -61,6 +62,12 @@ logger = logging.getLogger(
 )
 
 SIDES = ("left", "right")
+
+# Gain of each camera position as a multiple of the near cameras' gain:
+# row 1 (positions 4 and 5, at the laser) 1x, row 2 (3 and 6) 2x, row 3
+# (2 and 7) 4x, row 4 (1 and 8) 8x, each capped at CAMERA_GAIN_CEILING.
+ROW_GAIN_RATIO = (8, 4, 2, 1, 1, 2, 4, 8)
+CAMERA_GAIN_CEILING = max(CAMERA_GAIN_CHOICES)   # 16x, the sensor's top analog gain
 
 
 # ---------------------------------------------------------------------------
@@ -79,10 +86,12 @@ class OptimizerConfig:
     # the pair at the laser end. The brightest of them on any active side
     # decides.
     near_camera_ids: tuple = (3, 4)
-    # Brightest setting, where every run starts.
+    # Brightest setting, where every run starts (near-camera gain, pulse).
     max_gain: int = 16
     max_pulse_width_us: int = 2000
     min_pulse_width_us: int = TA_PULSE_WIDTH_MIN_US
+    # The other rows' gains as multiples of the near gain (ROW_GAIN_RATIO).
+    row_gain_ratio: tuple = ROW_GAIN_RATIO
     # Pulse width the balance curve pairs with 1x gain: W = this * sqrt(gain),
     # which also passes through (16x, 2000 µs). 500 µs is the stock setting.
     balance_width_us: float = 500.0
@@ -112,6 +121,22 @@ class OptimizerConfig:
     heavy_clip_fraction: float = 0.5
     heavy_clipped_step: float = 0.25
     max_probes: int = 10
+
+    def __post_init__(self) -> None:
+        if not 0 < self.target_mean_dn < 1000:
+            raise ValueError(f"target_mean_dn {self.target_mean_dn} outside 0-1000 DN")
+        if not 0 < self.tolerance < 1:
+            raise ValueError(f"tolerance {self.tolerance} outside 0-1")
+        if self.max_gain not in CAMERA_GAIN_CHOICES:
+            raise ValueError(f"max_gain {self.max_gain} not one of {CAMERA_GAIN_CHOICES}")
+        if not (TA_PULSE_WIDTH_MIN_US <= self.min_pulse_width_us
+                <= self.max_pulse_width_us <= TA_PULSE_WIDTH_MAX_US):
+            raise ValueError(
+                f"pulse widths {self.min_pulse_width_us}-{self.max_pulse_width_us} µs "
+                f"outside {TA_PULSE_WIDTH_MIN_US}-{TA_PULSE_WIDTH_MAX_US} µs")
+        if (len(self.row_gain_ratio) != 8
+                or any(r not in CAMERA_GAIN_CHOICES for r in self.row_gain_ratio)):
+            raise ValueError(f"row_gain_ratio {self.row_gain_ratio} is not 8 gain steps")
 
     @property
     def band(self) -> tuple[float, float]:
@@ -151,13 +176,11 @@ class OptimizerSetting:
         dark-corrected mean is proportional to this until pixels clip."""
         return self.near_gain * emitted_pulse_us(self.pulse_width_us)
 
-    def camera_gains(self, max_gain: int = 16) -> tuple:
-        """8 gains by camera position: the stock ladder (16/4/2/1/1/2/4/16)
-        scaled so the near cameras run at ``near_gain``, capped at max_gain.
-        16x everywhere at the brightest setting, the stock ladder at 1x."""
-        base = min(FW_DEFAULT_CAMERA_GAINS)
-        return tuple(min(max_gain, self.near_gain * g // base)
-                     for g in FW_DEFAULT_CAMERA_GAINS)
+    def camera_gains(self, row_ratio: Sequence[int] = ROW_GAIN_RATIO) -> tuple:
+        """8 gains by camera position: ``near_gain`` times the row's ratio
+        (1x/2x/4x/8x from the laser end out), capped at 16x. 16x everywhere
+        at 16x near gain; 8/4/2/1/1/2/4/8 at 1x."""
+        return tuple(min(CAMERA_GAIN_CEILING, self.near_gain * r) for r in row_ratio)
 
     def describe(self) -> str:
         return f"{self.near_gain}x / {self.pulse_width_us} µs"
@@ -493,7 +516,7 @@ def summary_text(result: LaserOptimizerResult, cfg: OptimizerConfig) -> str:
     """Plain-text block for scan notes: the chosen setting and the probe log."""
     lines = ["Laser optimizer (engineering): " + (
         f"scanned at {result.setting.describe()}, camera gains "
-        f"{'/'.join(str(g) for g in result.setting.camera_gains(cfg.max_gain))}, "
+        f"{'/'.join(str(g) for g in result.setting.camera_gains(cfg.row_gain_ratio))}, "
         f"exposure {cfg.exposure_us:g} µs"
         if result.setting else result.message)]
     lo, hi = cfg.band
@@ -649,7 +672,7 @@ class LaserOptimizerWorkflow:
         """Write the cameras' exposure/gains and the TA pulse width."""
         cfg = request.config
         rows = exposure_rows_for_us(cfg.exposure_us)
-        gains = setting.camera_gains(cfg.max_gain)
+        gains = setting.camera_gains(cfg.row_gain_ratio)
         for side, sensor, mask in self._active_sides(request):
             if (sensor, mask) not in self._touched_sides:
                 self._touched_sides.append((sensor, mask))
@@ -704,7 +727,7 @@ class LaserOptimizerWorkflow:
         """Start the caller's scan at ``setting`` and wait for it. Returns
         (session label, error, stopped)."""
         cfg = request.config
-        gains = list(setting.camera_gains(cfg.max_gain))
+        gains = list(setting.camera_gains(cfg.row_gain_ratio))
         meta = {
             "laser_optimizer": {
                 "near_gain": setting.near_gain,

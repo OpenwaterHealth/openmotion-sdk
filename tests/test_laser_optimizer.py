@@ -75,10 +75,34 @@ def test_width_never_exceeds_limits():
         assert st.near_gain in (1, 2, 4, 8, 16)
 
 
-def test_camera_gains_scale_the_stock_ladder_capped_at_16():
-    assert OptimizerSetting(16, 2000).camera_gains() == (16,) * 8
+def test_rows_run_at_1_2_4_8x_the_near_gain_capped_at_16():
+    # Positions 1..8: row 4, 3, 2, 1, 1, 2, 3, 4 (row 1 at the laser end).
+    assert OptimizerSetting(1, 500).camera_gains() == (8, 4, 2, 1, 1, 2, 4, 8)
     assert OptimizerSetting(2, 500).camera_gains() == (16, 8, 4, 2, 2, 4, 8, 16)
-    assert OptimizerSetting(1, 500).camera_gains() == FW_DEFAULT_CAMERA_GAINS
+    assert OptimizerSetting(4, 500).camera_gains() == (16, 16, 8, 4, 4, 8, 16, 16)
+    assert OptimizerSetting(16, 2000).camera_gains() == (16,) * 8
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"target_mean_dn": 0}, {"tolerance": 1.0}, {"max_gain": 3},
+    {"max_pulse_width_us": 2500}, {"min_pulse_width_us": 10},
+    {"row_gain_ratio": (8, 4, 2, 1)}, {"row_gain_ratio": (3,) * 8},
+])
+def test_config_rejects_values_outside_the_hardware(kwargs):
+    with pytest.raises(ValueError):
+        OptimizerConfig(**kwargs)
+
+
+def test_a_lower_start_and_setpoint_change_the_walk():
+    cfg = OptimizerConfig(target_mean_dn=150, max_gain=8, max_pulse_width_us=1000)
+    assert plan_next([], cfg).setting == OptimizerSetting(8, 1000)
+    assert cfg.band == (127.5, 172.5)
+    k = 300.0 / OptimizerSetting(8, 1000).signal    # clipped at the top
+    d, probes = _simulate(k, clip_onset_dn=280.0, cfg=cfg)
+    assert d.action == Action.ACCEPT
+    assert 127.5 <= probes[-1].mean_dn <= 172.5
+    assert all(p.setting.near_gain <= 8 and p.setting.pulse_width_us <= 1000
+               for p in probes)
 
 
 def test_signal_uses_the_emitted_pulse():
