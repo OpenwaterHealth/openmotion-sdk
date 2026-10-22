@@ -269,6 +269,7 @@ def _batch(rows, *, clip_bin=1020):
         pdc=None, tcm=None, tcl=None,
         frame_type=np.array([r[2] for r in rows], dtype="<U8"),
         mean_dc_rt=mean_dc, mean_raw=mean_raw, low_light_rt=low,
+        abs_frame_ids=np.arange(n, dtype=np.int64),
     )
 
 
@@ -282,12 +283,14 @@ def test_probe_sink_reads_median_mean_clip_and_dark():
         (1, 3, "light", 100.0, 172.0, False, 0.02),
         (1, 3, "light", 104.0, 176.0, False, 0.04),
         (1, 3, "light", 98.0, 170.0, False, 0.00),
+        (1, 3, "light", np.nan, 72.5, True, 0.0),       # terminal, laser off
     ]))
     r = sink.reading(1, 3)
     assert r.mean_dn == pytest.approx(100.0)
     assert r.clipped_fraction == pytest.approx(0.02)
     assert r.dark_dn == pytest.approx(72.0)
     assert r.light_frames == 3
+    assert r.laser_off_dn == pytest.approx(72.5)
 
 
 def test_probe_sink_counts_unlit_frames_as_zero():
@@ -372,8 +375,10 @@ class FakeScanWorkflow:
     """Synchronous scans. A probe (a sink with skip_default_storage) gets a
     simulated batch built from the registers currently written."""
 
-    def __init__(self, interface, k, clip_onset_dn, cancel_after_probes=None):
+    def __init__(self, interface, k, clip_onset_dn, cancel_after_probes=None,
+                 dark_leak_dn=0.0):
         self._iface = interface
+        self.dark_leak_dn = dark_leak_dn   # laser light reaching the scheduled dark
         self.k = k                    # {(side_idx, cam): DN per signal unit}
         self.clip_onset_dn = clip_onset_dn
         self.running = False
@@ -413,12 +418,15 @@ class FakeScanWorkflow:
                 g = sensor.gain(cam)
                 dark = 64.0 + 0.5 * g          # dark level grows with gain
                 rows.append((side_idx, cam, "warmup", np.nan, dark, False, 0.0))
-                rows.append((side_idx, cam, "dark", np.nan, dark, False, 0.0))
+                rows.append((side_idx, cam, "dark", np.nan, dark + self.dark_leak_dn,
+                             False, 0.0))
                 m = self.k.get((side_idx, cam), 0.0) * g * emitted
                 clip = 0.0 if m < self.clip_onset_dn else min(1.0, (m - self.clip_onset_dn) / self.clip_onset_dn)
                 for _ in range(10):
                     rows.append((side_idx, cam, "light", min(m, 900.0), dark + m,
                                  m <= 5.0, clip))
+                # The terminal frame, after the trigger stopped: laser-off.
+                rows.append((side_idx, cam, "light", np.nan, dark, True, 0.0))
         return _batch(rows)
 
     def await_complete(self, timeout_sec=None):
@@ -431,11 +439,12 @@ class FakeScanWorkflow:
 
 class FakeInterface:
     def __init__(self, k, *, clip_onset_dn=220.0, console=None, left=None, right=None,
-                 cancel_after_probes=None):
+                 cancel_after_probes=None, dark_leak_dn=0.0):
         self.console = console or FakeConsole()
         self.left = left or FakeSensor(connected=False)
         self.right = right or FakeSensor()
-        self.scan_workflow = FakeScanWorkflow(self, k, clip_onset_dn, cancel_after_probes)
+        self.scan_workflow = FakeScanWorkflow(self, k, clip_onset_dn, cancel_after_probes,
+                                              dark_leak_dn)
         self.laser_loads = 0
         self.optimizer = LaserOptimizerWorkflow(self)
 
@@ -643,3 +652,56 @@ def test_refuses_a_laser_off_final_scan():
         subject_id="s", duration_sec=10, left_camera_mask=0, right_camera_mask=0xFF,
         disable_laser=True))
     assert iface.optimizer.start(req) is False
+
+
+# ---------------------------------------------------------------------------
+# Dark-frame leak check and light frames per probe
+# ---------------------------------------------------------------------------
+
+def test_clean_probes_report_no_dark_leak():
+    iface = FakeInterface(_k_for(150.0, OptimizerSetting(8, 2000)))
+    result, probes = _run(iface)
+    assert result.outcome == OptimizerOutcome.COMPLETED
+    for p, _ in probes:
+        leak, cam = p.dark_leak
+        assert leak == pytest.approx(0.0) and cam is not None
+        assert "dark leak +0.0 DN" in p.describe()
+
+
+def test_laser_in_the_scheduled_dark_stops_the_run():
+    """Bench 2026-10-21: the stock 1800 µs skip at a 2196 µs exposure put
+    up to 890 DN of laser into the scheduled dark. Never dark-correct with it."""
+    iface = FakeInterface(_k_for(150.0, OptimizerSetting(8, 2000)), dark_leak_dn=40.0)
+    result, probes = _run(iface)
+    assert result.outcome == OptimizerOutcome.ERROR
+    assert "reached the dark-frame exposure" in result.message
+    assert not result.scan_ran and result.restored
+
+
+def test_small_leaks_under_the_limit_pass():
+    iface = FakeInterface(_k_for(150.0, OptimizerSetting(8, 2000)), dark_leak_dn=3.0)
+    result, _ = _run(iface)
+    assert result.outcome == OptimizerOutcome.COMPLETED
+
+
+@pytest.mark.parametrize("frames, seconds", [(5, 1), (30, 1), (31, 2), (100, 3)])
+def test_probe_length_follows_the_light_frame_count(frames, seconds):
+    iface = FakeInterface(_k_for(150.0, OptimizerSetting(8, 2000)))
+    request = LaserOptimizerRequest(final_scan=_final_scan(),
+                                    config=OptimizerConfig(probe_light_frames=frames))
+    _, probes = _run(iface, request)
+    probe_reqs = [r for r in iface.scan_workflow.requests if r.skip_default_storage]
+    assert {r.duration_sec for r in probe_reqs} == {seconds}
+    # The fake delivers 10 light frames; the sink takes at most `frames`.
+    assert all(r.light_frames == min(frames, 10) for p, _ in probes for r in p.near)
+
+
+def test_sink_keeps_the_terminal_frame_out_of_the_light_count():
+    sink = _ProbeSink(clip_bin=1020, max_light_frames=2)
+    sink.consume("live", _batch(
+        [(1, 3, "dark", np.nan, 128.0, False, 0.0)]
+        + [(1, 3, "light", 100.0, 228.0, False, 0.0)] * 2
+        + [(1, 3, "light", np.nan, 129.0, True, 0.0)]))      # terminal, laser off
+    r = sink.reading(1, 3)
+    assert r.light_frames == 2 and r.mean_dn == 100.0
+    assert r.laser_off_dn == 129.0 and r.dark_leak_dn == pytest.approx(-1.0)

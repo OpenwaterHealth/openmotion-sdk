@@ -69,6 +69,10 @@ SIDES = ("left", "right")
 ROW_GAIN_RATIO = (8, 4, 2, 1, 1, 2, 4, 8)
 CAMERA_GAIN_CEILING = max(CAMERA_GAIN_CHOICES)   # 16x, the sensor's top analog gain
 
+# Frames a probe spends before its first usable light frame: the pipeline's
+# warmup discard (default_pipeline discard_count = 9) plus the boundary dark.
+PROBE_LEADING_FRAMES = 10
+
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -106,8 +110,16 @@ class OptimizerConfig:
     # trips; RATE_LL sits under the 22,600 µs post-dark gap at 40 Hz.
     safety_pulse_width_ul_us: float = 2200.0
     safety_rate_ll_us: float = 22000.0
-    # One probe: seconds of laser-on capture.
-    probe_duration_sec: float = 1.0
+    # One probe: how many light frames each camera contributes. The probe
+    # scan runs long enough for the warmup discard, the boundary dark and
+    # this many lights at the trigger rate (30 = one second at 40 Hz).
+    probe_light_frames: int = 30
+    # A probe's scheduled dark frame reading more than this above the same
+    # probe's laser-off (terminal) frame means the displaced dark-frame pulse
+    # reached the exposure (the stock 1800 µs skip at long exposures does
+    # exactly that, bench 2026-10-21). The run stops rather than
+    # dark-correct with it. Ambient light raises both frames alike.
+    dark_leak_limit_dn: float = 5.0
     # A light frame's pixels in histogram bins >= clip_bin count as clipped;
     # a camera whose mean clipped fraction exceeds clip_fraction is clipped.
     clip_bin: int = 1020
@@ -137,6 +149,8 @@ class OptimizerConfig:
         if (len(self.row_gain_ratio) != 8
                 or any(r not in CAMERA_GAIN_CHOICES for r in self.row_gain_ratio)):
             raise ValueError(f"row_gain_ratio {self.row_gain_ratio} is not 8 gain steps")
+        if not 1 <= int(self.probe_light_frames) <= 2000:
+            raise ValueError(f"probe_light_frames {self.probe_light_frames} outside 1-2000")
 
     @property
     def band(self) -> tuple[float, float]:
@@ -238,6 +252,15 @@ class CameraReading:
     clipped_fraction: float     # mean fraction of pixels at full scale; NaN = no frames
     dark_dn: float              # raw mean of this probe's dark frame(s): the re-measured dark
     light_frames: int
+    # Raw mean of the probe's last frame, taken after the trigger stopped:
+    # laser-off by construction, the reference a clean scheduled dark matches.
+    laser_off_dn: float = float("nan")
+
+    @property
+    def dark_leak_dn(self) -> float:
+        """Scheduled dark minus the laser-off frame: ~0 (or negative, as
+        the sensor warms) when clean, positive when the laser reached it."""
+        return self.dark_dn - self.laser_off_dn
 
 
 @dataclass
@@ -270,12 +293,24 @@ class ProbeResult:
         f = self.clipped_fraction
         return math.isfinite(f) and f > self.clip_fraction_limit
 
+    @property
+    def dark_leak(self) -> tuple:
+        """(largest dark leak in DN, its CameraReading) over every camera
+        with both readings, or (NaN, None)."""
+        with_data = [r for r in self.near + self.others
+                     if math.isfinite(r.dark_leak_dn)]
+        if not with_data:
+            return float("nan"), None
+        worst = max(with_data, key=lambda r: r.dark_leak_dn)
+        return worst.dark_leak_dn, worst
+
     def to_dict(self) -> dict:
         def cam(r: CameraReading) -> dict:
             return {
                 "side": r.side, "camera": r.cam_id + 1,
                 "mean_dn": _round(r.mean_dn), "clipped_fraction": _round(r.clipped_fraction, 4),
-                "dark_dn": _round(r.dark_dn), "light_frames": r.light_frames,
+                "dark_dn": _round(r.dark_dn), "laser_off_dn": _round(r.laser_off_dn),
+                "light_frames": r.light_frames,
             }
         c = self.control
         return {
@@ -296,9 +331,11 @@ class ProbeResult:
             f"{r.side[0].upper()}{r.cam_id + 1} {r.dark_dn:.1f}"
             for r in self.near if math.isfinite(r.dark_dn)
         )
+        leak, _ = self.dark_leak
+        leak_txt = f", dark leak {leak:+.1f} DN" if math.isfinite(leak) else ""
         return (f"probe {self.index}: {self.setting.describe()}: near mean "
                 f"{self.mean_dn:.1f} DN{where}, clipped "
-                f"{self.clipped_fraction:.2%}, dark DN [{darks}]")
+                f"{self.clipped_fraction:.2%}, dark DN [{darks}]{leak_txt}")
 
 
 def _round(v: float, nd: int = 1):
@@ -404,22 +441,27 @@ class _ProbeSink:
     baseline) and the fraction of the histogram at full scale. A light frame
     the pipeline flags ``low_light_rt`` (camera saw nothing) counts as 0 DN.
     Light frames before the probe's first dark have no baseline yet and are
-    skipped. Dark frames: ``mean_raw``, reported so the probe table shows
-    the dark level re-measured at each gain.
+    skipped; only the first ``max_light_frames`` usable ones count. Dark
+    frames: ``mean_raw``, the dark level re-measured at each gain. The last
+    frame per camera (``mean_raw``) is the terminal frame, captured after the
+    trigger stopped, so laser-off: the reference a clean dark must match.
     """
 
     channels = frozenset({"live"})
 
-    def __init__(self, clip_bin: int) -> None:
+    def __init__(self, clip_bin: int, max_light_frames: int = 10**9) -> None:
         self._clip_bin = int(clip_bin)
+        self._max_light = int(max_light_frames)
         self._means: dict = {}
         self._clipped: dict = {}
         self._darks: dict = {}
+        self._last: dict = {}       # key -> (abs_frame_id, mean_raw)
 
     def on_scan_start(self, meta) -> None:
         self._means.clear()
         self._clipped.clear()
         self._darks.clear()
+        self._last.clear()
 
     def consume(self, channel: str, batch) -> None:
         if channel != "live" or batch.mean_dc_rt is None:
@@ -430,11 +472,19 @@ class _ProbeSink:
             if s < 0 or not 0 <= c < 8:
                 continue
             key = (s, c)
+            raw = (float(batch.mean_raw[i, s, c]) if batch.mean_raw is not None
+                   else float("nan"))
+            if math.isfinite(raw) and batch.abs_frame_ids is not None:
+                abs_id = int(batch.abs_frame_ids[i])
+                if key not in self._last or abs_id >= self._last[key][0]:
+                    self._last[key] = (abs_id, raw)
             if ft == "dark":
-                if batch.mean_raw is not None:
-                    v = float(batch.mean_raw[i, s, c])
-                    if math.isfinite(v):
-                        self._darks.setdefault(key, []).append(v)
+                if math.isfinite(raw):
+                    self._darks.setdefault(key, []).append(raw)
+                continue
+            # One spare slot: the terminal (laser-off) frame may land in it
+            # and is dropped in reading().
+            if len(self._means.get(key, ())) > self._max_light:
                 continue
             v = float(batch.mean_dc_rt[i, s, c])
             if not math.isfinite(v):
@@ -442,21 +492,27 @@ class _ProbeSink:
                     v = 0.0
                 else:
                     continue
-            self._means.setdefault(key, []).append(v)
+            abs_id = (int(batch.abs_frame_ids[i]) if batch.abs_frame_ids is not None
+                      else -1)
+            clip = float("nan")
             if hist is not None:
                 h = hist[i, s, c]
                 total = float(h.sum())
                 if total > 0:
-                    self._clipped.setdefault(key, []).append(
-                        float(h[self._clip_bin:].sum()) / total)
+                    clip = float(h[self._clip_bin:].sum()) / total
+            self._means.setdefault(key, []).append((abs_id, v, clip))
 
     def on_complete(self) -> None:
         pass
 
     def reading(self, side_idx: int, cam_id: int) -> CameraReading:
         key = (side_idx, cam_id)
-        means = self._means.get(key, [])
-        clipped = self._clipped.get(key, [])
+        last_id = self._last[key][0] if key in self._last else None
+        # The terminal frame is laser-off, not a light frame.
+        lights = [e for e in self._means.get(key, []) if e[0] != last_id]
+        lights = lights[:self._max_light]
+        means = [v for _, v, _ in lights]
+        clipped = [c for _, _, c in lights if math.isfinite(c)]
         darks = self._darks.get(key, [])
         return CameraReading(
             side=SIDES[side_idx],
@@ -465,6 +521,7 @@ class _ProbeSink:
             clipped_fraction=(sum(clipped) / len(clipped)) if clipped else float("nan"),
             dark_dn=(sum(darks) / len(darks)) if darks else float("nan"),
             light_frames=len(means),
+            laser_off_dn=self._last[key][1] if key in self._last else float("nan"),
         )
 
 
@@ -687,15 +744,16 @@ class LaserOptimizerWorkflow:
                index: int) -> ProbeResult:
         cfg = request.config
         self._apply(request, setting)
-        sink = _ProbeSink(cfg.clip_bin)
+        trigger = self._trigger_override(cfg, setting, request.final_scan.trigger_config)
+        rate_hz = float(self._interface.resolve_trigger_config(trigger)["TriggerFrequencyHz"])
+        sink = _ProbeSink(cfg.clip_bin, max_light_frames=cfg.probe_light_frames)
         finished = run_collection_scan(
             self._interface.scan_workflow, sink,
             subject_id="_laser_optimizer_probe",
-            duration_sec=cfg.probe_duration_sec,
+            duration_sec=(PROBE_LEADING_FRAMES + cfg.probe_light_frames) / rate_hz,
             left_camera_mask=request.final_scan.left_camera_mask,
             right_camera_mask=request.final_scan.right_camera_mask,
-            trigger_config=self._trigger_override(
-                cfg, setting, request.final_scan.trigger_config),
+            trigger_config=trigger,
             stop_evt=self._stop_evt,
             raise_on_error=True,
         )
@@ -709,8 +767,16 @@ class LaserOptimizerWorkflow:
                 if mask & (1 << cam):
                     (near if cam in cfg.near_camera_ids else others).append(
                         sink.reading(s, cam))
-        return ProbeResult(index=index, setting=setting, near=near, others=others,
-                           clip_fraction_limit=cfg.clip_fraction)
+        probe = ProbeResult(index=index, setting=setting, near=near, others=others,
+                            clip_fraction_limit=cfg.clip_fraction)
+        leak, cam = probe.dark_leak
+        if math.isfinite(leak) and leak > cfg.dark_leak_limit_dn:
+            raise RuntimeError(
+                f"probe {index} ({setting.describe()}): {cam.side} camera "
+                f"{cam.cam_id + 1}'s scheduled dark read {leak:.1f} DN above its "
+                f"laser-off frame (limit {cfg.dark_leak_limit_dn:g} DN): the laser "
+                f"reached the dark-frame exposure, so dark correction would be wrong")
+        return probe
 
     def _check_interlock(self, when: str) -> None:
         faults = read_safety_faults(self._interface.console)
