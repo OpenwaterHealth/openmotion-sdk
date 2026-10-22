@@ -8,7 +8,7 @@ import queue
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Optional, TYPE_CHECKING
+from typing import Callable, Optional, Sequence, TYPE_CHECKING
 
 from omotion import _log_root
 from omotion.connection_state import ConnectionState
@@ -168,6 +168,15 @@ class ScanRequest:
     # value can no longer carry. Fires on the worker thread, so the handler
     # must be thread-safe. See bloodflow-app issue #213.
     on_error: Callable[[BaseException], None] | None = None
+    # Analog gain each camera runs at, for the shot-noise correction:
+    # 8 values per position (both sides) or [left 8, right 8]. None = the
+    # firmware's stock ladder (config.CAMERA_GAIN_MAP). A caller that wrote
+    # its own gains (the laser optimizer, sdk#335) must pass them, or the
+    # Poisson term is off by the gain ratio.
+    camera_gain_map: Sequence | None = None
+    # Extra keys merged into the scan DB session_meta (JSON-serializable),
+    # e.g. the laser optimizer's chosen settings. Never replaces SDK keys.
+    extra_session_meta: dict | None = None
 
 
 @dataclass
@@ -193,6 +202,7 @@ def run_collection_scan(
     right_camera_mask: int,
     disable_laser: bool = False,
     reduced_mode: bool = False,
+    trigger_config: "dict | None" = None,
     stop_evt: "threading.Event | None" = None,
     poll_interval_s: float = 0.1,
     timeout_pad_s: float = 2.0,
@@ -210,6 +220,9 @@ def run_collection_scan(
     Without it (CQ): a single ``await_complete(duration_sec + timeout_pad_s)``.
     ``raise_on_error``: a refused start or a scan-level error raises
     ``RuntimeError``. Returns ``False`` when the scan was canceled, else ``True``.
+    ``trigger_config``: shallow-merged on top of the interface default, as
+    ``ScanRequest.trigger_config`` (the laser optimizer's probes move the
+    dark skip delay and record their pulse width this way).
 
     Operates only on ``scan_workflow``'s public surface (``start_scan`` /
     ``await_complete`` / ``running`` / ``cancel_scan`` / ``last_scan_error`` /
@@ -225,6 +238,7 @@ def run_collection_scan(
         reduced_mode=reduced_mode,
         sinks=[collector],
         skip_default_storage=True,
+        trigger_config=trigger_config,
     )
     started = scan_workflow.start_scan(request)
     if raise_on_error and not started:
@@ -421,6 +435,16 @@ class ScanWorkflow:
             self._last_scan_error = limits_error
             return False
 
+        camera_gain_map = None
+        if request.camera_gain_map is not None:
+            from omotion.pipeline.stages.shot_noise import gain_map_2x8
+            try:
+                camera_gain_map = gain_map_2x8(request.camera_gain_map)
+            except ValueError as exc:
+                logger.error("start_scan refused: %s", exc)
+                self._last_scan_error = str(exc)
+                return False
+
         with self._lock:
             if self._running or (self._thread and self._thread.is_alive()):
                 logger.warning(
@@ -448,6 +472,7 @@ class ScanWorkflow:
             left_camera_mask=request.left_camera_mask,
             right_camera_mask=request.right_camera_mask,
             reduced_mode=request.reduced_mode,
+            extra_session_meta=request.extra_session_meta,
         )
         # Mirror ScanDBSink.on_scan_start's label so callers can bind to this
         # exact session row (must match f"{scan_id}_{subject_id}" there).
@@ -494,7 +519,15 @@ class ScanWorkflow:
             pedestals=pedestals,
             raw_save_max_duration_s=request.raw_save_max_duration_s,
             telemetry=telemetry_aggregator,
+            camera_gain_map=camera_gain_map,
         )
+        if camera_gain_map is not None:
+            logger.info(
+                "start_scan: shot-noise correction uses the caller's camera "
+                "gains left=%s right=%s",
+                [int(g) for g in camera_gain_map[0]],
+                [int(g) for g in camera_gain_map[1]],
+            )
 
         # ── Auto-inject default sinks ──────────────────────────────────────
         # DiagnosticsLogSink is unconditional (not storage — it logs

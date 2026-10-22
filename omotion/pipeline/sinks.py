@@ -32,6 +32,10 @@ class ScanMetadata:
     left_camera_mask:  int
     right_camera_mask: int
     reduced_mode:      bool
+    # Caller-supplied keys merged into the scan DB session_meta (e.g. the
+    # laser optimizer's chosen settings and probe log, sdk#335). Must be
+    # JSON-serializable. None = nothing extra.
+    extra_session_meta: Optional[dict] = None
 
 
 @runtime_checkable
@@ -659,6 +663,11 @@ class ScanDBSink:
                 "right_camera_mask": meta.right_camera_mask,
             },
         }
+        extra = getattr(meta, "extra_session_meta", None)
+        if extra:
+            # Caller keys never replace the SDK's own (scan_id, sdk_flags...).
+            for key, value in extra.items():
+                self._session_meta.setdefault(key, value)
         self._session_id = self._db.create_session(
             session_label=label,
             session_start=time.time(),
