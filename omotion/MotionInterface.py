@@ -96,6 +96,7 @@ class MotionInterface:
         self._scan_workflow = None
         self._calibration_workflow = None
         self._cq_workflow = None
+        self._laser_optimizer_workflow = None
         self._monitor: Optional[ConnectionMonitor] = None
         self._started = False
 
@@ -345,6 +346,33 @@ class MotionInterface:
                 scan_workflow=self.scan_workflow
             )
         return self._cq_workflow
+
+    @property
+    def laser_optimizer_workflow(self):
+        """Lazy-loaded :class:`~omotion.LaserOptimizerWorkflow.LaserOptimizerWorkflow`
+        (sdk#335). Runs its probes and final scan through :attr:`scan_workflow`,
+        so it shares the scan-running lock with every other scan type."""
+        if self._laser_optimizer_workflow is None:
+            from omotion.LaserOptimizerWorkflow import LaserOptimizerWorkflow
+
+            self._laser_optimizer_workflow = LaserOptimizerWorkflow(self)
+        return self._laser_optimizer_workflow
+
+    @property
+    def laser_optimizer_running(self) -> bool:
+        """True from start until the run has restored the stock settings."""
+        return (
+            self._laser_optimizer_workflow is not None
+            and self._laser_optimizer_workflow.running
+        )
+
+    def start_laser_optimizer(self, request, **kwargs) -> bool:
+        """Facade passthrough for LaserOptimizerWorkflow.start."""
+        return self.laser_optimizer_workflow.start(request, **kwargs)
+
+    def cancel_laser_optimizer(self) -> None:
+        if self._laser_optimizer_workflow is not None:
+            self._laser_optimizer_workflow.cancel()
 
     @property
     def calibration_running(self) -> bool:
