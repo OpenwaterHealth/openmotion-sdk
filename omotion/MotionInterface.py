@@ -358,6 +358,14 @@ class MotionInterface:
             self._laser_optimizer_workflow = LaserOptimizerWorkflow(self)
         return self._laser_optimizer_workflow
 
+    @property
+    def laser_optimizer_running(self) -> bool:
+        """True from start until the run has restored the stock settings."""
+        return (
+            self._laser_optimizer_workflow is not None
+            and self._laser_optimizer_workflow.running
+        )
+
     def start_laser_optimizer(self, request, **kwargs) -> bool:
         """Facade passthrough for LaserOptimizerWorkflow.start."""
         return self.laser_optimizer_workflow.start(request, **kwargs)
