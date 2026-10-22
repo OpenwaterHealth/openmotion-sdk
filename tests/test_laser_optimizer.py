@@ -127,11 +127,36 @@ def test_bright_target_walks_down_then_jumps():
     d, probes = _simulate(k)
     assert d.action == Action.ACCEPT
     assert len(probes) <= CFG.max_probes
-    clipped = [p for p in probes if p.clipped]
-    # Each clipped probe halves the signal.
-    for a, b in zip(clipped, probes[1:]):
-        assert b.setting.signal == pytest.approx(a.setting.signal / 2, rel=0.02)
+    # Each clipped probe halves the signal, or quarters it when more than
+    # half the pixels clip.
+    for a, b in zip(probes, probes[1:]):
+        if not a.clipped:
+            continue
+        step = 0.25 if a.clipped_fraction > 0.5 else 0.5
+        assert b.setting.signal == pytest.approx(a.setting.signal * step, rel=0.02)
     assert d.setting == probes[-1].setting
+
+
+def test_bench_phantom_readings_converge_within_the_budget():
+    """Bench 2026-10-21, right module on a phantom: the readings each setting
+    produced (clipped fraction, near mean). Halving alone needed all 8 of the
+    old 8-probe budget; quarter steps under heavy clipping need 6."""
+    measured = {   # (gain, width) -> (near mean DN, clipped fraction)
+        (16, 2000): (895.4, 0.971), (8, 2000): (895.3, 0.971),
+        (8, 1009): (894.2, 0.961), (4, 1009): (855.5, 0.786),
+        (2, 1009): (681.4, 0.343), (2, 513): (410.4, 0.037),
+        (1, 513): (210.1, 0.0002), (1, 253): (101.9, 0.0),
+    }
+    probes = []
+    d = plan_next(probes, CFG)
+    while d.action == Action.PROBE:
+        key = (d.setting.near_gain, d.setting.pulse_width_us)
+        mean, clip = measured[key]
+        probes.append(_probe(d.setting, mean, clip, len(probes) + 1))
+        d = plan_next(probes, CFG)
+    assert d.action == Action.ACCEPT and d.setting == OptimizerSetting(1, 253)
+    assert [(p.setting.near_gain, p.setting.pulse_width_us) for p in probes] == [
+        (16, 2000), (8, 1009), (2, 1009), (2, 513), (1, 513), (1, 253)]
 
 
 def test_not_enough_light_at_the_brightest_setting():

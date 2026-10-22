@@ -23,6 +23,7 @@ import logging
 import os
 import sys
 import threading
+import time
 
 from omotion import MotionInterface
 from omotion.LaserOptimizerWorkflow import (
@@ -65,6 +66,23 @@ def read_console_registers(console) -> dict:
     return out
 
 
+def read_camera_settings(iface, left: int, right: int) -> dict:
+    """Commanded exposure (rows) and analog gain per active camera, from the
+    sensor firmware's cached camera telemetry (refreshed ~1 s). expo_cmd is
+    the register the writers set; expo_applied only moves while streaming."""
+    out = {}
+    for side, sensor, mask in (("left", iface.left, left), ("right", iface.right, right)):
+        if not mask:
+            continue
+        telem = sensor.get_camera_telemetry() or {}
+        cams = telem.get("cameras") or []
+        out[side] = [
+            (cam + 1, c.get("expo_cmd"), c.get("again_x"))
+            for cam, c in enumerate(cams) if mask & (1 << cam)
+        ]
+    return out
+
+
 def main() -> int:
     args = parse_args()
     logging.basicConfig(
@@ -80,6 +98,12 @@ def main() -> int:
         if not iface.wait_for_ready(console=True, sensors=1, timeout=30):
             print("Console and at least one sensor must be connected.")
             return 1
+        # Give each requested side time to finish connecting.
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and not all(
+                s.is_connected() for s, m in ((iface.left, args.left_mask),
+                                              (iface.right, args.right_mask)) if m):
+            time.sleep(0.2)
         left = args.left_mask if iface.left.is_connected() else 0
         right = args.right_mask if iface.right.is_connected() else 0
         print(f"Masks: left=0x{left:02X} right=0x{right:02X}")
@@ -97,6 +121,8 @@ def main() -> int:
             print(f"Laser power load failed: {iface.console.laser_limits_error}")
             return 1
         print("Before:", read_console_registers(iface.console))
+        print("Cameras before (cam, exposure rows, gain):",
+              read_camera_settings(iface, left, right))
 
         cfg = OptimizerConfig(target_mean_dn=args.target)
         request = LaserOptimizerRequest(
@@ -131,6 +157,9 @@ def main() -> int:
         print(summary_text(result, cfg))
         print(f"Outcome: {result.outcome.value}: {result.message}; restored={result.restored}")
         print("After:", read_console_registers(iface.console))
+        time.sleep(2.0)   # camera telemetry cache refreshes ~1 s
+        print("Cameras after (cam, exposure rows, gain):",
+              read_camera_settings(iface, left, right))
 
         if result.scan_label:
             from omotion.ScanDatabase import ScanDatabase

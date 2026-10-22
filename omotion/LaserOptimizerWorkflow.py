@@ -103,9 +103,15 @@ class OptimizerConfig:
     # a camera whose mean clipped fraction exceeds clip_fraction is clipped.
     clip_bin: int = 1020
     clip_fraction: float = 0.01
-    # Signal multiplier after a clipped probe (its mean is only a lower bound).
+    # Signal multiplier after a clipped probe (its mean is only a lower
+    # bound), and the bigger step once most of the image is clipped: a bright
+    # target (the bench phantom, 2026-10-21) sat >75% clipped for the first
+    # four halvings, which cost four probes. An overshoot only costs one
+    # probe, because an unclipped reading jumps straight back via the model.
     clipped_step: float = 0.5
-    max_probes: int = 8
+    heavy_clip_fraction: float = 0.5
+    heavy_clipped_step: float = 0.25
+    max_probes: int = 10
 
     @property
     def band(self) -> tuple[float, float]:
@@ -300,7 +306,8 @@ def plan_next(probes: Sequence[ProbeResult], cfg: OptimizerConfig) -> Decision:
 
     * No probes yet: probe the brightest setting.
     * Last probe clipped: its mean is only a lower bound, so ask for
-      ``clipped_step`` (half) of its signal.
+      ``clipped_step`` (half) of its signal, or ``heavy_clipped_step`` (a
+      quarter) when more than ``heavy_clip_fraction`` of the pixels clip.
     * Last probe in the band: accept it.
     * Last probe below the band at the brightest setting: not enough light.
     * Otherwise: the model wants ``signal x target / mean``. That is capped
@@ -324,9 +331,12 @@ def plan_next(probes: Sequence[ProbeResult], cfg: OptimizerConfig) -> Decision:
                         f"near mean {mean:.1f} DN is inside {lo:.0f}-{hi:.0f} DN")
 
     if last.clipped:
-        want = last.setting.signal * cfg.clipped_step
+        step = (cfg.heavy_clipped_step
+                if last.clipped_fraction > cfg.heavy_clip_fraction
+                else cfg.clipped_step)
+        want = last.setting.signal * step
         reason = (f"{last.clipped_fraction:.1%} of pixels clipped: "
-                  f"{cfg.clipped_step:g}x the signal")
+                  f"{step:g}x the signal")
     else:
         if mean < lo and _same_setting(last.setting, top):
             return Decision(
