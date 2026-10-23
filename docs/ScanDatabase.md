@@ -144,6 +144,15 @@ Notes:
 * Metric values are stored rounded (matching the corrected CSV writer's
   precision policy). Non-finite values (NaN) are stored as NULL; a frame with
   no finite metric at all is skipped.
+* `quality` takes one of four values:
+  * `ok`;
+  * `ts_corrected`: the frame's timestamp was re-anchored;
+  * `nan_filled`: a placeholder for a frame that never arrived;
+  * `low_light`: an unlit camera. The frame sat at its dark level, so
+    `bfi`, `bvi` and `contrast` are NULL while `mean` keeps the reading near 0.
+    See `SciencePipeline.md` §5.8.4.
+
+  A side-average row (`cam_id = -1`) carries the worst quality of its cameras.
 * `timestamp_s` is **seconds since scan start**, not firmware-clock seconds.
 * `cam_id` is **0-indexed**. The corrected CSV column names use 1-indexed
   cameras (e.g. `bfi_l3` is camera 3 (1-indexed) = `cam_id=2` (0-indexed)).
