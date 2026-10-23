@@ -75,7 +75,7 @@ def materialize_corrected_csv(
     meta is missing or malformed. Active-camera detection is implicit:
     cells without rows in ``session_data`` end up empty in the CSV
     (same behavior as the live writer when a (side, cam) pair was
-    masked off).
+    masked off). A NULL value is an empty cell in both layouts.
 
     When ``include_quality`` is True (non-reduced mode only), per-camera
     ``quality_l1`` … ``quality_r8`` columns are appended.
@@ -136,6 +136,19 @@ def materialize_corrected_csv(
             out_writer.writerow(out)
             rows_written += 1
 
+        def _reduced_vals(buf_red: dict) -> dict:
+            # Mean of each side's non-NULL values per metric. A metric
+            # with none stays out of the dict, so its cell is empty
+            # rather than 0.0 (issue #339: e.g. a covered module has a
+            # NULL BFI but a finite BVI).
+            vals: dict = {}
+            for sd, acc in buf_red.items():
+                for metric in ("bfi", "bvi"):
+                    n = acc[f"{metric}_n"]
+                    if n:
+                        vals[f"{metric}_{sd}"] = round(acc[metric] / n, 6)
+            return vals
+
         # Streaming merge: when frame_id changes, flush the buffered row.
         # Per-frame timestamp_s is the min of all contributing samples
         # — matches the CsvSink merge behavior.
@@ -146,7 +159,8 @@ def materialize_corrected_csv(
             buf_fid: Optional[int] = None
             buf_ts: Optional[float] = None
             buf_vals: dict = {}
-            # Reduced-mode accumulator: sum + count per side per frame.
+            # Reduced-mode accumulator: per side per frame, a sum and a
+            # count of the non-NULL values of each metric.
             buf_red: dict = {}
 
             for db_row in cur:
@@ -165,14 +179,13 @@ def materialize_corrected_csv(
                     first_frame_id = fid
 
                 if fid != buf_fid and buf_fid is not None:
-                    # Flush previous frame.
+                    # Flush previous frame. A reduced frame with no
+                    # value at all gets no row (the normal layout always
+                    # has one, since ScanDBSink drops all-NULL rows).
                     if reduced_mode:
-                        vals: dict = {}
-                        for sd, acc in buf_red.items():
-                            n = max(1, acc["count"])
-                            vals[f"bfi_{sd}"] = round(acc["bfi"] / n, 6)
-                            vals[f"bvi_{sd}"] = round(acc["bvi"] / n, 6)
-                        _emit(w, buf_fid, buf_ts, vals)
+                        vals = _reduced_vals(buf_red)
+                        if vals:
+                            _emit(w, buf_fid, buf_ts, vals)
                     else:
                         _emit(w, buf_fid, buf_ts, buf_vals)
                     buf_vals = {}
@@ -187,13 +200,14 @@ def materialize_corrected_csv(
                     sd_name = "left" if side_int == 0 else "right"
                     acc = buf_red.get(sd_name)
                     if acc is None:
-                        acc = {"bfi": 0.0, "bvi": 0.0, "count": 0}
+                        acc = {"bfi": 0.0, "bfi_n": 0, "bvi": 0.0, "bvi_n": 0}
                         buf_red[sd_name] = acc
                     if bfi is not None:
                         acc["bfi"] += float(bfi)
+                        acc["bfi_n"] += 1
                     if bvi is not None:
                         acc["bvi"] += float(bvi)
-                    acc["count"] += 1
+                        acc["bvi_n"] += 1
                 else:
                     suffix = f"{'l' if side_int == 0 else 'r'}{cam_id + 1}"
                     if bfi      is not None: buf_vals[f"bfi_{suffix}"]      = float(bfi)
@@ -206,12 +220,9 @@ def materialize_corrected_csv(
             # Flush the final frame.
             if buf_fid is not None:
                 if reduced_mode:
-                    vals = {}
-                    for sd, acc in buf_red.items():
-                        n = max(1, acc["count"])
-                        vals[f"bfi_{sd}"] = round(acc["bfi"] / n, 6)
-                        vals[f"bvi_{sd}"] = round(acc["bvi"] / n, 6)
-                    _emit(w, buf_fid, buf_ts, vals)
+                    vals = _reduced_vals(buf_red)
+                    if vals:
+                        _emit(w, buf_fid, buf_ts, vals)
                 else:
                     _emit(w, buf_fid, buf_ts, buf_vals)
 

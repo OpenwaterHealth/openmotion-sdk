@@ -249,9 +249,9 @@ finally:
 
 | File | Source | Contents |
 | --- | --- | --- |
-| `{ts}_{subject}_{side}_mask{XX}_raw.csv` | `Tee("raw")` → `CsvSink` | **The only raw-histogram record.** Gated by `writeRawData` / capped by `writeRawDataDurationSec`. |
+| `{ts}_{subject}_{side}_mask{XX}_raw.csv` | `Tee("raw")` → `CsvSink` | **The only raw-histogram record.** Gated and capped by `ScanRequest.raw_save_max_duration_s` (`0` omits the raw tee, `None` writes the whole scan). |
 | `{ts}_{subject}.csv` (corrected) | `"final"` channel → `CsvSink` | Same final-branch values as `session_data`. Opt-in when the DB is active (`writeCorrectedCsv`); forced on when no DB is configured. |
-| `{ts}_{subject}_telemetry.csv` | `"telemetry"` channel → `TelemetrySink` | Console telemetry snapshots. |
+| `{ts}_{subject}_telemetry.csv` | `_TelemetryCsvWriter` listener on `ConsoleTelemetryPoller` (not a pipeline sink) | Console telemetry snapshots. Gated by `ScanRequest.write_telemetry_csv`. |
 | `scans.db / session_data` | `"final"` channel → `ScanDBSink` | The corrected record (this document). |
 
 The corrected CSV and `session_data` are fed by the same `"final"` channel, so
@@ -285,13 +285,21 @@ What's preserved exactly:
   across all (side, cam) cells.
 - Per-frame `timestamp_s` — minimum of all contributing samples,
   same rule as `CsvSink`.
-- `bfi`, `bvi`, `contrast`, `mean` cell values.
+- `bfi`, `bvi`, `contrast`, `mean` and `temp` cell values.
 
-What's *not* preserved:
+Differences from the live `CsvSink` file:
 
-- `temp_*` cells are always empty (the DB doesn't carry temperature
-  in `session_data`). `plot_corrected_scan.py` ignores temperature,
-  so visualization still works.
+- A NULL value is an empty cell; `CsvSink` writes the in-memory NaN as
+  `nan`.
+- `timestamp_s` carries the DB's 6-decimal rounding; reduced-mode
+  values are rounded to 6 decimals.
+- `include_quality=True` (normal mode only) appends
+  `quality_l1` … `quality_r8`. The bloodflow-app's History → Export
+  CSV always passes it.
+- A reduced-mode frame whose side values are all NULL has no row;
+  `CsvSink` writes one full of `nan`.
+- `temp_*` cells are empty for sessions recorded before schema v2
+  added `session_data.temp` (issue #221).
 
 Pre-#92 Step F sessions raise `RuntimeError` — their `frame_id` rows
 are all the sentinel `-1`, so the row layout can't be reconstructed.
