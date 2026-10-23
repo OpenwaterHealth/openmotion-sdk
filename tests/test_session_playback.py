@@ -14,7 +14,7 @@ from omotion.SessionPlayback import materialize_corrected_csv
 from omotion.pipeline.sinks import _NORMAL_HEADERS
 
 
-def _make_db(tmp_path, rows):
+def _make_db(tmp_path, rows, *, reduced=False):
     """A one-session DB holding ``rows`` (session_id filled in here)."""
     db_path = str(tmp_path / "scans.db")
     db = ScanDatabase(db_path=db_path)
@@ -22,7 +22,7 @@ def _make_db(tmp_path, rows):
         session_label="s1", session_start=1.0, session_notes=None,
         session_meta={
             "data_semantics": "final",
-            "sdk_flags": {"reduced_mode": False,
+            "sdk_flags": {"reduced_mode": reduced,
                           "left_camera_mask": 0x03, "right_camera_mask": 0},
         },
     )
@@ -31,10 +31,10 @@ def _make_db(tmp_path, rows):
     return db_path, sid
 
 
-def _row(frame_id, cam_id, *, t=None, bfi=4.0, bvi=6.0, mean=100.0,
+def _row(frame_id, cam_id, *, side=0, t=None, bfi=4.0, bvi=6.0, mean=100.0,
          contrast=0.02, temp=None, quality="ok"):
     return {
-        "cam_id": cam_id, "side": 0, "frame_id": frame_id,
+        "cam_id": cam_id, "side": side, "frame_id": frame_id,
         "timestamp_s": (t if t is not None else frame_id * 0.025),
         "bfi": bfi, "bvi": bvi, "mean": mean, "contrast": contrast,
         "temp": temp, "quality": quality,
@@ -84,3 +84,48 @@ def test_export_header_matches_live_writer(tmp_path):
     expected += [f"quality_l{i}" for i in range(1, 9)]
     expected += [f"quality_r{i}" for i in range(1, 9)]
     assert header == expected
+
+
+def test_reduced_export_leaves_null_side_average_empty(tmp_path):
+    """Reduced (Clinical) layout: a side average stored as NULL is an empty
+    cell, not 0.0, and a side's mean counts only its non-NULL values
+    (issue #339). Covering every camera on a module is the usual cause:
+    contrast is NaN, so BFI is NULL, while BVI is still finite."""
+    db_path, sid = _make_db(tmp_path, [
+        _row(10, -1, side=0, bfi=None, bvi=-3.0),
+        _row(10, -1, side=0, bfi=None, bvi=-3.0),
+        _row(10, -1, side=1, bfi=4.0, bvi=6.0),
+        _row(11, -1, side=0, bfi=None, bvi=-3.0),
+        _row(11, -1, side=0, bfi=2.0, bvi=-5.0),
+        _row(11, -1, side=1, bfi=4.0, bvi=6.0),
+        _row(12, -1, side=0, bfi=None, bvi=-2.0),   # final frame
+    ], reduced=True)
+    out = str(tmp_path / "out.csv")
+    materialize_corrected_csv(db_path, sid, out, include_quality=True)
+
+    rows = _read(out)
+    assert list(rows[0]) == ["frame_id", "timestamp_s", "bfi_left",
+                             "bfi_right", "bvi_left", "bvi_right"]
+    assert [r["frame_id"] for r in rows] == ["10", "11", "12"]
+    assert rows[0]["bfi_left"] == ""
+    assert float(rows[0]["bvi_left"]) == pytest.approx(-3.0)
+    assert float(rows[0]["bfi_right"]) == pytest.approx(4.0)
+    assert float(rows[1]["bfi_left"]) == pytest.approx(2.0)
+    assert float(rows[1]["bvi_left"]) == pytest.approx(-4.0)
+    assert rows[2]["bfi_left"] == ""
+    assert float(rows[2]["bvi_left"]) == pytest.approx(-2.0)
+    assert rows[2]["bfi_right"] == "" and rows[2]["bvi_right"] == ""
+
+
+def test_reduced_export_skips_frame_with_no_value(tmp_path):
+    """A reduced frame whose side averages are all NULL gets no row,
+    rather than a row of zeros or blanks."""
+    db_path, sid = _make_db(tmp_path, [
+        _row(10, -1, side=0),
+        _row(11, -1, side=0, bfi=None, bvi=None),
+        _row(12, -1, side=0),
+    ], reduced=True)
+    out = str(tmp_path / "out.csv")
+    materialize_corrected_csv(db_path, sid, out, include_quality=True)
+
+    assert [r["frame_id"] for r in _read(out)] == ["10", "12"]
