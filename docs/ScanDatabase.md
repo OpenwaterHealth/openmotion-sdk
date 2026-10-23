@@ -296,8 +296,8 @@ Differences from the live `CsvSink` file:
 - `include_quality=True` (normal mode only) appends
   `quality_l1` … `quality_r8`. The bloodflow-app's History → Export
   CSV always passes it.
-- In reduced mode, a side value stored as NULL currently comes out as
-  `0.0` instead of an empty cell.
+- A reduced-mode frame whose side values are all NULL has no row;
+  `CsvSink` writes one full of `nan`.
 - `temp_*` cells are empty for sessions recorded before schema v2
   added `session_data.temp` (issue #221).
 

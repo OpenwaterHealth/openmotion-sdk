@@ -743,7 +743,7 @@ Writes the two legacy CSV families. File creation is lazy on first `consume()`.
 
 On `on_complete`, any partial accumulator rows are flushed verbatim (with blanks for the missing slots) so no completed frames are lost.
 
-The bloodflow-app's History → Export CSV is not written by `CsvSink`: `materialize_corrected_csv` (`omotion/SessionPlayback.py`) rebuilds the same layout from `session_data`. Its output differs in that a NULL (NaN) value is a blank cell rather than `nan`, `timestamp_s` carries the DB's 6-decimal rounding, reduced-mode values are rounded to 6 decimals, and `include_quality=True` (normal mode only; the app always passes it) appends `quality_l1..quality_r8`. In reduced mode a side value stored as NULL currently comes out as `0.0`, not blank. The app documents every CSV column for users in `docs/csv-formats.md` in the bloodflow-app repository.
+The bloodflow-app's History → Export CSV is not written by `CsvSink`: `materialize_corrected_csv` (`omotion/SessionPlayback.py`) rebuilds the same layout from `session_data`. Its output differs in that a NULL (NaN) value is a blank cell rather than `nan`, `timestamp_s` carries the DB's 6-decimal rounding, reduced-mode values are rounded to 6 decimals, and `include_quality=True` (normal mode only; the app always passes it) appends `quality_l1..quality_r8`. A reduced-mode frame with no value at all has no row. The app documents every CSV column for users in `docs/csv-formats.md` in the bloodflow-app repository.
 
 ### 8.2 ScanDBSink
 
