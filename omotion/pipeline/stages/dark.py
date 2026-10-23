@@ -158,6 +158,7 @@ class _LightSample:
     u2: float
     quality: str = "ok"
     temp_c: Optional[float] = None  # on-chip camera temperature (°C)
+    low_light: bool = False  # u1 at/below pedestal + guard margin: unlit
 
 
 @dataclass
@@ -200,7 +201,7 @@ class CorrectedFrame:
     raw_var:       float     # u2 - u1^2 (raw variance before dark sub)
     dark_var:      float     # interpolated dark baseline variance
     contrast:      Optional[float] = None  # set by ShotNoiseCorrectionStage
-    quality:       str = "ok"
+    quality:       str = "ok"  # the row's batch.quality, or "low_light" (unlit, #341)
     temp_c:        Optional[float] = None  # on-chip camera temperature (°C)
 
 
@@ -255,10 +256,11 @@ class PendingInterval:
 
     def add_light(self, *, abs_frame_id: int, t: float, u1: float, u2: float,
                   quality: str = "ok",
-                  temp_c: Optional[float] = None) -> None:
+                  temp_c: Optional[float] = None,
+                  low_light: bool = False) -> None:
         self._light.append(_LightSample(
             abs_frame_id=int(abs_frame_id), t=float(t), u1=float(u1), u2=float(u2),
-            quality=str(quality), temp_c=temp_c,
+            quality=str(quality), temp_c=temp_c, low_light=bool(low_light),
         ))
 
     def set_right_dark(self, obs: DarkObservation, *, abs_frame_id: int) -> None:
@@ -321,12 +323,24 @@ class LinearInterpolation:
                 corrected_var = 0.0
             std = float(corrected_var ** 0.5)
 
+            quality = lf.quality
+            if lf.low_light:
+                # Unlit frame (covered sensor, decoupled fiber). Its mean
+                # above the dark baseline is a real ~0 reading and is kept,
+                # but there is no speckle signal: std is undefined, and with
+                # it contrast, BFI and BVI downstream. Without this, a mean
+                # scattering just above 0 divided into the residual std gave
+                # BFI in the -10^5 range and BVI pinned at 10 (#341) — the
+                # realtime path already suppresses these frames.
+                std = float("nan")
+                quality = "low_light"
+
             corrected_frames.append(CorrectedFrame(
                 abs_frame_id=lf.abs_frame_id, t=lf.t,
                 side=side, cam_id=cam_id,
                 mean=mean, std=std,
                 raw_u1=lf.u1, raw_var=raw_var, dark_var=baseline_var,
-                quality=lf.quality, temp_c=lf.temp_c,
+                quality=quality, temp_c=lf.temp_c,
             ))
 
         return CorrectedInterval(
@@ -558,7 +572,7 @@ class DarkCorrectionStage:
                         if np.isfinite(tv):
                             temp_c = tv
                     pi.add_light(abs_frame_id=abs_id, t=t, u1=u1, u2=u2,
-                                 quality=q, temp_c=temp_c)
+                                 quality=q, temp_c=temp_c, low_light=dark_like)
 
         batch.dark_baseline_rt = baseline_rt
         batch.mean_dc_rt = mean_dc_rt
