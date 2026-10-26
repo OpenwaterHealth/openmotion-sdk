@@ -21,9 +21,18 @@ flash rather than guess.
 from __future__ import annotations
 
 import struct
+from dataclasses import dataclass
 from enum import Enum
+from typing import Optional
 
-__all__ = ["BootMode", "boot_mode_from_dfu", "parse_boot_info", "flash_address_for"]
+__all__ = [
+    "BootMode",
+    "BootInfo",
+    "boot_mode_from_dfu",
+    "parse_boot_info",
+    "parse_boot_info_details",
+    "flash_address_for",
+]
 
 
 class BootMode(Enum):
@@ -75,6 +84,69 @@ def parse_boot_info(payload) -> BootMode:
         return BootMode.UNKNOWN
     _ver, _rsvd, vtor, _flash_base = _BOOT_INFO.unpack_from(payload)
     return _BOOT_MODE_BY_VTOR.get(vtor, BootMode.UNKNOWN)
+
+
+# Console boot-info v2 appends u8 interlocks; u8 fpga_attest; u8 build;
+# u8 reserved2 (console-fw PTR-2026-1-5 change). Sensors stay at v1.
+_BOOT_INFO_V2_TAIL = struct.Struct("<BBBB")
+
+#: ``BootInfo.build`` bit 0: a Factory image (FPGA/UFM programming compiled in).
+BOOT_INFO_BUILD_FACTORY = 0x01
+
+
+@dataclass(frozen=True)
+class BootInfo:
+    """Decoded ``OW_CMD_BOOT_INFO`` reply.
+
+    The v2 fields are ``None`` on a v1 reply (sensor modules, and console
+    firmware before the PTR-2026-1-5 safety-state change).
+    """
+
+    struct_version: int
+    vtor: int
+    flash_base: int
+    interlocks: Optional[int] = None
+    """``TRIG_INTERLOCK_*`` bits active when the reply was made."""
+    fpga_attest: Optional[int] = None
+    """Attestation state: 0 idle, 1 running, 2 pass, 3 fail (omotion.fpga_attest)."""
+    build: Optional[int] = None
+    """Build flags; bit 0 (:data:`BOOT_INFO_BUILD_FACTORY`) is a Factory image."""
+
+    @property
+    def boot_mode(self) -> BootMode:
+        return _BOOT_MODE_BY_VTOR.get(self.vtor, BootMode.UNKNOWN)
+
+    @property
+    def firmware_owns_safety_state(self) -> bool:
+        """True on console firmware that loads and owns the laser-safety
+        limits itself (boot-info v2): the host must not write them."""
+        return self.struct_version >= 2 and self.build is not None
+
+    @property
+    def factory_image(self) -> Optional[bool]:
+        """True on a Factory image, False on Release/Debug, ``None`` when the
+        reply has no build field (v1)."""
+        if self.build is None:
+            return None
+        return bool(self.build & BOOT_INFO_BUILD_FACTORY)
+
+
+def parse_boot_info_details(payload) -> Optional[BootInfo]:
+    """Decode an ``OW_CMD_BOOT_INFO`` reply into :class:`BootInfo`.
+
+    Never raises: ``None`` for a missing or short reply. The v2 fields are
+    read only when the struct version says 2 or more and the bytes are there.
+    """
+    if not payload or len(payload) < _BOOT_INFO.size:
+        return None
+    payload = bytes(payload)
+    ver, _rsvd, vtor, flash_base = _BOOT_INFO.unpack_from(payload)
+    if ver >= 2 and len(payload) >= _BOOT_INFO.size + _BOOT_INFO_V2_TAIL.size:
+        interlocks, fpga_attest, build, _rsvd2 = _BOOT_INFO_V2_TAIL.unpack_from(
+            payload, _BOOT_INFO.size
+        )
+        return BootInfo(ver, vtor, flash_base, interlocks, fpga_attest, build)
+    return BootInfo(ver, vtor, flash_base)
 
 # omotion.dfu.classify_alt_names() reads the alt-setting strings of a connected
 # DFU device and answers in the bootloader tooling's vocabulary.

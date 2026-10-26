@@ -358,7 +358,8 @@ def test_write_failure_leaves_the_limits_unverified():
     console = _FakeConsole(write_ok=False)
 
     assert apply_laser_power(console) is False
-    assert "did not complete" in console.laser_limits_error
+    # names the first register the console did not accept
+    assert "TA_PULSE_WIDTH write was not accepted" in console.laser_limits_error
 
 
 def test_a_passing_load_clears_an_earlier_failure():

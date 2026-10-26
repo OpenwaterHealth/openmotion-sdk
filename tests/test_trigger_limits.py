@@ -128,7 +128,8 @@ def test_describe_trigger_refusal():
     assert "unknown" not in describe_trigger_refusal(TRIG_INTERLOCK_CONFIG | TRIG_INTERLOCK_TEC)
     assert "unreadable" in describe_trigger_refusal(TRIG_INTERLOCK_SAFETY_UNKNOWN)
     assert "safety limit" in describe_trigger_refusal(TRIG_INTERLOCK_LIMITS)
-    assert "0x40" in describe_trigger_refusal(0x40)
+    # 0x40 is TRIG_INTERLOCK_FPGA_ATTEST since the PTR-2026-1-5 console change
+    assert "attest" in describe_trigger_refusal(0x40)
     assert "no status byte" in describe_trigger_refusal(None)
 
 

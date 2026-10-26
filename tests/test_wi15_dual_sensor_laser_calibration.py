@@ -640,3 +640,16 @@ def test_final_trigger_stop_failure_changes_pending_pass_to_failed():
     assert result.trigger_cleanup_failure == "Trigger stop failed."
     assert result.requested_final_config is not None
     assert recorder.checkpoints[-1] == result
+
+
+def test_dual_preflight_on_a_release_image_that_refuses_safety_keys_stops_at_setup():
+    from omotion.fpga_attest import FACTORY_IMAGE_REQUIRED
+
+    bench = FakeDualBench()
+    bench.snapshot = replace(bench.snapshot, safety_keys_writable=False)
+    result, recorder, placements = run_workflow(bench)
+    assert result.status is ProcedureStatus.FAILED
+    assert result.failure_kind is FailureKind.SETUP
+    assert result.failure_reason == FACTORY_IMAGE_REQUIRED
+    assert bench.user_configuration_writes == []
+    assert "measure_energy" not in bench.calls

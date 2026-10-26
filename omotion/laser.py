@@ -27,13 +27,24 @@ EE and OPT FPGAs (sdk#310). Until a load verifies clean,
 ``console.laser_limits_error`` holds the reason, ``ScanWorkflow.start_scan``
 refuses laser scans and ``MotionConsole.start_trigger`` raises
 :class:`LaserSafetyLimitError`.
+
+Console firmware with the PTR-2026-1-5 safety-state change (boot-info v2)
+loads the safety limits itself from each safety FPGA's per-unit record and
+refuses host writes to them. On that firmware a load writes only the
+operating point (:data:`omotion.fpga_attest.HOST_LASER_REGISTERS`, bounded by
+the console) and verifies by asking the console: FPGA attestation passed and
+no attestation or limits interlock is set.
 """
 
 from __future__ import annotations
 
 import copy
 import logging
+import time
 from typing import Any, Optional
+
+from omotion.config import TRIG_INTERLOCK_FPGA_ATTEST, TRIG_INTERLOCK_LIMITS
+from omotion.fpga_attest import ATTEST_FAIL, ATTEST_PASS, HOST_LASER_REGISTERS
 
 from omotion.data.fpga_model import FPGA_MODEL
 from omotion.data.laser_params import LASER_PARAMS
@@ -46,8 +57,53 @@ logger = logging.getLogger("openmotion.sdk.laser")
 _SAFETY_FPGAS = ("Safety EE", "Safety OPT")
 
 
+# Boot attestation takes about 6.5 s on the console; a load right after
+# connect waits for it.
+ATTEST_WAIT_S = 15.0
+_ATTEST_POLL_S = 0.25
+
+
 class LaserSafetyLimitError(RuntimeError):
     """``start_trigger`` was called while ``console.laser_limits_error`` is set."""
+
+
+def _console_boot_info(console: Any):
+    """``console.get_boot_info()``, or None on a console object without it."""
+    get = getattr(console, "get_boot_info", None)
+    if not callable(get):
+        return None
+    try:
+        return get()
+    except Exception as e:
+        logger.warning("Could not read console boot info: %s", e)
+        return None
+
+
+def _firmware_safety_problem(console: Any, timeout_s: float) -> Optional[str]:
+    """On firmware that owns the safety state: wait for the FPGA attestation
+    to finish, then describe why laser scans must stay refused, or None."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        info = _console_boot_info(console)
+        if info is None or info.fpga_attest is None:
+            return "Laser safety state not verified: console boot info unreadable"
+        if info.fpga_attest in (ATTEST_PASS, ATTEST_FAIL) or time.monotonic() >= deadline:
+            break
+        time.sleep(_ATTEST_POLL_S)
+    if info.fpga_attest != ATTEST_PASS:
+        detail = ""
+        get_report = getattr(console, "get_fpga_attestation", None)
+        report = get_report() if callable(get_report) else None
+        if report is not None and report.faults():
+            detail = ": " + "; ".join(report.faults())
+        if info.fpga_attest == ATTEST_FAIL:
+            return "Safety FPGA attestation failed" + detail
+        return f"Safety FPGA attestation did not finish within {timeout_s:.0f} s" + detail
+    if info.interlocks & TRIG_INTERLOCK_LIMITS:
+        return "Console reports its safety limits not loaded and verified (interlock 0x20)"
+    if info.interlocks & TRIG_INTERLOCK_FPGA_ATTEST:
+        return "Console reports the FPGA attestation interlock (0x40) set"
+    return None
 
 
 def _read_back_safety_limits(console: Any, written: dict) -> list:
@@ -145,9 +201,17 @@ def apply_laser_power(
     fpga_map: Optional[FpgaMap] = None,
     force_fault: bool = False,
     lock: Optional[Any] = None,
+    attest_timeout_s: float = ATTEST_WAIT_S,
 ) -> bool:
     """Write the laser-driver configuration to ``console`` over I2C, then
     read back the safety limits it wrote.
+
+    On console firmware that owns the safety state (boot-info v2) only the
+    operating-point registers in :data:`~omotion.fpga_attest.HOST_LASER_REGISTERS`
+    are written, the user-config DRIVE CL overrides are not applied, and the
+    load verifies by waiting up to ``attest_timeout_s`` for the console's FPGA
+    attestation to pass. ``force_fault`` cannot be staged there (the faulted
+    register is firmware-owned), so such a load returns False.
 
     Reads user overrides from ``console.read_config()`` and applies the
     ``laser_params`` list, honoring per-key overrides and the safety DRIVE CL
@@ -194,6 +258,25 @@ def apply_laser_power(
 
     logger.info("Setting laser power from config...")
 
+    boot_info = _console_boot_info(console)
+    firmware_owned = boot_info is not None and boot_info.firmware_owns_safety_state
+    if firmware_owned:
+        if force_fault:
+            console.laser_limits_error = (
+                "force_fault cannot be staged: this console firmware owns the "
+                "laser-safety limits and refuses host writes to them"
+            )
+            logger.error("%s", console.laser_limits_error)
+            return False
+        skipped = [p["friendlyName"] for p in laser_params
+                   if p["friendlyName"] not in HOST_LASER_REGISTERS]
+        laser_params = [p for p in laser_params
+                        if p["friendlyName"] in HOST_LASER_REGISTERS]
+        logger.info(
+            "Console firmware owns the safety limits; writing the operating "
+            "point only, not %s", skipped,
+        )
+
     faulted_names: set = set()
     faulted_coords: set = set()
     if force_fault:
@@ -219,6 +302,9 @@ def apply_laser_power(
     ee_gain = user_cfg.get("EE_GAIN")
     opt_thresh = user_cfg.get("OPT_THRESH")
     opt_gain = user_cfg.get("OPT_GAIN")
+    if firmware_owned:
+        # The console loads DRIVE CL from the unit's safety record.
+        ee_thresh = ee_gain = opt_thresh = opt_gain = None
 
     # (channel, offset) entries to skip in the JSON pass when a user override
     # supersedes them.
@@ -299,8 +385,14 @@ def apply_laser_power(
                 reg_addr=offset,
                 data=data_to_send,
             ):
+                console.laser_limits_error = (
+                    f"Laser power load failed: {friendly_name} write was not accepted"
+                    + (" (the console refuses values above the unit's safety limits)"
+                       if firmware_owned else "")
+                )
                 logger.error(
-                    "Failed to set laser power (muxIdx=%d, channel=%d)", mux_idx, channel
+                    "Failed to set laser power (muxIdx=%d, channel=%d): %s",
+                    mux_idx, channel, console.laser_limits_error,
                 )
                 return False
             if fpga_entry["label"] in _SAFETY_FPGAS:
@@ -335,6 +427,19 @@ def apply_laser_power(
         elif not _write_drive_cl("OPT_DRIVE_CL", 7, opt_thresh, opt_gain, "Safety OPT"):
             logger.error("Failed to write user-config Safety OPT DRIVE CL")
             return False
+
+        if firmware_owned:
+            problem = _firmware_safety_problem(console, attest_timeout_s)
+            if problem:
+                console.laser_limits_error = problem
+                logger.error("%s", problem)
+                return False
+            console.laser_limits_error = None
+            logger.info(
+                "Laser power set successfully. Console attestation passed; "
+                "safety limits loaded by the firmware"
+            )
+            return True
 
         # Still under the caller's lock (if any), so nothing else touches
         # the registers between the writes and the read-back.
