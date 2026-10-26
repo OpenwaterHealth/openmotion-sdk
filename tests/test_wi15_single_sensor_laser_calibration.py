@@ -1925,3 +1925,18 @@ def test_each_raw_measurement_path_is_durable_before_criterion_derivation(
     payload = observed_payloads[0]
     assert len(payload["measurements"]) == validation_call
     assert len(payload["measurement_criteria"]) == validation_call - 1
+
+
+def test_preflight_on_a_release_image_that_refuses_safety_keys_stops_before_configuration():
+    from omotion.fpga_attest import FACTORY_IMAGE_REQUIRED
+
+    snapshot = replace(_preflight(), safety_keys_writable=False)
+    bench = FakeLaserBench([snapshot])
+    recorder = FakeRecorder()
+
+    result = SingleSensorLaserCalibrationWorkflow(bench, recorder).run(_request())
+
+    assert result.status is ProcedureStatus.FAILED
+    assert result.failure_kind is FailureKind.SETUP
+    assert result.failure_reason == FACTORY_IMAGE_REQUIRED
+    assert bench.calls == ["preflight:left", "stop_trigger"]

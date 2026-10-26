@@ -11,7 +11,8 @@ import numpy as np
 
 from omotion import _log_root
 from omotion.MotionUart import MotionUart
-from omotion.boot_mode import BootMode, parse_boot_info
+from omotion.boot_mode import BootInfo, BootMode, parse_boot_info, parse_boot_info_details
+from omotion.fpga_attest import FpgaAttestReport, parse_attest_report
 from omotion.ConsoleTelemetry import ConsoleTelemetryPoller
 from omotion.connection_state import ConnectionState
 from omotion.signal_wrapper import SignalWrapper
@@ -44,7 +45,12 @@ from omotion.config import (
     OW_CMD_USR_CFG,
     OW_CMD_VERSION,
     OW_CMD_BOOT_INFO_CONSOLE,
+    OW_CMD_FPGA_ATTEST,
     OW_CMD_MESSAGES,
+    OW_CODE_BUSY,
+    OW_CODE_CFG_RANGE,
+    OW_CODE_CFG_SAFETY_KEY,
+    OW_CODE_CFG_UNKNOWN_KEY,
     OW_RESP,
     OW_CONTROLLER,
     OW_CTRL_BOARDID,
@@ -97,6 +103,15 @@ logger = logging.getLogger(f"{_log_root}.Console" if _log_root else "Console")
 # Backwards-compatible alias; the canonical validator now lives in
 # omotion.config.is_valid_serial (shared by console + sensor).
 is_valid_console_serial = is_valid_serial
+
+_CONFIG_REFUSAL_REASONS = {
+    OW_CODE_CFG_SAFETY_KEY: (
+        "names a firmware-owned safety parameter; those come from the unit's "
+        "safety record and are writable only on a Factory image"
+    ),
+    OW_CODE_CFG_UNKNOWN_KEY: "a key is not in the console allow-list",
+    OW_CODE_CFG_RANGE: "a value is not a finite number or is out of range",
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -202,6 +217,12 @@ class MotionConsole(SignalWrapper):
         # description. Both None after a start the console accepted.
         self.last_start_refusal: Optional[int] = None
         self.last_start_refusal_reason: Optional[str] = None
+
+        # Why the console refused the last write_config: the OW_CODE_* byte
+        # (None if the firmware sent none) and its description. Both None
+        # after a write the console accepted.
+        self.last_config_refusal: Optional[int] = None
+        self.last_config_refusal_reason: Optional[str] = None
 
     # ──────────────────────────────────────────────────────────────────
     # State (read-only from outside)
@@ -539,6 +560,69 @@ class MotionConsole(SignalWrapper):
         if r is None or r.packetType != OW_RESP:
             return BootMode.UNKNOWN
         return parse_boot_info(bytes(r.data[: r.data_len]) if r.data else b"")
+
+    def get_boot_info(self) -> Optional[BootInfo]:
+        """The full ``OW_CMD_BOOT_INFO`` reply: boot mode and, on console
+        firmware with the PTR-2026-1-5 safety-state change (v2), the active
+        trigger interlocks, the FPGA attestation state and the Factory flag.
+
+        Never raises: ``None`` when disconnected, in demo mode, or when the
+        firmware does not answer the command.
+        """
+        try:
+            if self.uart.demo_mode or not self.is_connected():
+                return None
+            r = self.uart.send_packet(
+                id=None, packetType=OW_CMD, command=OW_CMD_BOOT_INFO_CONSOLE
+            )
+            self.uart.clear_buffer()
+        except Exception:
+            return None
+        if r is None or r.packetType != OW_RESP:
+            return None
+        return parse_boot_info_details(bytes(r.data[: r.data_len]) if r.data else b"")
+
+    def firmware_owns_safety_state(self) -> bool:
+        """True when the console loads and enforces the laser-safety limits
+        itself (boot-info v2). The host must then not write the registers in
+        :data:`omotion.fpga_attest.FIRMWARE_OWNED_REGISTERS` or the config
+        keys in :data:`omotion.fpga_attest.CONFIG_SAFETY_KEYS`."""
+        info = self.get_boot_info()
+        return info is not None and info.firmware_owns_safety_state
+
+    def get_fpga_attestation(self, start: bool = False) -> Optional[FpgaAttestReport]:
+        """Read the console's FPGA attestation report (``OW_CMD_FPGA_ATTEST``).
+
+        With ``start=True`` the console first starts a new run (about 6.5 s;
+        poll this method until ``report.done``). The console refuses a start
+        while a run or the trigger is running; that and firmware without the
+        command return ``None``, with the reason logged.
+        """
+        try:
+            if self.uart.demo_mode or not self.is_connected():
+                return None
+            r = self.uart.send_packet(
+                id=None,
+                packetType=OW_CMD,
+                command=OW_CMD_FPGA_ATTEST,
+                reserved=1 if start else 0,
+            )
+            self.uart.clear_buffer()
+        except Exception as e:
+            self._log_command_error("get_fpga_attestation", e)
+            return None
+        if r is None:
+            return None
+        data = bytes(r.data[: r.data_len]) if r.data else b""
+        if r.packetType == OW_ERROR:
+            if data[:1] == bytes([OW_CODE_BUSY]):
+                logger.warning("FPGA attestation refused: a run or the trigger is running")
+            else:
+                logger.warning("FPGA attestation not available on this console firmware")
+            return None
+        if r.packetType != OW_RESP:
+            return None
+        return parse_attest_report(data)
 
     def echo(self, echo_data=None) -> tuple[bytes, int]:
         """
@@ -2284,12 +2368,21 @@ class MotionConsole(SignalWrapper):
             if r.packetType == OW_ERROR:
                 # Console firmware with the strict-config check refuses a
                 # config that is not a strict JSON object or does not fit the
-                # page, and keeps the stored one.
+                # page; firmware that owns the safety state also refuses a
+                # safety key, an unknown key or an out-of-range value. Either
+                # way the stored config is unchanged.
+                code = r.data[0] if r.data_len >= 1 else None
+                self.last_config_refusal = code
+                self.last_config_refusal_reason = _CONFIG_REFUSAL_REASONS.get(
+                    code, "not strict JSON, or too long"
+                )
                 logger.error(
-                    "Console refused the config write (not strict JSON, or too "
-                    "long); the stored config is unchanged"
+                    "Console refused the config write (%s); the stored config is unchanged",
+                    self.last_config_refusal_reason,
                 )
                 return None
+            self.last_config_refusal = None
+            self.last_config_refusal_reason = None
 
             # The firmware write ACK returns only the updated 16-byte header
             # (with the new seq/crc stamped by the device) — it does NOT echo

@@ -65,7 +65,8 @@ from .CalibrationWorkflow import (
     ungated_cameras,
 )
 from .connection_state import ConnectionState
-from .boot_mode import BootMode, parse_boot_info
+from .boot_mode import BootInfo, BootMode, parse_boot_info, parse_boot_info_details
+from .fpga_attest import FpgaAttestReport, parse_attest_report
 from .firmware_update import (
     BootloaderChangeRequired,
     FirmwareKind,
@@ -127,7 +128,11 @@ __all__ = [
     "check_latest",
     "download_firmware",
     "BootMode",
+    "BootInfo",
     "parse_boot_info",
+    "parse_boot_info_details",
+    "FpgaAttestReport",
+    "parse_attest_report",
     "UnsupportedReleaseError",
     "is_update_available",
     "parse_version",
