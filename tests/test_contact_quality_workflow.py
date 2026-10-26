@@ -5,6 +5,7 @@ results are in **background-subtracted DN** scale (subtracted_mean), matching
 the legacy ContactQuality module semantics.
 """
 
+import numpy as np
 import pytest
 from unittest.mock import MagicMock
 
@@ -174,6 +175,117 @@ def test_cq_sink_on_scan_start_clears_accumulated_data():
     result = sink.result(left_mask=0x01, right_mask=0, duration_sec=1.0)
     cam = result.per_camera[("left", 0)]
     assert cam.reason == "no_signal"
+
+
+# ---------------------------------------------------------------------------
+# Unlit cameras: frames arrived, no light in them (sdk#343)
+# ---------------------------------------------------------------------------
+
+def _unlit(batch, side_idx=None, cam_ids=None):
+    """Mark light rows unlit the way DarkCorrectionStage does: low_light_rt
+    True, mean_dc_rt left NaN, subtracted_mean still a real near-zero
+    reading. Restricted to one side's ``cam_ids`` when given."""
+    low = np.zeros(batch.mean_dc_rt.shape, dtype=bool)
+    sides = range(2) if side_idx is None else (side_idx,)
+    cams = range(8) if cam_ids is None else cam_ids
+    for i, s, c, _ft in batch.iter_rows():
+        if s in sides and c in cams:
+            low[i, s, c] = True
+            batch.mean_dc_rt[i, s, c] = np.nan
+            batch.subtracted_mean[i, s, c] = 0.2
+    batch.low_light_rt = low
+    return batch
+
+
+def _sink(rolling_window=5):
+    sink = _ContactQualitySink(
+        dark_thresholds=[3.0] * 8,
+        light_thresholds=[15.0] * 8,
+        rolling_window=rolling_window,
+    )
+    sink.on_scan_start(None)
+    return sink
+
+
+def test_cq_sink_tells_an_unlit_camera_from_one_that_sent_nothing():
+    """The 2026-10-26 bench shape (app#731 retest): L3-L5 streamed but every
+    light frame was unlit, R8 delivered no usable frames, the rest were lit.
+    Unlit is poor contact, as the live monitor reports it; only the camera
+    that sent nothing is no_signal."""
+    sink = _sink()
+    sink.consume("live", _dn_batch(1, 0.0, frame_types=["dark"]))
+    lights = _unlit(_dn_batch(10, 40.0), side_idx=0, cam_ids=(2, 3, 4))
+    r8 = (lights.side_ids == 1) & (lights.cam_ids == 7)
+    lights.frame_type[r8] = "stale"           # R8: nothing usable arrived
+    sink.consume("live", lights)
+
+    result = sink.result(left_mask=0xFF, right_mask=0xFF, duration_sec=1.0)
+    reasons = {k: v.reason for k, v in result.per_camera.items()}
+
+    for cam_id in (2, 3, 4):
+        cam = result.per_camera[("left", cam_id)]
+        assert cam.reason == "poor_contact"
+        assert cam.passed is False
+        assert np.isnan(cam.light_avg_dn)     # no light reading to report
+        assert cam.dark_max_dn == pytest.approx(0.0)
+    assert reasons[("right", 7)] == "no_signal"
+    others = {k: r for k, r in reasons.items()
+              if k not in {("left", 2), ("left", 3), ("left", 4), ("right", 7)}}
+    assert set(others.values()) == {"ok"}
+    assert result.passed is False
+
+
+def test_cq_sink_terminal_unlit_frame_is_not_evidence():
+    """The firmware's terminal laser-off frame reaches every camera unlit.
+    A lit camera stays ok, and a camera whose only frame was that one is
+    still no_signal: fewer unlit frames than a rolling window proves
+    nothing."""
+    sink = _sink(rolling_window=5)
+    sink.consume("live", _dn_batch(6, 40.0))
+    sink.consume("live", _unlit(_dn_batch(1, 40.0)))
+    lit = sink.result(left_mask=0x01, right_mask=0, duration_sec=1.0)
+    assert lit.per_camera[("left", 0)].reason == "ok"
+
+    sink = _sink(rolling_window=5)
+    sink.consume("live", _unlit(_dn_batch(4, 40.0)))
+    few = sink.result(left_mask=0x01, right_mask=0, duration_sec=1.0)
+    assert few.per_camera[("left", 0)].reason == "no_signal"
+
+    sink.consume("live", _unlit(_dn_batch(1, 40.0)))   # 5 = one full window
+    enough = sink.result(left_mask=0x01, right_mask=0, duration_sec=1.0)
+    assert enough.per_camera[("left", 0)].reason == "poor_contact"
+
+
+def test_cq_sink_nan_light_without_low_light_flag_stays_no_signal():
+    """A NaN light reading without low_light_rt means no dark baseline yet,
+    not an unlit frame — no measurement exists, so no_signal stands. Covers
+    both a batch with no low_light_rt array and one where it reads False."""
+    for with_flags in (False, True):
+        sink = _sink()
+        batch = _dn_batch(10, 40.0)
+        batch.mean_dc_rt[:] = np.nan
+        if with_flags:
+            batch.low_light_rt = np.zeros(batch.mean_dc_rt.shape, dtype=bool)
+        sink.consume("live", batch)
+        result = sink.result(left_mask=0x01, right_mask=0, duration_sec=1.0)
+        assert result.per_camera[("left", 0)].reason == "no_signal"
+
+
+def test_cq_sink_unlit_camera_with_ambient_dark_reports_ambient_light():
+    """Ambient light outranks poor contact for an unlit camera too."""
+    sink = _sink()
+    sink.consume("live", _dn_batch(1, 9.0, frame_types=["dark"]))
+    sink.consume("live", _unlit(_dn_batch(10, 40.0)))
+    result = sink.result(left_mask=0x01, right_mask=0, duration_sec=1.0)
+    assert result.per_camera[("left", 0)].reason == "ambient_light"
+
+
+def test_cq_sink_on_scan_start_clears_unlit_counts():
+    sink = _sink()
+    sink.consume("live", _unlit(_dn_batch(10, 40.0)))
+    sink.on_scan_start(None)
+    result = sink.result(left_mask=0x01, right_mask=0, duration_sec=1.0)
+    assert result.per_camera[("left", 0)].reason == "no_signal"
 
 
 # ---------------------------------------------------------------------------

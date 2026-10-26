@@ -190,6 +190,22 @@ def test_evaluate_reason_precedence_matches_legacy_order():
     ) == REASON_OK
 
 
+def test_evaluate_reason_unlit_camera_is_poor_contact_not_no_signal():
+    """sdk#343: light frames that arrived unlit leave no light reading, but
+    the camera is poorly coupled, not silent — the live monitor's verdict
+    for the same frames. Ambient light still outranks it."""
+    nan = float("nan")
+    assert evaluate_reason(
+        light_avg=nan, dark_max=0.0, thresholds=THRESHOLDS, cam_id=0, unlit=True
+    ) == REASON_POOR_CONTACT
+    assert evaluate_reason(
+        light_avg=nan, dark_max=99.0, thresholds=THRESHOLDS, cam_id=0, unlit=True
+    ) == REASON_AMBIENT_LIGHT
+    assert evaluate_reason(
+        light_avg=nan, dark_max=0.0, thresholds=THRESHOLDS, cam_id=0
+    ) == REASON_NO_SIGNAL
+
+
 def test_latch_debounce_one_is_immediate():
     latch = CameraLatch(activate_debounce=1, clear_debounce=1)
     assert latch.observe(True) == TRANSITION_ACTIVATED

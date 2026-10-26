@@ -24,7 +24,9 @@ the consumer's camera-dropout watchdog rather than to contact quality. A
 frame that DID arrive but was unlit — DarkCorrectionStage's own
 ``low_light_rt`` determination — is reported as poor contact instead of
 silently dropped; that is the disconnected-fiber case the live monitor
-exists to catch (see :class:`ContactQualityMonitor`).
+exists to catch (see :class:`ContactQualityMonitor`). The preflight agrees:
+a camera whose light frames all arrived unlit is ``poor_contact`` there
+too, and ``no_signal`` means no light frames arrived (sdk#343).
 
 Thresholds are background-subtracted DN. See docs/SciencePipeline.md §11.2
 and §11.3.
@@ -120,6 +122,7 @@ def evaluate_reason(
     dark_max: float,
     thresholds: CQThresholds,
     cam_id: int,
+    unlit: bool = False,
 ) -> str:
     """Single precedence-ordered verdict for one camera.
 
@@ -127,11 +130,19 @@ def evaluate_reason(
     check; the live monitor uses the two predicates directly because a
     camera can be ambient-lit and poorly coupled at the same time and the
     UI renders those as separate rows.
+
+    ``unlit`` says the camera's light frames DID arrive but all of them were
+    unlit (``low_light_rt``), so ``light_avg`` has no reading. That is poor
+    contact — a covered or lifted sensor, a decoupled fiber — exactly as the
+    live monitor reports it, not a missing signal (sdk#343). Without it a
+    non-finite ``light_avg`` means no light frames arrived: ``no_signal``.
     """
-    if not math.isfinite(light_avg):
+    if not math.isfinite(light_avg) and not unlit:
         return REASON_NO_SIGNAL
     if is_ambient_light(dark_max, thresholds, cam_id):
         return REASON_AMBIENT_LIGHT
+    if not math.isfinite(light_avg):
+        return REASON_POOR_CONTACT
     if is_poor_contact(light_avg, thresholds, cam_id):
         return REASON_POOR_CONTACT
     return REASON_OK
