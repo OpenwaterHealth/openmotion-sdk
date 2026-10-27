@@ -4,7 +4,9 @@ import logging
 
 import numpy as np
 import pytest
-from omotion.pipeline.batch import CameraStreamGap, FrameBatch, FrameQuarantined
+from omotion.pipeline.batch import (
+    CameraLateStart, CameraStreamGap, FrameBatch, FrameQuarantined,
+)
 from omotion.pipeline.stages.classify import FrameClassificationStage
 
 
@@ -349,3 +351,126 @@ def test_large_corrupt_pair_does_not_poison_clean_counter_state():
 
     assert list(batch.frame_type) == ["warmup", "stale", "warmup"]
     np.testing.assert_array_equal(batch.abs_frame_ids, [1, 65, 2])
+
+
+# ---------------------------------------------------------------------------
+# Rule 5: a camera whose frame 1 never arrived anchors from the module clock
+# (#319). On 2026-10-12 the parser dropped frame 1 of left cam 8, right cam 8
+# and right cam 2 (bad histogram sums); each camera's frame 2 was then
+# quarantined as a leading frame and the camera was lost for the whole check.
+# ---------------------------------------------------------------------------
+
+def _scan_rows(frames, *, drop=(), sides=(0, 1), cams=range(8), t0=0.0):
+    """Packet rows for every (side, cam) over `frames`, minus the
+    (side, cam, frame) captures in `drop` (never delivered)."""
+    rows = []
+    for p, f in enumerate(frames):
+        for side in sides:
+            for cam in cams:
+                if (side, cam, f) in drop:
+                    continue
+                rows.append((p * 2 + side, t0 + (f - 1) * 0.025, side, cam, f & 0xFF))
+    return rows
+
+
+def test_camera_whose_frame_1_was_dropped_anchors_from_the_module_clock(caplog):
+    drop = {(0, 7, 1), (1, 7, 1), (1, 1, 1)}
+    batch = _packet_batch(_scan_rows(range(1, 45), drop=drop))
+    stage = FrameClassificationStage(discard_count=9, dark_interval=600)
+    with caplog.at_level(logging.WARNING):
+        stage.process(batch)
+
+    stale = sorted(
+        (int(batch.side_ids[i]), int(batch.cam_ids[i]), int(batch.frame_ids[i]))
+        for i in range(len(batch.frame_ids)) if batch.frame_type[i] == "stale"
+    )
+    # Each affected camera loses only its held frame 2 (a warmup frame).
+    assert stale == [(0, 7, 2), (1, 1, 2), (1, 7, 2)]
+    accepted = batch.frame_type != "stale"
+    np.testing.assert_array_equal(batch.abs_frame_ids[accepted],
+                                  batch.frame_ids[accepted])
+    for side, cam in [(0, 7), (1, 1), (1, 7)]:
+        rows = [i for i in range(len(batch.frame_ids))
+                if batch.side_ids[i] == side and batch.cam_ids[i] == cam]
+        types = {int(batch.frame_ids[i]): batch.frame_type[i] for i in rows}
+        assert types[3] == "warmup" and types[10] == "dark" and types[11] == "light"
+
+    late = [e for e in batch.events if isinstance(e, CameraLateStart)]
+    assert sorted((e.side, e.cam_id, e.abs_frame_id, e.missing_frames)
+                  for e in late) == [(0, 7, 3, 2), (1, 1, 3, 2), (1, 7, 3, 2)]
+    assert "camera anchored late: side=right(1) cam_id=1" in caplog.text
+
+
+def test_late_start_needs_an_anchored_camera_on_the_same_module():
+    # The right module's clock is independent of the left one, so a left
+    # camera with no anchored left module-mate stays quarantined (today's
+    # fail-closed behaviour), even though the right module anchored.
+    rows = _scan_rows(range(1, 13), drop={(0, 0, 1)}, cams=[0])
+    batch = _packet_batch(rows)
+    FrameClassificationStage().process(batch)
+
+    left = [batch.frame_type[i] for i in range(len(rows)) if batch.side_ids[i] == 0]
+    right = [batch.frame_type[i] for i in range(len(rows)) if batch.side_ids[i] == 1]
+    assert left == ["stale"] * 11
+    assert "stale" not in right
+    assert not any(isinstance(e, CameraLateStart) for e in batch.events)
+
+
+def test_stale_leftovers_are_not_anchored_by_the_module_clock():
+    # Leftovers from the previous scan can carry small frame ids, but their
+    # device timestamps predate this scan's frame 1, so the module clock never
+    # places them. The camera's real frame 1 still anchors normally.
+    rows = [
+        (0, 100.000, 0, 0, 1),
+        (1, 98.500, 0, 1, 2),     # leftover, small id, old timestamp
+        (1, 98.525, 0, 1, 3),     # leftover
+        (2, 100.000, 0, 1, 1),
+        (3, 100.025, 0, 0, 2),
+        (3, 100.025, 0, 1, 2),
+    ]
+    batch = _packet_batch(rows)
+    FrameClassificationStage().process(batch)
+
+    assert list(batch.frame_type) == [
+        "warmup", "stale", "stale", "warmup", "warmup", "warmup"]
+    np.testing.assert_array_equal(batch.abs_frame_ids[[0, 3, 4, 5]], [1, 1, 2, 2])
+    assert not any(isinstance(e, CameraLateStart) for e in batch.events)
+
+
+def test_late_candidate_is_adopted_only_when_the_next_frame_confirms_it():
+    # Frame 2 is held; a corrupt id then breaks the chain, so nothing is
+    # adopted. Frame 4 is held afresh and frame 5 confirms it.
+    rows = [
+        (0, 0.000, 0, 0, 1),
+        (1, 0.025, 0, 0, 2), (1, 0.025, 0, 1, 2),
+        (2, 0.050, 0, 0, 3), (2, 0.050, 0, 1, 77),
+        (3, 0.075, 0, 0, 4), (3, 0.075, 0, 1, 4),
+        (4, 0.100, 0, 0, 5), (4, 0.100, 0, 1, 5),
+    ]
+    batch = _packet_batch(rows)
+    FrameClassificationStage().process(batch)
+
+    cam1 = [i for i in range(len(rows)) if batch.cam_ids[i] == 1]
+    assert [batch.frame_type[i] for i in cam1] == [
+        "stale", "stale", "stale", "warmup"]
+    assert batch.abs_frame_ids[cam1[-1]] == 5
+    late = [e for e in batch.events if isinstance(e, CameraLateStart)]
+    assert [(e.cam_id, e.abs_frame_id, e.missing_frames) for e in late] == [(1, 5, 4)]
+
+
+def test_reset_forgets_the_module_clock():
+    stage = FrameClassificationStage()
+    stage.process(_packet_batch(_scan_rows(range(1, 5), sides=[0], cams=[0])))
+    stage.reset()
+    # Next scan: only cam 1 delivers, starting at frame 2. Last scan's clock
+    # must not anchor it.
+    batch = _packet_batch(_scan_rows(range(2, 6), sides=[0], cams=[1]))
+    stage.process(batch)
+    assert list(batch.frame_type) == ["stale"] * 4
+
+
+def test_late_start_event_carries_detail_to_the_diagnostics_log():
+    from omotion.pipeline.sinks import _diagnostic_detail
+    event = CameraLateStart(side=1, cam_id=7, abs_frame_id=3, missing_frames=2,
+                            packet_id=4, timestamp_s=0.05)
+    assert _diagnostic_detail(event)["missing_frames"] == 2

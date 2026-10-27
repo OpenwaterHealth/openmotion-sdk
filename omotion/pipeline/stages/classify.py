@@ -27,7 +27,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from ..batch import (
-    CameraStreamGap, FrameBatch, FrameIdConsensusCorrection,
+    CameraLateStart, CameraStreamGap, FrameBatch, FrameIdConsensusCorrection,
     FrameIdPacketAnomaly, FrameQuarantined,
 )
 
@@ -98,6 +98,16 @@ class _FrameUnwrapper:
        length, one camera or the whole module, passes both, and because the
        epoch comes from the clock, absolute ids stay correct past 8-bit wraps.
        Only the first resumed frame is lost.
+    5. **Late start (#319).** A camera anchors on frame id 1. When its frame 1
+       never arrives (the parser dropped it for a bad histogram sum, or it was
+       lost in transit), its first frame is held the same way as rule 4, but
+       against the module clock: the clock of a camera on the same sensor
+       module that did anchor this scan. The camera anchors there once its
+       next frame confirms it, and the frames before it are reported missing
+       instead of the camera being lost for the whole scan. With no anchored
+       module-mate there is no clock to ask, and leading frames stay
+       quarantined. Stale leftovers from the previous scan carry older device
+       timestamps, so the module clock never places them.
     """
 
     __slots__ = (
@@ -147,19 +157,90 @@ class _FrameUnwrapper:
                 return abs_id
         return None
 
-    def unwrap(self, raw_frame_id: int, timestamp_s: float) -> _UnwrapResult:
-        """Adjudicate a counter/clock pair without adopting a bad witness."""
-        ts = float(timestamp_s)
-        if self.last_abs is None:
-            if raw_frame_id != 1:
-                return _UnwrapResult(
-                    abs_frame_id=raw_frame_id,
-                    accepted=False,
-                    reason="leading_frame",
-                    detail="leading frame id is not the scan-start value 1",
-                )
+    @staticmethod
+    def _module_clock_candidate(
+        raw_frame_id: int, ts: float, module_clock: tuple[int, float] | None,
+    ) -> int | None:
+        """The absolute id a module-mate's clock implies for a camera that has
+        not anchored yet, if its low byte is the wire id (rule 5)."""
+        if module_clock is None:
+            return None
+        clock_abs, clock_ts = module_clock
+        elapsed = ts - clock_ts
+        nearest = clock_abs + round(elapsed / _NOMINAL_PERIOD_S)
+        slack = _CLOCK_RESIDUAL_ABS_S + _CLOCK_DRIFT_FRAC * abs(elapsed)
+        for abs_id in (nearest - 1, nearest, nearest + 1):
+            # Id 1 anchors directly; anything at or before it would place the
+            # frame before this scan started (a stale leftover).
+            if abs_id < 2:
+                continue
+            if (abs_id - raw_frame_id) % _FRAME_ID_MODULUS:
+                continue
+            claimed = (abs_id - clock_abs) * _NOMINAL_PERIOD_S
+            if abs(elapsed - claimed) <= slack:
+                return abs_id
+        return None
+
+    def _unwrap_leading(
+        self, raw_frame_id: int, ts: float,
+        module_clock: tuple[int, float] | None,
+    ) -> _UnwrapResult:
+        """First frames of a camera that has not anchored yet (rules 1 and 5)."""
+        pending, self.resync_candidate = self.resync_candidate, None
+        if raw_frame_id == 1:
             self._adopt(raw_frame_id, raw_frame_id, ts, clock=True)
             return _UnwrapResult(raw_frame_id, True)
+
+        if pending is not None:
+            pending_raw, pending_abs, pending_ts = pending
+            pending_slack = max(
+                _CLOCK_RESIDUAL_ABS_S,
+                _CLOCK_RESIDUAL_FRAC * _NOMINAL_PERIOD_S,
+            )
+            if (raw_frame_id == (pending_raw + 1) % _FRAME_ID_MODULUS
+                    and abs((ts - pending_ts) - _NOMINAL_PERIOD_S)
+                    <= pending_slack):
+                abs_id = pending_abs + 1
+                self._adopt(abs_id, raw_frame_id, ts, clock=True)
+                return _UnwrapResult(
+                    abs_frame_id=abs_id,
+                    accepted=True,
+                    reason="anchored_late",
+                    detail=("frame 1 never arrived; the module clock placed "
+                            "the first frame and the next frame confirmed it"),
+                )
+
+        candidate = self._module_clock_candidate(raw_frame_id, ts, module_clock)
+        if candidate is not None:
+            self.resync_candidate = (raw_frame_id, candidate, ts)
+            return _UnwrapResult(
+                abs_frame_id=candidate,
+                accepted=False,
+                reason="leading_frame",
+                detail=(f"leading frame id is not the scan-start value 1; "
+                        f"the module clock places it at frame {candidate}, "
+                        f"held until the next frame confirms it"),
+            )
+        return _UnwrapResult(
+            abs_frame_id=raw_frame_id,
+            accepted=False,
+            reason="leading_frame",
+            detail="leading frame id is not the scan-start value 1",
+        )
+
+    def unwrap(
+        self, raw_frame_id: int, timestamp_s: float,
+        module_clock: tuple[int, float] | None = None,
+    ) -> _UnwrapResult:
+        """Adjudicate a counter/clock pair without adopting a bad witness.
+
+        ``module_clock`` is the latest (abs id, timestamp) clock anchor of a
+        camera on the same sensor module; it is only consulted before this
+        camera has anchored (rule 5).
+        """
+        ts = float(timestamp_s)
+        if self.last_abs is None:
+            return self._unwrap_leading(raw_frame_id, ts, module_clock)
 
         anchors = dict(
             counter_anchor_abs_frame_id=self.last_abs,
@@ -294,6 +375,10 @@ class FrameClassificationStage:
         self.discard_count = int(discard_count)
         self.dark_interval = int(dark_interval)
         self._unwrappers: dict[tuple[int, int], _FrameUnwrapper] = {}
+        # Latest counter-and-clock-agreed (abs id, timestamp) per sensor
+        # module. Cameras on one module share its clock, so a camera whose
+        # frame 1 never arrived can anchor from it (rule 5, #319).
+        self._module_clocks: dict[int, tuple[int, float]] = {}
         masks = expected_camera_masks or (0, 0)
         if len(masks) != 2:
             raise ValueError("expected_camera_masks must contain left and right masks")
@@ -372,12 +457,21 @@ class FrameClassificationStage:
                 unwrapper = _FrameUnwrapper()
                 self._unwrappers[key] = unwrapper
 
-            result = unwrapper.unwrap(raw_id, float(batch.timestamp_s[i]))
+            ts = float(batch.timestamp_s[i])
+            result = unwrapper.unwrap(
+                raw_id, ts, self._module_clocks.get(side_idx),
+            )
             abs_id = result.abs_frame_id
             abs_ids[i] = abs_id
+            if (result.accepted and unwrapper.clock_abs == abs_id
+                    and unwrapper.clock_ts == ts):
+                self._module_clocks[side_idx] = (abs_id, ts)
 
             packet_id = (int(batch.packet_ids[i])
                          if batch.packet_ids is not None else None)
+            if result.reason == "anchored_late":
+                self._note_late_start(batch, side_idx, cam_id, abs_id,
+                                      packet_id, ts)
             if result.accepted and i in consensus:
                 # The repaired id fits this camera's sequence — record the
                 # correction. (If the packet "majority" was itself corrupt,
@@ -514,6 +608,32 @@ class FrameClassificationStage:
             gap.first_packet_id, packet_id, gap.first_timestamp_s, timestamp_s,
         )
 
+    def _note_late_start(
+        self,
+        batch: FrameBatch,
+        side: int,
+        cam_id: int,
+        abs_id: int,
+        packet_id: int | None,
+        timestamp_s: float,
+    ) -> None:
+        """Report the frames a late-anchored camera never delivered (#319)."""
+        missing = abs_id - 1
+        batch.events.append(CameraLateStart(
+            side=side,
+            cam_id=cam_id,
+            abs_frame_id=abs_id,
+            missing_frames=missing,
+            packet_id=packet_id,
+            timestamp_s=timestamp_s,
+        ))
+        logger.warning(
+            "camera anchored late: side=%s(%d) cam_id=%d first accepted "
+            "frame %d; frames 1-%d never arrived or were held back, the "
+            "camera is kept",
+            self._side_name(side), side, cam_id, abs_id, missing,
+        )
+
     @staticmethod
     def _side_name(side: int) -> str:
         return {0: "left", 1: "right"}.get(side, "unknown")
@@ -554,6 +674,7 @@ class FrameClassificationStage:
 
     def reset(self) -> None:
         self._unwrappers.clear()
+        self._module_clocks.clear()
         self._quarantine_counts.clear()
         self._quarantine_logged.clear()
         self._camera_gaps.clear()

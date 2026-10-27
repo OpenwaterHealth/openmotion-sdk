@@ -185,6 +185,24 @@ class CameraStreamGap(BatchEvent):
 
 
 @dataclass
+class CameraLateStart(BatchEvent):
+    """A camera's frame 1 never arrived, so it anchored on a later frame.
+
+    The module clock placed the camera's first frame and its next frame
+    confirmed it (#319). Frames ``1 .. abs_frame_id - 1`` are missing for
+    this camera; every later frame is classified normally. Without this
+    rule, one lost first frame quarantined the camera for the whole scan.
+    """
+    side:            int
+    cam_id:          int
+    abs_frame_id:    int  # first accepted absolute frame id
+    missing_frames:  int  # abs_frame_id - 1
+    packet_id:       Optional[int]
+    timestamp_s:     float
+    reason:          str = "first_frame_never_arrived"
+
+
+@dataclass
 class TimestampRepairInputAnomaly(BatchEvent):
     """Consecutive captures arrived carrying one reused packet timestamp
     (frozen clock) while the frame counter advanced — the sensor-fw#123

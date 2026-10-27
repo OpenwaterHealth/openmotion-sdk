@@ -513,6 +513,7 @@ def _event_frame(event):
 
 
 _DETAILED_DIAGNOSTIC_TYPES = {
+    "CameraLateStart",
     "CameraStreamGap",
     "FrameGapFillAnomaly",
     "FrameIdConsensusCorrection",

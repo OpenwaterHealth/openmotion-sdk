@@ -235,10 +235,27 @@ missing ids are represented as NaN gaps; the raw rows and diagnostics preserve
 the evidence. The hard bound makes that ambiguity finite and fail-closed for
 larger claims.
 
-**Stale-first guard.** The very first accepted frame for any `(side, cam_id)`
-must have `raw_frame_id == 1`. Any other leading value is quarantined without
-seeding state, so a garbage prefix cannot wedge or offset the unwrapper; a
-later `1` starts the sequence normally.
+**Stale-first guard.** A `(side, cam_id)` normally anchors on
+`raw_frame_id == 1`. Any other leading value is quarantined without seeding
+state, so a garbage prefix cannot wedge or offset the unwrapper; a later `1`
+starts the sequence normally.
+
+**Late start (#319).** When a camera's frame 1 never arrives (the parser
+dropped it for a bad histogram sum, or it was lost in transit), its first row
+is held against the *module clock*: the latest counter-and-clock-agreed
+anchor of a camera on the same sensor module that did anchor this scan. The
+same test as rule 4 applies. The clock must place the row at an absolute id
+whose low byte is its wire id, and the next row must continue it by exactly
+one frame and 25 ms. The camera then anchors there. The frames before it are
+reported as missing, through one `CameraLateStart` event and a WARNING, and
+the camera is kept. Before #319 one lost first frame quarantined the camera
+(`leading_frame`) for the whole scan, which the contact-quality check reported
+as `no_signal` (bloodflow-app#722, 2026-10-12: three cameras lost 132 frames).
+The guard still holds for stale leftovers from the previous scan: their device
+timestamps predate this scan's frame 1, so the module clock never places them.
+With no anchored camera on the module there is no clock to ask, and leading
+rows stay quarantined. The two modules have independent clocks and never
+anchor each other.
 
 **Camera delivery warning.** The factory passes the enabled left/right camera
 masks into this stage. For every source packet, the stage compares its camera
@@ -258,7 +275,7 @@ retain them intentionally, preserving the wire evidence needed in post.
 
 | Condition | `frame_type` |
 |---|---|
-| unwrapper rejected the frame (rule 1 or 4 above), or leading stale run | `"stale"` |
+| unwrapper rejected the frame (rule 1 or 4 above), leading stale run, or a late-start row held for confirmation | `"stale"` |
 | `abs_id ≤ d` | `"warmup"` |
 | `abs_id == d + 1` OR (`abs_id > d + 1` AND `(abs_id - 1) mod Δ == 0`) | `"dark"` |
 | otherwise | `"light"` |
