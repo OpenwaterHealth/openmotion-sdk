@@ -7,7 +7,7 @@ subtracted_mean = mean_raw - pedestal. Used by dark-frame diagnostics
 Negative values are valid: they indicate the frame's mean is below the
 pedestal average, which is normal noise for dark frames.
 
-See docs/SciencePipeline.md §7.1.
+See docs/SciencePipeline.md §5.7 PedestalSubtractionStage.
 """
 
 from __future__ import annotations

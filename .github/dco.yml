@@ -1,0 +1,11 @@
+# Configuration for the DCO GitHub App (https://github.com/apps/dco).
+# The app reads this file from the default branch only.
+#
+# Allow a missing Signed-off-by to be fixed with a follow-up remediation
+# commit instead of rewriting history on a shared branch such as `next`:
+#   individual - the original author adds their own sign-off retroactively
+#   thirdParty - a maintainer signs off on the author's behalf
+# Message formats: https://github.com/dcoapp/app#individual-remediation-commit-support
+allowRemediationCommits:
+  individual: true
+  thirdParty: true

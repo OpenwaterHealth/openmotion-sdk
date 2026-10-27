@@ -1,5 +1,9 @@
 # openmotion-sdk
 
+## Disclaimer
+
+CAUTION - The system described here has not been evaluated by the FDA and is not designed for the treatment or diagnosis of any disease. It is provided AS-IS, with no warranties. User assumes all liability and responsibility for identifying and mitigating risks associated with using this software.
+
 Host-side Python SDK for **Open-Motion** — Openwater's optical speckle imaging
 system for non-invasive blood-flow monitoring. The package `omotion` (PyPI:
 `openmotion-sdk`) is the library every other host tool talks through: it
@@ -106,7 +110,8 @@ pip install --force-reinstall dist/openmotion_sdk-*.whl
 - **Python 3.12+.** Version is computed from git tags via `setuptools_scm` —
   never edit a version string by hand; tag and push to release.
 - **Windows USB:** sensors need WinUSB via Zadig (`pyusb` + `libusb`); the
-  console uses the OS VCP driver. `dfu-util` is vendored under `omotion/dfu-util/`.
+  console uses the OS VCP driver. Firmware update is pure Python (`omotion/dfu/`)
+  and needs the DFU device (`0483:DF11`) on WinUSB too; `winusb-driver/` installs that.
 
 ```powershell
 # quick runtime check (device bound to WinUSB/libusbK)

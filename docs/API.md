@@ -23,6 +23,7 @@ science of the pipeline) see [Architecture.md](./Architecture.md),
 7. [Signals & threading](#7-signals--threading)
 8. [Constants — `omotion.config`](#8-constants--omotionconfig)
 9. [Logging & versioning](#9-logging--versioning)
+10. [Firmware update](#10-firmware-update)
 
 ---
 
@@ -176,7 +177,7 @@ below.
 | `cancel_scan(**kw)` | Stop the running scan. |
 | `start_configure_camera_sensors(request) -> bool` | Program/enable cameras (see §4). |
 | `start_calibration(request) -> bool` / `start_test_scan(request)` | Calibration / validation (see §4). |
-| `apply_laser_power(*, force_fault=False) -> bool` | Write laser-driver config over I2C — a **cold-start prerequisite** for any laser scan (see §3). |
+| `apply_laser_power(*, force_fault=False) -> bool` | Write laser-driver config over I2C — a **cold-start prerequisite** for any laser scan (see §3) — then read back the safety limits; `False` on a failed write or a mismatch. |
 | `get_single_histogram(side, camera_id, test_pattern_id=4, auto_upload=True)` | One-shot histogram grab. |
 | `scan_workflow` | The `ScanWorkflow` instance (lazy). |
 | `calibration_workflow` / `contact_quality_workflow` | The other workflows (lazy; CQ shares the scan workflow). |
@@ -239,10 +240,24 @@ ok = iface.start_scan(request)   # -> bool
 ```
 
 Returns `False` (scan refused, never started) when a previous scan is still
-running **or** the configured scan DB fails its pre-flight open. When the DB is
-the only record (corrected CSV opt-in/off), this refusal is deliberate — it
-aborts before the laser fires rather than run a scan whose data is lost. The
-reason is on `scan_workflow.last_scan_error`.
+running, **or** the configured scan DB fails its pre-flight open, **or** the
+last laser safety-limit read-back failed (laser scans only; see below). When
+the DB is the only record (corrected CSV opt-in/off), the DB refusal is
+deliberate — it aborts before the laser fires rather than run a scan whose
+data is lost. The reason is on `scan_workflow.last_scan_error`.
+
+**Laser safety-limit read-back (sdk#310).** `apply_laser_power()` reads back
+every limit register it wrote on the Safety EE and OPT FPGAs and returns
+`False` if any write failed, any register is unreadable, or any value differs
+from what was written. The reason is left on `iface.console.laser_limits_error`
+(a string naming each failing register with its expected and read values;
+`None` once a load verifies clean). While it is set, `start_scan` refuses every
+scan with `disable_laser=False` (which includes contact-quality and calibration
+sub-scans), and `console.start_trigger()` raises `LaserSafetyLimitError`
+without sending anything. Disconnecting does not clear it; only a later
+`apply_laser_power()` that verifies clean does (in practice, the next
+reconnect once the register is fixed). Callers that never call
+`apply_laser_power()` are unaffected.
 
 ### Observing & finishing
 
@@ -350,7 +365,9 @@ Key read methods:
 | `iter_sessions()` / `stream_sessions(batch_size=100)` | All sessions, oldest first. |
 | `get_session(id)` / `get_session_by_label(label)` | One session. |
 | `iter_session_data(session_id, side=None, cam_id=None, t_lo=None, t_hi=None)` | Per-frame BFI/BVI/mean/contrast/temp; optional side/camera/time-range filters. |
-| `iter_raw_frames(...)` / `get_raw_frame(id)` | Raw histograms (only if `write_raw_to_db`). |
+
+Raw histograms are not stored in `ScanDatabase`; the raw CSVs written by
+`CsvSink` from the pipeline's `Tee("raw")` are the only raw record.
 
 **`session_data` layout:** `cam_id` 0..7 are per-camera rows (normal mode);
 `cam_id = -1` is the reduced-mode dark-corrected **per-side average** (one per
@@ -458,3 +475,60 @@ Debug flags are pushed to firmware with `MotionSensor.set_debug_flags(...)`.
 - `omotion.set_log_root("MyApp")` prefixes every SDK logger name (e.g.
   `MyApp.Console`). Call it before `start()`.
 - `omotion.__version__` is derived from git tags (`setuptools_scm`) — never hand-edited.
+
+---
+
+## 10. Firmware update
+
+`FirmwareUpdater.update()` is the one entry point. It asks the unit into DFU,
+works out what it is running, verifies every image on the host, and only then
+writes. It blocks until the application is back on USB (minutes on the
+bootloader paths), so call it from a worker thread with reconnection handling
+paused.
+
+```python
+from omotion import FirmwareUpdater, FirmwareKind, BootloaderChangeRequired
+
+updater = FirmwareUpdater()
+try:
+    result = updater.update(iface.console, "motion-console-fw-signed.bin",
+                            progress_cb=lambda p: print(p.phase, p.percent, p.message),
+                            kind=FirmwareKind.CONSOLE)
+except BootloaderChangeRequired as e:
+    print(e, e.needs)           # e.g. ("updater_image", "acknowledge_irreversible")
+```
+
+| Unit has | Default | With `acknowledge_irreversible=True` |
+|---|---|---|
+| Bootloader 1.2.0 or newer | Signed application into the slot (`0x08020000`). | Same. |
+| Older bootloader (console 1.0.0, sensor 1.0.0/1.1.0) | A signed application the old bootloader accepts (legacy key). A current application raises `BootloaderChangeRequired`. | With `updater_image`: installs the bootloader updater, waits for bootloader 1.2.0, then installs the application. |
+| No bootloader (STM32 ROM loader) | Bare-metal application at `0x08000000`. A signed application raises `BootloaderChangeRequired`. | With `production_image`: writes bootloader + application. |
+| Unrecognised DFU device or bootloader version | Refuses; nothing is written. | Same. |
+
+- **Images are paths you supply.** The firmware releases the SDK downloads
+  (`check_latest` / `download_firmware`) hold the application images. The
+  bootloader updater is not in those releases; obtain it from the firmware
+  team's artifact store. Use the `1.8.97` build for both the console and the
+  sensor: it embeds the released bootloader 1.2.0. The `1.8.98` and `1.8.99`
+  builds in the bucket embed bootloader 1.2.0-rc.1 and must not be used.
+- **Replacing or installing a bootloader cannot be undone over USB.** The unit
+  must stay powered and plugged in while it runs; a failure while sector 0 is
+  rewritten needs bench recovery (SWD). Afterwards the unit only accepts images
+  signed for bootloader 1.2.0. An application that must never do this (the
+  bloodflow app) simply never passes `acknowledge_irreversible`.
+- **`kind`** selects which product's keys the images are checked against. It is
+  inferred from a downloaded file or the device handle; pass it for a file you
+  picked yourself.
+- **`handle=None`** resumes a unit that is already in DFU after an interrupted
+  run. Otherwise exactly one DFU device may be attached.
+- The result is a `FirmwareUpdateResult`: `action` (`UpdateAction`), bootloader
+  versions before and after, `app_reenumerated`, and `needs_power_cycle` (a
+  sensor without a bootloader can hang after the ROM loader's jump until it is
+  power-cycled).
+- Windows needs the DFU device (`0483:DF11`) bound to WinUSB, as before; see
+  `winusb-driver/`.
+- From the command line: `python scripts/update_firmware.py <console|left|right>
+  --release-dir <folder>` picks the signed application, the bootloader updater
+  and the production image for the device out of a release folder by name and
+  runs the update. Add `--acknowledge-irreversible` to allow a bootloader to be
+  installed or replaced.

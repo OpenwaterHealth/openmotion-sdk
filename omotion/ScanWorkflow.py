@@ -159,7 +159,7 @@ class ScanRequest:
     # classification — without this the boundary dark frame can land on a
     # laser-on frame and corrupt dark correction. None -> the interface's
     # resolved default (DEFAULT_TRIGGER_CONFIG ⊕ constructor override). A dict
-    # here is shallow-merged on top (e.g. {"TriggerFrequencyHz": 20}).
+    # here is shallow-merged on top (e.g. {"TriggerFrequencyHz": 30}).
     trigger_config: dict | None = None
     # Called (with the exception) when the scan worker thread aborts AFTER
     # start_scan returned True — e.g. a critical sink failing in on_scan_start
@@ -296,6 +296,12 @@ class ScanWorkflow:
         # scan completion.
         self._cancel_requested: bool = False
 
+        # Orders the worker's trigger start against cancel_scan's trigger
+        # stop (sdk#318). A Stop during the worker's pre-flight used to send
+        # its stop_trigger before the worker's start_trigger, leaving the
+        # trigger and laser running after Stop.
+        self._trigger_lock = threading.Lock()
+
     @property
     def running(self) -> bool:
         with self._lock:
@@ -405,6 +411,15 @@ class ScanWorkflow:
         # Clear the prior scan's outcome up front so a refusal below (busy, or
         # a pre-flight failure) never reports a stale error from an earlier run.
         self._last_scan_error = None
+
+        # Laser safety limits (sdk#310): refuse a laser scan while the last
+        # apply_laser_power did not verify them. A laser-off scan never
+        # starts the trigger, so it is allowed.
+        limits_error = getattr(self._interface.console, "laser_limits_error", None)
+        if limits_error and not request.disable_laser:
+            logger.error("start_scan refused: %s", limits_error)
+            self._last_scan_error = limits_error
+            return False
 
         with self._lock:
             if self._running or (self._thread and self._thread.is_alive()):
@@ -613,6 +628,7 @@ class ScanWorkflow:
 
         # ── Spawn worker thread ────────────────────────────────────────────
         def _worker():
+            trigger_error = None  # why the trigger did not start, if it did not
             try:
                 # ── Pre-flight hardware setup ─────────────────────────────
                 active_sides = self._resolve_active_sides(
@@ -678,15 +694,42 @@ class ScanWorkflow:
                     # bloodflow app does this via QML; doing it here makes any
                     # direct SDK caller (contact-quality, examples) correct too.
                     # Idempotent for the app: its trigger ≈ this resolved config.
-                    trigger_cfg = self._interface.resolve_trigger_config(
-                        request.trigger_config
-                    )
-                    self._interface.console.set_trigger_json(data=trigger_cfg)
-                    self._interface.console.start_trigger()
-                    self._emit_trigger_event("ON")
+                    #
+                    # Skip the start if a cancel arrived during the pre-flight
+                    # above: its stop_trigger has already been sent (sdk#318).
+                    with self._trigger_lock:
+                        if self._cancel_requested:
+                            logger.info(
+                                "start_scan: canceled during pre-flight; "
+                                "trigger not started"
+                            )
+                        else:
+                            trigger_cfg = self._interface.resolve_trigger_config(
+                                request.trigger_config
+                            )
+                            console = self._interface.console
+                            # A rejected config or a refused start ends the
+                            # scan through the normal teardown below, then
+                            # reports the reason as the scan error.
+                            try:
+                                applied = console.set_trigger_json(data=trigger_cfg)
+                            except ValueError as e:
+                                trigger_error = f"trigger configuration rejected: {e}"
+                            else:
+                                if applied is None and not console.uart.demo_mode:
+                                    trigger_error = (
+                                        "console rejected the trigger configuration"
+                                    )
+                                elif not console.start_trigger():
+                                    trigger_error = (
+                                        "console refused to start the trigger: "
+                                        f"{console.last_start_refusal_reason}"
+                                    )
+                                else:
+                                    self._emit_trigger_event("ON")
 
                 # ── Duration gate: stop the source when time is up ────────
-                stop_after = float(request.duration_sec)
+                stop_after = 0.0 if trigger_error else float(request.duration_sec)
 
                 def _duration_guard():
                     deadline = time.monotonic() + stop_after
@@ -787,6 +830,9 @@ class ScanWorkflow:
                                 )
                             except Exception:
                                 pass
+
+                if trigger_error:
+                    raise RuntimeError(trigger_error)
             except Exception as e:
                 logger.exception("ScanWorkflow worker raised")
                 self._last_scan_error = str(e) or type(e).__name__
@@ -939,17 +985,23 @@ class ScanWorkflow:
         and close() returns quickly. cancel_scan then sets _stop_evt and
         joins the worker thread.
         """
-        # Stop the laser FIRST (laser-safety: fastest response).
-        try:
-            if self._interface and self._interface.console:
-                self._interface.console.stop_trigger()
-        except Exception:
-            logger.warning("stop_trigger raised in cancel_scan", exc_info=True)
-        finally:
-            # Even if stop_trigger raised (console died mid-scan) the trigger
-            # is not firing anymore — downstream trigger-state consumers must
-            # still see the close.
-            self._emit_trigger_event("OFF")
+        # Mark the cancel before taking the lock, so the worker can't start
+        # the trigger after this stop (sdk#318).
+        self._cancel_requested = True
+
+        # Stop the laser FIRST (laser-safety: fastest response). If the
+        # worker is mid start_trigger, this waits for it and then stops it.
+        with self._trigger_lock:
+            try:
+                if self._interface and self._interface.console:
+                    self._interface.console.stop_trigger()
+            except Exception:
+                logger.warning("stop_trigger raised in cancel_scan", exc_info=True)
+            finally:
+                # Even if stop_trigger raised (console died mid-scan) the trigger
+                # is not firing anymore — downstream trigger-state consumers must
+                # still see the close.
+                self._emit_trigger_event("OFF")
 
         # Stop cameras capturing so the firmware DMA stops being filled.
         # Use the snapshotted active_sides from the running worker. If the

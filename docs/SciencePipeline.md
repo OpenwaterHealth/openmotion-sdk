@@ -259,7 +259,7 @@ retain them intentionally, preserving the wire evidence needed in post.
 
 | Condition | `frame_type` |
 |---|---|
-| unwrapper rejected the frame (rules 1–2 above), or leading stale run | `"stale"` |
+| unwrapper rejected the frame (rule 1 or 4 above), or leading stale run | `"stale"` |
 | `abs_id ≤ d` | `"warmup"` |
 | `abs_id == d + 1` OR (`abs_id > d + 1` AND `(abs_id - 1) mod Δ == 0`) | `"dark"` |
 | otherwise | `"light"` |
@@ -276,8 +276,8 @@ poller; omitted for replays and tests).
 Stamps each frame with the most recent `TelemetrySample` at-or-before the
 frame's capture time: `pdc[i]` (photodiode current, mA), `tcm[i]` (MCU
 trigger count), `tcl[i]` (laser trigger count). Frames before the first
-sample get `pdc = NaN`, `tcm = tcl = 0` — the CSV writers render those as
-blank cells.
+sample get `pdc = NaN`, `tcm = tcl = 0`. The raw CSV writes the NaN `pdc` as
+a blank cell but the zero counters as `0.0` (§8.1).
 
 **Clock bridging.** Frame timestamps are sensor-firmware clock normalised
 to scan start; telemetry samples carry host `time.time()`. The stage
@@ -739,12 +739,14 @@ The runner calls `on_scan_start(metadata)` on every sink before the first batch,
 
 Writes the two legacy CSV families. File creation is lazy on first `consume()`.
 
-- **Raw CSV** — one file per side, named `{scan_id}_{subject_id}_{side}_mask{XX}_raw.csv`. Schema: `cam_id, frame_id, timestamp_s, type, 0..1023, temperature, sum, tcm, tcl, pdc`. Each frame's `type` column is the `frame_type` written by FrameClassificationStage (`"warmup" | "dark" | "light" | "stale"`). Quarantined stale rows are retained here as wire evidence, while science/live consumers exclude them. Telemetry columns (`tcm`, `tcl`, `pdc`) carry TelemetryIngestStage's per-frame stamps (§5.2); cells are blank when no telemetry sample preceded the frame or no aggregator was wired (replays of pre-telemetry scans stay column-compatible).
-- **Corrected CSV** — one file per scan, named `{scan_id}_corrected.csv`.
+- **Raw CSV** — one file per side, named `{scan_id}_{subject_id}_{side}_mask{XX}_raw.csv`. Schema: `cam_id, frame_id, timestamp_s, type, 0..1023, temperature, sum, tcm, tcl, pdc`. Each frame's `type` column is the `frame_type` written by FrameClassificationStage (`"warmup" | "dark" | "light" | "stale"`). Quarantined stale rows are retained here as wire evidence, while science/live consumers exclude them. Telemetry columns (`tcm`, `tcl`, `pdc`) carry TelemetryIngestStage's per-frame stamps (§5.2), written as floats (`4010.0`). Before the first telemetry sample `pdc` is blank and `tcm`/`tcl` are `0.0`; all three are blank when no aggregator was wired (replays of pre-telemetry scans stay column-compatible). `frame_id` is the wire 8-bit counter and `timestamp_s` the pre-repair wire timestamp (§5.4).
+- **Corrected CSV** — one file per scan, named `{scan_id}_{subject_id}.csv` (`{scan_id}.csv` when `subject_id` is empty; there is no `_corrected` suffix — the `_raw` suffix already tells the two apart). `frame_id` is the absolute (unwrapped) frame id; metric values and `timestamp_s` are rounded to 9 decimals. A metric the pipeline could not compute (NaN) is written as `nan`; slots for masked-off cameras, and `temp` where no firmware stamp was available, stay blank.
   - **Normal mode** (82 columns): `frame_id, timestamp_s, {bfi,bvi,mean,contrast,temp}_{l,r}{1..8}`. Per-frame rows are accumulated in `_corrected_acc` until every expected `(side, cam)` slot has contributed a `mean`; only then is the row written.
   - **Reduced mode** (6 columns): `frame_id, timestamp_s, bfi_left, bfi_right, bvi_left, bvi_right`. Each `EnrichedCorrectedFrame` writes into the row's `bfi_{side}`/`bvi_{side}` slot based on `frame.side`; a row is flushed once both expected sides have contributed (or only one, if the other's camera mask is zero).
 
 On `on_complete`, any partial accumulator rows are flushed verbatim (with blanks for the missing slots) so no completed frames are lost.
+
+The bloodflow-app's History → Export CSV is not written by `CsvSink`: `materialize_corrected_csv` (`omotion/SessionPlayback.py`) rebuilds the same layout from `session_data`. Its output differs in that a NULL (NaN) value is a blank cell rather than `nan`, `timestamp_s` carries the DB's 6-decimal rounding, reduced-mode values are rounded to 6 decimals, and `include_quality=True` (normal mode only; the app always passes it) appends `quality_l1..quality_r8`. In reduced mode a side value stored as NULL currently comes out as `0.0`, not blank. The app documents every CSV column for users in `docs/csv-formats.md` in the bloodflow-app repository.
 
 ### 8.2 ScanDBSink
 
@@ -837,7 +839,8 @@ Two independent telemetry paths exist, both fed by the long-lived
 - **Telemetry CSV (outside the pipeline)** — the `_TelemetryCsvWriter`
   listener writes one row per snapshot to
   `{scan_id}_{subject_id}_telemetry.csv` (full snapshot: TEC, PDU,
-  safety, counters). Not a pipeline sink; no channel.
+  safety, counters — 50 columns, listed in `_TELEMETRY_HEADERS` in
+  `omotion/ScanWorkflow.py`). Not a pipeline sink; no channel.
 
 The aggregator and the CSV writer are independent listeners; closing one
 does not affect the other.
@@ -876,9 +879,9 @@ After the scan, the workflow drains the sink's `corrected_samples` and `dark_sam
 `omotion/ContactQualityWorkflow.py` defines `_ContactQualitySink` with `channels = {"live"}`. For each FrameBatch, it reads **two different DN-scale signals depending on frame type**:
 
 - For `frame_type == "dark"` rows, tracks the per-camera maximum `subtracted_mean` (= `max(0, mean_raw − pedestal)`). Baseline is the zero-light pedestal; this measures ambient light leaking onto the sensor — the right quantity for the **AMBIENT_LIGHT** gate.
-- For all other non-warmup/non-stale rows (light frames), maintains a per-camera rolling deque (default 10 samples) of `mean_dc_rt` (= `mean_raw − predicted_dark_baseline`). Baseline is the just-measured dark, not the pedestal; this measures actual laser-driven signal strength — the right quantity for the **POOR_CONTACT** gate. Early light frames before the first dark observation have `mean_dc_rt = NaN` (predictor returned `None`) and are skipped; the window fills up once the first dark lands.
+- For all other non-warmup/non-stale rows (light frames), maintains a per-camera rolling deque (default 10 samples) of `mean_dc_rt` (= `mean_raw − predicted_dark_baseline`). Baseline is the just-measured dark, not the pedestal; this measures actual laser-driven signal strength — the right quantity for the **POOR_CONTACT** gate. Early light frames before the first dark observation have `mean_dc_rt = NaN` (predictor returned `None`) and are skipped; the window fills up once the first dark lands. A light frame that arrived unlit (`low_light_rt = True`, see §11.3) also has `mean_dc_rt = NaN`; it stays out of the window but is counted per camera.
 
-After the scan, `result()` evaluates per camera: `no_signal` if no light samples were collected, `ambient_light` if the dark-frame max exceeds the per-cam dark threshold, `poor_contact` if the rolling light average falls below the per-cam light threshold, else `ok`. The verdict is rolled up into `ContactQualityResult.passed`. This verdict logic is not open-coded here — `result()` delegates to `evaluate_reason` in `omotion/contact_quality.py` (§11.3), the same module `ContactQualityMonitor` shares its two threshold predicates with.
+After the scan, `result()` evaluates per camera: `no_signal` if no light samples were collected and the camera did not deliver unlit frames either, `ambient_light` if the dark-frame max exceeds the per-cam dark threshold, `poor_contact` if the rolling light average falls below the per-cam light threshold or if every light frame arrived unlit, else `ok`. "Every light frame arrived unlit" means an empty window plus at least `rolling_window` unlit frames: the firmware's terminal laser-off frame arrives unlit on every camera, so a single unlit frame is not evidence. This keeps the preflight in line with the live monitor, which reports an unlit frame as `poor_contact` (§11.3). Before sdk#343 such a camera came back `no_signal`, which the bloodflow-app words as a camera that sends no data. The verdict is rolled up into `ContactQualityResult.passed`. This verdict logic is not open-coded here — `result()` delegates to `evaluate_reason` in `omotion/contact_quality.py` (§11.3), the same module `ContactQualityMonitor` shares its two threshold predicates with.
 
 ### 11.3 ContactQualityMonitor — live per-camera edge detection
 
@@ -903,7 +906,7 @@ Treating the two alike inverts the detection window this feature exists for: a s
 | light CLEAR | `light_clear_debounce` | 80 | consecutive **light**-frame observations, ~40 Hz | ≈ 2 s |
 | dark RAISE/CLEAR | `dark_debounce` | 1 | consecutive **dark**-frame observations, one every `dark_interval` frames | ≈ 15 s (immediate latch — legacy-equivalent) |
 
-`REASON_NO_SIGNAL` is never reported live — it is preflight-only. Total loss of frames belongs to the consumer's camera-dropout watchdog; reporting it as a contact-quality fault would send the operator to fix the wrong thing.
+`REASON_NO_SIGNAL` is never reported live — it is preflight-only. Total loss of frames belongs to the consumer's camera-dropout watchdog; reporting it as a contact-quality fault would send the operator to fix the wrong thing. In the preflight it means the camera delivered no light frames; an unlit camera is `poor_contact` in both consumers.
 
 `on_transition(side, cam_id, reason, value, active)` fires on edges only — once per genuine activate/clear, not once per frame — and runs on the pipeline runner thread, so a GUI consumer must marshal to its own thread. The monitor catches and logs callback exceptions itself: an uncaught one would unwind the rest of that `consume()` call — abandoning every remaining row in the batch after the one that raised, silently skipping the other cameras — and log a fresh traceback per batch, at ~40 Hz, for as long as the callback keeps raising. This is not patching a runner gap — `_safe_consume` (`omotion/pipeline/runner.py`) already logs and continues past a raising sink without disabling it — the monitor's own `try/except` just contains the damage to a single row.
 
