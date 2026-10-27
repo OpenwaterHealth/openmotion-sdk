@@ -1,4 +1,5 @@
 import logging
+from types import SimpleNamespace
 
 from omotion.ConsoleTelemetry import ConsoleTelemetry, ConsoleTelemetryPoller
 
@@ -70,6 +71,79 @@ def test_read_safety_unknown_leaves_faults_empty():
     poller._read_safety(snap)
     assert snap.safety_known is False
     assert snap.safety_faults == []
+
+
+class _FakeConsoleForTec:
+    """Console stub whose tec_status() either answers or raises."""
+
+    def __init__(self, result=None, exc: Exception | None = None) -> None:
+        self._result = result
+        self._exc = exc
+        self.calls = 0
+
+    def is_connected(self):
+        return True
+
+    def tec_status(self):
+        self.calls += 1
+        if self._exc is not None:
+            raise self._exc
+        return self._result
+
+    def read_pdu_mon(self):
+        return SimpleNamespace(raws=[], volts=[])
+
+    def read_i2c_packet(self, mux_index, channel, device_addr, reg_addr, read_len):
+        return b"\x00" * read_len, read_len
+
+    def get_lsync_pulsecount(self):
+        return 0
+
+
+def test_tec_known_defaults_false_on_fresh_snapshot():
+    # tec_good defaults False, which is indistinguishable from "tripped" --
+    # tec_known is what tells a consumer the value was never measured (#206).
+    snap = ConsoleTelemetry()
+    assert snap.tec_known is False
+    assert snap.tec_good is False
+
+
+def test_read_tec_sets_known_on_successful_read():
+    console = _FakeConsoleForTec(result=("1.0", "0.5", "0.5", "25.0", True))
+    poller = ConsoleTelemetryPoller(console)
+    snap = ConsoleTelemetry()
+
+    poller._read_tec(snap)
+
+    assert snap.tec_known is True
+    assert snap.tec_good is True
+    assert snap.tec_v_raw == 1.0
+    assert snap.tec_set_raw == 0.5
+
+
+def test_read_tec_reports_trip_as_known_false_good():
+    # A real trip: firmware answered and cleared the bit.
+    console = _FakeConsoleForTec(result=("1.0", "0.5", "0.5", "25.0", False))
+    poller = ConsoleTelemetryPoller(console)
+    snap = ConsoleTelemetry()
+
+    poller._read_tec(snap)
+
+    assert snap.tec_known is True
+    assert snap.tec_good is False
+
+
+def test_failed_tec_read_leaves_known_false():
+    # tec_status() raises -> _read_all catches, read_ok goes False, and the
+    # snapshot must NOT look like a trip the console never reported.
+    console = _FakeConsoleForTec(exc=RuntimeError("UART timeout"))
+    poller = ConsoleTelemetryPoller(console)
+
+    snap = poller._read_all()
+
+    assert snap.read_ok is False
+    assert "UART timeout" in (snap.error or "")
+    assert snap.tec_known is False
 
 
 from omotion.ConsoleTelemetry import PdcSample, PDC_MA_PER_LSB

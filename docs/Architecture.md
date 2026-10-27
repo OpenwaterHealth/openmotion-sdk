@@ -139,7 +139,12 @@ command/response on the sensor):
 - `len` (LE u32) — total packet bytes
 - `timestamp` (LE u32, ms; optional) — firmware TIM5 counter / 100, present
   when packet length matches `header + N × block + 4 + footer`. Wraps every
-  ~42 949 s (~12 h); `parse_histogram_stream` unwraps it monotonically.
+  ~42 949 s (~12 h); `parse_histogram_stream` unwraps it monotonically. The
+  unwrapper only latches a rollover when the sample lands plausibly just past
+  the previous one, and never lets a single implausible jump (a corrupt
+  timestamp byte, sdk#220) become the monotonic reference — one bad sample
+  passes through for the pipeline's repair stage instead of permanently
+  shifting the rest of the scan.
 - Per-camera block (4103 B):
   - `cam` (1 B) — camera index 0–7
   - `histogram` (4096 B) — 1024 bins × LE u32; **last word's high byte is
@@ -301,7 +306,8 @@ Fallback (zero span): identity scaling, `BFI = K × 10`, `BVI = μ₁ × 10`. Ca
 
 | Module | Mechanism |
 |---|---|
-| `DFUProgrammer` | Spawns `dfu-util` subprocess; parses progress output; reports phase and percent via callback |
+| `dfu.STM32DFU` | Pure-Python DfuSe over pyusb (ported from the bootloader repo's `py-tools`): sector erase, block download/upload, bootloader version read; progress via callback |
+| `firmware_update.FirmwareUpdater` | Enters DFU, detects ROM loader / old bootloader / bootloader 1.2.0+, verifies images on the host (`dfu.image`), then runs the matching `dfu.migration` sequence |
 | `FPGAProgrammer` | Page-by-page FPGA flash over the console UART; erases, writes CFG pages in 32-page batches, optionally verifies, writes feature row, refreshes |
 | `jedecParser` | Parses JEDEC ASCII fuse files into `JedecImage` (rows × 16 bytes) + extra feature row data |
 | `GitHubReleases` | GitHub Releases API client; lists, fetches, and downloads release assets |
@@ -312,8 +318,8 @@ Fallback (zero span): identity scaling, `BFI = K × 10`, `BVI = μ₁ × 10`. Ca
 
 | Thread | Owner | Daemon | Lifecycle | Purpose |
 |---|---|---|---|---|
-| `CommInterface.read_thread` | `CommInterface` | Yes | `claim()` → `release()` | USB bulk read into `_read_buffer` |
-| `CommInterface.response_thread` | `CommInterface` | Yes | async mode only | Parse packets from buffer, route to response queues |
+| `CommInterface.read_thread` | `CommInterface` | Yes | `start_read_thread()` → `stop_read_thread()` (joined on stop; also exits on fatal USB error) | USB bulk read into `_read_buffer` |
+| `CommInterface.response_thread` | `CommInterface` | Yes | async mode only; same lifecycle as `read_thread` — started by `start_read_thread()`, stopped + joined by `stop_read_thread()`, self-terminates when the read loop dies on a fatal USB error | Parse packets from buffer, route to response queues |
 | `MotionUart.read_thread` | `MotionUart` | Yes | `connect()` → `disconnect()` | Serial read, parse packets or queue by ID |
 | `StreamInterface.thread` | `StreamInterface` | Yes | `start_streaming()` → `stop_streaming()` | Fixed-size USB reads into data queue |
 | `ConsoleTelemetryPoller._thread` | `ConsoleTelemetryPoller` | Yes | `start()` → `stop()` | ~1 Hz console health polls |
@@ -384,7 +390,9 @@ The SDK uses a layered catch-log-reraise pattern: each layer catches hardware ex
 | `usb.core.USBError` | `CommInterface`, `StreamInterface` | USB communication error |
 | `JedecError` | `jedecParser` | JEDEC file format violation |
 | `FpgaUpdateError` | `FPGAProgrammer` | FPGA programming sequence failure |
-| `FileNotFoundError` | `DFUProgrammer`, `usb_backend` | Missing dfu-util binary or libusb DLL |
+| `FileNotFoundError` | `usb_backend` | Missing libusb DLL |
+| `FirmwareUpdateError` | `FirmwareUpdater` | Update refused or failed; subclasses `BootloaderChangeRequired`, `ImageRejectedError`, `UpdaterRefusedError` |
+| `DFUError` | `dfu.STM32DFU` | DFU protocol or USB failure (re-raised as `FirmwareUpdateError` by `FirmwareUpdater`) |
 
 USB timeout errnos (110 on Linux, 10060 on Windows) are suppressed inside read loops and treated as normal idle conditions. Errno 32 (broken pipe) and 19/5 (IO/no-device) trigger disconnect callbacks.
 
@@ -432,4 +440,5 @@ application UI be developed and tested without physical hardware.
 | `TelemetrySample` | `Console` | Timestamped temperature + TEC ADC snapshot |
 | `ScanRequest` / `ScanResult` | `ScanWorkflow` | Scan parameters and outcome |
 | `JedecImage` | `jedecParser` | Parsed FPGA bitstream rows |
-| `DFUProgress` / `DFUResult` | `DFUProgrammer` | Firmware flash progress and result |
+| `DFUProgress` | `dfu` | Firmware flash progress (phase, percent, message) |
+| `FirmwareUpdateResult` | `firmware_update` | What an update did (`UpdateAction`), bootloader versions, whether the unit needs a power cycle |

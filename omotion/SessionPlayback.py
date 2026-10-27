@@ -14,12 +14,11 @@ marker were written by older SDKs and hold realtime (live-branch)
 values instead — playback still works, but the values are the
 pre-refinement ones.
 
-The output matches what ``CsvSink`` writes during the scan **for the
-columns ``session_data`` carries** (bfi, bvi, contrast, mean). Columns
-the science pipeline produces but the DB doesn't store — ``temp_*``,
-``std_*`` — are emitted as empty cells. The visualizer
-(``plot_corrected_scan.py``) ignores those columns, so the resulting
-plot matches the live-scan output.
+The output matches what ``CsvSink`` writes during the scan
+(bfi, bvi, contrast, mean, temp). ``temp`` cells are empty only for
+rows recorded before ``session_data.temp`` existed (schema v2, issue
+#221). Dark rows are covered too: the stencilled row's temp is
+fabricated by the same neighbour stencil as its other metrics.
 
 Reduced-mode column layout is recovered from
 ``session_meta.sdk_flags.reduced_mode`` (stamped by ScanDBSink).
@@ -42,6 +41,7 @@ from typing import Optional
 
 from omotion import _log_root
 from omotion.ScanDatabase import ScanDatabase
+from omotion.pipeline.sinks import _NORMAL_HEADERS, _REDUCED_HEADERS
 
 logger = logging.getLogger(
     f"{_log_root}.SessionPlayback" if _log_root else "SessionPlayback"
@@ -49,22 +49,11 @@ logger = logging.getLogger(
 
 
 def _corrected_columns(reduced_mode: bool, include_quality: bool = False) -> list[str]:
-    """Match CsvSink._corrected_columns(reduced_mode) exactly."""
-    if reduced_mode:
-        return ["bfi_left", "bfi_right", "bvi_left", "bvi_right"]
-    cols = (
-        [f"bfi_l{i}" for i in range(1, 9)]
-        + [f"bfi_r{i}" for i in range(1, 9)]
-        + [f"bvi_l{i}" for i in range(1, 9)]
-        + [f"bvi_r{i}" for i in range(1, 9)]
-        + [f"mean_l{i}" for i in range(1, 9)]
-        + [f"mean_r{i}" for i in range(1, 9)]
-        + [f"contrast_l{i}" for i in range(1, 9)]
-        + [f"contrast_r{i}" for i in range(1, 9)]
-        + [f"temp_l{i}" for i in range(1, 9)]
-        + [f"temp_r{i}" for i in range(1, 9)]
-    )
-    if include_quality:
+    """CsvSink's corrected-CSV columns (sans the frame_id / timestamp_s
+    prefix), taken from the live writer's own header lists so the two
+    layouts cannot drift; plus the export-only quality columns."""
+    cols = list((_REDUCED_HEADERS if reduced_mode else _NORMAL_HEADERS)[2:])
+    if include_quality and not reduced_mode:
         cols += [f"quality_l{i}" for i in range(1, 9)]
         cols += [f"quality_r{i}" for i in range(1, 9)]
     return cols
@@ -121,7 +110,9 @@ def materialize_corrected_csv(
 
         # Pull every per-(side, cam, frame) cell for this session. Order
         # by frame_id so we can stream-merge into per-frame rows.
-        select_cols = "frame_id, timestamp_s, side, cam_id, bfi, bvi, contrast, mean"
+        select_cols = (
+            "frame_id, timestamp_s, side, cam_id, bfi, bvi, contrast, mean, temp"
+        )
         if emit_quality:
             select_cols += ", quality"
         cur = db._connection().execute(
@@ -167,7 +158,8 @@ def materialize_corrected_csv(
                 bvi       = db_row[5]
                 contrast  = db_row[6]
                 mean      = db_row[7]
-                quality   = db_row[8] if emit_quality else None
+                temp      = db_row[8]
+                quality   = db_row[9] if emit_quality else None
 
                 if first_frame_id is None:
                     first_frame_id = fid
@@ -208,6 +200,7 @@ def materialize_corrected_csv(
                     if bvi      is not None: buf_vals[f"bvi_{suffix}"]      = float(bvi)
                     if contrast is not None: buf_vals[f"contrast_{suffix}"] = float(contrast)
                     if mean     is not None: buf_vals[f"mean_{suffix}"]     = float(mean)
+                    if temp     is not None: buf_vals[f"temp_{suffix}"]     = float(temp)
                     if quality  is not None: buf_vals[f"quality_{suffix}"]  = quality
 
             # Flush the final frame.

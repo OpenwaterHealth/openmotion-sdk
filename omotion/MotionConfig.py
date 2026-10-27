@@ -1,5 +1,6 @@
 import struct
 import json
+import math
 from dataclasses import dataclass
 from typing import Optional, Any, Dict
 import logging
@@ -10,6 +11,53 @@ logger = logging.getLogger(f"{_log_root}.MotionConfig" if _log_root else "Motion
 # Constants from C code
 MOTION_MAGIC = 0x4D4F5449  # 'MOTI'
 MOTION_VER = 0x00010000  # v1.0.0
+
+# Longest config JSON the console stores, in bytes: one 2036-byte flash page
+# minus the 16-byte header, minus the terminating NUL (console-fw
+# motion_config.h MOTION_CFG_JSON_MAX - 1). The console refuses a longer one.
+MOTION_CFG_JSON_MAX_LEN = 2036 - 16 - 1
+
+
+def _reject_constant(name: str):
+    raise ValueError(f"non-JSON constant {name}")
+
+
+def _finite_float(text: str) -> float:
+    v = float(text)
+    if not math.isfinite(v):
+        raise ValueError(f"number {text} is out of range")
+    return v
+
+
+def strict_json_problem(text: str) -> Optional[str]:
+    """Why ``text`` is not a config the console firmware accepts, or None.
+
+    The console (console-fw fix/jsmn-strict) stores a config only when it is
+    a strict JSON object: no NaN / Infinity / -Infinity, no out-of-range
+    numbers, and at most MOTION_CFG_JSON_MAX_LEN bytes. Python's json module
+    accepts NaN and Infinity by default, so this check is stricter than
+    ``json.loads``.
+    """
+    if len(text.encode("utf-8")) > MOTION_CFG_JSON_MAX_LEN:
+        return f"{len(text.encode('utf-8'))} bytes, more than {MOTION_CFG_JSON_MAX_LEN}"
+    try:
+        data = json.loads(text, parse_constant=_reject_constant, parse_float=_finite_float)
+    except ValueError as e:
+        return str(e)
+    if not isinstance(data, dict):
+        return "root is not a JSON object"
+    return None
+
+
+def _non_finite_paths(value: Any, path: str = "") -> list:
+    """Key paths of float values that are NaN or infinite."""
+    if isinstance(value, float):
+        return [] if math.isfinite(value) else [path or "<root>"]
+    if isinstance(value, dict):
+        return [p for k, v in value.items() for p in _non_finite_paths(v, f"{path}.{k}" if path else str(k))]
+    if isinstance(value, (list, tuple)):
+        return [p for i, v in enumerate(value) for p in _non_finite_paths(v, f"{path}[{i}]")]
+    return []
 
 
 @dataclass
@@ -116,11 +164,19 @@ class MotionConfig:
         # Parse JSON (handle null terminator if present)
         json_str = json_bytes.rstrip(b"\x00").decode("utf-8", errors="ignore")
 
+        # An undecodable payload is a transport/flash problem (a truncated
+        # read most often), not an empty configuration. Treating it as {}
+        # made every stored key look absent: read_calibration() then fell
+        # back to SDK defaults, and write_calibration()'s read-modify-write
+        # would have re-written the config without the other keys. Raise
+        # so read_config() reports the failure (returns None) instead.
         try:
             json_data = json.loads(json_str) if json_str else {}
         except json.JSONDecodeError as e:
-            logger.warning(f"Failed to parse JSON: {e}. Using empty config.")
-            json_data = {}
+            raise ValueError(
+                f"Config JSON payload is not decodable ({e}); "
+                f"header json_len={header.json_len}, received {len(json_bytes)} bytes"
+            ) from e
 
         return cls(header=header, json_data=json_data)
 
@@ -130,10 +186,22 @@ class MotionConfig:
 
         Returns:
             bytes: Wire format [header][json_bytes]
+
+        Raises:
+            ValueError: if a value is NaN or infinite (not JSON; the console
+                refuses it), or the JSON is longer than MOTION_CFG_JSON_MAX_LEN.
         """
-        # Convert JSON to bytes
-        json_str = json.dumps(self.json_data, separators=(",", ":"))
+        bad = _non_finite_paths(self.json_data)
+        if bad:
+            raise ValueError(f"config values are NaN or infinite: {', '.join(bad)}")
+        # allow_nan=False: json.dumps would otherwise write NaN / Infinity.
+        json_str = json.dumps(self.json_data, separators=(",", ":"), allow_nan=False)
         json_bytes = json_str.encode("utf-8")
+        if len(json_bytes) > MOTION_CFG_JSON_MAX_LEN:
+            raise ValueError(
+                f"config JSON is {len(json_bytes)} bytes; the console stores at most "
+                f"{MOTION_CFG_JSON_MAX_LEN}"
+            )
 
         # Update header with JSON length
         self.header.json_len = len(json_bytes)

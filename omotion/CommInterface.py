@@ -99,12 +99,18 @@ class CommInterface(USBInterfaceBase):
         self.on_io_error = None
         self._io_lock = threading.RLock()
         self._send_lock = threading.Lock()
+        # The async response-parser thread is created by start_read_thread()
+        # alongside the read thread — never here. Starting it in the
+        # constructor meant a CommInterface that was built but never opened
+        # (e.g. MotionComposite.open() failed in the post-enumeration
+        # "resource busy" window) had a _process_responses thread that
+        # nothing could ever stop: stop_event is only set on the stop path,
+        # which such orphans never reach. A packaged-app fault dump
+        # (2026-08-17) showed ~52 of these threads accumulated across a day
+        # of sensor connect/disconnect cycles.
+        self.response_thread = None
         if self.async_mode:
             self.response_queue = queue.Queue()
-            self.response_thread = threading.Thread(
-                target=self._process_responses, daemon=True
-            )
-            self.response_thread.start()
 
     def claim(self):
         super().claim()
@@ -161,7 +167,6 @@ class CommInterface(USBInterfaceBase):
             )
 
             self.write(tx_bytes)
-            time.sleep(0.0005)
 
             if not self.async_mode:
                 start = time.monotonic()
@@ -184,26 +189,36 @@ class CommInterface(USBInterfaceBase):
                             continue
                 last_error = TimeoutError("No response")
             else:
+                # Block on the queue instead of sleep-polling: get(timeout=)
+                # wakes the instant _process_responses enqueues the packet.
+                # The 50 ms chunks are only so a dead transport still cancels
+                # an in-flight send promptly (bloodflow-app#130); on the happy
+                # path they add no latency. The old poll loop paid a fixed
+                # ~2.5 ms of sleep per command — the dominant cost of bulk
+                # command streams like the NVCM burn (#233).
                 start_time = time.monotonic()
-                while time.monotonic() - start_time < timeout:
+                while True:
                     if self._transport_down_evt.is_set():
                         raise ConnectionError(
                             f"{self.desc}: transport down, packet id "
                             f"0x{id:04X} not deliverable"
                         )
-                    if self.response_queue.empty():
-                        time.sleep(0.0005)
-                    else:
-                        time.sleep(0.001)
-                        pkt = self.response_queue.get()
-                        if pkt.id != id:
-                            logger.warning(
-                                "%s: discarding stale response id=0x%04X (expected 0x%04X)",
-                                self.desc, pkt.id, id,
-                            )
-                            continue
-                        return pkt
-                raise TimeoutError(f"No response in async mode, packet id 0x{id:04X}")
+                    remaining = timeout - (time.monotonic() - start_time)
+                    if remaining <= 0:
+                        raise TimeoutError(
+                            f"No response in async mode, packet id 0x{id:04X}"
+                        )
+                    try:
+                        pkt = self.response_queue.get(timeout=min(0.05, remaining))
+                    except queue.Empty:
+                        continue
+                    if pkt.id != id:
+                        logger.warning(
+                            "%s: discarding stale response id=0x%04X (expected 0x%04X)",
+                            self.desc, pkt.id, id,
+                        )
+                        continue
+                    return pkt
 
     def clear_buffer(self):
         with self._buffer_lock:
@@ -283,18 +298,45 @@ class CommInterface(USBInterfaceBase):
         # transport-down latch from a previous USB error must clear or
         # subsequent sends would short-circuit on the stale flag.
         self._transport_down_evt.clear()
-        self.read_thread = threading.Thread(target=self._read_loop, daemon=True)
+        if self.async_mode and not (
+            self.response_thread and self.response_thread.is_alive()
+        ):
+            self.response_thread = threading.Thread(
+                target=self._process_responses,
+                daemon=True,
+                name=f"{self.desc}-resp",
+            )
+            self.response_thread.start()
+        self.read_thread = threading.Thread(
+            target=self._read_loop, daemon=True, name=f"{self.desc}-read"
+        )
         self.read_thread.start()
         logger.info(f"{self.desc}: Read thread started")
 
     def stop_read_thread(self):
-        """Signal the read loop to exit and join it (unless we're being
-        called from the read thread itself, in which case the caller is
-        already on its way out)."""
+        """Signal both transport threads (read loop + async response parser)
+        to exit and join them, except any we are currently running on (that
+        caller is already on its way out).
+
+        The response thread parks in ``_buffer_condition.wait(timeout=0.1)``
+        between packets, so wake it explicitly rather than waiting out its
+        poll interval."""
         self.stop_event.set()
-        rt = self.read_thread
-        if rt is not None and threading.current_thread() is not rt:
-            rt.join(timeout=2.0)
+        with self._buffer_condition:
+            self._buffer_condition.notify_all()
+        current = threading.current_thread()
+        for label, t in (
+            ("read", self.read_thread),
+            ("response", self.response_thread),
+        ):
+            if t is None or t is current:
+                continue
+            t.join(timeout=2.0)
+            if t.is_alive():
+                logger.warning(
+                    "%s: %s thread did not exit within 2s of stop",
+                    self.desc, label,
+                )
         logger.info(f"{self.desc}: Read thread stopped")
 
     def _notify_io_error(self, error):
@@ -324,7 +366,8 @@ class CommInterface(USBInterfaceBase):
                         self._read_buffer.extend(data_bytes)
                         self._buffer_condition.notify()
                     logger.debug(f"Read {len(data)} bytes.")
-                time.sleep(0.001)
+                # No pacing sleep: dev.read blocks (timeout=100 ms) when the
+                # endpoint is idle, so looping straight back cannot busy-spin.
             except usb.core.USBError as e:
                 # During an intentional shutdown the read loop will see USB
                 # errors as the transport is closed; suppress them silently.
@@ -349,6 +392,16 @@ class CommInterface(USBInterfaceBase):
                 # send_packet that is currently spinning in its wait loop
                 # observes the dead transport on its next tick.
                 self._transport_down_evt.set()
+                # A dead transport has no further work for the response
+                # parser: no bytes will ever reach _read_buffer again, and
+                # pending sends abort on _transport_down_evt, not on parsed
+                # responses. Stop it here so the thread pair shuts down even
+                # on paths where nobody calls stop_read_thread() afterwards;
+                # start_read_thread() clears the event and restarts both on
+                # reconnect.
+                self.stop_event.set()
+                with self._buffer_condition:
+                    self._buffer_condition.notify_all()
                 self._notify_io_error(e)
                 break
 

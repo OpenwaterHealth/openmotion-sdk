@@ -54,7 +54,15 @@ Raw ADC voltages returned by `MotionConsole.tec_status()` → `(vout, temp_set, 
 | `tec_set_raw` | `float` (V) | IN2P / TEMPSET | Setpoint bridge voltage; converted to target temperature (°C) in the app |
 | `tec_curr_raw` | `float` (V) | V_itec | TEC current monitor voltage; converted to amps via `(v − 0.5·VREF) / (25·R_s)` |
 | `tec_volt_raw` | `float` (V) | V_vtec | TEC voltage monitor; converted via `(v − 0.5·VREF) × 4` |
-| `tec_good` | `bool` | TMPGD pin | `True` when `\|OUT1 − IN2P\| < 100 mV` (temperature settled to setpoint) |
+| `tec_good` | `bool` | `TecStats.tec_status` | **TEC over-temp trip result**, *not* a TMPGD "settled to setpoint" pin. `False` = tripped. Only meaningful when `tec_known` is `True` |
+| `tec_known` | `bool` | derived | `False` until `_read_tec` completes one successful read. Gate on this before treating `tec_good == False` as a trip |
+
+`tec_good` comes from console FW `tec_trip_evaluate()` (`Core/Src/uart_comms.c`), the only writer of `TecStats.tec_status`. It clears the bit when the TEC sense voltage crosses `TEC_TRIP_VALUE`, calls `Trigger_Safety_Disconnect()`, pushes a `TEC trip point reached` system-error message, and re-arms only after 200 consecutive clean polls. So `tec_good == False` is a **laser safety shutdown**, not a "still warming up" indication.
+
+Two caveats for consumers:
+
+- **Gate on `tec_known`.** `tec_good` defaults to `False`, which is indistinguishable from "tripped", and `_read_tec` assigns it only on a successful read — so a failed poll would otherwise report a trip that never happened. Same trap `safety_known` fixes for the EE/OPT interlock ([bloodflow-app#107](https://github.com/OpenwaterHealth/openmotion-bloodflow-app/issues/107)); see [#206](https://github.com/OpenwaterHealth/openmotion-sdk/issues/206).
+- **A steady `True` is not proof the trip is armed.** The trip is disarmed when `TEC_TRIP_VALUE == 0.0` (console FW never applied its settings), and firmware then reports `tec_status = true` unconditionally.
 
 ### PDU monitor
 
@@ -76,6 +84,8 @@ Polled from two I2C channels on mux 1, device `0x41`, register `0x24`.
 | `safety_se` | `int` (raw byte) | ch 6 | SE interlock raw register byte |
 | `safety_so` | `int` (raw byte) | ch 7 | SO interlock raw register byte |
 | `safety_ok` | `bool` | derived | `True` when `(safety_se & 0x0F) == 0` and `(safety_so & 0x0F) == 0` — both low nibbles clear means the interlock is not tripped |
+| `safety_known` | `bool` | derived | `False` until the interlock chip has actually answered. Distinguishes "no data, defaulted to OK" from "chip responded, faults absent" |
+| `safety_faults` | `List[str]` | derived | Decoded fault labels (peak-current / pulse / rate) across both channels, de-duplicated; empty when clear. Only meaningful when `safety_known` is `True` |
 
 ### Read health
 

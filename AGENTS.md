@@ -25,6 +25,8 @@ library used by the bloodflow app and other tools.
   scan persistence outputs.
 - `omotion/CalibrationWorkflow.py`, `omotion/Calibration.py`: calibration flow
   and calibration math.
+- `omotion/calibration/`: auditable WI-00015 procedure rules, workflows,
+  hardware adapters, and reports used by operator scripts and future app UI.
 - `omotion/config.py`: protocol constants and USB identifiers.
 
 The SDK is the right place for protocol behavior, hardware sequencing, stream
@@ -66,7 +68,7 @@ Windows USB behavior depends on WinUSB/libusb drivers. Driver files live under
 - Versioning uses `setuptools_scm` from git tags such as `v1.2.3` or `1.2.3`.
 - Release notes and PyPI guidance live in `PYPI_SETUP.md` and `docs/Releasing.md`.
 - Keep package data rules in `pyproject.toml` in sync when adding bundled
-  binaries, config, bitstreams, or dfu-util assets.
+  binaries, config, bitstreams, or key files.
 
 ## Editing Guidance
 

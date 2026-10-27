@@ -115,3 +115,7 @@ def test_start_read_thread_clears_transport_down():
     assert not ci._transport_down_evt.is_set(), (
         "_transport_down_evt should be cleared when read thread (re)starts"
     )
+    # start_read_thread also spawns the async response thread; stop and
+    # join it so this test leaves no thread behind.
+    ci.stop_read_thread()
+    assert ci.response_thread is None or not ci.response_thread.is_alive()

@@ -5,7 +5,7 @@ Operates on two paths:
   Batch:    IntervalClosed events carrying CorrectedInterval (after shot-noise)
             → replaces with EnrichedCorrectedInterval carrying per-frame BFI/BVI.
 
-See docs/SciencePipeline.md §9:
+See docs/SciencePipeline.md §5.10 BfiBviStage:
     BFI = (1 - (K - C_min) / (C_max - C_min)) * 10
     BVI = (1 - (mean - I_min) / (I_max - I_min)) * 10
 
@@ -106,7 +106,7 @@ class BfiBviStage:
                     mean=float(f.mean), std=float(f.std),
                     contrast=float(contrast),
                     bfi=float(bfi), bvi=float(bvi),
-                    quality=f.quality,
+                    quality=f.quality, temp_c=f.temp_c,
                 ))
             event.corrected_batch = EnrichedCorrectedInterval(
                 left_abs=ci.left_abs, right_abs=ci.right_abs,

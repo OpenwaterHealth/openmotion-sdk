@@ -57,10 +57,12 @@ def test_resolve_asset(kind, mode, names, expected):
     (FirmwareKind.CONSOLE, LEGACY_CONSOLE, "1.8.1"),
 ])
 def test_bootloader_unit_rejects_prebootloader_release(kind, names, minimum):
-    """A legacy release has no signed image. Say so, and name the minimum
-    version, rather than silently flashing something else."""
+    """The refusal must lead with the device state — the active bootloader is
+    why the rollback is impossible, the missing signed asset is only the
+    mechanism (#225). Keep naming the minimum version the unit can take."""
     with pytest.raises(UnsupportedReleaseError) as exc:
         resolve_asset(kind, BootMode.BOOTLOADER, names)
+    assert "bootloader is active" in str(exc.value)
     assert minimum in str(exc.value)
 
 

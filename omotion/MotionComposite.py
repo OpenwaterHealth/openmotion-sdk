@@ -74,12 +74,15 @@ class MotionComposite:
         logger.info(f"{self.desc}: opened")
 
     def close(self) -> None:
-        """Release all three interfaces and free USB resources. Idempotent.
-        Each step runs regardless of whether earlier steps fail — failures
-        are logged with enough context to diagnose without aborting cleanup."""
+        """Stop and join all transport threads, release all three interfaces
+        and free USB resources. Idempotent, and safe on a composite that was
+        never (or only partially) opened — the connect retry loop relies on
+        that to roll back a failed open(). Each step runs regardless of
+        whether earlier steps fail — failures are logged with enough context
+        to diagnose without aborting cleanup."""
         steps = []
         if getattr(self.comm, "async_mode", False):
-            steps.append(("stop comm read thread", self.comm.stop_read_thread))
+            steps.append(("stop comm threads", self.comm.stop_read_thread))
         steps += [
             ("stop histo streaming", self.histo.stop_streaming),
             ("stop imu streaming", self.imu.stop_streaming),

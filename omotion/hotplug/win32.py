@@ -60,8 +60,11 @@ class _DEV_BROADCAST_DEVICEINTERFACE_W(ctypes.Structure):
     ]
 
 
+# LRESULT is pointer-sized (LONG_PTR); c_long would truncate on 64-bit.
+_LRESULT = ctypes.c_ssize_t
+
 _WNDPROC = ctypes.WINFUNCTYPE(
-    ctypes.c_long, wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM
+    _LRESULT, wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM
 )
 
 
@@ -101,7 +104,7 @@ _user32.DestroyWindow.argtypes = [wt.HWND]
 _user32.DestroyWindow.restype = wt.BOOL
 
 _user32.DefWindowProcW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
-_user32.DefWindowProcW.restype = ctypes.c_long
+_user32.DefWindowProcW.restype = _LRESULT
 
 _user32.GetMessageW.argtypes = [
     ctypes.POINTER(wt.MSG), wt.HWND, wt.UINT, wt.UINT,
@@ -128,6 +131,31 @@ _kernel32.GetModuleHandleW.restype = wt.HMODULE
 _kernel32.GetCurrentThreadId.restype = wt.DWORD
 
 
+# ── Module-level WNDPROC trampoline ─────────────────────────────────────────
+# The window class is registered once per process and (deliberately) never
+# unregistered, so the WNDPROC it points at must outlive every provider
+# instance. A per-instance ctypes thunk cannot: the first provider's thunk
+# becomes the class WNDPROC forever, and once that instance is garbage
+# collected the pointer dangles — the next message dispatched through the
+# class (including the WM_DESTROY that DestroyWindow sends during a *newer*
+# instance's teardown) jumps into freed memory and kills the process with an
+# access violation. Route everything through this immortal module-level
+# trampoline instead, and look up the owning instance by window handle.
+_instances: dict[int, "Win32HotplugProvider"] = {}
+
+
+def _trampoline(hwnd, msg, wparam, lparam):
+    provider = _instances.get(hwnd)
+    if provider is not None:
+        return provider._wndproc_impl(hwnd, msg, wparam, lparam)
+    # Sent before CreateWindowExW returns (WM_NCCREATE/WM_CREATE) or after
+    # teardown has unregistered the hwnd.
+    return _user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+
+_MODULE_WNDPROC = _WNDPROC(_trampoline)
+
+
 # ────────────────────────────────────────────────────────────────────────────
 
 
@@ -141,9 +169,6 @@ class Win32HotplugProvider:
         self._thread: threading.Thread | None = None
         self._tid: int | None = None
         self._ready = threading.Event()
-        # The WNDPROC ctypes callback must be kept alive for the lifetime of
-        # the registered class — Windows will crash if it gets GC'd.
-        self._wndproc = _WNDPROC(self._wndproc_impl)
         self._hinstance = _kernel32.GetModuleHandleW(None)
         self._hwnd = None
         self._notify_handle = None
@@ -183,6 +208,9 @@ class Win32HotplugProvider:
             self._register_device_notifications()
         except Exception:
             logger.exception("Win32 hotplug setup failed")
+            # Release whatever partial setup succeeded (window, registry
+            # entry) so a failed provider doesn't leak its hwnd.
+            self._teardown()
             self._ready.set()
             return
 
@@ -210,13 +238,14 @@ class Win32HotplugProvider:
     def _register_class(self):
         wc = _WNDCLASSEXW()
         wc.cbSize = ctypes.sizeof(_WNDCLASSEXW)
-        wc.lpfnWndProc = self._wndproc
+        wc.lpfnWndProc = _MODULE_WNDPROC
         wc.hInstance = self._hinstance
         wc.lpszClassName = self._CLASS_NAME
         atom = _user32.RegisterClassExW(ctypes.byref(wc))
         if not atom:
             err = ctypes.get_last_error()
-            # 1410 == ERROR_CLASS_ALREADY_EXISTS — fine, reuse it.
+            # 1410 == ERROR_CLASS_ALREADY_EXISTS — fine, reuse it: the class
+            # WNDPROC is the module-level trampoline for every instance.
             if err != 1410:
                 raise OSError(err, "RegisterClassExW failed")
         self._class_atom = atom or 0
@@ -237,6 +266,10 @@ class Win32HotplugProvider:
             err = ctypes.get_last_error()
             raise OSError(err, "CreateWindowExW failed")
         self._hwnd = hwnd
+        # Route messages for this window to this instance. Must happen before
+        # device notifications are registered so no WM_DEVICECHANGE can race
+        # the registry entry.
+        _instances[hwnd] = self
 
     def _register_device_notifications(self):
         nf = _DEV_BROADCAST_DEVICEINTERFACE_W()
@@ -261,13 +294,18 @@ class Win32HotplugProvider:
                 logger.exception("UnregisterDeviceNotification failed")
             self._notify_handle = None
         if self._hwnd is not None:
+            # Unregister first: WM_DESTROY/WM_NCDESTROY from DestroyWindow
+            # then fall through the trampoline to DefWindowProcW instead of
+            # dispatching into a half-torn-down instance.
+            _instances.pop(self._hwnd, None)
             try:
                 _user32.DestroyWindow(self._hwnd)
             except Exception:
                 logger.exception("DestroyWindow failed")
             self._hwnd = None
-        # Don't UnregisterClassW — we may share the class with another instance
-        # in the same process. Leaving it is harmless on process exit.
+        # Don't UnregisterClassW — the class is shared by every instance in
+        # the process and its WNDPROC (the module-level trampoline) is
+        # immortal, so leaving it registered is safe and harmless.
 
     # ── Window proc ─────────────────────────────────────────────────────────
 

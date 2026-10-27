@@ -148,6 +148,10 @@ class StreamInterface(USBInterfaceBase):
         self.on_stream_stall = None
         self._last_data_mono: float | None = None
         self._stall_reported = False
+        # Deepest the data queue got since start_streaming: how far the
+        # consumer fell behind. When it reaches the queue's size the reads
+        # stop and the sensor starts dropping frames (#116).
+        self.queue_high_water: int = 0
 
     def start_streaming(self, queue_obj, expected_size):
         # Recover from a stale thread left over by a previous scan whose
@@ -176,8 +180,11 @@ class StreamInterface(USBInterfaceBase):
         # immediately at the start of N+1 (#192).
         self._last_data_mono = time.monotonic()
         self._stall_reported = False
+        self.queue_high_water = 0
         self.stop_event.clear()
-        self.thread = threading.Thread(target=self._stream_loop, daemon=True)
+        self.thread = threading.Thread(
+            target=self._stream_loop, daemon=True, name=f"{self.desc}-stream"
+        )
         self.thread.start()
         self.isStreaming = True
         logger.info(f"{self.desc}: Streaming started")
@@ -198,13 +205,21 @@ class StreamInterface(USBInterfaceBase):
                     "data_queue/expected_size to be nulled — loop will exit "
                     "on next iteration", self.desc,
                 )
+        capacity = getattr(self.data_queue, "maxsize", 0) or 0
         self.isStreaming = False
         self.data_queue = None
         self.expected_size = None
         logger.info(
             f"{self.desc}: Streaming stopped — "
-            f"{self.packets_received} USB read chunk(s) received"
+            f"{self.packets_received} USB read chunk(s) received, "
+            f"packet queue high-water {self.queue_high_water}/{capacity or 'unbounded'}"
         )
+        if capacity and self.queue_high_water * 2 >= capacity:
+            logger.warning(
+                "%s: packet queue reached %d/%d during this scan: the consumer "
+                "fell well behind the sensor; frames are lost once it is full",
+                self.desc, self.queue_high_water, capacity,
+            )
 
     def flush_stale_data(
         self,
@@ -340,15 +355,17 @@ class StreamInterface(USBInterfaceBase):
         if self.isStreaming:
             logger.warning(f"{self.desc}: drain_final called while streaming — skipping")
             return []
-        if self.ep_in is None:
+        endpoint = self.ep_in
+        if endpoint is None:
             logger.warning(f"{self.desc}: drain_final called before endpoint claimed — skipping")
             return []
+        endpoint_address = endpoint.bEndpointAddress
 
         chunks: list[bytes] = []
         while True:
             try:
                 data = self.dev.read(
-                    self.ep_in.bEndpointAddress, expected_size, timeout=timeout_ms
+                    endpoint_address, expected_size, timeout=timeout_ms
                 )
                 if data:
                     chunks.append(bytes(data))
@@ -499,6 +516,9 @@ class StreamInterface(USBInterfaceBase):
                     try:
                         data_queue.put(bytes(data), timeout=1.0)
                         self.packets_received += 1
+                        depth = data_queue.qsize()
+                        if depth > self.queue_high_water:
+                            self.queue_high_water = depth
                     except queue.Full:
                         if self.stop_event.is_set():
                             break

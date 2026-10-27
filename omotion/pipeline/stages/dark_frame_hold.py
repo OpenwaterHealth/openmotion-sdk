@@ -10,7 +10,7 @@ frame's values for that camera, so the live trace holds steady through the dark
 interval instead of spiking.
 
 Batch path: for IntervalClosed events carrying EnrichedCorrectedInterval, the
-stage applies the 4-point quadratic stencil (§8.4) to compute corrected values
+stage applies the 4-point quadratic stencil (§5.8.6) to compute corrected values
 for the leading dark frame D_prev and prepends it to the interval. This gives
 the "final" sinks a complete, gapless time series.
 
@@ -47,7 +47,7 @@ class DarkFrameHoldStage:
         self._stencil = DarkFrameQuadraticStencil()
         # Ring buffer (≤2 entries) of the last two EnrichedCorrectedFrames from
         # the previous interval, keyed by (side, cam_id). Used as the left
-        # neighbours v(D-1) and v(D-2) for the quadratic stencil (§8.4).
+        # neighbours v(D-1) and v(D-2) for the quadratic stencil (§5.8.6).
         self._prev_interval_tail: dict[tuple[str, int], list[EnrichedCorrectedFrame]] = {}
 
     def process(self, batch: FrameBatch) -> FrameBatch:
@@ -133,7 +133,7 @@ class DarkFrameHoldStage:
     ) -> Optional[EnrichedCorrectedFrame]:
         """Compute the stencil-interpolated corrected value for the dark frame D_prev.
 
-        Uses the quadratic 4-point stencil (§8.4):
+        Uses the quadratic 4-point stencil (§5.8.6):
             v(D) = (-1/6)*v(D-2) + (2/3)*v(D-1) + (2/3)*v(D+1) + (-1/6)*v(D+2)
 
         Left neighbours  v(D-1), v(D-2) come from self._prev_interval_tail[key].
@@ -143,6 +143,11 @@ class DarkFrameHoldStage:
         DarkFrameQuadraticStencil.interpolate_dark_value for the fallback chain).
 
         Returns None if there is no v(D+1) (interval has no corrected light frames).
+
+        temp_c is fabricated by the same stencil as the other metrics
+        (issue #221). Unlike them it is Optional on the neighbours: a
+        missing stamp counts as a missing neighbour, and with no stamped
+        v(D+1) the dark row's temp stays None instead of raising.
         """
         if not enriched_frames:
             return None
@@ -164,6 +169,8 @@ class DarkFrameHoldStage:
                 v_plus_1=r1, v_plus_2=r2,
             )
 
+        temp_c = _interp("temp_c") if right1.temp_c is not None else None
+
         return EnrichedCorrectedFrame(
             abs_frame_id=d_prev_abs,
             t=d_prev_t,
@@ -175,6 +182,7 @@ class DarkFrameHoldStage:
             bfi=_interp("bfi"),
             bvi=_interp("bvi"),
             quality="ok",
+            temp_c=temp_c,
         )
 
     # ── Lifecycle ────────────────────────────────────────────────────────

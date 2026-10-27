@@ -21,7 +21,9 @@ pytest tests/test_pipeline/                          # pure-software pipeline te
 
 - Python **3.12+**. Version is computed from git tags via `setuptools_scm` — never edit a version string by hand. To cut a release, tag and push. Tags use **semantic versioning** (`MAJOR.MINOR.PATCH`, e.g. `1.6.0`, `1.6.0-rc.1`).
 - No Makefile, no pre-commit, no lint/format/type-check configured. If you reach for `black`/`ruff`/`mypy`, they aren't wired up here.
-- `dfu-util` binaries are vendored under `omotion/dfu-util/` and shipped with the wheel (see `pyproject.toml` `[tool.setuptools.package-data]`).
+- Firmware update is pure Python: `omotion/dfu/` is ported from the bootloader repo's `py-tools` (source commit and local changes in `omotion/dfu/PROVENANCE.txt`). No `dfu-util`. The four bootloader public keys ship as package data (`omotion/dfu/keys/*.pem`); `cryptography` is needed only when an image is verified.
+- **libusb ships as exactly two DLLs, both libusb ≥ 1.0.30** (#305): `omotion/_vendor/libusb/windows/{x64,x86}` (VS2022 builds, loaded by pyusb, which firmware update also goes through). Source and update steps: `omotion/_vendor/libusb/README.txt`. `tests/test_vendored_libusb.py` fails on an older DLL or on any other libusb binary (static lib, `*-static` tool, dylib) in the package.
+- The laser-driver register baseline (`LASER_PARAMS`, `LASER_PARAMS_FAULT`) and the FPGA register map (`FPGA_MODEL`) are **Python modules** under `omotion/data/`, not data files (#278: nothing editable ships next to the compiled app). `omotion.laser.load_laser_params()` / `FpgaMap()` return deep copies. Locked baseline — loop in the firmware/laser owners before changing a value.
 
 ## Layout
 
@@ -37,11 +39,13 @@ Three-tier API: facade → device wrapper → transport.
 | Transport | `omotion/StreamInterface.py` | 382 | USB bulk streaming (sensor IF 1 = histo, IF 2 = IMU). Daemon reader thread per endpoint. |
 | Workflow | `omotion/ScanWorkflow.py` | 1110 | Full acquisition orchestration. Owns hardware bring-up + lifecycle; feeds frames into the pipeline. |
 | Workflow | `omotion/CalibrationWorkflow.py` | 1643 | Per-camera gain / I_max calibration. |
+| Procedure | `omotion/calibration/` | — | Auditable WI-00015 laser and safety calibration workflows, hardware adapters, and reports. |
 | **Science** | `omotion/pipeline/` | — | **Stage-based BFI/BVI pipeline** (`sources`, stages in `pipeline.py`, `sinks`, `runner`, `factory`, `pedestal`, `batch`, `tee`, `telemetry`). **The science lives here.** Full reference: `docs/SciencePipeline.md`. |
 | Science | `omotion/MotionProcessing.py` | 730 | Wire-level histogram packet **parsing only** — a thin shim feeding the pipeline. (BFI/BVI moved to `omotion/pipeline/`; this module is slated to dissolve eventually.) |
 | Config | `omotion/config.py` | 291 | VID/PID, baud, packet types, command opcodes, `DEBUG_FLAG_*` bits. Single source of truth. |
 | Programming | `omotion/FPGAProgrammer.py` | 567 | Page-by-page Lattice XO2 flash. |
-| Programming | `omotion/DFUProgrammer.py` | 346 | STM32 DFU over USB (uses vendored `dfu-util`). |
+| Programming | `omotion/dfu/` | — | STM32 DFU over USB in pure Python: `stm32dfu.py` (DfuSe), `image.py` (signed-image pre-flight), `migration.py` (flash sequences per device state), `keys/`. |
+| Programming | `omotion/firmware_update.py` | — | `FirmwareUpdater.update()`: one call for a unit with bootloader 1.2.0+, an older bootloader, or none. Bootloader changes need `acknowledge_irreversible=True`. |
 | Telemetry | `omotion/ConsoleTelemetry.py` | 478 | PDC + TEC poller. Daemon thread. Raw-ADC→units conversion lives in `console_telemetry_conversions.py`. |
 | Hotplug | `omotion/connection_monitor.py`, `connection_state.py`, `hotplug/` | — | Daemon thread that watches Win32/libusb hotplug events and emits to the app thread. |
 | Storage | `omotion/pipeline/sinks.py` (`CsvSink`, `ScanDBSink`), `omotion/ScanDatabase.py`, `SessionPlayback.py` | — | CSV + SQLite scan sinks + playback (issue #92). |
@@ -61,7 +65,7 @@ Signals are `pyqtSignal` when PyQt is importable, otherwise a fallback `MotionSi
 
 - `MotionInterface(demo_mode=True)` **or** `OPENMOTION_DEMO=1` — skips device discovery, generates fake data. The first thing to reach for if a script is hanging on enumeration. (Note: the *new pipeline* scan path does not yet support demo mode end-to-end — demo sensors have no real `uart`, so a full `start_scan` in demo mode will not stream. Demo mode is for discovery/connection-level work.)
 - Pure-software tests that run anywhere: the entire `tests/test_pipeline/` suite, plus `test_calibration_workflow_compute.py`, `test_contact_quality_workflow.py`, `test_scan_database.py`, `test_console_telemetry_unit.py`, `test_pedestal_height.py`. Run them with `pytest -m "not console and not sensor and not destructive"`.
-- Pure-software scripts: `scripts/test_jed_parser.py`, `scripts/test_github_release.py`, `scripts/run_pipeline_csv_tests.py`, `scripts/plot_telemetry.py`, `scripts/view_corrected_scan.py`.
+- Pure-software scripts: `scripts/test_jed_parser.py`, `scripts/test_github_release.py`, `scripts/run_pipeline_csv_tests.py`, `scripts/visualize_scan.py` (the one scan/telemetry CSV viewer — needs the `viz` extra), `scripts/plot_dark_drift.py`.
 
 ## Running a scan end-to-end (headless)
 
@@ -121,8 +125,8 @@ iface.stop()
 |---|---|
 | `docs/API.md` | **Public API / interface guide** — how a host app or script drives the SDK (`MotionInterface`, scans, reading the DB, custom sinks). Start here for consumer-facing usage. |
 | `docs/Architecture.md` | Comprehensive — layer diagram, module reference, transport details. |
-| `docs/scan-sequencing.md` | Frame ID unwrapping + histogram packet ordering. |
-| `docs/SciencePipeline.md` | BFI/BVI computation. |
+| `docs/scan-sequencing.md` | Scan lifecycle MCU↔SDK↔app sequencing (configure/start/per-frame/teardown) + firmware correctness analysis. |
+| `docs/SciencePipeline.md` | BFI/BVI computation; frame-ID unwrap + quarantine (§5.1) and timestamp repair (§5.4). |
 | `docs/ScanDatabase.md` | SQLite schema. |
 | `docs/ScanDatabase-HardwareVerification.md` | DB sink test plan. |
 | `docs/ConsoleTelemetry.md` | PDC (dark correction) + TEC telemetry. |
@@ -155,5 +159,6 @@ iface.stop()
 | Change histogram parsing | `omotion/MotionProcessing.py` (parsing) + `omotion/StreamInterface.py` (framing). |
 | Add a science-pipeline step | `omotion/pipeline/` (add a stage in `pipeline.py`, wire it in `factory.py`), then a unit test under `tests/test_pipeline/`. |
 | Change connection/discovery behavior | `omotion/connection_monitor.py` + `omotion/MotionInterface.py`. |
-| Flash sensor firmware from a script | `scripts/test_sensor_program.py` (CLI over `omotion/DFUProgrammer.py`); `scripts/enter_dfu.py` for DFU entry alone. |
+| Update a device's firmware from a script | `scripts/update_firmware.py <console\|left\|right> --release-dir <folder>` (CLI over `omotion.FirmwareUpdater`; add `--acknowledge-irreversible` to let it install or replace a bootloader). `scripts/test_sensor_program.py` is the older sensor-only flasher; `scripts/enter_dfu.py` does DFU entry and a bootloader version read. |
+| Change the firmware update flow | `omotion/firmware_update.py` (decisions) + `omotion/dfu/migration.py` (tested sequences — re-sync with the bootloader repo's `py-tools`, don't diverge). State table: `docs/API.md` §10. |
 | Flash a console FPGA | `omotion/FPGAProgrammer.py`; the JED parser is `scripts/test_jed_parser.py`. |

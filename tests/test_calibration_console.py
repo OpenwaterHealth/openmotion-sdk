@@ -34,11 +34,71 @@ def _valid_calibration_dict():
     }
 
 
-def test_read_calibration_returns_defaults_when_read_config_returns_none(console):
+def test_read_calibration_raises_when_read_config_returns_none(console):
+    """A failed read is not "no calibration on device": returning defaults
+    here let a partial calibration run write SDK defaults over the other
+    module's stored values whenever the console momentarily failed to
+    answer."""
     console.read_config = MagicMock(return_value=None)
+    with pytest.raises(RuntimeError, match="could not be read"):
+        console.read_calibration()
+
+
+def test_read_calibration_propagates_transport_errors(console):
+    console.read_config = MagicMock(side_effect=OSError("uart gone"))
+    with pytest.raises(OSError, match="uart gone"):
+        console.read_calibration()
+
+
+def _wire_bytes(json_data: dict) -> bytes:
+    return MotionConfig(json_data=json_data).to_wire_bytes()
+
+
+def _console_answering(console, payload: bytes) -> MotionConsole:
+    """Route read_config through a mocked UART that answers with payload."""
+    from types import SimpleNamespace
+    from omotion.config import OW_RESP
+    console.uart.demo_mode = False
+    console.is_connected = MagicMock(return_value=True)
+    console.uart.send_packet = MagicMock(
+        return_value=SimpleNamespace(packetType=OW_RESP, data=payload))
+    console.uart.clear_buffer = MagicMock()
+    return console
+
+
+def test_from_wire_bytes_rejects_undecodable_json():
+    """A truncated payload used to parse as an EMPTY config, which made
+    every stored key — the calibration block included — look absent."""
+    full = _wire_bytes(_valid_calibration_dict())
+    truncated = full[: len(full) - 40]
+    with pytest.raises(ValueError, match="not decodable"):
+        MotionConfig.from_wire_bytes(truncated)
+
+
+def test_from_wire_bytes_accepts_empty_payload():
+    """json_len == 0 is a legitimately empty (never written) config."""
+    cfg = MotionConfig.from_wire_bytes(_wire_bytes({}))
+    assert cfg.json_data == {}
+
+
+def test_read_config_returns_none_for_truncated_payload(console):
+    full = _wire_bytes(_valid_calibration_dict())
+    _console_answering(console, full[: len(full) - 40])
+    assert console.read_config() is None
+
+
+def test_read_calibration_raises_for_truncated_payload(console):
+    full = _wire_bytes(_valid_calibration_dict())
+    _console_answering(console, full[: len(full) - 40])
+    with pytest.raises(RuntimeError, match="could not be read"):
+        console.read_calibration()
+
+
+def test_read_calibration_round_trips_through_wire_format(console):
+    _console_answering(console, _wire_bytes(_valid_calibration_dict()))
     cal = console.read_calibration()
-    assert cal.source == "default"
-    assert cal.c_max.shape == (2, 8)
+    assert cal.source == "console"
+    np.testing.assert_array_equal(cal.c_max, np.full((2, 8), 0.5))
 
 
 def test_read_calibration_returns_defaults_when_block_absent(console):
@@ -66,6 +126,9 @@ def test_read_calibration_falls_back_when_block_malformed(console, caplog):
         cal = console.read_calibration()
     assert cal.source == "default"
     assert any("monotonic" in rec.message.lower() or "greater" in rec.message.lower()
+               for rec in caplog.records)
+    # ... and the fallback is loud, unlike the "no block on device" case.
+    assert any("invalid" in rec.message.lower() and rec.levelname == "WARNING"
                for rec in caplog.records)
 
 
@@ -209,3 +272,46 @@ def test_set_realtime_calibration_marks_override(interface):
     cal = interface.get_calibration()
     assert cal.source == "override"
     np.testing.assert_array_equal(cal.c_max, np.full((2, 8), 0.6))
+
+
+# ----- a failed read never downgrades a loaded cache -----
+
+def _load_console_calibration(interface, json_data):
+    interface.console.read_config = MagicMock(
+        return_value=MotionConfig(json_data=json_data))
+    interface.console.is_connected = MagicMock(return_value=True)
+    interface.console.log_device_info = MagicMock()
+    interface.log_console_info()
+    assert interface.get_calibration().source == "console"
+
+
+def test_refresh_calibration_raises_and_keeps_cache_on_read_failure(interface):
+    _load_console_calibration(interface, _valid_calibration_dict())
+    interface.console.read_config = MagicMock(return_value=None)
+    with pytest.raises(RuntimeError):
+        interface.refresh_calibration()
+    cal = interface.get_calibration()
+    assert cal.source == "console"
+    np.testing.assert_array_equal(cal.c_max, np.full((2, 8), 0.5))
+
+
+def test_log_console_info_keeps_cache_on_read_failure(interface):
+    """The best-effort connect-time load (the app calls this on every
+    console CONNECTED transition) must not replace a loaded calibration
+    with SDK defaults when one read fails — that reset was what a later
+    right-only calibration run then wrote to the EEPROM."""
+    _load_console_calibration(interface, _valid_calibration_dict())
+    interface.console.read_config = MagicMock(return_value=None)
+    interface.log_console_info()            # no raise: best-effort
+    cal = interface.get_calibration()
+    assert cal.source == "console"
+    np.testing.assert_array_equal(cal.c_max, np.full((2, 8), 0.5))
+
+
+def test_log_console_info_keeps_cache_on_truncated_payload(interface):
+    _load_console_calibration(interface, _valid_calibration_dict())
+    full = MotionConfig(json_data=_valid_calibration_dict()).to_wire_bytes()
+    _console_answering(interface.console, full[: len(full) - 40])
+    interface.log_console_info()
+    assert interface.get_calibration().source == "console"
+

@@ -2,9 +2,9 @@
 ScanDatabase - SQLite database manager for openwater scan sessions.
 
 The database stores session metadata (``sessions``) and the corrected
-science record (``session_data`` — final-branch BFI/BVI/mean/contrast,
-one row per camera per frame, with cam_id=-1 rows holding reduced-mode
-side averages).
+science record (``session_data`` — final-branch BFI/BVI/mean/contrast
+plus the camera temperature, one row per camera per frame, with
+cam_id=-1 rows holding reduced-mode side averages).
 
 Raw histograms are NOT stored here: the raw CSVs written by the
 pipeline's Tee("raw") → CsvSink are the only raw record. Databases
@@ -270,6 +270,7 @@ class ScanDatabase:
         bvi: Optional[float] = None,
         contrast: Optional[float] = None,
         mean: Optional[float] = None,
+        temp: Optional[float] = None,
         quality: str = "ok",
     ) -> int:
         # frame_id defaults to the "unknown" sentinel (-1) so callers from
@@ -281,9 +282,9 @@ class ScanDatabase:
             """
             INSERT INTO session_data (
                 session_id, cam_id, side,
-                frame_id, timestamp_s, bfi, bvi, contrast, mean, quality
+                frame_id, timestamp_s, bfi, bvi, contrast, mean, temp, quality
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 session_id,
@@ -295,6 +296,7 @@ class ScanDatabase:
                 bvi,
                 contrast,
                 mean,
+                temp,
                 quality,
             ),
         )
@@ -316,6 +318,7 @@ class ScanDatabase:
                     row.get("bvi"),
                     row.get("contrast"),
                     row.get("mean"),
+                    row.get("temp"),
                     row.get("quality", "ok"),
                 )
             )
@@ -324,9 +327,9 @@ class ScanDatabase:
             """
             INSERT INTO session_data (
                 session_id, cam_id, side,
-                frame_id, timestamp_s, bfi, bvi, contrast, mean, quality
+                frame_id, timestamp_s, bfi, bvi, contrast, mean, temp, quality
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             params,
         )

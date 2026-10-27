@@ -6,6 +6,7 @@ test_i2c_parser_verify.py) against a scripted mock sensor.
 
 import pytest
 
+import omotion.NvcmProgrammer as nvcm_mod
 from omotion.NvcmProgrammer import (
     NvcmProgrammer,
     NvcmResult,
@@ -13,6 +14,14 @@ from omotion.NvcmProgrammer import (
     DEFAULT_DATA_PATH,
     _CountingSimDriver,
 )
+
+
+@pytest.fixture(autouse=True)
+def _fast_power_settle(monkeypatch):
+    """Zero the power-cycle settle sleeps — these tests exercise dispatch
+    logic, not bench timing (which test_nvcm_pacing.py covers)."""
+    monkeypatch.setattr(nvcm_mod, "_POWER_OFF_SETTLE_S", 0)
+    monkeypatch.setattr(nvcm_mod, "_POWER_ON_SETTLE_S", 0)
 from omotion.i2c_parser import (
     I2C_STARTTRAN, I2C_RESTARTTRAN, I2C_ENDTRAN, I2C_TRANSOUT, I2C_TRANSIN,
     I2C_TDI, I2C_TDO, I2C_MASK, I2C_CONTINUE, I2C_TRST, I2C_ENDVME,
@@ -28,6 +37,10 @@ class MockSensor:
     def __init__(self, read_results=None):
         self.calls = []
         self._reads = list(read_results or [])
+
+    def disable_camera_power(self, mask):
+        self.calls.append(("disable_camera_power", mask))
+        return True
 
     def enable_camera_power(self, mask):
         self.calls.append(("enable_camera_power", mask))

@@ -4,6 +4,7 @@ None of these touch the real OS keyring: policy tests are pure, and key
 get/create/export tests monkeypatch keyring.get_password/set_password.
 """
 import importlib
+import sys
 
 import pytest
 
@@ -16,6 +17,18 @@ def _reset_policy():
     importlib.reload(db_key)
     yield
     importlib.reload(db_key)
+
+
+@pytest.fixture(autouse=True)
+def _non_darwin_platform(monkeypatch):
+    """Pin sys.platform away from darwin for the whole module.
+
+    db_key now refuses every keystore access on macOS, so without this the
+    keystore tests below would all fail when the suite is run on a Mac — the
+    result would depend on the developer's laptop, not on the code. The
+    macOS-refusal tests set it back to "darwin" themselves.
+    """
+    monkeypatch.setattr(sys, "platform", "win32")
 
 
 # --------------------------------------------------------------------------
@@ -104,26 +117,132 @@ def test_get_key_create_true_is_idempotent(fake_keyring):
 # Backend pinning — the real _assert_backend (not stubbed)
 # --------------------------------------------------------------------------
 
-def test_set_policy_true_rejects_non_windows_backend(monkeypatch):
+def _fake_backend(monkeypatch, module: str, name: str):
+    """Install a stand-in keyring backend reporting the given module + class name.
+
+    The real backends can't be instantiated off-platform, and the identity
+    _assert_backend pins on is exactly (module, class name) — so faking those
+    two attributes is the whole contract under test.
+    """
     import keyring
 
-    class _PlaintextKeyring:  # name lacks 'WinVault'; module lacks 'Windows'
-        pass
+    kr = type(name, (), {})()
+    type(kr).__module__ = module
+    monkeypatch.setattr(keyring, "get_keyring", lambda: kr)
+    return kr
 
-    monkeypatch.setattr(keyring, "get_keyring", lambda: _PlaintextKeyring())
+
+def test_set_policy_true_accepts_winvault_backend(monkeypatch):
+    _fake_backend(monkeypatch, "keyring.backends.Windows", "WinVaultKeyring")
+    db_key.set_policy(require_encryption=True)  # must not raise
+    assert db_key.require_encryption() is True
+
+
+def test_set_policy_true_rejects_macos_keychain_backend(monkeypatch):
+    """Even the real macOS Keychain is refused: macOS is research-only, so the
+    encryption path must not quietly work on an unvalidated platform."""
+    monkeypatch.setattr(sys, "platform", "darwin")
+    _fake_backend(monkeypatch, "keyring.backends.macOS", "Keyring")
     with pytest.raises(db_key.EncryptionUnavailable):
         db_key.set_policy(require_encryption=True)
 
 
-def test_set_policy_true_accepts_winvault_backend(monkeypatch):
-    import keyring
+def test_set_policy_true_rejects_unknown_backend(monkeypatch):
+    _fake_backend(monkeypatch, "keyrings.alt.file", "PlaintextKeyring")
+    with pytest.raises(db_key.EncryptionUnavailable):
+        db_key.set_policy(require_encryption=True)
 
-    class WinVaultKeyring:  # name contains 'WinVault'
-        pass
 
-    monkeypatch.setattr(keyring, "get_keyring", lambda: WinVaultKeyring())
-    db_key.set_policy(require_encryption=True)  # must not raise
-    assert db_key.require_encryption() is True
+def test_set_policy_true_rejects_plaintext_backend_impersonating_winvault(monkeypatch):
+    """A class *named* like the Windows backend but living in keyrings.alt must
+    still be rejected — keyrings.alt stores secrets in plaintext, so accepting
+    it would silently void the at-rest guarantee the policy exists to enforce."""
+    _fake_backend(monkeypatch, "keyrings.alt.file", "WinVaultKeyring")
+    with pytest.raises(db_key.EncryptionUnavailable):
+        db_key.set_policy(require_encryption=True)
+
+
+def test_set_policy_true_rejects_fail_backend(monkeypatch):
+    # keyring's fail backend = "no usable keystore on this machine"
+    _fake_backend(monkeypatch, "keyring.backends.fail", "Keyring")
+    with pytest.raises(db_key.EncryptionUnavailable):
+        db_key.set_policy(require_encryption=True)
+
+
+def test_set_policy_true_rejects_chainer_backend(monkeypatch):
+    """The chainer delegates to whatever it found, so it can't be verified up
+    front — the point of asserting at startup is to know, not to hope."""
+    _fake_backend(monkeypatch, "keyring.backends.chainer", "ChainerBackend")
+    with pytest.raises(db_key.EncryptionUnavailable):
+        db_key.set_policy(require_encryption=True)
+
+
+def test_backend_rejection_names_the_offending_backend(monkeypatch):
+    # the message is read off a bench console; it has to say what was found
+    _fake_backend(monkeypatch, "keyrings.alt.file", "PlaintextKeyring")
+    with pytest.raises(db_key.EncryptionUnavailable) as exc:
+        db_key.set_policy(require_encryption=True)
+    assert "keyrings.alt.file.PlaintextKeyring" in str(exc.value)
+
+
+# --------------------------------------------------------------------------
+# macOS is refused outright — research-only platform, never clinical
+# --------------------------------------------------------------------------
+
+@pytest.fixture
+def _darwin(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "darwin")
+
+
+def test_get_key_is_refused_on_macos(_darwin, fake_keyring):
+    # fake_keyring proves the refusal is the platform, not a missing backend
+    with pytest.raises(db_key.EncryptionUnavailable):
+        db_key.get_key(create=True)
+
+
+def test_get_key_without_create_is_refused_on_macos(_darwin, fake_keyring):
+    # must be EncryptionUnavailable (wrong platform), NOT EncryptionKeyMissing
+    # (right platform, absent key) — the two point at different fixes
+    with pytest.raises(db_key.EncryptionUnavailable):
+        db_key.get_key(create=False)
+
+
+def test_import_key_is_refused_on_macos(_darwin, fake_keyring):
+    # the path deliberately does not exist: the platform refusal must land
+    # before any file is read, so the escrow CLI can't half-run on macOS
+    with pytest.raises(db_key.EncryptionUnavailable):
+        db_key.import_key("no_such_key_file.txt")
+
+
+def test_export_key_is_refused_on_macos(_darwin, fake_keyring):
+    # likewise nothing may be written to the target path
+    with pytest.raises(db_key.EncryptionUnavailable):
+        db_key.export_key("no_such_dir/out.txt")
+
+
+def test_macos_provisions_nothing_before_refusing(_darwin, fake_keyring):
+    """The refusal must land before any keystore write — a half-provisioned key
+    on an unsupported platform is worse than a clean failure."""
+    with pytest.raises(db_key.EncryptionUnavailable):
+        db_key.get_key(create=True)
+    assert fake_keyring._store == {}
+
+
+def test_macos_refusal_names_the_platform_and_the_fix(_darwin, fake_keyring):
+    # read off a bench console: it has to say macOS, and what to change
+    with pytest.raises(db_key.EncryptionUnavailable) as exc:
+        db_key.get_key(create=True)
+    message = str(exc.value)
+    assert "macOS" in message
+    assert "require_encryption=False" in message
+
+
+def test_macos_research_build_still_boots(_darwin):
+    """The whole point of the refusal: policy-off on macOS must stay silent.
+    A research build is the only supported macOS configuration, so it cannot be
+    collateral damage of refusing the clinical path."""
+    db_key.set_policy(require_encryption=False)  # must not raise
+    assert db_key.require_encryption() is False
 
 
 # --------------------------------------------------------------------------

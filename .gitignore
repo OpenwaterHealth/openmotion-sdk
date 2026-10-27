@@ -169,4 +169,4 @@ histogram.csv
 /camera-test-data/*
 /reports/*
 .claude/*
-.scratch/
+.scratch/wi15_out/

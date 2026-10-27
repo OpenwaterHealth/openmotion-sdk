@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import secrets
+import sys
 from pathlib import Path
 
 logger = logging.getLogger("omotion.db_key")
@@ -57,7 +58,12 @@ def _keyring():
     that forgets it fails at the first keystore touch. Mirrors how ``db_open``
     handles the ``sqlcipher3`` import — the message has to name the fix, because
     the place this surfaces is a packaged clinical app on a bench.
+
+    Also the single chokepoint where macOS is refused: every keystore touch in
+    this module (``_assert_backend``, ``get_key``, ``import_key``, and
+    ``export_key`` via ``get_key``) routes through here.
     """
+    _assert_keystore_platform()
     try:
         import keyring
     except ImportError as exc:  # pragma: no cover - exercised via monkeypatch
@@ -71,15 +77,57 @@ def _keyring():
     return keyring
 
 
+def _assert_keystore_platform() -> None:
+    """Refuse every keystore access on macOS.
+
+    macOS is a research-only platform for this product — it is never shipped in
+    clinical mode, so the encrypted scan DB (and therefore the keystore) has no
+    role there. The macOS Keychain would be a technically adequate backend, but
+    accepting it would mean the encryption path silently exists on a platform
+    that is not validated for clinical use. Reaching the keystore on darwin is
+    therefore a build/configuration error, and a loud one is better than a
+    working-but-unvalidated encryption path.
+
+    A macOS *research* build never gets here: ``require_encryption()`` is False,
+    so ``db_open`` takes the plaintext branch without asking for a key.
+    """
+    if sys.platform == "darwin":
+        raise EncryptionUnavailable(
+            "the scan-database keystore is not available on macOS. macOS builds "
+            "are research-only and are never validated for clinical mode, so the "
+            "encryption policy must stay off (require_encryption=False) there. "
+            "Reaching the keystore on macOS means something enabled the clinical "
+            "encryption path on an unsupported platform — fix the build config "
+            "rather than the keystore."
+        )
+
+
+# The OS-owned keystores approved to hold the scan-db key, by backend module.
+# Windows Credential Manager is the only one: it is hardware/OS-protected and
+# per-user, and Windows is the only platform shipped in clinical mode. The
+# macOS Keychain is deliberately absent — see _assert_keystore_platform, which
+# refuses darwin outright and fires before this check is ever reached.
+#
+# Everything else is rejected — most importantly ``keyrings.alt`` (plaintext or
+# obfuscated files), ``keyring.backends.fail`` (no keystore at all) and
+# ``keyring.backends.chainer`` (defers to whatever it discovered, so it cannot
+# be verified up front). Matching on the module rather than the class name
+# matters: a plaintext backend is free to call its class ``WinVaultKeyring``,
+# and a name-only check would wave it through.
+_SUPPORTED_BACKENDS = {
+    "keyring.backends.Windows": "Windows Credential Manager",
+}
+
+
 def _assert_backend() -> None:
     keyring = _keyring()
 
     kr = keyring.get_keyring()
-    # Windows Credential Manager is the supported clinical backend.
-    if "WinVault" not in type(kr).__name__ and "Windows" not in type(kr).__module__:
+    if type(kr).__module__ not in _SUPPORTED_BACKENDS:
+        supported = ", ".join(sorted(_SUPPORTED_BACKENDS.values()))
         raise EncryptionUnavailable(
-            "encryption policy requires the Windows Credential Manager keyring, "
-            f"got {type(kr).__module__}.{type(kr).__name__}"
+            f"encryption policy requires an OS keystore ({supported}), got "
+            f"{type(kr).__module__}.{type(kr).__name__}"
         )
 
 

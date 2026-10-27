@@ -15,7 +15,6 @@ from .stages.moments import MomentsStage
 from .stages.pedestal_sub import PedestalSubtractionStage
 from .stages.dark import (
     DarkCorrectionStage, HybridRealtimePredictor, LinearInterpolation,
-    EnrichedCorrectedFrame, EnrichedCorrectedInterval,
 )
 from .stages.shot_noise import ShotNoiseCorrectionStage
 from .stages.bfi_bvi import BfiBviStage
@@ -48,10 +47,18 @@ def default_pipeline(*,
             omits the stage (replay sources, tests, no console telemetry).
     """
 
-    not_warmup_or_stale = lambda ft: ft != "warmup" and ft != "stale"
+    def not_warmup_or_stale(frame_type: str) -> bool:
+        return frame_type not in {"warmup", "stale"}
 
     stages: list = [
-        FrameClassificationStage(discard_count=discard_count, dark_interval=dark_interval),
+        FrameClassificationStage(
+            discard_count=discard_count,
+            dark_interval=dark_interval,
+            expected_camera_masks=(
+                metadata.left_camera_mask,
+                metadata.right_camera_mask,
+            ),
+        ),
     ]
 
     if telemetry is not None:
@@ -65,8 +72,7 @@ def default_pipeline(*,
     # now to keep the raw CSV a faithful pre-processing capture.
     if raw_save_max_duration_s is None or raw_save_max_duration_s > 0:
         stages.append(
-            Tee("raw", emit_if_any=lambda ft: ft != "stale",
-                max_duration_s=raw_save_max_duration_s, snapshot=True)
+            Tee("raw", max_duration_s=raw_save_max_duration_s, snapshot=True)
         )
 
     stages.extend([

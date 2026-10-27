@@ -34,7 +34,7 @@ import logging
 logger = logging.getLogger("omotion.db_schema")
 
 # Bump this whenever a migration is appended to MIGRATIONS.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class SchemaTooNewError(RuntimeError):
@@ -127,6 +127,15 @@ def _migration_001_baseline(conn) -> None:
         conn.execute(f"CREATE INDEX IF NOT EXISTS {name} ON session_data({cols})")
 
 
+def _migration_002_session_data_temp(conn) -> None:
+    """Per-frame camera temperature (°C) in the corrected record (issue
+    #221). Light rows carry the firmware's cached stamp; the stencilled
+    dark row's temp is interpolated from its neighbours like the rest of
+    that fabricated row. NULL on reduced-mode side averages and all
+    pre-migration rows."""
+    _add_column_if_missing(conn, "session_data", "temp", "REAL")
+
+
 # (version, description, function) — ordered, append-only.
 #
 # Only real, used schema belongs here: every entry lands in every database in
@@ -136,6 +145,8 @@ def _migration_001_baseline(conn) -> None:
 MIGRATIONS: list[tuple[int, str, object]] = [
     (1, "baseline schema (sessions, session_data, database_settings)",
      _migration_001_baseline),
+    (2, "session_data.temp — per-frame camera temperature",
+     _migration_002_session_data_temp),
 ]
 
 

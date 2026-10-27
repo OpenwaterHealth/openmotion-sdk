@@ -110,6 +110,27 @@ def test_csv_replay_splits_into_multiple_batches(tmp_path):
     assert len(batches[1].frame_ids) == 2
 
 
+def test_csv_replay_never_splits_a_source_packet(tmp_path):
+    bins = [0] * 1024
+    rows = [
+        [cam, fid, ts, "warmup"] + bins + [27.0, 0, 0.0, 0.0, 0.0]
+        for fid, ts in ((1, 0.025), (2, 0.050))
+        for cam in range(4)
+    ]
+    path = _write_raw_csv(tmp_path, rows)
+
+    batches = list(CsvReplaySource(
+        raw_csv_left=path, raw_csv_right=None,
+        batch_size_frames=3, metadata=_meta(),
+    ))
+
+    assert [len(batch.frame_ids) for batch in batches] == [4, 4]
+    assert [batch.packet_ids.tolist() for batch in batches] == [
+        [0, 0, 0, 0],
+        [1, 1, 1, 1],
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Task 22: LiveUsbSource skeleton
 # ---------------------------------------------------------------------------
@@ -141,19 +162,31 @@ def test_live_usb_source_reader_loop_builds_batches_from_packet_queue(monkeypatc
     import numpy as np
     from omotion.pipeline.batch import FrameBatch
 
-    # Fake parse_histogram_stream: ignores the real queue and fires on_row_fn
-    # with 15 synthetic samples positionally (matching the real call site), then returns.
+    from omotion.MotionProcessing import HistogramPacket, HistogramSample
+
+    # Fake parse_histogram_stream: ignores the real queue and emits 15
+    # one-camera packets, matching the parser's packet callback contract.
     def _fake_parse_histogram_stream(q, stop_evt, buf, *, on_row_fn=None,
-                                     expected_row_sum=None, t0_normalizer=None):
+                                     on_packet_fn=None, expected_row_sum=None,
+                                     t0_normalizer=None):
         for i in range(15):
-            if on_row_fn is not None:
+            sample = HistogramSample(
+                cam_id=0,
+                frame_id=i + 1,
+                timestamp_s=0.025 * (i + 1),
+                histogram=np.ones(1024, dtype=np.uint32),
+                row_sum=1024,
+                temperature_c=27.0,
+            )
+            if on_packet_fn is not None:
+                on_packet_fn(HistogramPacket(
+                    samples=[sample], bytes_consumed=0,
+                    timestamp_s=sample.timestamp_s,
+                ))
+            elif on_row_fn is not None:
                 on_row_fn(
-                    0,                              # cam_id
-                    i + 1,                          # frame_id
-                    0.025 * (i + 1),                # ts
-                    np.ones(1024, dtype=np.uint32), # histogram
-                    1024,                           # row_sum
-                    27.0,                           # temperature_c (temp)
+                    sample.cam_id, sample.frame_id, sample.timestamp_s,
+                    sample.histogram, sample.row_sum, sample.temperature_c,
                 )
             if stop_evt.is_set():
                 return 15
@@ -202,6 +235,11 @@ def test_live_usb_source_reader_loop_builds_batches_from_packet_queue(monkeypatc
     # Each batch has the correct histogram shape
     for b in batches:
         assert b.raw_histograms.shape[-1] == 1024
+        assert b.packet_ids is not None
+    assert np.array_equal(
+        np.concatenate([b.packet_ids for b in batches]),
+        np.arange(total_frames),
+    )
 
 
 def _consume_bounded(src, *, want_batches: int, timeout_s: float):
@@ -408,8 +446,11 @@ def test_live_usb_reader_loops_anchor_t0_per_side(monkeypatch):
     # Absolute firmware clocks: right booted ~82.6 s before left.
     clock_base = {"left": 100.0, "right": 8283.0}
 
+    from omotion.MotionProcessing import HistogramPacket, HistogramSample
+
     def _fake_parse_histogram_stream(q, stop_evt, buf, *, on_row_fn=None,
-                                     expected_row_sum=None, t0_normalizer=None):
+                                     on_packet_fn=None, expected_row_sum=None,
+                                     t0_normalizer=None):
         side = next(s for s, sq in src._packet_queues.items() if sq is q)
         base = clock_base[side]
         for i in range(15):
@@ -417,9 +458,17 @@ def test_live_usb_reader_loops_anchor_t0_per_side(monkeypatch):
             # Same call the real parser makes before firing on_row_fn.
             if t0_normalizer is not None:
                 ts = t0_normalizer(ts)
-            if on_row_fn is not None:
-                on_row_fn(0, i + 1, ts,
-                          np.ones(1024, dtype=np.uint32), 1024, 27.0)
+            sample = HistogramSample(
+                cam_id=0, frame_id=i + 1, timestamp_s=ts,
+                histogram=np.ones(1024, dtype=np.uint32),
+                row_sum=1024, temperature_c=27.0,
+            )
+            if on_packet_fn is not None:
+                on_packet_fn(HistogramPacket(
+                    samples=[sample], bytes_consumed=0, timestamp_s=ts,
+                ))
+            elif on_row_fn is not None:
+                on_row_fn(0, i + 1, ts, sample.histogram, 1024, 27.0)
         return 15
 
     monkeypatch.setattr(

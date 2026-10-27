@@ -13,7 +13,10 @@ import sqlite3
 from types import SimpleNamespace
 
 from omotion.pipeline.batch import (
+    CameraStreamGap,
     DarkIntegrityWarning,
+    FrameIdConsensusCorrection,
+    FrameQuarantined,
     PipelineError,
     TerminalDarkResult,
     TriggerStateEvent,
@@ -75,6 +78,34 @@ def test_log_sink_ignores_routine_events(caplog):
     assert caplog.text == ""
 
 
+def test_log_sink_coalesces_high_volume_frame_integrity_events(caplog):
+    sink = DiagnosticsLogSink()
+    sink.on_scan_start(_meta())
+    with caplog.at_level(logging.WARNING, logger="openmotion.sdk.pipeline.sinks"):
+        for fid in range(10, 60):
+            sink.consume("diagnostics", FrameIdConsensusCorrection(
+                side=0, cam_id=0, timestamp_s=fid * 0.025,
+                wire_frame_id=(fid + 1) & 0xFF,
+                corrected_frame_id=fid & 0xFF,
+                abs_frame_id=fid,
+            ))
+        for fid in range(60, 70):
+            sink.consume("diagnostics", FrameQuarantined(
+                side=0, cam_id=0, packet_id=fid,
+                timestamp_s=fid * 0.025, wire_frame_id=fid & 0xFF,
+                previous_abs_frame_id=fid - 1,
+                clock_anchor_abs_frame_id=fid - 1,
+                clock_anchor_timestamp_s=(fid - 1) * 0.025,
+                step=1, elapsed_s=0.0, reason="timestamp_inconsistent",
+            ))
+        sink.on_complete()
+
+    warnings = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1
+    assert "FrameIdConsensusCorrection×50" in warnings[0]
+    assert "FrameQuarantined×10" in warnings[0]
+
+
 def test_scan_db_sink_writes_diagnostics_summary_to_session_meta(tmp_path):
     db_path = str(tmp_path / "scan.db")
     sink = ScanDBSink(db_path=db_path)
@@ -114,3 +145,65 @@ def test_scan_db_sink_meta_has_no_diagnostics_key_when_clean(tmp_path):
         "SELECT session_meta FROM sessions").fetchone()[0])
     conn.close()
     assert "diagnostics" not in meta
+
+
+def test_scan_db_sink_keeps_packet_integrity_evidence(tmp_path):
+    db_path = str(tmp_path / "scan.db")
+    sink = ScanDBSink(db_path=db_path)
+    sink.on_scan_start(_meta())
+    sink.consume("final", _final_interval())
+    for fid, reason in ((42, "counter_clock_mismatch"), (43, "gap_too_large")):
+        sink.consume("diagnostics", FrameQuarantined(
+            side=0, cam_id=2, packet_id=17 + fid,
+            timestamp_s=fid * 0.025, wire_frame_id=fid,
+            previous_abs_frame_id=fid - 2,
+            clock_anchor_abs_frame_id=fid - 2,
+            clock_anchor_timestamp_s=(fid - 2) * 0.025,
+            step=2, elapsed_s=0.025, reason=reason,
+        ))
+    sink.on_complete()
+
+    conn = sqlite3.connect(db_path)
+    meta = json.loads(conn.execute(
+        "SELECT session_meta FROM sessions").fetchone()[0])
+    conn.close()
+
+    rec = meta["diagnostics"]["FrameQuarantined"]
+    assert rec["count"] == 2
+    assert rec["reasons"] == {
+        "counter_clock_mismatch": 1,
+        "gap_too_large": 1,
+    }
+    assert rec["first_detail"]["packet_id"] == 59
+    assert rec["first_detail"]["previous_abs_frame_id"] == 40
+    assert rec["last_detail"]["packet_id"] == 60
+
+
+def test_scan_db_sink_keeps_camera_gap_and_recovery_evidence(tmp_path):
+    db_path = str(tmp_path / "scan.db")
+    sink = ScanDBSink(db_path=db_path)
+    sink.on_scan_start(_meta())
+    sink.consume("final", _final_interval())
+    sink.consume("diagnostics", CameraStreamGap(
+        side=0, cam_id=1, state="missing", missing_frames=9,
+        packet_id=109, timestamp_s=2.7,
+        first_missing_packet_id=101, first_missing_timestamp_s=2.5,
+    ))
+    sink.consume("diagnostics", CameraStreamGap(
+        side=0, cam_id=1, state="resumed", missing_frames=12,
+        packet_id=113, timestamp_s=2.8,
+        first_missing_packet_id=101, first_missing_timestamp_s=2.5,
+    ))
+    sink.on_complete()
+
+    conn = sqlite3.connect(db_path)
+    meta = json.loads(conn.execute(
+        "SELECT session_meta FROM sessions").fetchone()[0])
+    conn.close()
+
+    rec = meta["diagnostics"]["CameraStreamGap"]
+    assert rec["count"] == 2
+    assert rec["first_detail"]["state"] == "missing"
+    assert rec["first_detail"]["first_missing_packet_id"] == 101
+    assert rec["last_detail"]["state"] == "resumed"
+    assert rec["last_detail"]["missing_frames"] == 12

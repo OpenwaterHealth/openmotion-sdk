@@ -1,18 +1,17 @@
 """Sink protocol + ScanMetadata.
 
 Concrete sink implementations (CsvSink, ScanDBSink) live below the
-protocol definitions. The live-plot UI sink lives in the bloodflow-app
-(`motion_connector.py` — `_LivePlotSink` for the `"live"` channel and
-`_FinalBatchSink` for the `"final"` channel) rather than in the SDK.
+protocol definitions. The app-side sinks (e.g. the live-plot UI sink,
+`_LivePlotSink`) live in the bloodflow-app's `motion_connector.py` rather
+than in the SDK.
 """
 
 from __future__ import annotations
 
-import collections
 import csv
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Optional, Protocol, runtime_checkable
 
 from omotion.config import HISTO_SIZE_WORDS
@@ -40,7 +39,7 @@ class Sink(Protocol):
     """A consumer of pipeline output.
 
     Channels in this pipeline:
-        "raw"          — per-frame, all non-stale frames including warmup
+        "raw"          — every wire frame, including warmup and quarantined
         "live"         — per-frame, best-effort corrected (light + dark)
         "live_side"    — reduced mode: realtime per-side average
                          (SideAverageSample), one per capture per side
@@ -155,7 +154,8 @@ class CsvSink:
     """Channel-based CSV sink for the pipeline.
 
     Channels:
-        "raw"   — per-frame raw histograms (gated by meta.write_raw_csv)
+        "raw"   — per-frame raw histograms (only when the pipeline includes
+                  ``Tee("raw")``)
         "final" — per-interval corrected output
 
     Raw file naming:       ``{scan_id}_{subject_id}_{side}_mask{XX}_raw.csv``
@@ -184,8 +184,9 @@ class CsvSink:
         # When False, the corrected CSV ({scan_id}_{subject}.csv) is not
         # written — the scan DB's session_data is the system of record
         # for per-cam BFI/BVI instead. Raw histogram CSV handling (the
-        # "raw" channel, separately gated by meta.write_raw_csv) is
-        # unaffected. The SDK runner forces this True when no scan DB is
+        # "raw" channel, gated by whether the pipeline includes Tee("raw")
+        # and by its optional max_duration_s cap) is unaffected.
+        # ScanWorkflow.start_scan forces this True when no scan DB is
         # configured so there's always at least one persisted record.
         self._write_corrected = bool(write_corrected)
         self._meta: Optional[ScanMetadata] = None
@@ -269,17 +270,9 @@ class CsvSink:
 
         import numpy as np
 
-        # Tee("raw")'s gate is batch-level, so stale rows (leftover packets
-        # from a previous scan) can still arrive here; iter_rows skips them.
-        if batch.frame_type is not None:
-            n_stale = int(np.sum(batch.frame_type == "stale"))
-            if n_stale:
-                logger.warning(
-                    "stale raw frame skipped x%d (leftover packets from a "
-                    "previous scan)", n_stale,
-                )
-
-        for i, _side_idx, cam_id, frame_type in batch.iter_rows(exclude={"stale"}):
+        # This is the wire record, so retain quarantined rows as evidence.
+        # ``frame_type='stale'`` keeps them out of science stages downstream.
+        for i, _side_idx, cam_id, frame_type in batch.iter_rows():
             frame_id = int(batch.frame_ids[i])
             ts = float(batch.timestamp_s[i])
 
@@ -357,12 +350,17 @@ class CsvSink:
                 side_char = "l" if frame.side == "left" else "r"
                 cam_1 = cam_id % 8 + 1
                 if isinstance(frame, EnrichedCorrectedFrame):
+                    # temp_c is None only where no firmware stamp was
+                    # available; that cell stays empty.
                     for metric, val in (
                         ("bfi",      frame.bfi),
                         ("bvi",      frame.bvi),
                         ("mean",     frame.mean),
                         ("contrast", frame.contrast),
+                        ("temp",     frame.temp_c),
                     ):
+                        if val is None:
+                            continue
                         col_idx = _NORMAL_COL_IDX[(metric, side_char, cam_1)]
                         row[col_idx] = round(float(val), 9)
                 else:
@@ -370,7 +368,6 @@ class CsvSink:
                     for metric, val in (("mean", frame.mean),):
                         col_idx = _NORMAL_COL_IDX[(metric, side_char, cam_1)]
                         row[col_idx] = round(float(val), 9)
-                # temp: leave empty (not propagated through corrected path yet)
 
             # Check whether this frame is complete (all expected cams seen for
             # sides that have non-empty masks).
@@ -505,21 +502,45 @@ def _is_integrity_event(event) -> bool:
 
 def _event_frame(event):
     """Best-effort frame/time locator for an event, for summaries."""
-    for attr in ("abs_frame_id", "onset_fid", "first_timestamp_s"):
+    for attr in (
+        "abs_frame_id", "onset_fid", "gap_start_fid", "wire_frame_id",
+        "first_timestamp_s", "timestamp_s",
+    ):
         v = getattr(event, attr, None)
         if v is not None:
             return v
     return None
 
 
+_DETAILED_DIAGNOSTIC_TYPES = {
+    "CameraStreamGap",
+    "FrameGapFillAnomaly",
+    "FrameIdConsensusCorrection",
+    "FrameIdPacketAnomaly",
+    "FrameQuarantined",
+    "TimestampRepairInputAnomaly",
+}
+_FULLY_COALESCED_DIAGNOSTIC_TYPES = {
+    "CameraStreamGap",
+    "FrameIdConsensusCorrection",
+    "FrameQuarantined",
+}
+
+
+def _diagnostic_detail(event) -> Optional[dict]:
+    """Return compact, JSON-safe evidence for packet-integrity events."""
+    if type(event).__name__ not in _DETAILED_DIAGNOSTIC_TYPES:
+        return None
+    return asdict(event)
+
+
 class DiagnosticsLogSink:
     """Default consumer for the "diagnostics" channel.
 
     Always injected by ScanWorkflow (independent of storage flags) so
-    integrity events — DarkIntegrityWarning (laser apparently on during a
-    dark frame), TerminalDarkResult(found=False) (terminal interval lost),
-    StencilFallback, PipelineError (batch dropped) — are logged at WARNING
-    instead of silently evaporating, with a per-type summary at scan end.
+    low-volume integrity events are logged at WARNING instead of silently
+    evaporating, with a per-type summary at scan end. High-volume packet
+    evidence is coalesced to keep a bad sensor from flooding the log.
 
     The durable counterpart lives in ScanDBSink, which also subscribes to
     "diagnostics" and writes the same summary into the session's
@@ -532,10 +553,12 @@ class DiagnosticsLogSink:
     def __init__(self) -> None:
         self._scan_id: str = ""
         self._counts: dict[str, int] = {}
+        self._examples_logged: set[str] = set()
 
     def on_scan_start(self, meta: ScanMetadata) -> None:
         self._scan_id = meta.scan_id
         self._counts = {}
+        self._examples_logged = set()
 
     def consume(self, channel: str, event: Any) -> None:
         if not _is_integrity_event(event):
@@ -544,8 +567,19 @@ class DiagnosticsLogSink:
         name = type(event).__name__
         self._counts[name] = self._counts.get(name, 0) + 1
         # TimestampRepairStage already logs each window with full context
-        # under its own logger — count it for the summary, don't double-log.
-        if not isinstance(event, TimestampMisalignmentWindow):
+        # under its own logger. Packet evidence can number in the thousands,
+        # so keep it to one detailed example plus the scan-end tally. Per-row
+        # corrections/quarantines are fully coalesced; the classifier logs
+        # the first quarantine for every decision reason itself.
+        if name in _DETAILED_DIAGNOSTIC_TYPES:
+            if (name not in _FULLY_COALESCED_DIAGNOSTIC_TYPES
+                    and name not in self._examples_logged):
+                self._examples_logged.add(name)
+                logger.warning(
+                    "scan %s integrity event (first %s; further examples "
+                    "coalesced): %r", self._scan_id, name, event,
+                )
+        elif not isinstance(event, TimestampMisalignmentWindow):
             logger.warning("scan %s integrity event: %r", self._scan_id, event)
 
     def on_complete(self) -> None:
@@ -687,14 +721,26 @@ class ScanDBSink:
         name = type(event).__name__
         rec = self._diag.get(name)
         loc = _event_frame(event)
+        detail = _diagnostic_detail(event)
         if rec is None:
-            self._diag[name] = {"count": 1, "first": loc, "last": loc}
+            rec = {"count": 1, "first": loc, "last": loc}
+            if detail is not None:
+                rec["first_detail"] = detail
+                rec["last_detail"] = detail
+            self._diag[name] = rec
         else:
             rec["count"] += 1
             if loc is not None:
                 rec["last"] = loc
                 if rec["first"] is None:
                     rec["first"] = loc
+            if detail is not None:
+                rec["last_detail"] = detail
+
+        reason = getattr(event, "reason", None)
+        if reason is not None:
+            reasons = rec.setdefault("reasons", {})
+            reasons[reason] = reasons.get(reason, 0) + 1
 
     # ------------------------------------------------------------------
     # Internal
@@ -751,6 +797,7 @@ class ScanDBSink:
                 "bvi": bvi,
                 "mean": mean_v,
                 "contrast": contrast_v,
+                "temp": _round(getattr(f, "temp_c", None)),
                 "quality": str(getattr(f, "quality", "ok") or "ok"),
             })
 

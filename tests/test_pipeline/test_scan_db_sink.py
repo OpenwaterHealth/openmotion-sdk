@@ -35,11 +35,11 @@ def _meta_reduced():
 
 
 def _frame(abs_id, *, side="left", cam_id=0, t=None, mean=100.0, std=2.0,
-           contrast=0.02, bfi=4.0, bvi=6.0, quality="ok"):
+           contrast=0.02, bfi=4.0, bvi=6.0, quality="ok", temp_c=None):
     return EnrichedCorrectedFrame(
         abs_frame_id=abs_id, t=(t if t is not None else abs_id * 0.025),
         side=side, cam_id=cam_id, mean=mean, std=std,
-        contrast=contrast, bfi=bfi, bvi=bvi, quality=quality,
+        contrast=contrast, bfi=bfi, bvi=bvi, quality=quality, temp_c=temp_c,
     )
 
 
@@ -232,6 +232,27 @@ def test_scan_db_sink_quality_persisted(tmp_path):
     rows = conn.execute("SELECT quality FROM session_data").fetchall()
     conn.close()
     assert rows == [("ts_corrected",)]
+
+
+def test_scan_db_sink_temp_persisted(tmp_path):
+    """Camera temperature rides the corrected record (issue #221). A frame
+    without a firmware stamp (e.g. temperature telemetry unavailable)
+    stores NULL, not 0."""
+    db_path = str(tmp_path / "scan.db")
+    sink = ScanDBSink(db_path=db_path)
+    sink.on_scan_start(_meta_simple())
+    sink.consume("final", _interval([
+        _frame(10, cam_id=0),                   # no stamp available
+        _frame(11, cam_id=0, temp_c=45.625),
+    ]))
+    sink.on_complete()
+
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute(
+        "SELECT frame_id, temp FROM session_data ORDER BY frame_id"
+    ).fetchall()
+    conn.close()
+    assert rows == [(10, None), (11, pytest.approx(45.625))]
 
 
 def test_scan_db_sink_ignores_other_channels(tmp_path):

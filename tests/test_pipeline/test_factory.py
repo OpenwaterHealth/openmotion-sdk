@@ -45,6 +45,11 @@ def test_default_pipeline_has_expected_stages():
         "side_average",
         "tee:live",
     ]
+    classifier = pipeline.stages[0]
+    assert classifier._expected_cameras == {
+        0: set(range(8)),
+        1: set(range(8)),
+    }
 
 
 def test_default_pipeline_omits_raw_tee_when_duration_zero():

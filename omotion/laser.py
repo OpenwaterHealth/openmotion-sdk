@@ -7,49 +7,83 @@ light until these are written. The bloodflow app does this on its scan path
 (its "Issue #108" guard); this module is the SDK-owned equivalent so any SDK
 consumer (scripts, headless tools) can do it without the app.
 
-The register values live in two bundled data files under ``omotion/data``:
+The register values are Python modules under ``omotion.data`` (they were
+JSON data files until openmotion-sdk#278 compiled them into the package so a
+shipped application carries no editable data file):
 
-* ``laser_params.json``  — list of ``{"friendlyName", "dataToSend"}`` driver
-  register payloads (the locked baseline; mirrors the bloodflow app's
-  ``config/laser_params.json``).
-* ``fpga_model.json``    — maps each ``friendlyName`` to its I2C location
-  (mux/channel/device addr/register offset/size).
+* :data:`omotion.data.laser_params.LASER_PARAMS` — list of
+  ``{"friendlyName", "dataToSend"}`` driver register payloads (the locked
+  baseline).
+* :data:`omotion.data.laser_params_fault.LASER_PARAMS_FAULT` — the same set
+  with register(s) deliberately faulted, for testing the safety interlock.
+* :data:`omotion.data.fpga_model.FPGA_MODEL` — maps each ``friendlyName`` to
+  its I2C location (mux/channel/device addr/register offset/size).
 
 This is laser-sensitive: editing the bundled values risks wrong pulse widths
 or tripping the safety interlock. Treat them as locked baseline data.
+
+Every load ends by reading back the limit registers it wrote on the Safety
+EE and OPT FPGAs (sdk#310). Until a load verifies clean,
+``console.laser_limits_error`` holds the reason, ``ScanWorkflow.start_scan``
+refuses laser scans and ``MotionConsole.start_trigger`` raises
+:class:`LaserSafetyLimitError`.
 """
 
 from __future__ import annotations
 
-import json
+import copy
 import logging
-from pathlib import Path
 from typing import Any, Optional
+
+from omotion.data.fpga_model import FPGA_MODEL
+from omotion.data.laser_params import LASER_PARAMS
+from omotion.data.laser_params_fault import LASER_PARAMS_FAULT
 
 logger = logging.getLogger("openmotion.sdk.laser")
 
-_DATA_DIR = Path(__file__).resolve().parent / "data"
-_FPGA_MODEL_PATH = _DATA_DIR / "fpga_model.json"
+# Every register a load writes on these FPGAs is a safety limit (the two
+# CURRENT registers are the PWM/CW current limits in the safety FPGA RTL).
+_SAFETY_FPGAS = ("Safety EE", "Safety OPT")
+
+
+class LaserSafetyLimitError(RuntimeError):
+    """``start_trigger`` was called while ``console.laser_limits_error`` is set."""
+
+
+def _read_back_safety_limits(console: Any, written: dict) -> list:
+    """Read back each register in ``written`` (friendlyName -> (I2C location,
+    bytes written)) and describe every one that does not hold those bytes.
+    Values print as little-endian integers, the safety FPGAs' byte order."""
+    problems = []
+    for name, ((mux_idx, channel, i2c_addr, offset), expected) in written.items():
+        data, _ = console.read_i2c_packet(
+            mux_index=mux_idx,
+            channel=channel,
+            device_addr=i2c_addr,
+            reg_addr=offset,
+            read_len=len(expected),
+        )
+        want = int.from_bytes(expected, "little")
+        if data is None:
+            problems.append(f"{name}: expected {want}, unreadable")
+        elif bytes(data) != expected:
+            problems.append(f"{name}: expected {want}, read {int.from_bytes(data, 'little')}")
+    return problems
 
 
 class FpgaMap:
     """Maps a laser-driver ``friendlyName`` to its I2C location.
 
-    Backed by the bundled ``fpga_model.json``. This is the minimal lookup the
-    laser-power write needs — it deliberately omits the bloodflow app's QML
-    scale-override machinery and the legacy ``FpgaModel.js`` fallback.
+    Backed by the bundled :data:`omotion.data.fpga_model.FPGA_MODEL`. This is
+    the minimal lookup the laser-power write needs — it deliberately omits the
+    bloodflow app's QML scale-override machinery and the legacy
+    ``FpgaModel.js`` fallback.
     """
 
     def __init__(self, model: Optional[list] = None) -> None:
-        if model is not None:
-            self._model = model
-            return
-        try:
-            with open(_FPGA_MODEL_PATH, "r", encoding="utf-8") as f:
-                self._model = json.load(f)
-        except Exception as e:  # pragma: no cover - data file ships with package
-            logger.error("Failed to load bundled fpga_model.json: %s", e)
-            self._model = []
+        # Deep copy so no caller can mutate the compiled-in baseline through
+        # the map (each instance used to parse its own fresh copy from disk).
+        self._model = model if model is not None else copy.deepcopy(FPGA_MODEL)
 
     def get_entry_by_friendly_name(self, friendly_name: str) -> Optional[dict]:
         """Return the I2C location + format for ``friendly_name`` or None.
@@ -76,20 +110,32 @@ class FpgaMap:
 def load_laser_params(force_fault: bool = False) -> list:
     """Load the bundled laser-driver register payloads.
 
-    Returns a list of ``{"friendlyName", "dataToSend"}`` dicts, or an empty
-    list on error. ``force_fault`` loads ``laser_params_fault.json`` — a set
+    Returns a fresh list of ``{"friendlyName", "dataToSend"}`` dicts — a deep
+    copy, so callers may edit their copy (the app's alt-laser overrides do)
+    without touching the compiled-in baseline. ``force_fault`` selects
+    :data:`~omotion.data.laser_params_fault.LASER_PARAMS_FAULT` — a set
     engineered to trip the laser-safety interlock for testing the safety path.
     """
-    name = "laser_params_fault.json" if force_fault else "laser_params.json"
-    path = _DATA_DIR / name
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            params = json.load(f)
-        logger.info("Loaded %d laser parameter sets from %s", len(params), path)
-        return params
-    except Exception as e:
-        logger.error("Failed to load laser params from %s: %s", path, e)
-        return []
+    if force_fault:
+        params, source = LASER_PARAMS_FAULT, "omotion.data.laser_params_fault"
+    else:
+        params, source = LASER_PARAMS, "omotion.data.laser_params"
+    logger.info("Loaded %d laser parameter sets from %s", len(params), source)
+    return copy.deepcopy(params)
+
+
+def _fault_diff_names() -> set:
+    """friendlyNames whose value the fault set deliberately changes.
+
+    Computed by diffing the two bundled sets so a future fault vector
+    (a different register, or several) is picked up automatically.
+    """
+    normal = {e["friendlyName"]: e["dataToSend"] for e in load_laser_params()}
+    fault = {
+        e["friendlyName"]: e["dataToSend"]
+        for e in load_laser_params(force_fault=True)
+    }
+    return {k for k, v in fault.items() if normal.get(k) != v}
 
 
 def apply_laser_power(
@@ -100,11 +146,24 @@ def apply_laser_power(
     force_fault: bool = False,
     lock: Optional[Any] = None,
 ) -> bool:
-    """Write the laser-driver configuration to ``console`` over I2C.
+    """Write the laser-driver configuration to ``console`` over I2C, then
+    read back the safety limits it wrote.
 
     Reads user overrides from ``console.read_config()`` and applies the
     ``laser_params`` list, honoring per-key overrides and the safety DRIVE CL
-    values. Returns True on success, False if any I2C write fails.
+    values. Every register written on the Safety EE/OPT FPGAs is then read
+    back and compared with the bytes written (sdk#310). Returns True only
+    when every write succeeded and every limit read back as written.
+    Otherwise returns False and leaves ``console.laser_limits_error`` set to
+    the reason, naming each failing register with its expected and read
+    values; laser scans are refused until a later call verifies clean.
+
+    ``force_fault`` additionally exempts the deliberately-faulted registers
+    (the fault file's diff vs the baseline) from every user-config override
+    path. Without that, a console whose config carries the same key — e.g.
+    ``EE_PULSE_WIDTH_UL`` written during safety-param calibration — silently
+    restores the safe value right after the fault is staged and the interlock
+    test never trips (sdk#252).
 
     Args:
         console: a connected ``MotionConsole`` (has ``read_config`` and
@@ -112,13 +171,19 @@ def apply_laser_power(
         laser_params: register payloads; defaults to the bundled set
             (``load_laser_params(force_fault)``).
         fpga_map: friendlyName→I2C map; defaults to the bundled ``FpgaMap``.
-        force_fault: when ``laser_params`` is None, load the fault set instead.
+        force_fault: when ``laser_params`` is None, load the fault set instead;
+            always shields the faulted registers from user-config overrides.
         lock: optional mutex (anything with ``lock()``/``unlock()``) held for
             the duration of the I2C writes so the whole sequence is atomic
             w.r.t. other console access. Pass the app's console mutex when
             delegating from a multithreaded context; ``None`` = no external
             lock (the console serializes individual packets itself).
     """
+    # Cleared only at the end of a load that verifies clean, so a load that
+    # fails or raises part-way leaves laser scans refused.
+    console.laser_limits_error = (
+        "Laser safety limits not verified: laser power load did not complete"
+    )
     if laser_params is None:
         laser_params = load_laser_params(force_fault=force_fault)
     if fpga_map is None:
@@ -128,6 +193,19 @@ def apply_laser_power(
         return False
 
     logger.info("Setting laser power from config...")
+
+    faulted_names: set = set()
+    faulted_coords: set = set()
+    if force_fault:
+        faulted_names = _fault_diff_names()
+        for name in faulted_names:
+            entry = fpga_map.get_entry_by_friendly_name(name)
+            if entry is not None:
+                faulted_coords.add((entry["channel"], entry["start_address"]))
+        logger.info(
+            "force_fault: exempting deliberately-faulted register(s) from "
+            "user-config overrides: %s", sorted(faulted_names),
+        )
 
     user_cfg: dict = {}
     try:
@@ -151,6 +229,13 @@ def apply_laser_power(
         skip_entries.add(_EE_DRIVE_CL)
     if opt_thresh is not None or opt_gain is not None:
         skip_entries.add(_OPT_DRIVE_CL)
+    # A faulted DRIVE CL must be written from the fault file, not skipped
+    # here and rewritten from user config below.
+    skip_entries -= faulted_coords
+
+    # friendlyName -> ((mux, channel, i2c addr, offset), bytes) of the last
+    # write to each safety-FPGA register; read back once the writes are done.
+    written: dict = {}
 
     if lock is not None:
         lock.lock()
@@ -177,7 +262,12 @@ def apply_laser_power(
                 )
                 continue
 
-            if friendly_name in user_cfg:
+            if friendly_name in user_cfg and friendly_name in faulted_names:
+                logger.info(
+                    "force_fault: keeping fault value for %s "
+                    "(user-config override suppressed)", friendly_name,
+                )
+            elif friendly_name in user_cfg:
                 override_val = user_cfg[friendly_name]
                 num_bytes = int(data_size.rstrip("B")) // 8
                 scale = fpga_entry.get("scale")
@@ -213,10 +303,12 @@ def apply_laser_power(
                     "Failed to set laser power (muxIdx=%d, channel=%d)", mux_idx, channel
                 )
                 return False
+            if fpga_entry["label"] in _SAFETY_FPGAS:
+                written[friendly_name] = ((mux_idx, channel, i2c_addr, offset), bytes(data_to_send))
 
         # User-config safety DRIVE CL overrides, written after the JSON pass.
         # 16-bit LSB-first uint16 raw register value (isMsbFirst=false).
-        def _write_drive_cl(ch: int, thresh, gain, label: str) -> bool:
+        def _write_drive_cl(name: str, ch: int, thresh, gain, label: str) -> bool:
             if thresh is None:
                 return True
             set_value = thresh
@@ -226,18 +318,36 @@ def apply_laser_power(
             raw = max(0, min(0xFFFF, int(round(set_value))))
             data = bytearray([raw & 0xFF, (raw >> 8) & 0xFF])
             logger.info("Writing user-config %s DRIVE CL: raw=%d, gain=%s", label, raw, gain_f)
-            return console.write_i2c_packet(
+            if not console.write_i2c_packet(
                 mux_index=1, channel=ch, device_addr=0x41, reg_addr=0x10, data=data
-            )
+            ):
+                return False
+            written[name] = ((1, ch, 0x41, 0x10), bytes(data))
+            return True
 
-        if not _write_drive_cl(6, ee_thresh, ee_gain, "Safety EE"):
+        if _EE_DRIVE_CL in faulted_coords:
+            logger.info("force_fault: Safety EE DRIVE CL kept at fault value")
+        elif not _write_drive_cl("EE_DRIVE_CL", 6, ee_thresh, ee_gain, "Safety EE"):
             logger.error("Failed to write user-config Safety EE DRIVE CL")
             return False
-        if not _write_drive_cl(7, opt_thresh, opt_gain, "Safety OPT"):
+        if _OPT_DRIVE_CL in faulted_coords:
+            logger.info("force_fault: Safety OPT DRIVE CL kept at fault value")
+        elif not _write_drive_cl("OPT_DRIVE_CL", 7, opt_thresh, opt_gain, "Safety OPT"):
             logger.error("Failed to write user-config Safety OPT DRIVE CL")
             return False
 
-        logger.info("Laser power set successfully.")
+        # Still under the caller's lock (if any), so nothing else touches
+        # the registers between the writes and the read-back.
+        problems = _read_back_safety_limits(console, written)
+        if problems:
+            console.laser_limits_error = "Laser safety limit mismatch: " + "; ".join(problems)
+            logger.error("%s", console.laser_limits_error)
+            return False
+        console.laser_limits_error = None
+        logger.info(
+            "Laser power set successfully. Laser safety limits verified (%d registers)",
+            len(written),
+        )
         return True
     finally:
         if lock is not None:

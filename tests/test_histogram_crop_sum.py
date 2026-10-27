@@ -6,6 +6,8 @@ The sensor-fw debug crop (DEBUG_FLAG_CAMERA_CROP, sensor-fw #86) streams
 genuinely corrupt (partial/doubled) frames.
 """
 import struct
+import queue
+import threading
 
 import numpy as np
 import pytest
@@ -23,6 +25,7 @@ from omotion.MotionProcessing import (
     _histogram_sum_ok,
     _resolve_valid_sums,
     parse_histogram_packet_structured,
+    parse_histogram_stream,
 )
 
 FULL_SUM = 1920 * 1280 + 6   # 2,457,606
@@ -54,6 +57,25 @@ def _build_histo_packet(total: int, cam_id: int = 0, frame_id: int = 7,
 def _parse(total: int, **kw):
     pkt = _build_histo_packet(total)
     return parse_histogram_packet_structured(memoryview(pkt), **kw)
+
+
+def _build_timestamped_packet(timestamp_ms: int, frame_id: int,
+                              cams=(0, 1)) -> bytes:
+    """Build a valid multi-camera packet with one shared wire timestamp."""
+    blocks = []
+    for cam_id in cams:
+        hist = np.zeros(HISTO_SIZE_WORDS, dtype=np.uint32)
+        hist[0] = FULL_SUM
+        hist[-1] = (frame_id & 0xFF) << 24
+        blocks.append(
+            bytes([SOH, cam_id]) + hist.tobytes()
+            + struct.pack("<f", 25.0) + bytes([EOH])
+        )
+    payload = struct.pack("<I", timestamp_ms) + b"".join(blocks)
+    pkt_len = 6 + len(payload) + 3
+    header = struct.pack("<BBI", SOF, TYPE_HISTO, pkt_len)
+    crc = _crc16(memoryview(header + payload[:-1]))
+    return header + payload + struct.pack("<H", crc) + bytes([EOF])
 
 
 def test_full_frame_roundtrip_sanity():
@@ -109,3 +131,28 @@ def test_resolve_and_predicate_helpers():
     assert _histogram_sum_ok(CROP_SUM, None) is True
     assert _histogram_sum_ok(999, None) is False
     assert _histogram_sum_ok(999, ()) is True       # disabled -> accept
+
+
+def test_stream_callback_preserves_packets_and_outlier_does_not_poison_clock():
+    wire = b"".join((
+        _build_timestamped_packet(1_000, 1),
+        _build_timestamped_packet(11_000, 2),  # forward timestamp outlier
+        _build_timestamped_packet(1_050, 3),
+    ))
+    chunks = queue.Queue()
+    chunks.put(wire)
+    stop = threading.Event()
+    stop.set()
+    packets = []
+
+    rows = parse_histogram_stream(
+        chunks, stop, bytearray(), on_packet_fn=packets.append,
+        expected_row_sum=EXPECTED_HISTOGRAM_SUMS,
+    )
+
+    assert rows == 6
+    assert len(packets) == 3
+    assert [len(packet.samples) for packet in packets] == [2, 2, 2]
+    assert [[sample.cam_id for sample in packet.samples]
+            for packet in packets] == [[0, 1], [0, 1], [0, 1]]
+    assert [packet.timestamp_s for packet in packets] == [1.0, 11.0, 1.05]

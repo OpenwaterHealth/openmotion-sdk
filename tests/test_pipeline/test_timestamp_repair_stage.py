@@ -79,8 +79,8 @@ def test_condition1_bad_timestamp_gets_corrected():
     assert abs(result.timestamp_s[2] - expected_ts_13) < 1e-9
 
 
-def test_condition2_frame_id_disagreement():
-    """Cameras at the same timestamp with different frame_ids are flagged bad."""
+def test_frame_id_disagreement_is_not_rederived_from_timestamp():
+    """Packet identity belongs to classification, not timestamp repair."""
     stage = TimestampRepairStage()
     # Two cameras at t=0.050 disagree: cam0 says frame_id 12, cam1 says frame_id 13
     # Then a good frame (cam0, frame 14) at t=0.100 re-anchors.
@@ -95,13 +95,13 @@ def test_condition2_frame_id_disagreement():
         frame_types=["light", "light", "light", "light"],
     )
     result = stage.process(batch)
-    # Both frames at t=0.050 are bad (frame_id disagreement) and same-side
-    # as the re-anchor, so both get re-anchored as ts_corrected
-    assert result.quality[1] == "ts_corrected"
-    assert result.quality[2] == "ts_corrected"
+    # Equal timestamps are legitimate when the source clock freezes. Packet
+    # consensus has already run upstream using source packet ids, so this
+    # stage must only judge each camera's cadence.
+    assert "ts_corrected" not in result.quality
 
 
-def test_condition2_frame_id_disagreement_is_per_side():
+def test_equal_timestamps_on_different_sides_are_independent():
     """Equal timestamps on different modules do not imply a shared packet."""
     stage = TimestampRepairStage()
     batch = _make_batch(
@@ -215,28 +215,109 @@ def test_default_tolerance_allows_two_ms_device_jitter():
     np.testing.assert_allclose(result.timestamp_s, [0.250, 0.277, 0.300])
 
 
-def test_buffer_force_flush_at_max():
-    """When buffer fills without a re-anchor, force-flush using nominal period."""
-    stage = TimestampRepairStage(max_buffer_frames=4)
-    # 1 good frame, then 5 bad frames (buffer size 4, so force-flush at frame 4)
-    ts = [0.025]
-    fids = [11]
-    # Bad frames: all have timestamp 0.050 (way off from expected 50ms, 75ms, 100ms, 125ms, 150ms)
-    for i in range(5):
-        ts.append(0.050)
-        fids.append(12 + i)
+def test_burst_right_anchor_must_be_condition1_clean():
+    """A corrupted frame may never become the next interpolation anchor."""
+    stage = TimestampRepairStage()
     batch = _make_batch(
-        cam_ids=[0] * 6,
-        frame_ids=fids,
-        side_ids=[0] * 6,
-        timestamps=ts,
-        abs_frame_ids=fids,
-        frame_types=["light"] * 6,
+        cam_ids=[0] * 5,
+        frame_ids=[100, 101, 102, 103, 104],
+        side_ids=[0] * 5,
+        timestamps=[2.500, 7.000, 7.025, 2.575, 2.600],
+        abs_frame_ids=[100, 101, 102, 103, 104],
+        frame_types=["light"] * 5,
     )
+
     result = stage.process(batch)
-    # The first 4 bad frames should be force-flushed as ts_corrected
-    corrected_count = sum(1 for q in result.quality if q == "ts_corrected")
-    assert corrected_count >= 4
+
+    np.testing.assert_array_equal(
+        result.quality, ["ok", "ts_corrected", "ts_corrected", "ok", "ok"])
+    np.testing.assert_allclose(
+        result.timestamp_s, [2.500, 2.525, 2.550, 2.575, 2.600], atol=1e-9)
+    assert np.all(np.diff(result.timestamp_s) > 0)
+
+
+def test_single_camera_divergence_is_one_window_despite_interleaving(caplog):
+    """A healthy sibling must not churn another camera's open window."""
+    stage = TimestampRepairStage()
+    rows = []
+    for fid in range(11, 16):
+        timestamp_s = 0.025 * (fid - 10)
+        rows.append((0, fid, timestamp_s + 0.5 if fid in (12, 13, 14)
+                     else timestamp_s))
+        rows.append((1, fid, timestamp_s))
+    batch = _make_batch(
+        cam_ids=[row[0] for row in rows],
+        frame_ids=[row[1] for row in rows],
+        side_ids=[0] * len(rows),
+        timestamps=[row[2] for row in rows],
+        abs_frame_ids=[row[1] for row in rows],
+        frame_types=["light"] * len(rows),
+    )
+
+    with caplog.at_level(
+            logging.WARNING,
+            logger="openmotion.sdk.pipeline.stages.timestamp_repair"):
+        stage.process(batch)
+
+    warnings = [record for record in caplog.records
+                if "Misalignment window" in record.message]
+    assert len(warnings) == 1
+    events = [event for event in batch.events
+              if isinstance(event, TimestampMisalignmentWindow)]
+    assert len(events) == 1
+    assert events[0].n_corrected == 3
+
+
+def test_persistent_timeline_shift_resyncs(caplog):
+    """A coherent permanent clock shift is adopted after eight frames."""
+    stage = TimestampRepairStage()
+    fids = list(range(10, 26))
+    timestamps = [0.250] + [
+        0.250 + 0.025 * (fid - 10) + 3.0 for fid in fids[1:]
+    ]
+    batch = _make_batch(
+        cam_ids=[0] * len(fids),
+        frame_ids=fids,
+        side_ids=[0] * len(fids),
+        timestamps=timestamps,
+        abs_frame_ids=fids,
+        frame_types=["light"] * len(fids),
+    )
+
+    with caplog.at_level(
+            logging.WARNING,
+            logger="openmotion.sdk.pipeline.stages.timestamp_repair"):
+        result = stage.process(batch)
+
+    assert result.quality[0] == "ok"
+    assert all(q == "ts_corrected" for q in result.quality[1:8])
+    assert all(q == "ok" for q in result.quality[8:])
+    np.testing.assert_allclose(result.timestamp_s[8:], timestamps[8:], atol=1e-9)
+    assert any("re-anchored" in record.message for record in caplog.records)
+
+
+def test_nan_fill_preserves_telemetry_stamps():
+    """Batch reconstruction preserves telemetry on real rows."""
+    stage = TimestampRepairStage()
+    batch = _make_batch(
+        cam_ids=[0, 0],
+        frame_ids=[11, 14],
+        side_ids=[0, 0],
+        timestamps=[0.025, 0.100],
+        abs_frame_ids=[11, 14],
+        frame_types=["light", "light"],
+    )
+    batch.pdc = np.array([1.5, 2.5], dtype=np.float32)
+    batch.tcm = np.array([40, 41], dtype=np.int64)
+    batch.tcl = np.array([30, 31], dtype=np.int64)
+
+    result = stage.process(batch)
+
+    assert len(result.cam_ids) == 4
+    np.testing.assert_allclose(result.pdc[[0, 3]], [1.5, 2.5])
+    assert np.isnan(result.pdc[1]) and np.isnan(result.pdc[2])
+    np.testing.assert_array_equal(result.tcm, [40, 0, 0, 41])
+    np.testing.assert_array_equal(result.tcl, [30, 0, 0, 31])
 
 
 def test_logging_one_warning_per_window(caplog):
@@ -361,6 +442,32 @@ def test_terminal_stop_frame_not_warned(caplog):
     assert len(infos) == 1
     assert not any(isinstance(e, TimestampMisalignmentWindow)
                    for e in list(batch.events) + list(flush.events))
+
+
+def test_arbitrary_final_timestamp_outlier_is_not_terminal_artifact(caplog):
+    """Being last is insufficient: a +10 s packet is not the stop-frame skew."""
+    stage = TimestampRepairStage()
+    batch = _make_batch(
+        cam_ids=[0, 1, 0, 1, 0, 1],
+        frame_ids=[11, 11, 12, 12, 13, 13],
+        side_ids=[0, 0, 0, 0, 0, 0],
+        timestamps=[0.025, 0.025, 0.050, 0.050, 10.050, 10.050],
+        abs_frame_ids=[11, 11, 12, 12, 13, 13],
+        frame_types=["light"] * 6,
+    )
+    flush = _make_batch([], [], [], [], abs_frame_ids=[], frame_types=[])
+
+    with caplog.at_level(
+        logging.WARNING,
+        logger="openmotion.sdk.pipeline.stages.timestamp_repair",
+    ):
+        stage.process(batch)
+        stage.on_scan_stop(flush)
+
+    events = [e for e in flush.events if isinstance(e, TimestampMisalignmentWindow)]
+    assert len(events) == 1
+    assert events[0].n_corrected == 2
+    assert "Misalignment window" in caplog.text
 
 
 def test_terminal_artifact_per_side_independent(caplog):

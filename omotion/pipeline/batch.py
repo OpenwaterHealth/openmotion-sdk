@@ -111,6 +111,106 @@ class TimestampMisalignmentWindow(BatchEvent):
 
 
 @dataclass
+class FrameIdConsensusCorrection(BatchEvent):
+    """One camera's wire frame_id disagreed with its packet-mates and was
+    repaired to the packet majority before unwrapping, preserving the
+    frame's histogram data (sdk#220 / sensor-fw#123 fid_single evidence).
+
+    The wire record (raw CSV) keeps the original value — the correction
+    applies to the unwrapped abs_frame_id and everything downstream.
+    Routed to "diagnostics"."""
+    side:               int
+    cam_id:             int
+    timestamp_s:        float
+    wire_frame_id:      int    # the corrupted 8-bit value as received
+    corrected_frame_id: int    # the packet-majority 8-bit value used instead
+    abs_frame_id:       int    # unwrapped id after correction
+    packet_id:          Optional[int] = None
+
+
+@dataclass
+class FrameIdPacketAnomaly(BatchEvent):
+    """Cameras in one packet disagreed on frame_id with no strict majority
+    to adjudicate (sensor-fw#123 fid_multi evidence). No consensus repair
+    is possible; the per-camera counter-vs-clock check quarantines the
+    inconsistent frames instead. Routed to "diagnostics"."""
+    side:        int
+    timestamp_s: float
+    cam_ids:     list   # cameras in the packet, wire order
+    frame_ids:   list   # their wire frame_ids, same order
+    packet_id:   Optional[int] = None
+    reason:      str = "no_single_outlier_consensus"
+
+
+@dataclass
+class FrameQuarantined(BatchEvent):
+    """One wire row was excluded before the science path.
+
+    The event preserves both counter/clock witnesses and the decision reason
+    for post-scan diagnosis. The raw CSV retains the row; science stages skip
+    it through the legacy ``frame_type='stale'`` label.
+    """
+    side:                 int
+    cam_id:               int
+    packet_id:            Optional[int]
+    timestamp_s:          float
+    wire_frame_id:        int
+    previous_abs_frame_id: Optional[int]
+    clock_anchor_abs_frame_id: Optional[int]
+    clock_anchor_timestamp_s: Optional[float]
+    step:                 Optional[int]
+    elapsed_s:            Optional[float]
+    reason:               str
+
+
+@dataclass
+class CameraStreamGap(BatchEvent):
+    """An expected camera disappeared from source packets for >8 captures.
+
+    One ``state="missing"`` event is emitted when the threshold is crossed,
+    and one ``state="resumed"`` event when that camera next appears.  The
+    prolonged-loss watchdog remains responsible for stopping the scan; this
+    event supplies the early warning and durable packet evidence needed to
+    diagnose an intermittent camera after the scan.
+    """
+    side:                       int
+    cam_id:                     int
+    state:                      str  # "missing" or "resumed"
+    missing_frames:             int
+    packet_id:                  Optional[int]
+    timestamp_s:                float
+    first_missing_packet_id:    Optional[int]
+    first_missing_timestamp_s:  float
+    reason:                      str = "camera_missing_from_source_packets"
+
+
+@dataclass
+class TimestampRepairInputAnomaly(BatchEvent):
+    """Consecutive captures arrived carrying one reused packet timestamp
+    (frozen clock) while the frame counter advanced — the sensor-fw#123
+    timestamp_freeze signature. The affected frames are re-timestamped by
+    TimestampRepairStage; one event is emitted per (side, frozen value).
+    Routed to "diagnostics"."""
+    side:        int
+    timestamp_s: float  # the reused timestamp value
+    n_frames:    int    # frames observed carrying it beyond the first capture
+
+
+@dataclass
+class FrameGapFillAnomaly(BatchEvent):
+    """A gap in one camera's abs_frame_id sequence (lost or quarantined
+    frames) was back-filled with synthetic nan_filled placeholder rows —
+    the sensor-fw#123 packet_drop evidence, emitted when the next frame
+    arrives and the gap becomes visible. Routed to "diagnostics"."""
+    side:          int
+    cam_id:        int
+    gap_start_fid: int    # first missing abs_frame_id
+    gap_end_fid:   int    # last missing abs_frame_id
+    n_filled:      int
+    timestamp_s:   float  # timestamp of the gap-closing frame
+
+
+@dataclass
 class PipelineError(BatchEvent):
     """A stage raised during pipeline.process(); the batch was dropped.
 
@@ -180,7 +280,7 @@ class FrameBatch:
     """N frames worth of data, two sides, 8 cameras each.
 
     Field ownership (which stage populates which field):
-      Parse:           cam_ids, frame_ids, side_ids, raw_histograms,
+      Parse:           cam_ids, frame_ids, side_ids, packet_ids, raw_histograms,
                        temperature_c, timestamp_s, pdc, tcm, tcl
       Classify:        abs_frame_ids, frame_type
       NoiseFloor:      (mutates raw_histograms in place — no new field)
@@ -225,12 +325,13 @@ class FrameBatch:
     # None when telemetry is unavailable.
     pdc:            Optional[np.ndarray]
 
-    # (N,) optional float — TEC module temperature (TCM) from console
-    # telemetry. Diagnostic only.
+    # (N,) optional int64 — MCU (lsync) trigger count from console
+    # telemetry; 0 when no telemetry sample preceded the frame (unlike
+    # pdc's NaN). Diagnostic only.
     tcm:            Optional[np.ndarray]
 
-    # (N,) optional float — TEC laser temperature (TCL) from console
-    # telemetry. Diagnostic only.
+    # (N,) optional int64 — laser trigger count from console telemetry;
+    # 0 when no telemetry sample preceded the frame. Diagnostic only.
     tcl:            Optional[np.ndarray]
 
     # ── Source: side assignment ───────────────────────────────────────────
@@ -242,6 +343,11 @@ class FrameBatch:
     # to side 0). Optional only so existing sources can be migrated
     # incrementally; a missing-source-side defaults to None.
     side_ids:       Optional[np.ndarray] = None
+
+    # (N,) int64 — source packet ordinal, unique within a side for the scan.
+    # All rows parsed from one USB packet share the same id. Never substitute
+    # timestamp_s for packet identity: frozen clocks intentionally repeat it.
+    packet_ids:     Optional[np.ndarray] = None
 
     # ── FrameClassificationStage outputs ─────────────────────────────────
 
@@ -270,7 +376,8 @@ class FrameBatch:
 
     # (N, 2, 8) float32 — raw contrast. Intentionally left None by
     # MomentsStage because contrast requires pedestal subtraction
-    # (K = std / (mean - pedestal)). Computed downstream by BfiBviStage.
+    # (K = std / (mean - pedestal)). Contrast is computed downstream by
+    # ShotNoiseCorrectionStage (contrast_sn_rt, CorrectedFrame.contrast).
     contrast_raw:   Optional[np.ndarray] = None
 
     # ── PedestalSubtractionStage output ──────────────────────────────────
@@ -376,11 +483,9 @@ class FrameBatch:
         """Yield ``(i, side_idx, cam_id, frame_type)`` per row, skipping rows
         whose ``frame_type`` is in ``exclude``.
 
-        The canonical per-row filter for sinks. Tee gates are BATCH-level —
-        a batch is emitted if any row passes, so stale/warmup rows still
-        reach every subscribed sink and must be skipped per row. Use this
-        instead of hand-rolling the loop so the skip policy can't drift
-        between sinks.
+        The canonical per-row iterator for sinks. Callers state their own
+        exclusion policy explicitly: science/live consumers skip stale rows,
+        while the raw wire record intentionally retains them.
 
         ``side_idx`` is -1 when the batch carries no ``side_ids`` (legacy
         replay batches); ``frame_type`` is "" before classification.
@@ -394,3 +499,46 @@ class FrameBatch:
                 continue
             side_idx = int(side_ids[i]) if side_ids is not None else -1
             yield i, side_idx, int(self.cam_ids[i]), ftype
+
+    def packet_groups(self) -> list[list[int]]:
+        """Return source-packet row indices in wire order.
+
+        Live/replay sources provide ``packet_ids``. Hand-built legacy batches
+        fall back to the wire invariant that one packet contains at most one
+        row per camera: a timestamp change or repeated camera starts a new
+        packet. The fallback therefore remains correct for timestamp freezes.
+        """
+        n = self.cam_ids.shape[0]
+        if n == 0:
+            return []
+
+        sides = self.side_ids
+        if self.packet_ids is not None:
+            groups: dict[tuple[int, int], list[int]] = {}
+            for i in range(n):
+                side = int(sides[i]) if sides is not None else -1
+                key = (side, int(self.packet_ids[i]))
+                groups.setdefault(key, []).append(i)
+            return list(groups.values())
+
+        completed: list[list[int]] = []
+        active: dict[int, tuple[float, set[int], list[int]]] = {}
+        for i in range(n):
+            side = int(sides[i]) if sides is not None else -1
+            cam = int(self.cam_ids[i])
+            ts = float(self.timestamp_s[i])
+            current = active.get(side)
+            if current is None:
+                active[side] = (ts, {cam}, [i])
+                continue
+            packet_ts, seen_cams, indices = current
+            if cam in seen_cams or abs(ts - packet_ts) > 1e-9:
+                completed.append(indices)
+                active[side] = (ts, {cam}, [i])
+            else:
+                seen_cams.add(cam)
+                indices.append(i)
+
+        completed.extend(indices for _, _, indices in active.values())
+        completed.sort(key=lambda indices: indices[0])
+        return completed

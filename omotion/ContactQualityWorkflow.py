@@ -12,7 +12,11 @@ matching the legacy ContactQuality module semantics.  Two failure modes:
 * AMBIENT_LIGHT  — any dark frame's DN exceeds dark_threshold_per_camera
                    (ambient light leaking onto the sensor)
 * POOR_CONTACT   — rolling average of light frame DN falls below
-                   light_threshold_per_camera (laser not coupled)
+                   light_threshold_per_camera (laser not coupled), or every
+                   light frame arrived unlit (covered/lifted sensor,
+                   decoupled fiber — sdk#343)
+
+A camera that delivered no light frames at all is NO_SIGNAL.
 
 See spec section 3.8 for the contact-quality procedure definition.
 """
@@ -89,12 +93,15 @@ class _ContactQualitySink:
         self._dark_max: dict = {}
         # (side, cam_id) -> float          (std_raw paired with max dark frame)
         self._dark_std: dict = {}
+        # (side, cam_id) -> int            (light frames that arrived unlit)
+        self._unlit_count: dict = {}
 
     def on_scan_start(self, meta) -> None:
         self._light_window.clear()
         self._light_std_window.clear()
         self._dark_max.clear()
         self._dark_std.clear()
+        self._unlit_count.clear()
 
     def consume(self, channel: str, batch) -> None:
         if channel != "live":
@@ -115,6 +122,7 @@ class _ContactQualitySink:
         # present.
         if batch.subtracted_mean is None or getattr(batch, "mean_dc_rt", None) is None:
             return
+        low_light_rt = getattr(batch, "low_light_rt", None)
         # Each row carries exactly one (side, cam) — iter_rows is the
         # canonical per-row filter (warmup/stale rows still reach "live"
         # sinks because the Tee gate is batch-level).
@@ -140,9 +148,15 @@ class _ContactQualitySink:
                 # dark has been observed (predictor returns None →
                 # baseline_rt/mean_dc_rt stay at their NaN init).
                 # Skip those frames; the rolling window will fill up
-                # once the first dark lands.
+                # once the first dark lands. DarkCorrectionStage also leaves
+                # it NaN for a frame that arrived unlit (low_light_rt) — a
+                # covered or lifted sensor, a decoupled fiber. Count those:
+                # a camera that only ever delivers unlit frames is poor
+                # contact, not a missing signal (sdk#343).
                 v = float(batch.mean_dc_rt[i, side_idx, cam_id])
                 if not math.isfinite(v):
+                    if low_light_rt is not None and bool(low_light_rt[i, side_idx, cam_id]):
+                        self._unlit_count[key] = self._unlit_count.get(key, 0) + 1
                     continue
                 w = self._light_window.get(key)
                 if w is None:
@@ -187,12 +201,21 @@ class _ContactQualitySink:
 
                 dark_max = self._dark_max.get(key, float("nan"))
                 dark_std = self._dark_std.get(key, float("nan"))
+                # Unlit only when no light frame had a reading at all, and
+                # with at least a rolling window's worth of unlit frames:
+                # the firmware's terminal laser-off frame arrives unlit on
+                # every camera, so one or two unlit frames prove nothing.
+                unlit = (
+                    math.isnan(light_avg)
+                    and self._unlit_count.get(key, 0) >= self._window_size
+                )
 
                 reason = evaluate_reason(
                     light_avg=light_avg,
                     dark_max=dark_max,
                     thresholds=self._thresholds,
                     cam_id=cam_id,
+                    unlit=unlit,
                 )
                 passed = reason == REASON_OK
                 per_cam[key] = CamCQResult(

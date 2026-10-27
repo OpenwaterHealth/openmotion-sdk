@@ -56,18 +56,24 @@ from . import db_key, db_migrate, db_open, db_schema
 from .SessionPlayback import materialize_corrected_csv
 from .Calibration import Calibration
 from .CalibrationWorkflow import (
+    CalibrationOutcome,
     CalibrationRequest,
     CalibrationResult,
     CalibrationResultRow,
     CalibrationThresholds,
+    factory_calibration_thresholds,
+    ungated_cameras,
 )
 from .connection_state import ConnectionState
 from .boot_mode import BootMode, parse_boot_info
 from .firmware_update import (
+    BootloaderChangeRequired,
     FirmwareKind,
     FirmwareUpdater,
     FirmwareUpdateError,
+    FirmwareUpdateResult,
     LatestInfo,
+    UpdateAction,
     check_latest,
     download_firmware,
     UnsupportedReleaseError,
@@ -75,10 +81,9 @@ from .firmware_update import (
     parse_version,
     production_asset,
 )
-# NOTE: omotion.bootloader_install is deliberately NOT imported here. Converting
-# a device to bootloader mode is irreversible over USB, so reaching that code
-# must be a conscious submodule import, not something `from omotion import *`
-# hands you. See tests/test_bootloader_install.py.
+# NOTE: installing or replacing a bootloader is irreversible over USB. It is a
+# path inside FirmwareUpdater.update(), taken only with
+# acknowledge_irreversible=True. See tests/test_firmware_update_states.py.
 # Top-level handles + interface (deferred until after the leaf modules above
 # so MotionConsole/MotionSensor can do `from omotion import _log_root` during
 # their own module load without hitting the partially-loaded package).
@@ -104,14 +109,20 @@ __all__ = [
     "db_schema",
     "materialize_corrected_csv",
     "Calibration",
+    "CalibrationOutcome",
     "CalibrationRequest",
     "CalibrationResult",
     "CalibrationResultRow",
     "CalibrationThresholds",
+    "factory_calibration_thresholds",
+    "ungated_cameras",
     "ConnectionState",
     "FirmwareKind",
     "FirmwareUpdater",
     "FirmwareUpdateError",
+    "FirmwareUpdateResult",
+    "BootloaderChangeRequired",
+    "UpdateAction",
     "LatestInfo",
     "check_latest",
     "download_firmware",

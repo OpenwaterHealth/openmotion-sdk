@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import csv
 import logging
+import math
 import queue
 import threading
 import time
@@ -20,11 +21,35 @@ from typing import Any, Iterator, Optional, Protocol, runtime_checkable
 
 import numpy as np
 
+from omotion.config import CAPTURE_HZ
 from .batch import FrameBatch
 from .sinks import ScanMetadata
 
 
 logger = logging.getLogger("openmotion.sdk.pipeline.sources")
+
+# Seconds of sensor output each side's raw packet queue holds while the scan
+# thread is busy with something else: a dark-interval close with its DB
+# writes, a GC pause, a slow or antivirus-scanned disk. The sensor itself
+# buffers only ~5 frames (125 ms); once this queue is full the USB reader
+# stops reading and the sensor drops frames on both modules at the same
+# instant, which the frame classifier can turn into a 6.4 s lockout (#116,
+# #286). The old fixed depth of 64 reads gave ~0.65 s of total slack.
+PACKET_BUFFER_SECONDS = 10.0
+
+
+def packet_queue_depth_for(seconds: float) -> int:
+    """Packet-queue depth that holds ``seconds`` of one side's output.
+
+    Queue items are USB reads of at most ``HISTOGRAM_BYTES``; an
+    uncompressed packet (``MAX_PACKET_SIZE``) takes 9 of them, a compressed
+    one fewer, so this is sized for the uncompressed worst case. Memory is
+    only used while the queue is actually backed up: at most
+    ``depth * HISTOGRAM_BYTES`` (~15 MB per side at 10 s).
+    """
+    from omotion.MotionProcessing import HISTOGRAM_BYTES, MAX_PACKET_SIZE
+    reads_per_packet = math.ceil(MAX_PACKET_SIZE / HISTOGRAM_BYTES)
+    return math.ceil(seconds * CAPTURE_HZ * reads_per_packet)
 
 
 @runtime_checkable
@@ -100,7 +125,7 @@ class _BaseSource:
 class CsvReplaySource(_BaseSource):
     """Replays a raw-histogram CSV produced by CsvSink.
 
-    CSV schema (SciencePipeline.md §12 / spec §12):
+    CSV schema (SciencePipeline.md §7.2 CsvReplaySource / §8.1 CsvSink):
         cam_id, frame_id, timestamp_s, type, 0..1023, temperature, sum, tcm, tcl, pdc
 
     Accepts up to two CSVs (one per side); if a side is None, only the
@@ -126,13 +151,31 @@ class CsvReplaySource(_BaseSource):
     def _iter_side(self, side_name: str, path: Path) -> Iterator[FrameBatch]:
         side_idx = 0 if side_name == "left" else 1
         rows_buf: list[dict] = []
+        packet_id = -1
+        packet_ts: float | None = None
+        packet_cams: set[int] = set()
         with open(path, "r", newline="") as fh:
             reader = csv.DictReader(fh)
             for row in reader:
-                rows_buf.append(row)
-                if len(rows_buf) >= self._batch_size:
+                cam_id = int(row["cam_id"])
+                timestamp_s = float(row["timestamp_s"])
+                starts_packet = (
+                    packet_ts is None
+                    or cam_id in packet_cams
+                    or abs(timestamp_s - packet_ts) > 1e-9
+                )
+                # Only flush at a packet boundary. A nominal batch-size limit
+                # must never split the evidence used by packet consensus.
+                if starts_packet and rows_buf and len(rows_buf) >= self._batch_size:
                     yield self._rows_to_batch(side_idx, rows_buf)
                     rows_buf = []
+                if starts_packet:
+                    packet_id += 1
+                    packet_ts = timestamp_s
+                    packet_cams = set()
+                packet_cams.add(cam_id)
+                row["_packet_id"] = packet_id
+                rows_buf.append(row)
             if rows_buf:
                 yield self._rows_to_batch(side_idx, rows_buf)
 
@@ -140,6 +183,7 @@ class CsvReplaySource(_BaseSource):
         n = len(rows)
         cam_ids     = np.array([int(r["cam_id"])        for r in rows], dtype=np.int8)
         frame_ids   = np.array([int(r["frame_id"])      for r in rows], dtype=np.uint8)
+        packet_ids  = np.array([int(r["_packet_id"])    for r in rows], dtype=np.int64)
         timestamp_s = np.array([float(r["timestamp_s"]) for r in rows], dtype=np.float64)
         timestamp_s = self._apply_timestamp_normalization(timestamp_s)
         side_ids    = np.full(n, side_idx, dtype=np.int8)
@@ -171,6 +215,7 @@ class CsvReplaySource(_BaseSource):
         return FrameBatch(
             cam_ids=cam_ids,
             frame_ids=frame_ids,
+            packet_ids=packet_ids,
             side_ids=side_ids,
             raw_histograms=raw_hist,
             temperature_c=temp_arr,
@@ -194,13 +239,15 @@ class LiveUsbSource(_BaseSource):
                  console: Any, left: Any, right: Any,
                  batch_size_frames: int = 10,
                  flush_interval_s: float = 0.25,
-                 packet_queue_size: int = 64,
+                 packet_queue_size: Optional[int] = None,
                  metadata: ScanMetadata):
         super().__init__(metadata=metadata)
         self._console = console
         self._sensors: dict[str, Any] = {"left": left, "right": right}
         self._batch_size = int(batch_size_frames)
         self._flush_interval = float(flush_interval_s)
+        if packet_queue_size is None:
+            packet_queue_size = packet_queue_depth_for(PACKET_BUFFER_SECONDS)
         self._packet_queues: dict[str, queue.Queue] = {
             side: queue.Queue(maxsize=packet_queue_size)
             for side, sensor in self._sensors.items() if sensor is not None
@@ -348,14 +395,30 @@ class LiveUsbSource(_BaseSource):
 
         side_idx = 0 if side_name == "left" else 1
         accumulated: list = []
+        packet_id = 0
         last_flush = time.monotonic()
 
-        def on_row(cam_id, frame_id, ts, histogram, row_sum, temp):
-            nonlocal last_flush
-            accumulated.append((cam_id, frame_id, ts, histogram, row_sum, temp))
+        def on_packet(packet):
+            nonlocal last_flush, packet_id
+            current_packet_id = packet_id
+            packet_id += 1
+            accumulated.extend(
+                (
+                    sample.cam_id,
+                    sample.frame_id,
+                    sample.timestamp_s,
+                    sample.histogram,
+                    sample.row_sum,
+                    sample.temperature_c,
+                    current_packet_id,
+                )
+                for sample in packet.samples
+            )
             now = time.monotonic()
-            if (len(accumulated) >= self._batch_size
-                    or now - last_flush >= self._flush_interval):
+            if (accumulated and (
+                    len(accumulated) >= self._batch_size
+                    or now - last_flush >= self._flush_interval
+            )):
                 self._batch_queue.put(self._build_batch(side_idx, accumulated))
                 accumulated.clear()
                 last_flush = now
@@ -363,7 +426,7 @@ class LiveUsbSource(_BaseSource):
         buf = bytearray()
         parse_histogram_stream(
             self._packet_queues[side_name], self._stop, buf,
-            on_row_fn=on_row,
+            on_packet_fn=on_packet,
             expected_row_sum=EXPECTED_HISTOGRAM_SUMS,
             t0_normalizer=partial(self._t0_normalize, side_name),
         )
@@ -372,22 +435,25 @@ class LiveUsbSource(_BaseSource):
             self._batch_queue.put(self._build_batch(side_idx, accumulated))
 
     def _build_batch(self, side_idx: int, samples: list) -> FrameBatch:
-        """Convert a list of (cam_id, frame_id, ts, histogram, row_sum, temp)
-        tuples into one FrameBatch with (N, 2, 8, 1024) shape, populating the
-        (side_idx, cam_id) slot in the histograms array for each row.
+        """Convert parsed packet rows into one FrameBatch.
+
+        Each tuple is ``(cam_id, frame_id, ts, histogram, row_sum, temp,
+        packet_id)``. Batches flush only after a complete packet callback.
         """
         n = len(samples)
         cam_ids     = np.array([s[0] for s in samples], dtype=np.int8)
         frame_ids   = np.array([s[1] for s in samples], dtype=np.uint8)
         side_ids    = np.full(n, side_idx, dtype=np.int8)
         timestamp_s = np.array([s[2] for s in samples], dtype=np.float64)
+        packet_ids  = np.array([s[6] for s in samples], dtype=np.int64)
         raw_hist    = np.zeros((n, 2, 8, 1024), dtype=np.uint32)
         temps       = np.zeros((n, 2, 8), dtype=np.float32)
-        for i, (cam_id, _, _, histogram, _, temp) in enumerate(samples):
+        for i, (cam_id, _, _, histogram, _, temp, _) in enumerate(samples):
             raw_hist[i, side_idx, cam_id] = histogram
             temps[i, side_idx, cam_id] = temp
         return FrameBatch(
             cam_ids=cam_ids, frame_ids=frame_ids, side_ids=side_ids,
+            packet_ids=packet_ids,
             raw_histograms=raw_hist, temperature_c=temps,
             timestamp_s=timestamp_s, pdc=None, tcm=None, tcl=None,
         )

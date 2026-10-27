@@ -16,7 +16,7 @@ Both paths use spatial_side_average — a purely spatial operation (across
 cameras at one instant, no temporal element). Gated on ``enabled``
 (reduced mode).
 
-See docs/SciencePipeline.md §16 and
+See docs/SciencePipeline.md §5.11 SideAverageStage and
 docs/superpowers/specs/2026-05-28-reduced-mode-side-average-design.md.
 """
 
@@ -122,8 +122,20 @@ class SideAverageStage:
         if batch.bfi_live is None or batch.side_ids is None or batch.cam_ids is None:
             return
         fids = batch.abs_frame_ids if batch.abs_frame_ids is not None else batch.frame_ids
+        ftypes = batch.frame_type
+        quality = batch.quality
         n = batch.bfi_live.shape[0]
         for i in range(n):
+            # Real captures only. Stale rows carry advisory (epoch-shifted)
+            # frame ids and nan_filled rows are synthetic placeholders for
+            # frames that never arrived; letting either into the accumulator
+            # makes every fid change below emit a partial capture — the
+            # sdk#220 zigzag. Mirrors the iter_rows skip policy (batch.py),
+            # which sinks use for the same reason.
+            if ftypes is not None and str(ftypes[i]) not in ("light", "dark"):
+                continue
+            if quality is not None and str(quality[i]) == "nan_filled":
+                continue
             side = int(batch.side_ids[i])
             cam = int(batch.cam_ids[i])
             if side < 0 or side > 1 or cam < 0 or cam >= 8:

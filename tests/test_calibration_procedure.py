@@ -88,6 +88,10 @@ def test_calibration_procedure_end_to_end(motion, tmp_path):
         scan_delay_sec=1,
         max_duration_sec=150,
         trigger_config=_TRIGGER_CONFIG,
+        # Permissive thresholds cannot fail the pre-write gate, which
+        # start_calibration refuses by default (#256) — this test
+        # exercises plumbing, so opt in to the ungated run explicitly.
+        allow_ungated=True,
     )
 
     done = threading.Event()

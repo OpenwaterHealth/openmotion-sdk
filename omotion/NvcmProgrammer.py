@@ -7,6 +7,12 @@ omotion/nvcm/ (see README there for provenance).
 NVCM is ONE-TIME programmable: a successful burn is permanent. The replay
 performs full readback verification (omotion.i2c_parser), so a non-blank
 or already-programmed device fails fast and corrupt burns cannot PASS.
+
+The replay is deliberately paced (~2 ms per factory transaction, ~3 min per
+camera) and each burn starts with a hard power-cycle of the target camera.
+Burns faster than the paced envelope silently corrupt the array partway
+through and permanently brick the part — see _SensorI2CDriver.
+MIN_DISPATCH_INTERVAL_S and issue #245 before touching either behavior.
 """
 from __future__ import annotations
 
@@ -32,6 +38,12 @@ DEFAULT_DATA_PATH = _NVCM_DIR / "impl1_data.ied"
 #: initial IDCODE/status checks rejecting a non-blank (already programmed)
 #: device rather than a mid-burn error.
 _EARLY_FAIL_TX = 200
+
+#: Settle after powering the target camera off, before powering it back on.
+_POWER_OFF_SETTLE_S = 0.5
+#: Settle after power-on before the replay toggles CRESET: firmware delays
+#: ~200 ms per camera on power-on, and the CrossLink boot-scan must park.
+_POWER_ON_SETTLE_S = 1.0
 
 
 class NvcmTransportError(RuntimeError):
@@ -113,7 +125,23 @@ class _SensorI2CDriver(I2CDriver):
         pure write       -> sensor.i2c_write(addr, data)
         write then read  -> sensor.i2c_write_read(addr, data, n)
         pure read        -> sensor.i2c_read(addr, n)
+
+    Every dispatch to the sensor is paced (MIN_DISPATCH_INTERVAL_S) so the
+    NVCM replay cannot run faster than the envelope it was validated at,
+    no matter how fast the underlying transport is.
     """
+
+    #: Minimum start-to-start spacing between factory-I2C dispatches, in
+    #: seconds. This is a safety floor, not an optimization knob: CrossLink
+    #: NVCM burns are only proven good at >=1.4 ms/transaction (June 2026
+    #: validation ran at 2.26 ms/tx; the 1.4.2 release exe passes at
+    #: 1.43-1.60 ms/tx), and every burn observed at <=0.67 ms/tx corrupted
+    #: the array from ~28% in and permanently bricked the OTP part
+    #: (2026-08-13 incident, issue #245: 12 cameras lost). 2.0 ms sits in
+    #: the proven-good zone and reproduces the validated ~9 ms/page program
+    #: cadence. Do NOT lower without hardware revalidation on expendable
+    #: parts; 0.67-1.4 ms/tx is untested territory.
+    MIN_DISPATCH_INTERVAL_S = 0.002
 
     def __init__(self, sensor, total: int = 0,
                  progress_cb: Optional[Callable[[int, int], None]] = None,
@@ -127,6 +155,16 @@ class _SensorI2CDriver(I2CDriver):
         self._total = total
         self._progress_cb = progress_cb
         self._last_pct = -1
+        self._last_dispatch = 0.0
+
+    def _pace(self) -> None:
+        """Sleep so consecutive sensor dispatches start >= the floor apart."""
+        now = time.monotonic()
+        wait = self._last_dispatch + self.MIN_DISPATCH_INTERVAL_S - now
+        if wait > 0:
+            time.sleep(wait)
+            now = time.monotonic()
+        self._last_dispatch = now
 
     def is_simulation(self) -> bool:
         return False
@@ -159,6 +197,7 @@ class _SensorI2CDriver(I2CDriver):
         # Empty-buffer STOPs (e.g. the parser's EnableHardware bus test)
         # dispatch nothing — counted on both sim and hardware drivers.
         if self._state == _TxState.WRITE_PHASE and self._write_buf:
+            self._pace()
             # MotionSensor.i2c_write returns None on success, False on a
             # firmware error packet (despite its docstring claiming it raises).
             if self._sensor.i2c_write(self._addr, bytes(self._write_buf)) is False:
@@ -192,6 +231,7 @@ class _SensorI2CDriver(I2CDriver):
             logger.warning("write() in unexpected state %s", self._state)
 
     def read(self, num_bytes: int) -> bytes:
+        self._pace()
         if self._state == _TxState.READ_PHASE and self._write_buf:
             result = self._sensor.i2c_write_read(
                 self._addr, bytes(self._write_buf), num_bytes)
@@ -215,6 +255,7 @@ class _SensorI2CDriver(I2CDriver):
     def select_camera(self, camera: int) -> None:
         if not (1 <= camera <= 8):
             raise ValueError(f"camera must be 1-8, got {camera}")
+        self._pace()
         # MotionSensor.switch_camera returns the raw response packet; a NAK
         # shows up as packetType in _ERROR_TYPES (same check the other
         # MotionSensor methods use).
@@ -223,6 +264,7 @@ class _SensorI2CDriver(I2CDriver):
             raise NvcmTransportError(f"switch_camera({camera}) failed")
 
     def creset(self, value: int) -> None:
+        self._pace()
         # MotionSensor.creset returns the pin state int (0 or 1) on success,
         # False on a firmware error packet — identity check only, 0 is valid.
         if self._sensor.creset(value != 0) is False:
@@ -251,6 +293,12 @@ class NvcmProgrammer:
         out-of-range camera. Transport failures (sensor NAKs, short reads,
         unexpected exceptions) come back as a failed NvcmResult.
 
+        The target camera is hard power-cycled first (a refused power command
+        fails the burn before any I2C reaches the FPGA), and the replay is
+        paced to ~2 ms/transaction — a full burn takes ~3 minutes per camera
+        BY DESIGN. Both behaviors are OTP-safety requirements (issue #245),
+        not overhead to optimize away.
+
         progress_cb is invoked synchronously on the calling thread; GUI
         consumers must marshal updates to their UI thread. `done` is clamped
         to `total` (hardware polling retries can execute more transactions
@@ -272,36 +320,58 @@ class NvcmProgrammer:
                 return NvcmResult(False, f"image pre-check failed: {msg}", 0)
             total = sim.count
 
-            # Power the target camera and route the mux.
-            if not self._sensor.enable_camera_power(1 << (camera - 1)):
+            # Hard power-cycle the target camera so the burn always starts
+            # from a cold, unconfigured FPGA. Every validated PASS followed a
+            # fresh power state; a warm/long-idle part is exactly the regime
+            # where the 2026-08-13 bricking burns also showed anomalous
+            # busy-poll behavior (issue #245). A refused power command aborts
+            # BEFORE any I2C reaches the FPGA — never burn on a guess.
+            mask = 1 << (camera - 1)
+            if not self._sensor.disable_camera_power(mask):
+                return NvcmResult(
+                    False, "failed to power-cycle camera (power-off refused)", 0)
+            time.sleep(_POWER_OFF_SETTLE_S)
+            if not self._sensor.enable_camera_power(mask):
                 return NvcmResult(False, "failed to power camera", 0)
         except Exception as exc:  # disconnected sensor, corrupt image, ...
             logger.exception("NVCM burn pre-flight failed for camera %d", camera)
             return NvcmResult(False, str(exc), 0)
-        time.sleep(0.5)
+        time.sleep(_POWER_ON_SETTLE_S)
 
         driver = _SensorI2CDriver(self._sensor, total=total,
                                   progress_cb=progress_cb)
+
+        def pace_ms(elapsed: float) -> float:
+            # Average ms per countable transaction, incl. the .iea's own
+            # waits. Regression tripwire: every validated PASS logs >=1.4;
+            # the 2026-08-13 bricking burns logged 0.42-0.86 (issue #245).
+            return elapsed * 1000.0 / driver.count if driver.count else 0.0
+
+        t0 = time.monotonic()
         try:
             driver.select_camera(camera)
             logger.info("NVCM burn start: camera %d, %d transactions",
                         camera, total)
             ret = isp_entry_point(algo, data, driver=driver)
         except Exception as exc:  # incl. NvcmTransportError — never leak
-            logger.exception("NVCM burn ABORTED: camera %d after %d tx",
-                             camera, driver.count)
+            logger.exception("NVCM burn ABORTED: camera %d after %d tx "
+                             "(avg %.2f ms/tx)", camera, driver.count,
+                             pace_ms(time.monotonic() - t0))
             return NvcmResult(False, str(exc), driver.count)
+        elapsed = time.monotonic() - t0
 
         if ret < 0:
             msg = ERR_MESSAGES.get(ret, f"error {ret}")
             if driver.count < _EARLY_FAIL_TX:
                 msg += (" (failed during initial checks — device may already"
                         " be programmed / not blank)")
-            logger.warning("NVCM burn FAILED: camera %d after %d tx: %s",
-                           camera, driver.count, msg)
+            logger.warning("NVCM burn FAILED: camera %d after %d tx "
+                           "(avg %.2f ms/tx): %s",
+                           camera, driver.count, pace_ms(elapsed), msg)
             return NvcmResult(False, msg, driver.count)
 
         if progress_cb is not None:
             progress_cb(total, total)
-        logger.info("NVCM burn PASSED: camera %d (%d tx)", camera, driver.count)
+        logger.info("NVCM burn PASSED: camera %d (%d tx, %.1f s, avg %.2f "
+                    "ms/tx)", camera, driver.count, elapsed, pace_ms(elapsed))
         return NvcmResult(True, None, driver.count)

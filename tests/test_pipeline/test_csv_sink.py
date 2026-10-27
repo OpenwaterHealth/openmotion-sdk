@@ -1,7 +1,6 @@
 """New CsvSink — channel-based, with the 'type' column in raw output."""
 
 import csv
-import logging
 import numpy as np
 import pytest
 from dataclasses import dataclass
@@ -78,19 +77,22 @@ def test_csv_sink_raw_always_writes_data_rows(tmp_path):
     assert len(rows) >= 2
 
 
-def test_csv_sink_skips_stale_raw_rows_and_logs(tmp_path, caplog):
+def test_csv_sink_preserves_quarantined_raw_rows(tmp_path):
     sink = CsvSink(output_dir=tmp_path)
     sink.on_scan_start(_meta_simple())
 
     batch = _dummy_raw_batch()
     batch.frame_type = np.array(["stale"], dtype="<U8")
-    with caplog.at_level(logging.WARNING, logger="omotion.pipeline.sinks"):
-        sink.consume("raw", batch)
+    sink.consume("raw", batch)
     sink.on_complete()
 
     raw_files = list(tmp_path.glob("*raw*.csv"))
-    assert raw_files == []
-    assert "stale raw frame skipped" in caplog.text
+    assert len(raw_files) == 1
+    with open(raw_files[0]) as fh:
+        rows = list(csv.DictReader(fh))
+    assert len(rows) == 1
+    assert rows[0]["frame_id"] == "10"
+    assert rows[0]["type"] == "stale"
 
 
 def test_csv_sink_uses_source_side_ids_for_raw_rows(tmp_path):

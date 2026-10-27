@@ -81,7 +81,29 @@ class ConsoleTelemetry:
     tec_set_raw: float = 0.0        # IN2P / setpoint voltage (→ target temp)
     tec_curr_raw: float = 0.0       # V_itec (→ TEC current)
     tec_volt_raw: float = 0.0       # V_vtec (→ TEC voltage)
-    tec_good: bool = False          # TMPGD pin (abs(OUT1-IN2P) < 100 mV)
+    # TecStats.tec_status from console FW — the TEC over-temp TRIP result, NOT
+    # the TMPGD comparator pin this comment used to claim. tec_trip_evaluate()
+    # (console-fw Core/Src/uart_comms.c) is the only writer of that field: it
+    # clears the bit when the TEC sense voltage crosses TEC_TRIP_VALUE and
+    # calls Trigger_Safety_Disconnect(). So False means the console has tripped
+    # and shut the laser down — a safety event, not "temperature has not
+    # settled to setpoint yet". The bit returns to True on the first clean
+    # poll; the trigger interlock clears only after 200 consecutive clean polls
+    # (about 5 s), so a start can still be refused while tec_good is True.
+    # Only meaningful when tec_known is True. Caveat: the trip is disarmed when
+    # TEC_TRIP_VALUE == 0.0 (settings never applied), and firmware then always
+    # reports True — a steady True is not proof the trip is armed. See #206.
+    # The default stays False (unlike safety_ok, which defaults True): an
+    # ungated legacy consumer then errs toward "laser is down" on a failed
+    # poll rather than toward "keep firing".
+    tec_good: bool = False
+    # tec_known is False until _read_tec has completed one successful read on
+    # this poll. tec_good defaults are indistinguishable from "tripped", so
+    # consumers treating tec_good as a safety condition MUST gate on this
+    # rather than reporting a laser shutdown that was never measured. Same
+    # reasoning as safety_known below (bloodflow-app#107); see also
+    # OpenwaterHealth/openmotion-test-app#89.
+    tec_known: bool = False
 
     # --- PDU monitor (16 raw counts + 16 calibrated volts) ---
     pdu_raws: List[int] = field(default_factory=list)
@@ -373,6 +395,10 @@ class ConsoleTelemetryPoller:
         snap.tec_curr_raw = float(tec_curr)
         snap.tec_volt_raw = float(tec_volt)
         snap.tec_good = bool(tec_good)
+        # Only now is tec_good a measurement rather than the dataclass default.
+        # tec_status() raises on any failure, so an unset tec_known means the
+        # console never answered — see the field comment on ConsoleTelemetry.
+        snap.tec_known = True
 
     def _read_pdu(self, snap: ConsoleTelemetry) -> None:
         pdu = self._console.read_pdu_mon()

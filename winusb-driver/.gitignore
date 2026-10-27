@@ -3,12 +3,16 @@
 OpenMotion_signing_cert.pfx
 OpenMotion_signing_cert.cer
 
-# Build outputs produced by build_driver_msi.ps1 / CI (the signing key is the
-# single source of truth). The distributable zip is vendored in bloodflow-app.
+# Build outputs produced by build_driver_msi.ps1 / CI.
+# NOTE: OpenMotionDriver-x64.zip is deliberately NOT ignored — the committed
+# zip is the canonical EV-SIGNED artifact (eSigner signings are metered; the
+# driver is signed once per driver change via a manual driver-msi.yml
+# dispatch, and that artifact is committed here + vendored in bloodflow-app
+# resources/). A local/PR build overwrites the zip in your working tree with
+# a legacy self-signed one — REVERT it, never commit a legacy-signed zip.
 # NOTE: all four .cat files ARE committed content -- libwdi/Zadig-generated
 # driver catalogs (3 sensor + DFU_in_FS_Mode.cat). The build re-signs them only
 # when the signing key changes; regenerate via libwdi/Zadig on an INF change.
-OpenMotionDriver-x64.zip
 OpenMotionDriver-x64.msi
 cab1.cab
 *.wixpdb

@@ -68,6 +68,15 @@ MIN_PACKET_SIZE = MIN_HISTO_PACKET_SIZE
 # TIM5 on the sensor MCU runs at 100 kHz; get_timestamp_ms() returns TIM5->CNT/100
 # so the 32-bit counter wraps every 2^32 / 100 / 1000 ≈ 42949.67 seconds (~11.9 hours).
 _TIMESTAMP_ROLLOVER_S: float = (2**32) / 100.0 / 1000.0
+# Corrupt-timestamp guard for the rollover unwrapper (sdk#220): a single
+# EMI-corrupted timestamp jumping forward by more than this is passed through
+# but NOT allowed to advance the monotonic tracker — otherwise the next
+# honest sample reads as a huge backward jump, latches a spurious +11.9 h
+# offset, and every timestamp for the rest of the scan is permanently wrong.
+# One second is still far beyond any live-stream gap (the firmware stops the
+# scan after ~150 ms of silence), while preventing moderate forward outliers
+# from becoming the rollover tracker's reference.
+_TS_FORWARD_SUSPECT_S: float = 1.0
 # TYPE_HISTO_CMP has: header + compressed_payload(>=1) + uncmp_crc16(2) + footer(3)
 MIN_HISTO_CMP_PACKET_SIZE = PACKET_HEADER_SIZE + 1 + CMP_UNCMP_CRC_SIZE + PACKET_FOOTER_SIZE
 MAX_PACKET_SIZE = 32837
@@ -582,12 +591,13 @@ def parse_histogram_stream(
     stop_evt: threading.Event,
     buffer_accumulator: bytearray,
     on_row_fn: Callable[[int, int, float, np.ndarray, int, float], None] | None = None,
+    on_packet_fn: Callable[[HistogramPacket], None] | None = None,
     expected_row_sum: "int | Iterable[int] | None" = None,
     t0_normalizer: Callable[[float], float] | None = None,
 ) -> int:
     """
-    Parse a histogram USB stream queue and fire ``on_row_fn`` for every
-    valid sample.
+    Parse a histogram USB stream queue and fire ``on_row_fn`` per valid row
+    and/or ``on_packet_fn`` once per parsed source packet.
 
     Parameters
     ----------
@@ -599,6 +609,9 @@ def parse_histogram_stream(
         Optional callback that converts an absolute firmware timestamp
         into a per-scan-zero timestamp; invoked once per sample before
         ``on_row_fn`` fires.
+    on_packet_fn
+        Optional packet-preserving callback. Samples have already undergone
+        rollover handling and timestamp normalization when it fires.
 
     Returns
     -------
@@ -611,6 +624,43 @@ def parse_histogram_stream(
     # rolls over every ~42949.67 s.  Track an offset so timestamps never go backwards.
     _ts_last: float | None = None
     _ts_offset: float = 0.0
+
+    def emit_packet(packet: HistogramPacket) -> int:
+        """Normalize one packet once, then fan it out to selected callbacks."""
+        nonlocal _ts_last, _ts_offset
+        for sample in packet.samples:
+            adjusted_ts = sample.timestamp_s + _ts_offset
+            if (_ts_last is not None
+                    and adjusted_ts < _ts_last - _TIMESTAMP_ROLLOVER_S / 2):
+                relatched_ts = adjusted_ts + _TIMESTAMP_ROLLOVER_S
+                if 0.0 <= relatched_ts - _ts_last <= _TS_FORWARD_SUSPECT_S:
+                    _ts_offset += _TIMESTAMP_ROLLOVER_S
+                    adjusted_ts = relatched_ts
+
+            # Only a non-negative, bounded step can become the rollover
+            # reference. The outlier still flows to TimestampRepairStage.
+            if (_ts_last is None
+                    or 0.0 <= adjusted_ts - _ts_last <= _TS_FORWARD_SUSPECT_S):
+                _ts_last = adjusted_ts
+            if t0_normalizer is not None:
+                adjusted_ts = t0_normalizer(adjusted_ts)
+            sample.timestamp_s = adjusted_ts
+
+        if packet.samples:
+            packet.timestamp_s = packet.samples[0].timestamp_s
+        if on_packet_fn is not None:
+            on_packet_fn(packet)
+        if on_row_fn is not None:
+            for sample in packet.samples:
+                on_row_fn(
+                    sample.cam_id,
+                    sample.frame_id,
+                    sample.timestamp_s,
+                    sample.histogram,
+                    sample.row_sum,
+                    sample.temperature_c,
+                )
+        return len(packet.samples) if (on_packet_fn or on_row_fn) else 0
 
     while not stop_evt.is_set() or not q.empty():
         try:
@@ -630,34 +680,7 @@ def parse_histogram_stream(
                 )
                 offset += packet.bytes_consumed
 
-                for sample in packet.samples:
-                    # Unwrap the firmware's 32-bit millisecond timestamp so it
-                    # increases monotonically across the ~42949 s rollover boundary.
-                    raw_ts = sample.timestamp_s
-                    if _ts_last is not None and (raw_ts + _ts_offset) < (_ts_last - _TIMESTAMP_ROLLOVER_S / 2):
-                        _ts_offset += _TIMESTAMP_ROLLOVER_S
-                    sample.timestamp_s = raw_ts + _ts_offset
-                    _ts_last = sample.timestamp_s
-                    # Normalize to per-scan t0 if a normalizer was supplied
-                    # (typically by ScanWorkflow). After this, sample.timestamp_s
-                    # is seconds since the first sample emitted in this scan,
-                    # so every downstream consumer — raw CSV, row handler /
-                    # on_raw_frame_fn callback, the science pipeline, and the
-                    # corrected outputs that flow from it — sees the same
-                    # 0-based per-scan time origin.
-                    if t0_normalizer is not None:
-                        sample.timestamp_s = t0_normalizer(sample.timestamp_s)
-
-                    if on_row_fn:
-                        on_row_fn(
-                            sample.cam_id,
-                            sample.frame_id,
-                            sample.timestamp_s,
-                            sample.histogram,
-                            sample.row_sum,
-                            sample.temperature_c,
-                        )
-                        rows_processed += 1
+                rows_processed += emit_packet(packet)
 
             except ValueError as e:
                 old_off = offset
@@ -713,25 +736,7 @@ def parse_histogram_stream(
                     pkt_view, expected_row_sum=expected_row_sum
                 )
                 offset += packet.bytes_consumed
-                for sample in packet.samples:
-                    raw_ts = sample.timestamp_s
-                    if _ts_last is not None and (raw_ts + _ts_offset) < (_ts_last - _TIMESTAMP_ROLLOVER_S / 2):
-                        _ts_offset += _TIMESTAMP_ROLLOVER_S
-                    sample.timestamp_s = raw_ts + _ts_offset
-                    _ts_last = sample.timestamp_s
-                    if t0_normalizer is not None:
-                        sample.timestamp_s = t0_normalizer(sample.timestamp_s)
-
-                    if on_row_fn:
-                        on_row_fn(
-                            sample.cam_id,
-                            sample.frame_id,
-                            sample.timestamp_s,
-                            sample.histogram,
-                            sample.row_sum,
-                            sample.temperature_c,
-                        )
-                        rows_processed += 1
+                rows_processed += emit_packet(packet)
             except ValueError as e:
                 old_off = offset
                 search_from = offset + 1

@@ -64,8 +64,6 @@ from omotion.config import (
     OW_CTRL_I2C_STATUS,
     OW_CTRL_I2C_WR,
     OW_CTRL_PDUMON,
-    OW_CTRL_READ_ADC,
-    OW_CTRL_READ_GPIO,
     OW_CTRL_SET_IND,
     OW_CTRL_SET_TRIG,
     OW_CTRL_START_TRIG,
@@ -77,6 +75,9 @@ from omotion.config import (
     OW_ERROR,
     XO2_FLASH_PAGE_SIZE,
     MuxChannel,
+    TRIGGER_JSON_MAX,
+    describe_trigger_refusal,
+    validate_trigger_config,
 )
 
 from omotion.GitHubReleases import GitHubReleases
@@ -89,6 +90,7 @@ from omotion.Calibration import (
     CALIBRATION_JSON_KEY,
 )
 from omotion.CommandError import CommandError
+from omotion.laser import LaserSafetyLimitError
 
 logger = logging.getLogger(f"{_log_root}.Console" if _log_root else "Console")
 
@@ -110,6 +112,9 @@ class TelemetrySample:
     t2: float
     t3: float
     tec_adc: tuple[int, int, int, int]
+    # TecStats.tec_status — the TEC over-temp trip result (False = tripped,
+    # laser shut down by firmware), not a TMPGD settled-to-setpoint pin.
+    # See tec_status() below and issue #206.
     tec_good: bool
 
     def __str__(self):
@@ -177,6 +182,7 @@ class MotionConsole(SignalWrapper):
         self.telemetry = ConsoleTelemetryPoller(self)
 
         self._state = ConnectionState.DISCONNECTED
+        self._state_reason = ""
         self._state_cv = threading.Condition()
         self._monitor = None  # set by MotionInterface.start()
         self._version = "v0.0.0"
@@ -185,6 +191,18 @@ class MotionConsole(SignalWrapper):
         # then, or if the device firmware predates the I2C-status command).
         self._i2c_health: Optional[dict] = None
 
+        # Why the laser safety limits are not verified, set and cleared by
+        # omotion.laser.apply_laser_power (sdk#310); None = verified, or no
+        # load has run. Kept across disconnects: only a later load that
+        # verifies clean clears it, and while it is set start_trigger refuses.
+        self.laser_limits_error: Optional[str] = None
+
+        # Why the console refused the last start_trigger: the status byte
+        # (TRIG_INTERLOCK_* bits, or None if the firmware sent none) and its
+        # description. Both None after a start the console accepted.
+        self.last_start_refusal: Optional[int] = None
+        self.last_start_refusal_reason: Optional[str] = None
+
     # ──────────────────────────────────────────────────────────────────
     # State (read-only from outside)
     # ──────────────────────────────────────────────────────────────────
@@ -192,6 +210,11 @@ class MotionConsole(SignalWrapper):
     @property
     def state(self) -> ConnectionState:
         return self._state
+
+    @property
+    def state_reason(self) -> str:
+        """Reason given for the last state transition ("" before any)."""
+        return self._state_reason
 
     def is_connected(self) -> bool:
         return self._state == ConnectionState.CONNECTED
@@ -241,6 +264,7 @@ class MotionConsole(SignalWrapper):
                 return
             old = self._state
             self._state = new_state
+            self._state_reason = reason
             self._state_cv.notify_all()
         try:
             self.signal_state_changed.emit(self, old, new_state, reason)
@@ -383,11 +407,17 @@ class MotionConsole(SignalWrapper):
             logger.error("Unexpected error during %s: %s", method_name, e)
 
     def _drive_disconnecting(self, reason: str) -> None:
-        self._set_state(ConnectionState.DISCONNECTING, reason=reason)
+        # Stop the telemetry poller BEFORE leaving CONNECTED. Its poll
+        # thread may be mid-command; stop() joins it, so the in-flight
+        # command completes over the still-open UART. Flipping the state
+        # first made that command trip the ``is_connected()`` guard and
+        # log "ValueError: Console controller not connected" at ERROR on
+        # every ordinary teardown (#128).
         try:
             self.telemetry.stop()
         except Exception:
             logger.exception("telemetry stop failed")
+        self._set_state(ConnectionState.DISCONNECTING, reason=reason)
         try:
             self.uart.close()
         except Exception:
@@ -1020,16 +1050,17 @@ class MotionConsole(SignalWrapper):
             )
 
             self.uart.clear_buffer()
-            # r.print_packet()
 
-            if r.packetType == OW_ERROR:
-                logger.error("Error Reading I2C Device")
+            if r is None or r.packetType == OW_ERROR or r.data_len <= 0:
+                logger.error(
+                    "I2C read failed: %s (mux=%d ch=%d addr=0x%02X reg=0x%02X len=%d)",
+                    "UART not open" if r is None
+                    else "console returned OW_ERROR" if r.packetType == OW_ERROR
+                    else "console returned no data",
+                    mux_index, channel, device_addr, reg_addr, read_len,
+                )
                 return None, None
-
-            if r.data_len > 0:
-                return r.data, r.data_len
-            else:
-                return None, None
+            return r.data, r.data_len
 
         except Exception as e:
             # The underlying error is already logged by MotionUart.send_packet()
@@ -1221,7 +1252,7 @@ class MotionConsole(SignalWrapper):
             if self.uart.demo_mode:
                 return rgb_state
 
-            logger.info("Setting RGB LED state.")
+            logger.debug("Setting RGB LED state.")
 
             # Send the RGB state as the reserved byte in the packet
             r = self.uart.send_packet(
@@ -1237,7 +1268,7 @@ class MotionConsole(SignalWrapper):
                 logger.error("Error setting RGB LED state")
                 return -1
 
-            logger.info(f"Set RGB LED state to {rgb_state}")
+            logger.debug(f"Set RGB LED state to {rgb_state}")
             return rgb_state
 
         except ValueError as v:
@@ -1296,11 +1327,23 @@ class MotionConsole(SignalWrapper):
         Args:
             data (dict): A dictionary containing the trigger configuration.
 
+        The configuration is checked against the console limits first
+        (``omotion.config.validate_trigger_config``): 1..100 Hz, laser gate
+        20..2200 us, and the laser delay, gate and skip delay inside one
+        frame. A Release console accepts 40 Hz only and answers any other
+        rate with OW_ERROR (this method then returns None); Debug consoles
+        accept 1..100 Hz. The console enforces its limits and keeps its previous
+        configuration when it rejects one; a rejected configuration sent
+        while the trigger runs leaves it running.
+
         Returns:
-            dict: JSON response from the device.
+            dict: JSON response from the device, or None if the console
+            rejected the configuration (OW_ERROR).
 
         Raises:
-            ValueError: If `data` is None or the UART is not connected.
+            ValueError: If the UART is not connected, a field is outside the
+                console limits, or the JSON is longer than
+                ``TRIGGER_JSON_MAX`` (511) bytes.
             Exception: If an error occurs while setting the trigger.
         """
         try:
@@ -1315,13 +1358,22 @@ class MotionConsole(SignalWrapper):
             if not self.is_connected():
                 raise ValueError("Console controller not connected")
 
+            validate_trigger_config(data)
+
             try:
-                json_string = json.dumps(data)
-            except json.JSONDecodeError as e:
+                # Compact separators: the console accepts at most
+                # TRIGGER_JSON_MAX bytes of JSON.
+                json_string = json.dumps(data, separators=(",", ":"))
+            except (TypeError, ValueError) as e:
                 logger.error(f"Data must be valid JSON: {e}")
                 return None
 
             payload = json_string.encode("utf-8")
+            if len(payload) > TRIGGER_JSON_MAX:
+                raise ValueError(
+                    f"Trigger JSON is {len(payload)} bytes; the console "
+                    f"accepts at most {TRIGGER_JSON_MAX}"
+                )
 
             r = self.uart.send_packet(
                 id=None,
@@ -1340,6 +1392,10 @@ class MotionConsole(SignalWrapper):
                     logger.error(f"Error decoding JSON: {e}")
                     return None
             else:
+                if r.packetType == OW_ERROR:
+                    logger.error(
+                        "Console rejected the trigger configuration: %s", json_string
+                    )
                 return None
         except ValueError as v:
             logger.error("ValueError: %s", v)
@@ -1389,13 +1445,27 @@ class MotionConsole(SignalWrapper):
         """
         Start the trigger on the Console device.
 
+        The console refuses the start while an interlock is active: host
+        connection lost, a laser-safety fault latched, or a TEC thermal trip.
+        The reason is kept in ``last_start_refusal`` (status byte) and
+        ``last_start_refusal_reason`` (text). A TEC refusal is not a fault:
+        the TEC interlock clears about 5 s after ``tec_status()`` reports
+        ``tec_good`` again, so retry later. Console firmware older than the
+        CFW-06 fix replies OW_RESP to a refused start, so this returns True
+        even though nothing started.
+
         Returns:
             bool: True if the trigger was started successfully, False otherwise.
 
         Raises:
+            LaserSafetyLimitError: While ``laser_limits_error`` is set
+                (sdk#310); nothing is sent to the console.
             ValueError: If the UART is not connected.
             Exception: If an error occurs while starting the trigger.
         """
+        if self.laser_limits_error:
+            logger.error("start_trigger refused: %s", self.laser_limits_error)
+            raise LaserSafetyLimitError(self.laser_limits_error)
         try:
             if self.uart.demo_mode:
                 return True
@@ -1409,9 +1479,17 @@ class MotionConsole(SignalWrapper):
             self.uart.clear_buffer()
             # r.print_packet()
             if r.packetType == OW_ERROR:
-                logger.error("Error starting trigger")
+                status = r.data[0] if r.data_len >= 1 else None
+                self.last_start_refusal = status
+                self.last_start_refusal_reason = describe_trigger_refusal(status)
+                logger.error(
+                    "Console refused to start the trigger: %s",
+                    self.last_start_refusal_reason,
+                )
                 return False
             else:
+                self.last_start_refusal = None
+                self.last_start_refusal_reason = None
                 return True
         except ValueError as v:
             logger.error("ValueError: %s", v)
@@ -1535,7 +1613,7 @@ class MotionConsole(SignalWrapper):
                 return 0
 
         except ValueError as v:
-            logger.error("ValueError: %s", v)
+            self._log_command_error("get_lsync_pulsecount", v)
             raise  # Re-raise the exception for the caller to handle
 
         except Exception as e:
@@ -1625,84 +1703,6 @@ class MotionConsole(SignalWrapper):
         except Exception as e:
             self._log_command_error("reset_odometer", e)
             return False
-
-    def read_gpio_value(self) -> int:
-        """
-        Read GPIO value.
-
-        Returns:
-            int: The GPIO register value (4-byte unsigned integer).
-
-        Raises:
-            ValueError: If the UART is not connected or the firmware returns
-                an unexpected response.
-            Exception: If an error occurs during communication.
-        """
-        try:
-            if self.uart.demo_mode:
-                return 0
-
-            if not self.is_connected():
-                raise ValueError("Console controller not connected")
-
-            r = self.uart.send_packet(
-                id=None, packetType=OW_CONTROLLER, command=OW_CTRL_READ_GPIO, data=None
-            )
-            self.uart.clear_buffer()
-            if r.packetType == OW_ERROR:
-                raise ValueError("Device returned an error for OW_CTRL_READ_GPIO")
-            if r.data_len == 4:
-                return struct.unpack("<I", r.data)[0]
-            raise ValueError(
-                f"Unexpected data length for GPIO read: got {r.data_len}, expected 4"
-            )
-
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise
-
-        except Exception as e:
-            self._log_command_error("read_gpio_value", e)
-            raise
-
-    def read_adc_value(self) -> float:
-        """
-        Read ADC value.
-
-        Returns:
-            float: The ADC reading as a 32-bit float.
-
-        Raises:
-            ValueError: If the UART is not connected or the firmware returns
-                an unexpected response.
-            Exception: If an error occurs during communication.
-        """
-        try:
-            if self.uart.demo_mode:
-                return 0.0
-
-            if not self.is_connected():
-                raise ValueError("Console controller not connected")
-
-            r = self.uart.send_packet(
-                id=None, packetType=OW_CONTROLLER, command=OW_CTRL_READ_ADC, data=None
-            )
-            self.uart.clear_buffer()
-            if r.packetType == OW_ERROR:
-                raise ValueError("Device returned an error for OW_CTRL_READ_ADC")
-            if r.data_len == 4:
-                return struct.unpack("<f", r.data)[0]
-            raise ValueError(
-                f"Unexpected data length for ADC read: got {r.data_len}, expected 4"
-            )
-
-        except ValueError as v:
-            logger.error("ValueError: %s", v)
-            raise
-
-        except Exception as e:
-            self._log_command_error("read_adc_value", e)
-            raise
 
     def get_temperatures(self, return_all: bool = False) -> tuple[float, float, float]:
         """
@@ -1910,6 +1910,23 @@ class MotionConsole(SignalWrapper):
         """
         Get TEC status: (voltage, Temperature Setpoint, TEC Current, TEC Voltage, TEC Good)
 
+        ``tec_good`` is ``TecStats.tec_status`` from console FW — the TEC
+        over-temp **trip** result, not a TMPGD "temperature settled" pin.
+        ``tec_trip_evaluate()`` (console-fw ``Core/Src/uart_comms.c``) is its
+        only writer: it clears the bit when the TEC sense voltage crosses
+        ``TEC_TRIP_VALUE`` and opens the safety disconnect. ``False``
+        therefore means the console has tripped and shut the laser down.
+        ``tec_good`` returns to ``True`` on the first clean poll, but the
+        trigger interlock clears only after 200 consecutive clean polls
+        (about 5 s): until then ``start_trigger`` is refused with
+        ``TRIG_INTERLOCK_TEC``. Note the trip is disarmed when
+        ``TEC_TRIP_VALUE == 0.0``, and firmware then always reports ``True``.
+
+        This method raises rather than returning a sentinel on failure, so a
+        caller can never mistake a failed read for a trip; pollers that cache
+        the value should track "was it ever read" separately (see
+        ``ConsoleTelemetry.tec_known``). See issue #206.
+
         Returns:
             tuple: (volt, temp_set, tec_curr, tec_volt, tec_good)
 
@@ -2106,7 +2123,7 @@ class MotionConsole(SignalWrapper):
             return pdu
 
         except ValueError as v:
-            logger.error("ValueError: %s", v)
+            self._log_command_error("read_pdu_mon", v)
             raise  # Re-raise the exception for the caller to handle
 
         except Exception as e:
@@ -2265,7 +2282,13 @@ class MotionConsole(SignalWrapper):
             self.uart.clear_buffer()
 
             if r.packetType == OW_ERROR:
-                logger.error("Error writing config to device")
+                # Console firmware with the strict-config check refuses a
+                # config that is not a strict JSON object or does not fit the
+                # page, and keeps the stored one.
+                logger.error(
+                    "Console refused the config write (not strict JSON, or too "
+                    "long); the stored config is unchanged"
+                )
                 return None
 
             # The firmware write ACK returns only the updated 16-byte header
@@ -2323,38 +2346,45 @@ class MotionConsole(SignalWrapper):
         """Read the BFI/BVI calibration from the console EEPROM JSON.
 
         Returns a :class:`omotion.Calibration` with ``source="console"`` if
-        the JSON contains a valid ``calibration`` block, otherwise a fresh
-        :meth:`Calibration.default` (``source="default"``). Never raises on
-        bad data — invalid blocks are logged and replaced with defaults.
+        the JSON contains a valid ``calibration`` block. Returns a fresh
+        :meth:`Calibration.default` (``source="default"``) only when the
+        config was read successfully and holds no usable block: the key is
+        absent (a console that has never been calibrated) or the block
+        fails validation (logged as a warning by ``parse_calibration``).
+
+        A read that *fails* is reported, never papered over with defaults:
+        callers that carry stored values forward (the calibration workflow
+        writes the un-targeted cameras' rows back to the EEPROM) must be
+        able to tell "nothing stored" from "could not read what is stored".
 
         Raises:
             ValueError: if the UART is not connected (propagates from
                 ``read_config``).
+            RuntimeError: if the device returned an error or an
+                undecodable config payload (``read_config`` returned None).
+            Exception: any transport error raised by ``read_config``.
         """
-        try:
-            cfg = self.read_config()
-        except ValueError:
-            raise
-        except Exception as e:
-            logger.warning(
-                "read_calibration: read_config raised %s; using SDK defaults.",
-                e,
-            )
-            return Calibration.default()
+        cfg = self.read_config()
 
         if cfg is None:
-            logger.info(
-                "read_calibration: no config returned from device; "
-                "using SDK defaults."
+            raise RuntimeError(
+                "read_calibration: console config could not be read "
+                "(device returned an error or an undecodable payload)."
             )
-            return Calibration.default()
 
-        parsed = parse_calibration(cfg.json_data or {})
+        json_data = cfg.json_data or {}
+        parsed = parse_calibration(json_data)
         if parsed is None:
-            logger.info(
-                "read_calibration: no calibration on device or invalid; "
-                "using SDK defaults."
-            )
+            if CALIBRATION_JSON_KEY in json_data:
+                logger.warning(
+                    "read_calibration: calibration block on device is "
+                    "invalid; using SDK defaults."
+                )
+            else:
+                logger.info(
+                    "read_calibration: no calibration block on device; "
+                    "using SDK defaults."
+                )
             return Calibration.default()
 
         logger.info("read_calibration: loaded calibration from console.")
