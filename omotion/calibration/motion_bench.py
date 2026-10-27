@@ -210,6 +210,16 @@ class MotionConsoleBenchBase:
             return False, self._identity("console", self._console)
         return True, self._console_identity()
 
+    def _console_safety_keys_writable(self) -> bool | None:
+        """Whether the console accepts the WI-00015 safety config keys: False
+        on a Release/Debug image of firmware that owns the safety state, True
+        on its Factory image, None on older firmware (no boot-info v2)."""
+        get_boot_info = getattr(self._console, "get_boot_info", None)
+        info = get_boot_info() if callable(get_boot_info) else None
+        if info is None or not info.firmware_owns_safety_state:
+            return None
+        return info.factory_image
+
     def _topology_snapshot(self) -> TopologySnapshot:
         return TopologySnapshot(
             console_connected=bool(self._console.is_connected()),

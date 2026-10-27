@@ -516,6 +516,9 @@ class MotionLaserCalibrationBench(MotionConsoleBenchBase):
             ophir_ready=ophir_ready,
             ophir_setting_evidence=ophir_evidence,
             ophir_failure_reason=ophir_failure_reason,
+            safety_keys_writable=(
+                self._console_safety_keys_writable() if console_responsive else None
+            ),
         )
 
     def preflight_dual(self) -> DualPreflightSnapshot:
@@ -547,6 +550,9 @@ class MotionLaserCalibrationBench(MotionConsoleBenchBase):
             ophir_ready=ophir_ready,
             ophir_setting_evidence=ophir_evidence,
             ophir_failure_reason=ophir_failure_reason,
+            safety_keys_writable=(
+                self._console_safety_keys_writable() if console_responsive else None
+            ),
         )
 
     def revalidate_topology(self, side: str) -> TopologySnapshot:

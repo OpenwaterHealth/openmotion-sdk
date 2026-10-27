@@ -259,6 +259,30 @@ without sending anything. Disconnecting does not clear it; only a later
 reconnect once the register is fixed). Callers that never call
 `apply_laser_power()` are unaffected.
 
+**Console firmware that owns the safety state (PTR-2026-1-5).** Console
+firmware that replies to `OW_CMD_BOOT_INFO` with struct version 2 loads the
+safety limits itself, from each safety FPGA's per-unit record, and refuses host
+writes to them. It also attests the EE/OPT FPGA configuration at boot (about
+6.5 s) and refuses the trigger with interlock `0x40` until that passes. On such
+a console `apply_laser_power()` writes only the operating point
+(`TA_PULSE_WIDTH`, `TA_CURRENT_DRV`, `SEED_DDS_GAIN`, `SEED_CW_GAIN`; the
+console bounds each value), skips the `EE_THRESH`/`OPT_THRESH` DRIVE CL
+overrides, and verifies by waiting up to 15 s for attestation to pass with no
+`0x20`/`0x40` interlock instead of reading registers back. `force_fault=True`
+returns `False` there, because the faulted register is firmware-owned.
+
+| Call | Returns |
+|---|---|
+| `console.get_boot_info()` | `BootInfo` (boot mode; v2: `interlocks`, `fpga_attest`, `factory_image`) or `None` |
+| `console.firmware_owns_safety_state()` | `True` on boot-info v2 firmware |
+| `console.get_fpga_attestation(start=False)` | `FpgaAttestReport` (`state_name`, `passed`, `faults()`, per-device digests) or `None`; `start=True` begins a new run |
+| `console.write_config(...)` refusal | `None`, with `console.last_config_refusal` (`OW_CODE_CFG_SAFETY_KEY` 0xFA, `_UNKNOWN_KEY` 0xF9, `_RANGE` 0xF8) and `last_config_refusal_reason` |
+
+On a Release or Debug image the config keys in
+`omotion.fpga_attest.CONFIG_SAFETY_KEYS` are refused, so the WI-00015 laser
+and safety calibration workflows stop at preflight (`FailureKind.SETUP`)
+unless the console runs a Factory image.
+
 ### Observing & finishing
 
 `iface.scan_workflow` exposes:
