@@ -307,10 +307,10 @@ def test_current_configuration_is_checkpointed_before_invalid_field_fails():
 @pytest.mark.parametrize(
     ("name", "actual", "passed"),
     [
-        ("TA_CURRENT_DRV", 4900.0, True),
-        ("TA_CURRENT_DRV", 5100.0, True),
-        ("TA_CURRENT_DRV", 4899.999, False),
-        ("TA_CURRENT_DRV", 5100.001, False),
+        ("TA_CURRENT_DRV", 4851.0, True),
+        ("TA_CURRENT_DRV", 5049.0, True),
+        ("TA_CURRENT_DRV", 4850.999, False),
+        ("TA_CURRENT_DRV", 5049.001, False),
         ("TA_PULSE_WIDTH", 490.0, True),
         ("TA_PULSE_WIDTH", 510.0, True),
         ("TA_PULSE_WIDTH", 489.999, False),

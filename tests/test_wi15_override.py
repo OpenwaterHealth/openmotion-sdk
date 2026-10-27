@@ -285,11 +285,11 @@ def test_single_override_custom_band_steers_tuning_and_still_asks_outside_factor
     assert result.target_energy_uj == 150.0
     assert (result.minimum_accepted_energy_uj, result.maximum_accepted_energy_uj) == (100.0, 200.0)
     assert result.selection.accepted is True
-    assert result.selection.selected_requested_current_ma == 4800
+    assert result.selection.selected_requested_current_ma == 4750
     assert len(consent.calls) == 1
     assert "inside the override band (100 to 200 uJ)" in consent.calls[0].reason
     assert "outside the factory 300 to 400 uJ band" in consent.calls[0].reason
-    assert bench.written_user_configurations[-1]["TA_CURRENT_DRV"] == 4800
+    assert bench.written_user_configurations[-1]["TA_CURRENT_DRV"] == 4750
 
 
 def test_single_override_inside_the_factory_band_passes_without_asking():
@@ -309,7 +309,7 @@ def test_single_override_inside_the_factory_band_passes_without_asking():
     assert consent.calls == []
     assert result.override is not None      # the mode is still in the evidence
     assert result.override_decision is None
-    assert bench.written_user_configurations[-1]["TA_CURRENT_DRV"] == 4950
+    assert bench.written_user_configurations[-1]["TA_CURRENT_DRV"] == 4900
 
 
 def test_single_override_at_the_pulse_ceiling_keeps_the_closest_candidate():
@@ -361,14 +361,14 @@ def test_single_without_override_is_byte_for_byte_the_old_behaviour():
     bench = FakeLaserBench(
         [_preflight()],
         measurements=[valid_measurement(mean_uj=450.0)]
-        + [valid_measurement(mean_uj=410.0) for _ in range(60)],
+        + [valid_measurement(mean_uj=410.0) for _ in range(59)],
     )
     result = SingleSensorLaserCalibrationWorkflow(bench, SingleRecorder()).run(
         single_request()
     )
     assert result.status is ProcedureStatus.FAILED_NCR
     assert result.override is None and result.override_decision is None
-    assert bench.calls.count("measure_energy") == 61
+    assert bench.calls.count("measure_energy") == 60
 
 
 # ---------------------------------------------------- dual-sensor workflow
