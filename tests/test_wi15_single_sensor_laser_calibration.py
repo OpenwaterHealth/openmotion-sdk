@@ -696,7 +696,7 @@ def test_mutating_bench_write_cannot_change_the_approved_default_readback_contra
 
 @pytest.mark.parametrize(
     ("actual_current", "expected_status"),
-    [(5100.0, ProcedureStatus.PASSED), (5101.0, ProcedureStatus.FAILED)],
+    [(5049.0, ProcedureStatus.PASSED), (5050.0, ProcedureStatus.FAILED)],
 )
 def test_active_default_registers_allow_only_inclusive_two_percent_quantization(
     actual_current, expected_status
@@ -710,7 +710,7 @@ def test_active_default_registers_allow_only_inclusive_two_percent_quantization(
 
     assert result.status is expected_status
     assert result.configurations[0].name == "TA_CURRENT_DRV"
-    assert result.configurations[0].requested == 5000
+    assert result.configurations[0].requested == 4950
     assert result.configurations[0].actual == actual_current
     if expected_status is ProcedureStatus.FAILED:
         assert result.failure_kind is FailureKind.CONFIGURATION
@@ -720,7 +720,7 @@ def test_active_default_registers_allow_only_inclusive_two_percent_quantization(
 @pytest.mark.parametrize(
     ("name", "actual"),
     [
-        ("TA_CURRENT_DRV", 5150.0),
+        ("TA_CURRENT_DRV", 5100.0),
         ("TA_PULSE_WIDTH", 515.0),
         ("SEED_CW_GAIN", 143.0),
         ("EE_PULSE_WIDTH_UL", 567.0),
@@ -875,7 +875,7 @@ def test_invalid_initial_measurement_is_recorded_checkpointed_and_never_advances
     assert "tuning" not in [event.stage for event in result.events]
     assert bench.calls[bench.calls.index("measure_energy") + 1] == "stop_trigger"
     assert len(result.active_default_restore) == 5
-    restore_index = bench.calls.index("write_register:TA_CURRENT_DRV:5000")
+    restore_index = bench.calls.index("write_register:TA_CURRENT_DRV:4950")
     assert max(
         index for index, call in enumerate(bench.calls) if call == "stop_trigger"
     ) < restore_index
@@ -932,7 +932,7 @@ def test_persistent_measurement_stop_failure_is_reported_without_losing_failure_
     assert result.events[-2].stage == "trigger_cleanup"
     assert bench.calls.count("stop_trigger") == 2
     assert len(result.active_default_restore) == 5
-    restore_index = bench.calls.index("write_register:TA_CURRENT_DRV:5000")
+    restore_index = bench.calls.index("write_register:TA_CURRENT_DRV:4950")
     assert max(
         index for index, call in enumerate(bench.calls) if call == "stop_trigger"
     ) < restore_index
@@ -978,7 +978,7 @@ def test_exact_350_rejects_a_distinct_final_measurement_outside_300_to_400(
     assert bench.calls.count("measure_energy") == 2
     assert len(bench.written_user_configurations) == 1
     assert len(result.active_default_restore) == 5
-    restore_index = bench.calls.index("write_register:TA_CURRENT_DRV:5000")
+    restore_index = bench.calls.index("write_register:TA_CURRENT_DRV:4950")
     assert bench.calls[restore_index - 1] == "stop_trigger"
     assert recorder.checkpoints == [result]
 
@@ -986,8 +986,8 @@ def test_exact_350_rejects_a_distinct_final_measurement_outside_300_to_400(
 @pytest.mark.parametrize(
     ("name", "final_actual", "expected_status"),
     [
-        ("TA_CURRENT_DRV", 5100.0, ProcedureStatus.PASSED),
-        ("TA_CURRENT_DRV", 5100.001, ProcedureStatus.FAILED),
+        ("TA_CURRENT_DRV", 5049.0, ProcedureStatus.PASSED),
+        ("TA_CURRENT_DRV", 5049.001, ProcedureStatus.FAILED),
         ("TA_PULSE_WIDTH", 490.0, ProcedureStatus.PASSED),
         ("TA_PULSE_WIDTH", 489.999, ProcedureStatus.FAILED),
     ],
@@ -1024,7 +1024,7 @@ def test_final_requested_ta_settings_require_inclusive_two_percent_active_readba
     if expected_status is ProcedureStatus.FAILED:
         assert result.failure_kind is FailureKind.CONFIGURATION
         assert len(result.active_default_restore) == 5
-        restore_index = bench.calls.index("write_register:TA_CURRENT_DRV:5000")
+        restore_index = bench.calls.index("write_register:TA_CURRENT_DRV:4950")
         assert max(
             index for index, call in enumerate(bench.calls) if call == "stop_trigger"
         ) < restore_index
@@ -1046,15 +1046,15 @@ def test_downward_tuning_uses_50_ma_steps_and_reapplies_the_closer_prior_candida
     assert result.status is ProcedureStatus.PASSED
     register_writes = [call for call in bench.calls if call.startswith("write_register:")]
     assert register_writes == [
-        "write_register:TA_CURRENT_DRV:4950",
         "write_register:TA_CURRENT_DRV:4900",
-        "write_register:TA_CURRENT_DRV:4950",
+        "write_register:TA_CURRENT_DRV:4850",
+        "write_register:TA_CURRENT_DRV:4900",
     ]
     for write in register_writes[:2]:
         write_index = bench.calls.index(write)
         assert bench.calls[write_index + 1] == "measure_energy"
     assert all(item.name == "TA_CURRENT_DRV" for item in result.adjustments)
-    assert [item.requested for item in result.adjustments] == [4950, 4900, 4950]
+    assert [item.requested for item in result.adjustments] == [4900, 4850, 4900]
     assert [candidate.measurement.mean_uj for candidate in result.candidates] == [
         380.0,
         360.0,
@@ -1062,11 +1062,11 @@ def test_downward_tuning_uses_50_ma_steps_and_reapplies_the_closer_prior_candida
     ]
     assert result.selection is not None
     assert result.selection.direction == "downward_current"
-    assert result.selection.selected_requested_current_ma == 4950
+    assert result.selection.selected_requested_current_ma == 4900
     assert result.selection.selected_mean_uj == 360.0
     assert result.requested_final_config == {
         **DEFAULT_USER_CONFIG,
-        "TA_CURRENT_DRV": 4950,
+        "TA_CURRENT_DRV": 4900,
     }
 
 
@@ -1087,22 +1087,22 @@ def test_injected_validation_target_exercises_downward_current_without_changing_
     ).run(_request())
 
     assert result.status is ProcedureStatus.PASSED
-    assert [item.requested for item in result.adjustments] == [4950, 4900]
+    assert [item.requested for item in result.adjustments] == [4900, 4850]
     assert result.selection is not None
     assert result.selection.direction == "downward_current"
-    assert result.selection.selected_requested_current_ma == 4900
+    assert result.selection.selected_requested_current_ma == 4850
     assert result.selection.selected_mean_uj == 300.0
     assert "closest to 300 uJ" in result.selection.rationale
     assert result.requested_final_config == {
         **DEFAULT_USER_CONFIG,
-        "TA_CURRENT_DRV": 4900,
+        "TA_CURRENT_DRV": 4850,
     }
 
 
 def test_downward_tuning_can_pass_with_the_only_in_range_candidate_at_2000_ma():
     """Treating the floor itself as failure would discard an acceptable reachable result."""
     tuning_measurements = [
-        _valid_measurement(mean_uj=450.0) for _ in range(59)
+        _valid_measurement(mean_uj=450.0) for _ in range(58)
     ] + [_valid_measurement(mean_uj=320.0)]
     bench = FakeLaserBench(
         [_preflight()],
@@ -1116,7 +1116,7 @@ def test_downward_tuning_can_pass_with_the_only_in_range_candidate_at_2000_ma():
         call for call in bench.calls if call.startswith("write_register:TA_CURRENT_DRV:")
     ]
     assert current_writes[-1] == "write_register:TA_CURRENT_DRV:2000"
-    assert len(current_writes) == 60
+    assert len(current_writes) == 59
     assert result.selection is not None
     assert result.selection.selected_requested_current_ma == 2000
     assert result.requested_final_config["TA_CURRENT_DRV"] == 2000
@@ -1127,7 +1127,7 @@ def test_downward_tuning_fails_ncr_at_2000_when_every_candidate_is_out_of_range(
     bench = FakeLaserBench(
         [_preflight()],
         measurements=[_valid_measurement(mean_uj=450.0)]
-        + [_valid_measurement(mean_uj=410.0) for _ in range(60)],
+        + [_valid_measurement(mean_uj=410.0) for _ in range(59)],
     )
     recorder = FakeRecorder()
 
@@ -1138,10 +1138,10 @@ def test_downward_tuning_fails_ncr_at_2000_when_every_candidate_is_out_of_range(
     current_writes = [
         call for call in bench.calls if call.startswith("write_register:TA_CURRENT_DRV:")
     ]
-    tuning_current_writes = [call for call in current_writes if not call.endswith(":5000")]
+    tuning_current_writes = [call for call in current_writes if not call.endswith(":4950")]
     assert tuning_current_writes[-1] == "write_register:TA_CURRENT_DRV:2000"
     assert not any(call.endswith(":1950") for call in tuning_current_writes)
-    assert bench.calls.count("measure_energy") == 61
+    assert bench.calls.count("measure_energy") == 60
     assert len(bench.written_user_configurations) == 1
     assert len(result.active_default_restore) == 5
     assert result.active_default_restore_failure is None
@@ -1154,7 +1154,7 @@ def test_downward_tuning_fails_ncr_at_2000_when_every_candidate_is_out_of_range(
     assert result.selection.selected_mean_uj == 410.0
     assert "closest" in result.selection.rationale.lower()
     assert "outside" in result.selection.rationale.lower()
-    restore_index = bench.calls.index("write_register:TA_CURRENT_DRV:5000")
+    restore_index = bench.calls.index("write_register:TA_CURRENT_DRV:4950")
     assert bench.calls[restore_index - 1] == "stop_trigger"
     assert recorder.checkpoints == [result]
 
@@ -1164,7 +1164,7 @@ def test_downward_tuning_fails_ncr_at_2000_when_every_candidate_is_out_of_range(
     [
         (
             [_valid_measurement(mean_uj=380.0), _valid_measurement(n=25)],
-            SettingReadback("TA_CURRENT_DRV", 4950, 4950),
+            SettingReadback("TA_CURRENT_DRV", 4900, 4900),
             FailureKind.MEASUREMENT,
         ),
         (
@@ -1196,9 +1196,9 @@ def test_downward_tuning_quality_or_write_error_fails_without_passing_handoff(
     "immediate_evidence",
     [
         object(),
-        SettingReadback("TA_PULSE_WIDTH", 4950, 4950),
-        SettingReadback("TA_CURRENT_DRV", 4900, 4900),
-        SettingReadback("TA_CURRENT_DRV", 4950, 4800),
+        SettingReadback("TA_PULSE_WIDTH", 4900, 4900),
+        SettingReadback("TA_CURRENT_DRV", 4850, 4850),
+        SettingReadback("TA_CURRENT_DRV", 4900, 4750),
     ],
     ids=["wrong-type", "wrong-name", "wrong-request", "wrong-actual"],
 )
@@ -1217,7 +1217,7 @@ def test_adjustment_immediate_readback_is_validated_before_any_later_matching_re
     assert result.status is ProcedureStatus.FAILED
     assert result.failure_kind is FailureKind.CONFIGURATION
     assert "measure_energy" not in bench.calls[
-        bench.calls.index("write_register:TA_CURRENT_DRV:4950") + 1 :
+        bench.calls.index("write_register:TA_CURRENT_DRV:4900") + 1 :
     ]
     if isinstance(immediate_evidence, SettingReadback):
         assert result.adjustments[-1] == immediate_evidence
@@ -1299,7 +1299,7 @@ def test_upward_tuning_at_600_below_300_is_immediate_ncr_and_never_exceeds_ceili
     assert result.selection.selected_mean_uj == 290.0
     assert "600" in result.selection.rationale
     assert "below 300" in result.selection.rationale
-    restore_index = bench.calls.index("write_register:TA_CURRENT_DRV:5000")
+    restore_index = bench.calls.index("write_register:TA_CURRENT_DRV:4950")
     assert bench.calls[restore_index - 1] == "stop_trigger"
     assert recorder.checkpoints == [result]
 
@@ -1344,13 +1344,13 @@ def test_upward_closest_outside_at_ceiling_retains_rejected_selection_evidence()
     assert result.selection.direction == "upward_pulse"
     assert result.selection.decision_kind == "closest_candidate"
     assert result.selection.accepted is False
-    assert result.selection.selected_requested_current_ma == 5000
+    assert result.selection.selected_requested_current_ma == 4950
     assert result.selection.selected_requested_pulse_width_us == 600
     assert result.selection.selected_mean_uj == 410.0
     assert "closest" in result.selection.rationale.lower()
     assert "outside" in result.selection.rationale.lower()
     assert len(result.active_default_restore) == 5
-    restore_index = bench.calls.index("write_register:TA_CURRENT_DRV:5000")
+    restore_index = bench.calls.index("write_register:TA_CURRENT_DRV:4950")
     assert bench.calls[restore_index - 1] == "stop_trigger"
     assert len(bench.written_user_configurations) == 1
 
@@ -1368,7 +1368,7 @@ def test_upward_temporary_limit_readback_error_fails_before_any_pulse_adjustment
 
     assert result.status is ProcedureStatus.FAILED
     assert result.failure_kind is FailureKind.CONFIGURATION
-    writes_before_cleanup = bench.calls[: bench.calls.index("write_register:TA_CURRENT_DRV:5000")]
+    writes_before_cleanup = bench.calls[: bench.calls.index("write_register:TA_CURRENT_DRV:4950")]
     assert "write_register:TA_PULSE_WIDTH:510" not in writes_before_cleanup
     assert len(bench.written_user_configurations) == 1
     assert recorder.checkpoints == [result]
@@ -1383,15 +1383,15 @@ def test_downward_handoff_persists_requested_current_after_final_acceptance_not_
             _valid_measurement(mean_uj=340.0),
             _valid_measurement(mean_uj=345.0),
         ],
-        register_readbacks={"TA_CURRENT_DRV": [5000, 4949, 4949]},
+        register_readbacks={"TA_CURRENT_DRV": [4950, 4899, 4899]},
     )
 
     result = SingleSensorLaserCalibrationWorkflow(bench, FakeRecorder()).run(_request())
 
     assert result.status is ProcedureStatus.PASSED
-    assert result.candidates[-1].requested_current_ma == 4950
-    assert result.candidates[-1].actual_current_ma == 4949
-    assert result.requested_final_config["TA_CURRENT_DRV"] == 4950
+    assert result.candidates[-1].requested_current_ma == 4900
+    assert result.candidates[-1].actual_current_ma == 4899
+    assert result.requested_final_config["TA_CURRENT_DRV"] == 4900
     assert result.requested_final_config["EE_PULSE_WIDTH_UL"] == 550
     assert result.requested_final_config["OPT_PULSE_WIDTH_UL"] == 550
     assert result.final_config_readback == result.requested_final_config
@@ -1457,7 +1457,7 @@ def test_passing_configuration_write_failure_returns_failed_after_final_acceptan
     assert len(bench.written_user_configurations) == 2
     assert bench.calls.count("measure_energy") == 2
     assert len(result.active_default_restore) == 5
-    restore_index = bench.calls.index("write_register:TA_CURRENT_DRV:5000")
+    restore_index = bench.calls.index("write_register:TA_CURRENT_DRV:4950")
     assert max(
         index for index, call in enumerate(bench.calls) if call == "stop_trigger"
     ) < restore_index
@@ -1481,7 +1481,7 @@ def test_passing_configuration_write_exception_is_a_configuration_failure():
     assert result.final_config_readback is None
     assert len(bench.written_user_configurations) == 2
     assert len(result.active_default_restore) == 5
-    restore_index = bench.calls.index("write_register:TA_CURRENT_DRV:5000")
+    restore_index = bench.calls.index("write_register:TA_CURRENT_DRV:4950")
     assert max(
         index for index, call in enumerate(bench.calls) if call == "stop_trigger"
     ) < restore_index
@@ -1516,7 +1516,7 @@ def test_passing_configuration_requires_exact_complete_immediate_readback(final_
     assert result.final_config_readback == final_readback
     assert len(bench.written_user_configurations) == 2
     assert len(result.active_default_restore) == 5
-    restore_index = bench.calls.index("write_register:TA_CURRENT_DRV:5000")
+    restore_index = bench.calls.index("write_register:TA_CURRENT_DRV:4950")
     assert max(
         index for index, call in enumerate(bench.calls) if call == "stop_trigger"
     ) < restore_index
@@ -1530,7 +1530,7 @@ def test_adjustment_failure_records_best_effort_active_default_restore_after_sto
         [_preflight()],
         measurements=[_valid_measurement(mean_uj=380.0), _valid_measurement(n=25)],
         register_write_outcomes=[
-            SettingReadback("TA_CURRENT_DRV", 4950, 4950),
+            SettingReadback("TA_CURRENT_DRV", 4900, 4900),
             None,
             SettingReadback("TA_PULSE_WIDTH", 500, 500),
             SettingReadback("SEED_CW_GAIN", 140, 140),
@@ -1550,7 +1550,7 @@ def test_adjustment_failure_records_best_effort_active_default_restore_after_sto
         "OPT_PULSE_WIDTH_UL",
     ]
     assert "TA_CURRENT_DRV restore returned malformed evidence" in result.active_default_restore_failure
-    cleanup_index = bench.calls.index("write_register:TA_CURRENT_DRV:5000")
+    cleanup_index = bench.calls.index("write_register:TA_CURRENT_DRV:4950")
     assert bench.calls[cleanup_index - 1] == "stop_trigger"
 
 
@@ -1565,7 +1565,7 @@ def test_adjustment_failure_records_best_effort_active_default_restore_after_sto
         FakeLaserBench(
             [_preflight()],
             register_readbacks={
-                "TA_CURRENT_DRV": [5000, RuntimeError("register read failed")]
+                "TA_CURRENT_DRV": [4950, RuntimeError("register read failed")]
             },
         ),
     ],
@@ -1605,7 +1605,7 @@ def test_persistent_post_firing_restore_failures_do_not_replace_primary_ncr():
         "OPT_PULSE_WIDTH_UL restore returned malformed evidence"
     )
     assert result.active_default_restore == ()
-    restore_index = bench.calls.index("write_register:TA_CURRENT_DRV:5000")
+    restore_index = bench.calls.index("write_register:TA_CURRENT_DRV:4950")
     assert bench.calls[restore_index - 1] == "stop_trigger"
     assert len(bench.written_user_configurations) == 1
     assert recorder.checkpoints == [result]
@@ -1641,7 +1641,7 @@ def test_end_to_end_downward_pass_persists_and_reports_the_final_handoff(tmp_pat
     persisted_result = json.loads(recorder.json_path.read_text(encoding="utf-8"))
     assert persisted_result["status"] == "passed"
     assert persisted_result["selection"]["direction"] == "downward_current"
-    assert persisted_result["selection"]["selected_requested_current_ma"] == 4950
+    assert persisted_result["selection"]["selected_requested_current_ma"] == 4900
     assert bench.calls == [
         "preflight:left",
         "read_user_configuration",
@@ -1656,20 +1656,20 @@ def test_end_to_end_downward_pass_persists_and_reports_the_final_handoff(tmp_pat
         "read_trigger_rate_hz",
         "measure_energy",
         "stop_trigger",
-        "write_register:TA_CURRENT_DRV:4950",
-        "measure_energy",
-        "stop_trigger",
         "write_register:TA_CURRENT_DRV:4900",
         "measure_energy",
         "stop_trigger",
-        "write_register:TA_CURRENT_DRV:4950",
+        "write_register:TA_CURRENT_DRV:4850",
+        "measure_energy",
+        "stop_trigger",
+        "write_register:TA_CURRENT_DRV:4900",
         "measure_energy",
         "stop_trigger",
         "read_register:TA_CURRENT_DRV",
         "read_register:TA_PULSE_WIDTH",
         "write_user_configuration",
     ]
-    expected_handoff = {**DEFAULT_USER_CONFIG, "TA_CURRENT_DRV": 4950}
+    expected_handoff = {**DEFAULT_USER_CONFIG, "TA_CURRENT_DRV": 4900}
     assert bench.written_user_configurations == [
         dict(DEFAULT_USER_CONFIG),
         expected_handoff,
@@ -1693,11 +1693,11 @@ def test_end_to_end_downward_pass_persists_and_reports_the_final_handoff(tmp_pat
     assert final_json["final_setting_checks"] == [
         {
             "absolute_difference": 0,
-            "actual": 4950,
+            "actual": 4900,
             "name": "TA_CURRENT_DRV",
             "passed": True,
             "percent_difference": 0.0,
-            "requested": 4950,
+            "requested": 4900,
             "tolerance_percent": 2.0,
         },
         {
@@ -1718,7 +1718,7 @@ def test_end_to_end_downward_pass_persists_and_reports_the_final_handoff(tmp_pat
     assert final_json["sdk_version"] in html
     assert "Passing tuned User Configuration" in html
     assert "downward_current" in html
-    assert "4950" in html
+    assert "4900" in html
     assert 'href="run.json"' in html
 
 
@@ -1759,7 +1759,7 @@ def test_end_to_end_upward_ceiling_ncr_restores_defaults_without_handoff(tmp_pat
             "so closest-candidate selection was intentionally bypassed."
         ),
         "selected_mean_uj": 290.0,
-        "selected_requested_current_ma": 5000,
+        "selected_requested_current_ma": 4950,
         "selected_requested_pulse_width_us": 600,
     }
     assert bench.calls[:13] == [
@@ -1793,7 +1793,7 @@ def test_end_to_end_upward_ceiling_ncr_restores_defaults_without_handoff(tmp_pat
         )
     assert pulse_calls == expected_pulse_calls
     assert bench.calls[45:] == [
-        "write_register:TA_CURRENT_DRV:5000",
+        "write_register:TA_CURRENT_DRV:4950",
         "write_register:TA_PULSE_WIDTH:500",
         "write_register:SEED_CW_GAIN:140",
         "write_register:EE_PULSE_WIDTH_UL:550",
@@ -1864,7 +1864,7 @@ def test_downward_sweep_checkpoint_survives_interruption_with_complete_evidence(
     assert [item["mean_uj"] for item in payload["measurements"]] == [380.0, 360.0]
     assert len(payload["measurement_criteria"]) == 2
     assert payload["adjustments"] == [
-        {"actual": 4950, "name": "TA_CURRENT_DRV", "requested": 4950}
+        {"actual": 4900, "name": "TA_CURRENT_DRV", "requested": 4900}
     ]
     assert payload["candidates"][-1]["measurement"]["mean_uj"] == 360.0
     assert payload["requested_default_config"] == dict(DEFAULT_USER_CONFIG)
