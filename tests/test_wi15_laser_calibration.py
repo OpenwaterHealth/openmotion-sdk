@@ -90,14 +90,14 @@ def test_wi15_fixed_thresholds_and_default_user_configuration():
     assert TEMPORARY_PULSE_WIDTH_LIMIT_US == 660
     assert DEFAULT_USER_CONFIG == {
         "TA_PULSE_WIDTH": 500,
-        "TA_CURRENT_DRV": 5000,
+        "TA_CURRENT_DRV": 4950,
         "SEED_CW_GAIN": 140,
         "EE_PULSE_WIDTH_UL": 550,
         "EE_RATE_LL": 23125,
-        "EE_DRIVE_CL": 9999,
+        "EE_DRIVE_CL": 5000,
         "OPT_PULSE_WIDTH_UL": 550,
         "OPT_RATE_LL": 23125,
-        "OPT_DRIVE_CL": 9999,
+        "OPT_DRIVE_CL": 7200,
         "TEC_TRIP": 40,
     }
     assert isinstance(DEFAULT_USER_CONFIG["TEC_TRIP"], int)

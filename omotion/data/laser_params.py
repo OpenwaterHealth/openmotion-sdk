@@ -20,7 +20,10 @@ LASER_PARAMS = [
     },
     {
         "friendlyName": "TA_CURRENT_DRV",
-        "dataToSend": [23, 122],
+        # 31248 x 0.16 mA = 4999.68 mA: the 5000 mA EE drive rating as the safety
+        # FPGA holds it (2688 x 1.86 mA). Console firmware that owns the safety
+        # state refuses anything above the unit's EE limit; 31255 was 5000.8 mA.
+        "dataToSend": [16, 122],
     },
     {
         "friendlyName": "SEED_DDS_GAIN",
