@@ -67,11 +67,20 @@ FLASH_SIZE = 0x00200000
 SECTOR = 128 * 1024
 VERSION_ADDR = 0xFFFFFF00
 
-_IDLE, _DNLOAD_IDLE, _UPLOAD_IDLE = 2, 5, 9
+_IDLE, _DNLOAD_IDLE, _MANIFEST_SYNC, _MANIFEST, _UPLOAD_IDLE = 2, 5, 6, 7, 9
+
+_REQUEST_NAMES = {1: "DNLOAD", 2: "UPLOAD", 3: "GETSTATUS", 4: "CLRSTATUS",
+                  5: "GETSTATE", 6: "ABORT"}
 
 
 class FakeUsbDevice:
-    """Enough of a pyusb device, speaking enough DfuSe, to drive STM32DFU."""
+    """Enough of a pyusb device, speaking enough DfuSe, to drive STM32DFU.
+
+    Manifestation follows the Open-Motion bootloaders' DFU class, which is
+    manifestation-tolerant: the zero-length DNLOAD moves to dfuMANIFEST-SYNC,
+    the next GETSTATUS answers dfuMANIFEST and completes manifestation
+    (DFU_Leave), and the bootloader's main loop then reboots on its own (sdk#315).
+    """
 
     idVendor = 0x0483
     idProduct = 0xDF11
@@ -89,10 +98,14 @@ class FakeUsbDevice:
         self.state = _IDLE
         self.status = 0
         self.erased = []            # sector addresses, in order
-        self.manifested = False
+        self.manifested = False     # the zero-length DNLOAD arrived
+        self.manifest_complete = False
+        self.image_written = False  # a data block was programmed
+        self.requests = []          # ("DNLOAD", block, length), ("GETSTATUS",), ("reset",), ...
         self.short_upload = False   # return one byte less than asked
         self.fail_with = None       # exception to raise from every transfer
         self.stuck_busy = False     # never leave dfuDNLOAD-BUSY
+        self.gone_after_manifest = None  # exception for every transfer after the leave
 
     # -- pyusb surface STM32DFU touches ------------------------------------
     def set_configuration(self):
@@ -105,12 +118,27 @@ class FakeUsbDevice:
         return []
 
     def reset(self):
-        pass
+        self.requests.append(("reset",))
 
     def ctrl_transfer(self, request_type, request, value, index, data_or_length):
+        name = _REQUEST_NAMES.get(request, request)
+        if request in (1, 2):
+            length = data_or_length if isinstance(data_or_length, int) else len(data_or_length or b"")
+            self.requests.append((name, value, length))
+        else:
+            self.requests.append((name,))
         if self.fail_with is not None:
             raise self.fail_with
+        if self.manifested and self.gone_after_manifest is not None:
+            raise self.gone_after_manifest
         if request == 3:                                    # GETSTATUS
+            if self.state == _MANIFEST_SYNC and not self.manifest_complete:
+                # Answers dfuMANIFEST; once that status is sent, DFU_Leave()
+                # marks manifestation complete and returns to dfuMANIFEST-SYNC.
+                self.manifest_complete = True
+                return bytes([self.status, 1, 0, 0, _MANIFEST, 0])
+            if self.state == _MANIFEST_SYNC:
+                self.state = _IDLE                          # manifestation-tolerant
             state = 4 if self.stuck_busy else self.state
             return bytes([self.status, 0, 0, 0, state, 0])
         if request == 5:                                    # GETSTATE
@@ -130,7 +158,8 @@ class FakeUsbDevice:
         if block == 0:
             if not payload:
                 self.manifested = True
-                self.state = _IDLE
+                self.manifest_complete = False
+                self.state = _MANIFEST_SYNC
             elif payload[0] == 0x21:
                 self.pointer = struct.unpack_from("<I", payload, 1)[0]
             elif payload[0] == 0x41:
@@ -141,6 +170,7 @@ class FakeUsbDevice:
             return len(payload)
         off = self.pointer - FLASH_BASE + (block - 2) * self.xfer
         self.flash[off:off + len(payload)] = payload
+        self.image_written = True
         return len(payload)
 
     def _upload(self, block, length):
@@ -155,6 +185,24 @@ class FakeUsbDevice:
     def read(self, address, length):
         off = address - FLASH_BASE
         return bytes(self.flash[off:off + length])
+
+    @property
+    def bootloader_reboots(self):
+        """Would the bootloader's main loop reboot into the new image now?
+
+        Mirrors DFU_ImageDownloadComplete() in the bootloaders' usbd_dfu_if.c
+        (1.0.0 to 1.2.0): an image was written, manifestation is complete, and
+        the class sits in dfuMANIFEST-SYNC or dfuIDLE.
+        """
+        return (self.image_written and self.manifest_complete
+                and self.state in (_MANIFEST_SYNC, _IDLE))
+
+    def requests_after_first_write(self):
+        """Every request from the first data block on."""
+        for i, req in enumerate(self.requests):
+            if req[0] == "DNLOAD" and req[1] >= 2:
+                return self.requests[i:]
+        return []
 
 
 def install_fake_usb(monkeypatch, devices):

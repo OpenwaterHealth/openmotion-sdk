@@ -16,9 +16,17 @@ Needs no hardware.
 
 import pytest
 
-from _dfu_fakes import FakeDfuUnit, FakeHandle, TestKeys, make_production
+from _dfu_fakes import (
+    FakeDfuUnit,
+    FakeHandle,
+    FakeUsbDevice,
+    TestKeys,
+    install_fake_usb,
+    make_production,
+)
 from omotion import firmware_update
 from omotion.boot_mode import BootMode
+from omotion.dfu import STM32DFU
 from omotion.dfu.progress import DFUProgress
 from omotion.firmware_update import (
     BootloaderChangeRequired,
@@ -36,6 +44,7 @@ BASE = 0x08000000
 SLOT = 0x08020000
 BARE_METAL_IMAGE = b"\x00\x00\x08\x24\x01\x04\x00\x08" + b"\xa5" * 56
 SENSOR = FirmwareKind.SENSOR
+BOOTLOADER_ALTS = ["@Internal Flash/0x08000000/01*128Ka,04*128Kg,11*128Ka"]
 
 
 @pytest.fixture(scope="module")
@@ -378,6 +387,31 @@ def test_unit_power_cycled_in_time_is_a_normal_success(images):
 
     result = updater.update(FakeHandle(unit), images["baremetal"], kind=SENSOR)
 
+    assert result.app_reenumerated and not result.needs_power_cycle
+
+
+# ---------------------------------------------------------------------------
+# On the wire: a bootloader unit restarts by itself (sdk#315)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("version, image", [("1.2.0", "signed"), ("1.1.0", "legacy_signed")])
+def test_bootloader_unit_restarts_into_the_new_image_without_a_power_cycle(
+        monkeypatch, images, version, image):
+    """Through the real STM32DFU: nothing resets the device after the write,
+    and the bootloader is left in the state its main loop reboots from, so the
+    application comes back without a power cycle. 1.1.0 is the bootloader the
+    old dfu-util path (USB reset after the leave) wedged on 2026-10-07."""
+    dev = FakeUsbDevice(version=version)
+    install_fake_usb(monkeypatch, [dev])
+    monkeypatch.setattr(STM32DFU, "alt_setting_names", lambda self: BOOTLOADER_ALTS)
+    updater = FirmwareUpdater(app_present=lambda kind, handle: dev.bootloader_reboots)
+    updater.app_wait_timeout_s = 0
+    data = images[image].read_bytes()
+
+    result = updater.update(None, images[image], kind=SENSOR)
+
+    assert dev.read(SLOT, len(data)) == data
+    assert ("reset",) not in dev.requests_after_first_write()
     assert result.app_reenumerated and not result.needs_power_cycle
 
 
