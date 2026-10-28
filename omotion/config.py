@@ -116,6 +116,14 @@ OW_IMU_GET_MAG = 0x37
 
 
 OW_CODE_SUCCESS = 0x00
+# Console refusal codes (one data byte of an OW_ERROR reply), console firmware
+# with the PTR-2026-1-5 safety-state change (boot-info v2). A refused config
+# write stores nothing.
+OW_CODE_CFG_RANGE = 0xF8  # config write: value not a finite number or out of range
+OW_CODE_CFG_UNKNOWN_KEY = 0xF9  # config write: key not in the console allow-list
+OW_CODE_CFG_SAFETY_KEY = 0xFA  # config write: names a firmware-owned safety parameter
+OW_CODE_NOT_SUPPORTED = 0xFB  # command compiled out of this build (OW_FPGA_PROG on Release/Debug)
+OW_CODE_BUSY = 0xFC  # refused for now: attestation running, or trigger running
 OW_CODE_IDENT_ERROR = 0xFD
 OW_CODE_DATA_ERROR = 0xFE
 OW_CODE_ERROR = 0xFF
@@ -158,6 +166,10 @@ OW_CMD_RESET = 0x0F
 # off, host reset, watchdog, fault ...), boots since power-on, uptime. Parsed by
 # omotion/reset_history.py. See openmotion-sensor-fw #137.
 OW_CMD_RESET_HISTORY = 0x10
+# Console FPGA configuration attestation (console-fw PTR-2026-1-5 change).
+# reserved 0: report; reserved 1: start a run, then report. Parsed by
+# omotion/fpga_attest.py. Sensor modules use 0x10 for OW_CMD_RESET_HISTORY.
+OW_CMD_FPGA_ATTEST = 0x11
 OW_CMD_I2C_BROADCAST = 0x06
 OW_CMD_DEBUG_FLAGS = 0x0C
 OW_CMD_I2C_STATUS = 0x0B
@@ -410,6 +422,10 @@ TRIG_INTERLOCK_SAFETY_UNKNOWN: int = 0x10
 # range, not a settable register, write failed or read back wrong (console-fw
 # CFW-10). Cleared by the next config apply that succeeds.
 TRIG_INTERLOCK_LIMITS: int = 0x20
+# The two safety FPGAs' configuration has not been attested yet (the boot run
+# takes about 6.5 s), or attestation failed: digest mismatch, read failure, or
+# a blank/invalid per-unit safety record. Sticky until a run passes.
+TRIG_INTERLOCK_FPGA_ATTEST: int = 0x40
 TRIG_START_TIMER_FAILED: int = 0x80
 
 _TRIG_REFUSAL_REASONS = (
@@ -419,6 +435,7 @@ _TRIG_REFUSAL_REASONS = (
     (TRIG_INTERLOCK_CONFIG, "console user config invalid or missing; running on defaults until a config is written"),
     (TRIG_INTERLOCK_SAFETY_UNKNOWN, "laser-safety FPGA status unreadable (EE/OPT not responding)"),
     (TRIG_INTERLOCK_LIMITS, "a safety limit in the console config was not applied (out of range or failed read-back)"),
+    (TRIG_INTERLOCK_FPGA_ATTEST, "safety FPGA configuration not attested yet, or attestation failed (see get_fpga_attestation)"),
     (TRIG_START_TIMER_FAILED, "FSYNC timer failed to start"),
 )
 

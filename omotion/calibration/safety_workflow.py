@@ -14,6 +14,8 @@ try:
 except (ImportError, AttributeError):
     _RUNTIME_SDK_VERSION = "unavailable"
 
+from omotion.fpga_attest import FACTORY_IMAGE_REQUIRED
+
 from .laser import (
     CriterionResult,
     DeviceIdentity,
@@ -99,6 +101,10 @@ class ConsolePreflightSnapshot:
     topology: TopologySnapshot
     console_identity: DeviceIdentity
     console_responsive: bool
+    safety_keys_writable: bool | None = None
+    """False on console firmware that refuses the safety config keys (a
+    Release or Debug image with boot-info v2); True on a Factory image; None
+    on older firmware, which has no such check."""
 
 
 @dataclass(frozen=True)
@@ -563,6 +569,8 @@ class SafetyCalibrationWorkflow:
             raise _ProcedureFailure(
                 FailureKind.SETUP, "Console did not pass the responsiveness check."
             )
+        if preflight.safety_keys_writable is False:
+            raise _ProcedureFailure(FailureKind.SETUP, FACTORY_IMAGE_REQUIRED)
         if not validate_serial(preflight.console_identity.serial).passed:
             raise _ProcedureFailure(
                 FailureKind.SETUP, "Console serial number is missing or blank."

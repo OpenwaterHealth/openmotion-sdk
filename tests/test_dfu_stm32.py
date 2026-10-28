@@ -102,6 +102,33 @@ def test_download_erases_the_covered_sectors_and_writes_the_image(connected):
     assert dev.manifested
 
 
+def test_download_ends_the_way_the_bootloader_reboots_from(connected):
+    """sdk#315: the bootloaders' DFU class is manifestation-tolerant, so it does
+    not reset itself. Its main loop reboots once the host has read status after
+    the zero-length DNLOAD. The dfu-util path sent a USB reset right after that
+    leave, and the sensor sat wedged in DFU until a power cycle. So the download
+    ends with the DNLOAD and one GETSTATUS, and nothing resets the device."""
+    dfu, dev = connected
+
+    dfu.download(SLOT, bytes(range(256)) * 12)
+    dfu.disconnect()
+
+    assert dev.requests[-2:] == [("DNLOAD", 0, 0), ("GETSTATUS",)]
+    assert ("reset",) not in dev.requests_after_first_write()
+    assert dev.bootloader_reboots
+
+
+def test_download_does_not_fail_when_the_unit_is_gone_before_the_last_status(connected):
+    """The unit may reset before it answers the status read after the leave;
+    the image is written by then, so that is not a failure."""
+    dfu, dev = connected
+    dev.gone_after_manifest = usb_error("LIBUSB_ERROR_TIMEOUT")
+
+    dfu.download(SLOT, b"\x06" * 2048)
+
+    assert dev.manifested and dev.read(SLOT, 2048) == b"\x06" * 2048
+
+
 def test_download_without_manifest_leaves_the_device_in_dfu(connected):
     """The ROM loader starts the image at the manifestation, so a write that is
     still to be verified must not send it."""

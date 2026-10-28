@@ -608,6 +608,12 @@ class STM32DFU:
         After the manifestation the device issues NVIC_SystemReset(); the
         bootloader then verifies the signature and launches the app if valid.
         The STM32 ROM loader jumps to the image straight away.
+
+        The Open-Motion bootloaders' DFU class is manifestation-tolerant: the
+        reset comes from the bootloader's main loop once the host has read status
+        after the zero-length DNLOAD. Do not follow this with a USB reset. The
+        dfu-util path did (``-R`` after ``:leave``) and left a sensor wedged in
+        DFU until a power cycle (sdk#315).
         """
         data  = bytes(data)
         total = len(data)
