@@ -35,8 +35,8 @@ _SIDE_STR_TO_INT = {"left": 0, "right": 1}
 _SIDE_INT_TO_STR = ("left", "right")
 
 # Higher rank = worse quality; the side average inherits the worst quality
-# of any camera that contributed to it. Mirrors sinks._QUALITY_RANK.
-_QUALITY_RANK = {"ok": 0, "ts_corrected": 1, "nan_filled": 2}
+# of any camera that contributed to it.
+_QUALITY_RANK = {"ok": 0, "ts_corrected": 1, "low_light": 2, "nan_filled": 3}
 
 
 def _mask_to_cam_indices(mask: int) -> np.ndarray:
