@@ -87,6 +87,40 @@ class Calibration:
             source="default",
         )
 
+    def with_overrides(self, overrides: Optional[dict]) -> "Calibration":
+        """A copy with some arrays replaced, for one scan's
+        ``ScanRequest.calibration_override``.
+
+        ``overrides`` maps any of ``"c_min"``, ``"c_max"``, ``"i_min"``,
+        ``"i_max"`` to a value broadcastable to ``(2, 8)`` (a scalar applies to
+        every camera). The rest are kept, so e.g. ``{"i_max": 400.0}`` changes
+        only the BVI full-scale. Raises ``ValueError`` on an unknown key, a
+        non-finite value, or a result that is not monotonic. Empty or ``None``
+        returns ``self``.
+        """
+        if not overrides:
+            return self
+        unknown = set(overrides) - {"c_min", "c_max", "i_min", "i_max"}
+        if unknown:
+            raise ValueError(f"unknown calibration override keys {sorted(unknown)}")
+        arrays = {"c_min": self.c_min, "c_max": self.c_max,
+                  "i_min": self.i_min, "i_max": self.i_max}
+        for key, val in overrides.items():
+            try:
+                arr = np.broadcast_to(np.asarray(val, dtype=float), _EXPECTED_SHAPE)
+            except (TypeError, ValueError) as e:
+                raise ValueError(
+                    f"calibration override {key} must be a number or {_EXPECTED_SHAPE} array: {e}"
+                ) from e
+            if not np.all(np.isfinite(arr)):
+                raise ValueError(f"calibration override {key} contains NaN or inf")
+            arrays[key] = arr.copy()
+        if not np.all(arrays["c_max"] > arrays["c_min"]):
+            raise ValueError("calibration override leaves C_max not above C_min")
+        if not np.all(arrays["i_max"] > arrays["i_min"]):
+            raise ValueError("calibration override leaves I_max not above I_min")
+        return Calibration(**arrays, source="override")
+
 
 def parse_calibration(json_data: dict) -> Optional[Calibration]:
     """Parse a console JSON config dict into a Calibration or None.

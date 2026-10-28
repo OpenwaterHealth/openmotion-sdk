@@ -186,3 +186,57 @@ def test_realtime_nonpositive_mean_yields_nan_contrast():
     ShotNoiseCorrectionStage(pedestals=PEDESTALS, camera_gain_map=CAMERA_GAIN_MAP).process(batch)
 
     assert np.all(np.isnan(batch.contrast_sn_rt))
+
+
+# ── Per-side gain map (Optimize Laser) ───────────────────────────────────────
+# Optimize Laser solves a gain per camera on each module, so the map can be
+# (2, 8). An (8,) map still applies to both sides.
+
+# Left: fractional gains; right: the stock map.
+PER_SIDE_GAINS = np.array([[2.5, 1.25, 1.0, 1.0, 1.0, 1.0, 1.25, 2.5],
+                           list(CAMERA_GAIN_MAP)], dtype=np.float32)
+
+
+def test_realtime_uses_each_sides_own_gains():
+    mean = np.full((1, 2, 8), 100.0, dtype=np.float32)
+    std = np.full((1, 2, 8), 30.0, dtype=np.float32)
+    batch = _batch_with_dc_rt(mean, std)
+
+    ShotNoiseCorrectionStage(pedestals=PEDESTALS, camera_gain_map=PER_SIDE_GAINS).process(batch)
+
+    for side in range(2):
+        expected_var = 30.0 ** 2 - ADC_GAIN * 100.0 * PER_SIDE_GAINS[side]
+        np.testing.assert_allclose(batch.std_sn_rt[0, side], np.sqrt(expected_var), rtol=1e-5)
+
+
+def test_batch_uses_the_frames_side_gain():
+    left = _corrected_frame(100.0, 30.0)
+    right = _corrected_frame(100.0, 30.0)
+    right.side = "right"
+    batch = _corrected_interval_batch([left, right])
+
+    ShotNoiseCorrectionStage(pedestals=PEDESTALS, camera_gain_map=PER_SIDE_GAINS).process(batch)
+
+    for f, gain in ((left, PER_SIDE_GAINS[0, 0]), (right, PER_SIDE_GAINS[1, 0])):
+        assert f.std == pytest.approx((30.0 ** 2 - ADC_GAIN * 100.0 * float(gain)) ** 0.5)
+
+
+def test_one_side_map_matches_the_same_map_on_both_sides():
+    mean = np.full((1, 2, 8), 100.0, dtype=np.float32)
+    std = np.full((1, 2, 8), 30.0, dtype=np.float32)
+    one, both = _batch_with_dc_rt(mean, std), _batch_with_dc_rt(mean.copy(), std.copy())
+
+    ShotNoiseCorrectionStage(pedestals=PEDESTALS, camera_gain_map=CAMERA_GAIN_MAP).process(one)
+    ShotNoiseCorrectionStage(pedestals=PEDESTALS,
+                             camera_gain_map=np.tile(CAMERA_GAIN_MAP, (2, 1))).process(both)
+
+    np.testing.assert_array_equal(one.std_sn_rt, both.std_sn_rt)
+
+
+@pytest.mark.parametrize("bad", [
+    np.ones(7), np.ones((2, 7)), np.ones((3, 8)), np.ones((2, 8, 1)),
+    np.zeros(8), -np.ones(8), np.full(8, np.nan), np.full((2, 8), np.inf),
+])
+def test_bad_gain_map_is_rejected(bad):
+    with pytest.raises(ValueError):
+        ShotNoiseCorrectionStage(pedestals=PEDESTALS, camera_gain_map=bad)
