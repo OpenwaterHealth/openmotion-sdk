@@ -96,6 +96,7 @@ class MotionInterface:
         self._scan_workflow = None
         self._calibration_workflow = None
         self._cq_workflow = None
+        self._optimize_laser_workflow = None
         self._monitor: Optional[ConnectionMonitor] = None
         self._started = False
 
@@ -345,6 +346,19 @@ class MotionInterface:
                 scan_workflow=self.scan_workflow
             )
         return self._cq_workflow
+
+    @property
+    def optimize_laser_workflow(self):
+        """Lazy-loaded :class:`~omotion.OptimizeLaserWorkflow.OptimizeLaserWorkflow`.
+
+        Its short scans go through :attr:`scan_workflow`, so a run can't
+        overlap a scan or a CQ check. Pre-envelope console firmware only.
+        """
+        if self._optimize_laser_workflow is None:
+            from omotion.OptimizeLaserWorkflow import OptimizeLaserWorkflow
+
+            self._optimize_laser_workflow = OptimizeLaserWorkflow(self)
+        return self._optimize_laser_workflow
 
     @property
     def calibration_running(self) -> bool:

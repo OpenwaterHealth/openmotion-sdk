@@ -4,10 +4,11 @@ Pure algorithm, no hardware I/O: :mod:`.estimate` (saturation-aware frame
 brightness), :mod:`.settings` (the settings menu, hardware limits, gain
 ladder), :mod:`.controller` (the multi-camera controller) and
 :mod:`.firmware` (which console firmware may take the extended laser
-limits). The workflow that applies settings to a device and captures frames
-builds on these.
+limits). :mod:`.actuator` does the device writes, and
+:mod:`omotion.OptimizeLaserWorkflow` runs the whole procedure.
 """
 
+from .actuator import LaserBaseline, LaserCameraActuator
 from .controller import (
     CameraObservation,
     CameraRecord,
@@ -49,6 +50,8 @@ __all__ = [
     "HardwareLimits",
     "IterationRecord",
     "Knob",
+    "LaserBaseline",
+    "LaserCameraActuator",
     "Method",
     "OptimizeLaserSettings",
     "OptimizeStatus",
