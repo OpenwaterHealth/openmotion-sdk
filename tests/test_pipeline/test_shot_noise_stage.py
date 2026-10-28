@@ -186,3 +186,49 @@ def test_realtime_nonpositive_mean_yields_nan_contrast():
     ShotNoiseCorrectionStage(pedestals=PEDESTALS, camera_gain_map=CAMERA_GAIN_MAP).process(batch)
 
     assert np.all(np.isnan(batch.contrast_sn_rt))
+
+
+# --- Per-scan gain maps (sdk#335: the laser optimizer writes its own gains) ---
+
+def test_per_side_gain_map_applies_each_sides_gains_realtime():
+    """A (2, 8) map: each side's Poisson term uses that side's gains."""
+    gains = np.array([[16, 16, 16, 8, 8, 16, 16, 16],
+                      [1, 2, 4, 8, 16, 8, 4, 2]], dtype=np.float32)
+    mean = np.full((1, 2, 8), 100.0, dtype=np.float32)
+    std = np.full((1, 2, 8), 40.0, dtype=np.float32)
+    batch = _batch_with_dc_rt(mean, std)
+
+    ShotNoiseCorrectionStage(pedestals=PEDESTALS, camera_gain_map=gains).process(batch)
+
+    for s in range(2):
+        expected = np.sqrt(40.0 ** 2 - ADC_GAIN * 100.0 * gains[s])
+        np.testing.assert_allclose(batch.std_sn_rt[0, s], expected, rtol=1e-5)
+
+
+def test_per_side_gain_map_applies_on_the_event_path():
+    gains = np.array([[16] * 8, [1] * 8], dtype=np.float32)
+    left = _corrected_frame(100.0, 40.0)
+    right = CorrectedFrame(
+        abs_frame_id=12, t=5.0, side="right", cam_id=0, mean=100.0, std=40.0,
+        raw_u1=100.0, raw_var=1600.0, dark_var=0.0, quality="ok",
+    )
+    batch = _corrected_interval_batch([left, right])
+
+    ShotNoiseCorrectionStage(pedestals=PEDESTALS, camera_gain_map=gains).process(batch)
+
+    out = batch.events[0].corrected_batch.frames
+    assert out[0].std == pytest.approx((1600.0 - ADC_GAIN * 100.0 * 16) ** 0.5)
+    assert out[1].std == pytest.approx((1600.0 - ADC_GAIN * 100.0 * 1) ** 0.5)
+
+
+def test_eight_value_map_still_applies_to_both_sides():
+    """The stock (8,) map behaves exactly as before."""
+    from omotion.pipeline.stages.shot_noise import gain_map_2x8
+    np.testing.assert_array_equal(gain_map_2x8(CAMERA_GAIN_MAP),
+                                  np.tile(CAMERA_GAIN_MAP, (2, 1)))
+
+
+@pytest.mark.parametrize("bad", [[1, 2, 3], [[1] * 8] * 3, [0] * 8, [float("nan")] * 8])
+def test_malformed_gain_map_is_refused(bad):
+    with pytest.raises(ValueError):
+        ShotNoiseCorrectionStage(pedestals=PEDESTALS, camera_gain_map=bad)
