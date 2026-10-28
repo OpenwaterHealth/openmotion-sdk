@@ -19,6 +19,7 @@ import numpy as np
 
 from ..batch import DarkIntegrityWarning, FrameBatch, IntervalClosed, TerminalDarkResult
 from ..pedestal import SensorPedestals
+from ..quality_flags import LOW_LIGHT, join as join_quality
 
 
 logger = logging.getLogger("openmotion.sdk.pipeline.stages.dark")
@@ -201,7 +202,7 @@ class CorrectedFrame:
     raw_var:       float     # u2 - u1^2 (raw variance before dark sub)
     dark_var:      float     # interpolated dark baseline variance
     contrast:      Optional[float] = None  # set by ShotNoiseCorrectionStage
-    quality:       str = "ok"  # the row's batch.quality, or "low_light" (unlit, #341)
+    quality:       str = "ok"  # flag list: the row's batch.quality, plus low_light (unlit, #341)
     temp_c:        Optional[float] = None  # on-chip camera temperature (°C)
 
 
@@ -333,7 +334,7 @@ class LinearInterpolation:
                 # BFI in the -10^5 range (#341). BVI is still computed from
                 # the mean; the quality flag marks the frame as unlit.
                 std = float("nan")
-                quality = "low_light"
+                quality = join_quality(quality, LOW_LIGHT)
 
             corrected_frames.append(CorrectedFrame(
                 abs_frame_id=lf.abs_frame_id, t=lf.t,

@@ -28,16 +28,12 @@ from typing import Optional
 import numpy as np
 
 from ..batch import FrameBatch, IntervalClosed, LiveEmit, SideAverageSample
+from ..quality_flags import NAN_FILLED, OK, has as has_quality, join as join_quality
 from .dark import EnrichedCorrectedFrame, EnrichedCorrectedInterval
 
 
 _SIDE_STR_TO_INT = {"left": 0, "right": 1}
 _SIDE_INT_TO_STR = ("left", "right")
-
-# Higher rank = worse quality; the side average inherits the worst quality
-# of any camera that contributed to it.
-_QUALITY_RANK = {"ok": 0, "ts_corrected": 1, "low_light": 2, "nan_filled": 3}
-
 
 def _mask_to_cam_indices(mask: int) -> np.ndarray:
     return np.array([i for i in range(8) if mask & (1 << i)], dtype=np.int8)
@@ -134,7 +130,7 @@ class SideAverageStage:
             # which sinks use for the same reason.
             if ftypes is not None and str(ftypes[i]) not in ("light", "dark"):
                 continue
-            if quality is not None and str(quality[i]) == "nan_filled":
+            if quality is not None and has_quality(quality[i], NAN_FILLED):
                 continue
             side = int(batch.side_ids[i])
             cam = int(batch.cam_ids[i])
@@ -241,16 +237,15 @@ class SideAverageStage:
                 "t": float(getattr(f, "t", 0.0)),
                 "bfi": np.full(8, np.nan), "bvi": np.full(8, np.nan),
                 "mean": np.full(8, np.nan), "contrast": np.full(8, np.nan),
-                "quality": "ok",
+                "quality": OK,
             }
             self._frames[side][fid] = rec
         rec["bfi"][cam] = float(getattr(f, "bfi", np.nan))
         rec["bvi"][cam] = float(getattr(f, "bvi", np.nan))
         rec["mean"][cam] = float(getattr(f, "mean", np.nan))
         rec["contrast"][cam] = float(getattr(f, "contrast", np.nan))
-        fq = str(getattr(f, "quality", "ok") or "ok")
-        if _QUALITY_RANK.get(fq, 0) > _QUALITY_RANK.get(rec["quality"], 0):
-            rec["quality"] = fq
+        # The side row carries every flag of the cameras behind it.
+        rec["quality"] = join_quality(rec["quality"], getattr(f, "quality", None))
 
     def _emit_frames(self, side: int, fids: list, batch: FrameBatch,
                      *, right_abs: int) -> None:

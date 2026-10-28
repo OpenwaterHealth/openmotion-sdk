@@ -131,7 +131,7 @@ def test_side_average_is_nan_when_every_camera_is_invalid():
     assert np.isnan(_side_average(batch).bfi)
 
 
-def test_side_average_still_inherits_worst_quality_from_invalid_camera():
+def test_side_average_still_inherits_flag_from_invalid_camera():
     """The frame is dropped from the numeric average but its diagnostic flag
     must still reach the record."""
     batch = _batch(

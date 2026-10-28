@@ -25,6 +25,7 @@ from typing import Optional
 import numpy as np
 
 from ..batch import FrameBatch, IntervalClosed
+from ..quality_flags import LOW_LIGHT, OK, has as has_quality
 from .dark import (
     DarkFrameQuadraticStencil,
     EnrichedCorrectedFrame, EnrichedCorrectedInterval,
@@ -174,9 +175,10 @@ class DarkFrameHoldStage:
         # A dark row interpolated from unlit neighbours is unlit too (#341):
         # its NaN BFI/BVI then carries a matching flag instead of "ok".
         neighbours = (left2, left1, right1, right2)
-        quality = ("low_light"
-                   if any(n is not None and n.quality == "low_light" for n in neighbours)
-                   else "ok")
+        quality = (LOW_LIGHT
+                   if any(n is not None and has_quality(n.quality, LOW_LIGHT)
+                          for n in neighbours)
+                   else OK)
 
         return EnrichedCorrectedFrame(
             abs_frame_id=d_prev_abs,
