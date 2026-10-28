@@ -95,13 +95,7 @@ class BfiBviStage:
                     bfi = (1.0 - (contrast - c_min) / c_span) * 10.0
                 else:
                     bfi = contrast * 10.0
-                if f.quality == "low_light":
-                    # Unlit frame: its ~0 mean is a real reading but not a
-                    # blood-volume measurement — mapped, it pinned BVI at the
-                    # top of the scale (10.0) on every row of a covered
-                    # camera (#341). The realtime path leaves it NaN too.
-                    bvi = float("nan")
-                elif i_span > 0:
+                if i_span > 0:
                     bvi = (1.0 - (f.mean - i_min) / i_span) * 10.0
                 else:
                     bvi = f.mean * 10.0

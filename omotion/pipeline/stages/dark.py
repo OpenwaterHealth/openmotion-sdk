@@ -328,10 +328,10 @@ class LinearInterpolation:
                 # Unlit frame (covered sensor, decoupled fiber). Its mean
                 # above the dark baseline is a real ~0 reading and is kept,
                 # but there is no speckle signal: std is undefined, and with
-                # it contrast, BFI and BVI downstream. Without this, a mean
+                # it contrast and BFI downstream. Without this, a mean
                 # scattering just above 0 divided into the residual std gave
-                # BFI in the -10^5 range and BVI pinned at 10 (#341) — the
-                # realtime path already suppresses these frames.
+                # BFI in the -10^5 range (#341). BVI is still computed from
+                # the mean; the quality flag marks the frame as unlit.
                 std = float("nan")
                 quality = "low_light"
 

@@ -497,7 +497,7 @@ std           = √corrected_var
 
 The two clamps to zero prevent imaginary standard deviations when dark subtraction over-corrects due to statistical fluctuations. The result is a `CorrectedFrame(abs_frame_id, t, side, cam_id, mean, std, raw_u1, raw_var, dark_var)`.
 
-**Unlit frames.** A light frame whose raw mean sits at the dark level, `u1 ≤ pedestal + 5` DN, was not lit: a covered sensor, a lifted sensor or a decoupled fiber. This is the same dark-like test the realtime path applies (`low_light_rt`, §11.3), and `DarkCorrectionStage` makes it once per frame for both paths. Such a frame keeps its `mean`, because a value near 0 is a real reading. It gets `std = NaN`, since there is no speckle signal to measure, and `quality = "low_light"`. Downstream, its contrast, BFI and BVI are all NaN (§5.8.5).
+**Unlit frames.** A light frame whose raw mean sits at the dark level, `u1 ≤ pedestal + 5` DN, was not lit: a covered sensor, a lifted sensor or a decoupled fiber. This is the same dark-like test the realtime path applies (`low_light_rt`, §11.3), and `DarkCorrectionStage` makes it once per frame for both paths. Such a frame keeps its `mean`, because a value near 0 is a real reading. It gets `std = NaN`, since there is no speckle signal to measure, and `quality = "low_light"`. Downstream, its contrast and BFI are NaN; BVI is still computed from the mean (§5.8.5).
 
 #### 5.8.5 Enrichment — shot-noise correction + BFI/BVI calibration
 
@@ -520,8 +520,7 @@ else:
         contrast  = shot_std / f.mean   if f.mean > 0 else NaN
 
 bfi           = (1 − (contrast − c_min) / (c_max − c_min)) · 10
-bvi           = NaN   if f.quality == "low_light"
-                else (1 − (f.mean − i_min) / (i_max − i_min)) · 10
+bvi           = (1 − (f.mean   − i_min) / (i_max − i_min)) · 10
 ```
 
 When `c_min == c_max` (degenerate calibration), the fallback is identity scaling: `bfi = contrast · 10`, `bvi = mean · 10`.
@@ -533,7 +532,7 @@ When `c_min == c_max` (degenerate calibration), the fallback is identity scaling
 3. a frame whose measured variance falls **below the Poisson floor** (`f.std² < shot_var`). That is unphysical — the speckle variance cannot be resolved, so it is reported unresolvable rather than clamped to zero.
 4. an **unlit** frame (`quality = "low_light"`, §5.8.4).
 
-`bvi` is NaN only where the mean itself is not a blood-volume measurement: case 1, which has no mean, and case 4, whose mean is the dark level. In case 3 the mean is real and BVI stays finite. Case 2 is almost always also case 4, because a mean at or below the dark baseline is at the dark level. Case 4 closes the gap that cases 2 and 3 left. When an unlit frame's mean scattered slightly *above* zero with a little residual variance, `std / mean` came out in the hundreds, so BFI landed around −10⁴ and BVI pinned at 10.0 on every row. A fiber-unplugged bench scan stored about 2,100 such BFI values, down to −114,060 (issue #341).
+`bvi` is computed from the mean in every case except 1, which has no mean. For an unlit frame (case 4) that gives BVI near 10, the top of the scale; the `low_light` quality flag is what marks it as unlit. Case 2 is almost always also case 4, because a mean at or below the dark baseline is at the dark level. Case 4 closes the gap that cases 2 and 3 left: when an unlit frame's mean scattered slightly *above* zero with a little residual variance, `std / mean` came out in the hundreds, so BFI landed around −10⁴. A fiber-unplugged bench scan stored about 2,100 such BFI values, down to −114,060 (issue #341).
 
 Case 3 matters as much as cases 1 and 2: clamping to `√0 = 0` produced `contrast = 0.0` from a *positive* mean, sailing past any `mean <= 0` guard. On a pitch-dark bench scan (fiber unplugged, 9456 corrected frames) cases 1+2 accounted for 3200 frames and case 3 for a further **4151** — 44% of the scan reported as maximal flow. Emitting `0.0` instead (as the batch path did before issue #114) placed the frame at `C_min`, i.e. the *calibrated maximum*: `bfi = (1 + c_min/c_span) · 10` — 10.0 at default calibration, indistinguishable from real top-of-scale flow and silently averaged into the reduced-mode side average by `SideAverageStage`'s `nanmean`. A *measured* contrast of exactly 0 is still a real observation and still maps to BFI 10.0; only missing/undefined values are NaN. Constants:
 
@@ -636,7 +635,7 @@ The calibration object passed to `default_pipeline()` must expose `c_min`, `c_ma
 The reduced-mode per-side average is a **purely spatial** mean across the enabled cameras at one capture instant (the shared `spatial_side_average` helper) — never a temporal/rolling average. The live USB path delivers one camera per frame row, so the stage gathers a capture's cameras (sharing a `frame_id`) and emits **one value per capture per side**. One stage implements both paths:
 
 - **Realtime path** — averages the realtime `bfi_live`/`bvi_live` → `LiveEmit(channel="live_side", SideAverageSample(t, frame_id, side, bfi, bvi))`. Drives the live reduced-mode display (immediate, best-effort). After `DarkFrameHoldStage`, so dark intervals hold steady.
-- **Corrected path** — gathers the per-`(side,cam)` `EnrichedCorrectedInterval` events (`IntervalClosed`), averages the dark-corrected BFI/BVI/mean/contrast per capture, and emits one synthetic `IntervalClosed` per side whose `EnrichedCorrectedFrame`s carry **`cam_id=-1`** — the side-average convention. These ride the ordinary `"final"` channel: `ScanDBSink` persists them as the reduced-mode record (skipping per-camera frames in reduced mode), and `CsvSink` reads them for the reduced corrected CSV. A camera whose frame is `low_light` (unlit, §5.8.4) contributes nothing to that capture's average, mean included. The side row inherits the worst `quality` of its cameras (`ok` < `ts_corrected` < `low_light` < `nan_filled`), so an unlit camera stays visible in the record.
+- **Corrected path** — gathers the per-`(side,cam)` `EnrichedCorrectedInterval` events (`IntervalClosed`), averages the dark-corrected BFI/BVI/mean/contrast per capture, and emits one synthetic `IntervalClosed` per side whose `EnrichedCorrectedFrame`s carry **`cam_id=-1`** — the side-average convention. These ride the ordinary `"final"` channel: `ScanDBSink` persists them as the reduced-mode record (skipping per-camera frames in reduced mode), and `CsvSink` reads them for the reduced corrected CSV. A `low_light` (unlit, §5.8.4) camera drops out of the BFI and contrast averages, since those are NaN, but still counts toward BVI and mean. The side row inherits the worst `quality` of its cameras (`ok` < `ts_corrected` < `low_light` < `nan_filled`), so an unlit camera stays visible in the record.
 
 Both paths finalize a capture/window when the next begins and flush the last at `on_scan_stop`. The live and corrected averages differ by design — realtime display vs corrected record. Enabled cameras come from `metadata.left_camera_mask` / `right_camera_mask`.
 

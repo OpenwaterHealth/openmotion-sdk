@@ -149,7 +149,7 @@ Notes:
   * `ts_corrected`: the frame's timestamp was re-anchored;
   * `nan_filled`: a placeholder for a frame that never arrived;
   * `low_light`: an unlit camera. The frame sat at its dark level, so
-    `bfi`, `bvi` and `contrast` are NULL while `mean` keeps the reading near 0.
+    `bfi` and `contrast` are NULL; `mean` (near 0) and `bvi` are still computed.
     See `SciencePipeline.md` §5.8.4.
 
   A side-average row (`cam_id = -1`) carries the worst quality of its cameras.

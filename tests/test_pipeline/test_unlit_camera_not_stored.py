@@ -1,4 +1,4 @@
-"""An unlit camera never becomes a finite stored reading (issue #341).
+"""An unlit camera never stores a contrast or BFI (issue #341).
 
 A covered sensor or decoupled fiber delivers dark frames where light frames
 are scheduled. The realtime path recognises them (``low_light_rt``) and
@@ -9,6 +9,9 @@ came out in the hundreds and BFI in the -10^4 range, while BVI = map(~0 mean)
 pinned at 10.0 on every row. A fiber-unplugged bench scan stored about 2,100
 such BFI values (down to -114,060), and in reduced mode they were averaged
 into the side average ScanDBSink persists.
+
+BVI is still computed from the mean (near 10 for an unlit camera); the
+``low_light`` quality flag is what marks the row.
 """
 
 from __future__ import annotations
@@ -59,14 +62,16 @@ def _rows(result, cam_id):
     return [f for f in result.final if f.cam_id == cam_id]
 
 
-def test_covered_camera_stores_no_bfi_or_bvi():
+def test_covered_camera_stores_no_contrast_or_bfi():
     rows = _rows(run(_covered_scan(), CAL), COVERED)
     assert rows, "the covered camera produced no stored rows"
     for f in rows:
         assert f.quality == "low_light", f.abs_frame_id
-        assert np.isnan(f.contrast) and np.isnan(f.bfi) and np.isnan(f.bvi), f
-        # The ~0 mean is a real reading and stays in the record.
+        assert np.isnan(f.contrast) and np.isnan(f.bfi), f
+        # The ~0 mean is a real reading and stays in the record, and BVI is
+        # still computed from it: near the top of the scale.
         assert np.isfinite(f.mean) and abs(f.mean) < 1.0
+        assert f.bvi == pytest.approx(10.0, abs=0.05)
 
 
 def test_lit_cameras_are_untouched():
@@ -80,19 +85,20 @@ def test_lit_cameras_are_untouched():
             assert abs(f.bfi) < 20
 
 
-def test_side_average_excludes_the_covered_camera():
+def test_side_average_drops_the_covered_camera_from_bfi_only():
     result = run(_covered_scan(reduced_mode=True), CAL)
     side = {f.abs_frame_id: f for f in _rows(result, -1)}
     assert side, "no reduced-mode side average was emitted"
-    lit = {}
-    for cam in (0, 1, 6):
+    lit, every = {}, {}
+    for cam in (0, 1, 6, COVERED):
         for f in _rows(result, cam):
-            lit.setdefault(f.abs_frame_id, []).append(f)
+            every.setdefault(f.abs_frame_id, []).append(f)
+            if cam != COVERED:
+                lit.setdefault(f.abs_frame_id, []).append(f)
     for fid, s in side.items():
-        expected = lit[fid]
-        assert s.bfi == pytest.approx(np.mean([f.bfi for f in expected]))
-        assert s.bvi == pytest.approx(np.mean([f.bvi for f in expected]))
-        assert s.mean == pytest.approx(np.mean([f.mean for f in expected]))
+        assert s.bfi == pytest.approx(np.mean([f.bfi for f in lit[fid]]))
+        assert s.bvi == pytest.approx(np.mean([f.bvi for f in every[fid]]))
+        assert s.mean == pytest.approx(np.mean([f.mean for f in every[fid]]))
         assert s.quality == "low_light"  # the unlit camera stays visible
 
 

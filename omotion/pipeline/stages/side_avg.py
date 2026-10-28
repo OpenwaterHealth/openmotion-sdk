@@ -244,15 +244,11 @@ class SideAverageStage:
                 "quality": "ok",
             }
             self._frames[side][fid] = rec
+        rec["bfi"][cam] = float(getattr(f, "bfi", np.nan))
+        rec["bvi"][cam] = float(getattr(f, "bvi", np.nan))
+        rec["mean"][cam] = float(getattr(f, "mean", np.nan))
+        rec["contrast"][cam] = float(getattr(f, "contrast", np.nan))
         fq = str(getattr(f, "quality", "ok") or "ok")
-        # An unlit camera (#341) contributes nothing to the average: its
-        # BFI/BVI/contrast are already NaN, and its ~0 mean alone would drag
-        # the side mean down. Its quality still marks the side row.
-        if fq != "low_light":
-            rec["bfi"][cam] = float(getattr(f, "bfi", np.nan))
-            rec["bvi"][cam] = float(getattr(f, "bvi", np.nan))
-            rec["mean"][cam] = float(getattr(f, "mean", np.nan))
-            rec["contrast"][cam] = float(getattr(f, "contrast", np.nan))
         if _QUALITY_RANK.get(fq, 0) > _QUALITY_RANK.get(rec["quality"], 0):
             rec["quality"] = fq
 
