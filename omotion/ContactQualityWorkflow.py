@@ -233,6 +233,7 @@ class ContactQualityWorkflow:
         light_threshold_per_camera: list[float],
         left_camera_mask: int,
         right_camera_mask: int,
+        trigger_config: dict | None = None,
     ) -> ContactQualityResult:
         """Run a contact-quality check scan and return the verdict.
 
@@ -253,6 +254,11 @@ class ContactQualityWorkflow:
             triggers POOR_CONTACT (e.g. legacy default 15.0 DN).
         left_camera_mask / right_camera_mask:
             Bitmask of active cameras to evaluate.
+        trigger_config:
+            Per-scan trigger override, as for ``ScanRequest.trigger_config``.
+            A check that gates a scan should run with that scan's trigger
+            (e.g. Optimize Laser's longer dark skip), or its dark frames
+            judge a different pulse schedule.
         """
         sink = _ContactQualitySink(
             dark_thresholds=dark_threshold_per_camera,
@@ -269,6 +275,7 @@ class ContactQualityWorkflow:
             duration_sec=duration_sec,
             left_camera_mask=left_camera_mask,
             right_camera_mask=right_camera_mask,
+            trigger_config=trigger_config,
         )
         return sink.result(
             left_mask=left_camera_mask,

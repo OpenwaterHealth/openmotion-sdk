@@ -33,10 +33,14 @@ def default_pipeline(*,
                      dark_interval: int = 600,
                      realtime_dark_history_size: int = 4,
                      raw_save_max_duration_s: Optional[float] = None,
-                     telemetry: Optional[Any] = None) -> Pipeline:
+                     telemetry: Optional[Any] = None,
+                     camera_gain_map: Optional[Any] = None) -> Pipeline:
     """Build the canonical pipeline. See SciencePipeline.md for the algorithm.
 
     Args:
+        camera_gain_map: Per-camera analog gain for shot-noise correction,
+            ``(8,)`` for both sides or ``(2, 8)`` per side. None (default)
+            uses ``CAMERA_GAIN_MAP``, the gains the sensor firmware sets.
         raw_save_max_duration_s: If provided and > 0, includes Tee("raw") with
             max_duration_s set. If 0 or negative, omits the raw tee. If None
             (default), includes unbounded raw tee.
@@ -88,7 +92,10 @@ def default_pipeline(*,
             realtime_history_size=realtime_dark_history_size,
         ),
 
-        ShotNoiseCorrectionStage(pedestals=pedestals, camera_gain_map=CAMERA_GAIN_MAP),
+        ShotNoiseCorrectionStage(
+            pedestals=pedestals,
+            camera_gain_map=CAMERA_GAIN_MAP if camera_gain_map is None else camera_gain_map,
+        ),
         BfiBviStage(calibration=calibration),
 
         # Hold the last light frame's BFI/BVI across dark frames so the

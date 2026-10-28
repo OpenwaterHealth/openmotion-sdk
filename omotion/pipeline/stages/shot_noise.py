@@ -22,6 +22,24 @@ from ..pedestal import SensorPedestals, adc_gain_for_pedestal
 from .dark import CorrectedInterval
 
 
+def camera_gain_map_2d(camera_gain_map) -> np.ndarray:
+    """Per-camera analog gain as a ``(2, 8)`` float32 array (left, right).
+
+    An ``(8,)`` map applies to both sides (``CAMERA_GAIN_MAP``); a ``(2, 8)``
+    map gives each side its own gains (Optimize Laser). Raises ``ValueError``
+    for any other shape or a non-finite or non-positive gain, since the
+    shot-noise floor scales with it.
+    """
+    gm = np.asarray(camera_gain_map, dtype=np.float32)
+    if gm.shape == (8,):
+        gm = np.broadcast_to(gm, (2, 8))
+    elif gm.shape != (2, 8):
+        raise ValueError(f"camera gain map has shape {gm.shape}; expected (8,) or (2, 8)")
+    if not (np.all(np.isfinite(gm)) and np.all(gm > 0)):
+        raise ValueError("camera gains must be finite and positive")
+    return np.array(gm)
+
+
 class ShotNoiseCorrectionStage:
     name = "shot_noise_correction"
 
@@ -39,8 +57,9 @@ class ShotNoiseCorrectionStage:
             adc_gain_for_pedestal(pedestals.left),
             adc_gain_for_pedestal(pedestals.right),
         )
-        self._gain_map = np.asarray(camera_gain_map, dtype=np.float32).reshape(1, 1, 8)
-        self._gain_map_flat = np.asarray(camera_gain_map, dtype=np.float32).ravel()
+        # (2, 8): one gain per side and camera position.
+        self._gain_map_2d = camera_gain_map_2d(camera_gain_map)
+        self._gain_map = self._gain_map_2d.reshape(1, 2, 8)
 
     def process(self, batch: FrameBatch) -> FrameBatch:
         self._process_realtime(batch)
@@ -94,7 +113,7 @@ class ShotNoiseCorrectionStage:
                 side_idx = 0 if f.side == "left" else 1
                 cam_pos = int(f.cam_id) % 8
                 adc_gain = self._adc_gain_scalar[side_idx]
-                g_cam = float(self._gain_map_flat[cam_pos])
+                g_cam = float(self._gain_map_2d[side_idx, cam_pos])
 
                 mean = float(f.mean)
                 if not np.isfinite(mean):

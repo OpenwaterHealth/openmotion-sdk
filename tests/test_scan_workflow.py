@@ -1000,3 +1000,80 @@ def test_configure_failure_skips_security_uid_refresh():
 
     assert not result.ok
     sensor.refresh_id_cache.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Per-scan camera gains and calibration override (Optimize Laser)
+# ---------------------------------------------------------------------------
+
+def _pipeline_stage(motion, cls):
+    return next(s for s in motion.scan_workflow._runner.pipeline.stages if isinstance(s, cls))
+
+
+def _override_request(**kwargs):
+    return ScanRequest(subject_id="x", duration_sec=1, left_camera_mask=0xFF,
+                       right_camera_mask=0, skip_default_storage=True, **kwargs)
+
+
+def test_scan_request_overrides_default_to_none():
+    req = _override_request()
+    assert req.camera_gains is None
+    assert req.calibration_override is None
+
+
+def test_camera_gains_and_calibration_override_reach_the_pipeline():
+    import numpy as np
+    from omotion.pipeline.stages.bfi_bvi import BfiBviStage
+    from omotion.pipeline.stages.shot_noise import ShotNoiseCorrectionStage
+
+    motion = _build_motion_with_data_dir(None)
+    gains = np.array([[2.5, 1.25, 1, 1, 1, 1, 1.25, 2.5], [3, 2, 1, 1, 1, 1, 2, 3]])
+    assert motion.scan_workflow.start_scan(
+        _override_request(camera_gains=gains, calibration_override={"i_max": 400.0}))
+    motion.scan_workflow.await_complete(timeout_sec=5)
+
+    np.testing.assert_array_equal(
+        _pipeline_stage(motion, ShotNoiseCorrectionStage)._gain_map_2d, gains)
+    bfi_bvi = _pipeline_stage(motion, BfiBviStage)
+    np.testing.assert_array_equal(bfi_bvi._i_max, np.full((1, 2, 8), 400.0))
+    np.testing.assert_array_equal(
+        bfi_bvi._c_max, motion.get_calibration().c_max.reshape(1, 2, 8).astype(np.float32))
+
+
+def test_calibration_override_does_not_outlive_the_scan():
+    """Unlike set_realtime_calibration, the override applies to one scan: the
+    installed calibration, and so the next scan, keep the stock I_max."""
+    import numpy as np
+    from omotion.config import CAMERA_GAIN_MAP
+    from omotion.pipeline.stages.bfi_bvi import BfiBviStage
+    from omotion.pipeline.stages.shot_noise import ShotNoiseCorrectionStage
+
+    motion = _build_motion_with_data_dir(None)
+    stock = motion.get_calibration()
+    assert motion.scan_workflow.start_scan(_override_request(
+        camera_gains=np.ones(8), calibration_override={"i_max": 400.0}))
+    motion.scan_workflow.await_complete(timeout_sec=5)
+    assert motion.get_calibration() is stock
+
+    assert motion.scan_workflow.start_scan(_override_request())
+    motion.scan_workflow.await_complete(timeout_sec=5)
+    np.testing.assert_array_equal(_pipeline_stage(motion, BfiBviStage)._i_max,
+                                  stock.i_max.reshape(1, 2, 8).astype(np.float32))
+    np.testing.assert_array_equal(
+        _pipeline_stage(motion, ShotNoiseCorrectionStage)._gain_map_2d,
+        np.tile(CAMERA_GAIN_MAP, (2, 1)))
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"camera_gains": [1.0] * 7},
+    {"camera_gains": [0.0] * 8},
+    {"calibration_override": {"i_max": -1.0}},
+    {"calibration_override": {"bvi_max": 400.0}},
+])
+def test_bad_overrides_refuse_the_scan_before_it_starts(kwargs):
+    motion = _build_motion_with_data_dir(None)
+
+    assert motion.scan_workflow.start_scan(_override_request(**kwargs)) is False
+    assert motion.scan_workflow._thread is None
+    assert motion.scan_workflow.running is False
+    assert motion.scan_workflow.last_scan_error.startswith("scan request rejected:")

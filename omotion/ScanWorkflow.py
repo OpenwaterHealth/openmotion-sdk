@@ -24,6 +24,8 @@ from omotion.MotionProcessing import (
 from omotion.Calibration import Calibration
 
 if TYPE_CHECKING:
+    import numpy as np
+
     from omotion.MotionInterface import MotionInterface
 
 logger = logging.getLogger(f"{_log_root}.ScanWorkflow" if _log_root else "ScanWorkflow")
@@ -161,6 +163,16 @@ class ScanRequest:
     # resolved default (DEFAULT_TRIGGER_CONFIG ⊕ constructor override). A dict
     # here is shallow-merged on top (e.g. {"TriggerFrequencyHz": 30}).
     trigger_config: dict | None = None
+    # Per-camera analog gain the sensors run with for this scan, for
+    # shot-noise correction: (8,) for both sides or (2, 8) per side, as true
+    # multipliers (not register codes). None -> CAMERA_GAIN_MAP, the gains
+    # the sensor firmware sets. Optimize Laser sets its solved gains here.
+    camera_gains: "np.ndarray | None" = None
+    # BFI/BVI calibration arrays replaced for this scan only, on top of the
+    # installed calibration (Calibration.with_overrides): e.g.
+    # {"i_max": 400.0}. Unlike set_realtime_calibration it does not outlive
+    # the scan. None -> the installed calibration.
+    calibration_override: dict | None = None
     # Called (with the exception) when the scan worker thread aborts AFTER
     # start_scan returned True — e.g. a critical sink failing in on_scan_start
     # because the scan DB became unwritable in the race window past the
@@ -197,6 +209,7 @@ def run_collection_scan(
     poll_interval_s: float = 0.1,
     timeout_pad_s: float = 2.0,
     raise_on_error: bool = False,
+    trigger_config: dict | None = None,
 ) -> bool:
     """Run one short scan whose only sink is ``collector``, blocking until it
     finishes. This is the shared "threshold scan" engine behind both the
@@ -210,6 +223,8 @@ def run_collection_scan(
     Without it (CQ): a single ``await_complete(duration_sec + timeout_pad_s)``.
     ``raise_on_error``: a refused start or a scan-level error raises
     ``RuntimeError``. Returns ``False`` when the scan was canceled, else ``True``.
+    ``trigger_config`` becomes the request's per-scan trigger override (see
+    ``ScanRequest.trigger_config``), e.g. Optimize Laser's longer dark skip.
 
     Operates only on ``scan_workflow``'s public surface (``start_scan`` /
     ``await_complete`` / ``running`` / ``cancel_scan`` / ``last_scan_error`` /
@@ -225,6 +240,7 @@ def run_collection_scan(
         reduced_mode=reduced_mode,
         sinks=[collector],
         skip_default_storage=True,
+        trigger_config=trigger_config,
     )
     started = scan_workflow.start_scan(request)
     if raise_on_error and not started:
@@ -421,6 +437,19 @@ class ScanWorkflow:
             self._last_scan_error = limits_error
             return False
 
+        # Per-scan gain and calibration overrides: resolve them before
+        # anything starts, so a bad value refuses the scan rather than
+        # processing it with the stock gains or calibration.
+        from omotion.pipeline.stages.shot_noise import camera_gain_map_2d
+        try:
+            calibration = self._calibration.with_overrides(request.calibration_override)
+            camera_gain_map = (None if request.camera_gains is None
+                               else camera_gain_map_2d(request.camera_gains))
+        except ValueError as e:
+            logger.error("start_scan refused: %s", e)
+            self._last_scan_error = f"scan request rejected: {e}"
+            return False
+
         with self._lock:
             if self._running or (self._thread and self._thread.is_alive()):
                 logger.warning(
@@ -487,13 +516,17 @@ class ScanWorkflow:
                 telemetry_feeder = None
 
         # ── Build pipeline ────────────────────────────────────────────────
-        calibration = self._calibration
+        if request.calibration_override or camera_gain_map is not None:
+            logger.info("start_scan: per-scan overrides: calibration %s, camera gains %s",
+                        sorted(request.calibration_override or {}),
+                        "custom" if camera_gain_map is not None else "stock")
         pipeline = default_pipeline(
             metadata=meta,
             calibration=calibration,
             pedestals=pedestals,
             raw_save_max_duration_s=request.raw_save_max_duration_s,
             telemetry=telemetry_aggregator,
+            camera_gain_map=camera_gain_map,
         )
 
         # ── Auto-inject default sinks ──────────────────────────────────────
