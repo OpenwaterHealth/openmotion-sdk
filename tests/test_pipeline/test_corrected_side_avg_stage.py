@@ -210,14 +210,26 @@ def test_on_scan_stop_flushes_buffered_captures():
     assert frames[0].bfi == pytest.approx(4.0)  # both cams contributed
 
 
-def test_worst_contributing_quality_propagates():
-    stage = _stage()
-    good = _ef(12, 5.0, "left", 0, 2.0, 20.0)
-    bad = _ef(12, 5.0, "left", 1, 6.0, 60.0)
-    bad.quality = "nan_filled"
-    b = _batch([_interval(10, 20, [good]), _interval(10, 20, [bad])])
+def test_side_average_lists_every_contributing_flag():
+    """The side row carries every camera's flags, not only the worst one."""
+    stage = _stage(mask=0x07)  # cams 0, 1, 2
+    clean = _ef(12, 5.0, "left", 0, 2.0, 20.0)
+    shifted = _ef(12, 5.0, "left", 1, 6.0, 60.0)
+    shifted.quality = "ts_corrected"
+    unlit = _ef(12, 5.0, "left", 2, 6.0, 60.0)
+    unlit.quality = "ts_corrected;low_light"
+    b = _batch([_interval(10, 20, [clean]), _interval(10, 20, [shifted]),
+                _interval(10, 20, [unlit])])
     stage.process(b)
-    assert _avg_frames(b)[0].quality == "nan_filled"
+    assert _avg_frames(b)[0].quality == "ts_corrected;low_light"
+
+
+def test_side_average_of_clean_cameras_is_ok():
+    stage = _stage()
+    b = _batch([_interval(10, 20, [_ef(12, 5.0, "left", 0, 2.0, 20.0)]),
+                _interval(10, 20, [_ef(12, 5.0, "left", 1, 6.0, 60.0)])])
+    stage.process(b)
+    assert _avg_frames(b)[0].quality == "ok"
 
 
 def test_reset_clears_pending_window():

@@ -34,11 +34,14 @@ and §11.3.
 
 from __future__ import annotations
 
+import bisect
 import collections
 import logging
 import math
 from dataclasses import dataclass
-from typing import Callable, Sequence
+from typing import Callable, Optional, Sequence
+
+from omotion.pipeline.quality_flags import join as join_quality
 
 logger = logging.getLogger("openmotion.sdk.contact_quality")
 
@@ -277,6 +280,19 @@ class ContactQualityMonitor:
     The callback is invoked on the pipeline runner thread. A GUI consumer
     must marshal to its own thread. Exceptions from the callback are logged
     and swallowed so a broken consumer cannot disable the sink.
+
+    **Verdict history (bloodflow-app#589).** Every edge is also recorded
+    against the ``abs_frame_id`` of the frame that caused it, so
+    :meth:`verdict_at` can answer "what was this camera's latched verdict at
+    frame N" after the fact. :class:`~omotion.pipeline.sinks.ScanDBSink`
+    uses it to add the verdict to each per-camera row's ``quality`` flags.
+    It writes a row up to one dark interval (~15 s) after the live frame
+    went by, so it needs the verdict as of that frame, not the current one.
+    :meth:`observed_through` tells it, per camera, how far the history is
+    final. It is per camera, not one value for the scan: the live source
+    delivers each sensor's frames in its own batches (and a CSV replay
+    yields all of one side first), so one side can run ahead of the other.
+    Both are read on the runner thread, like everything else here.
     """
 
     channels = frozenset({"live"})
@@ -306,6 +322,11 @@ class ContactQualityMonitor:
         self._latches: dict = {}
         # (side, cam_id) pairs in the scan mask; empty means "all"
         self._active_cams: set = set()
+        # (side, cam_id) -> ([abs_frame_id, ...], [verdict flags, ...]), one
+        # entry per edge, ascending frame id.
+        self._history: dict = {}
+        # (side, cam_id) -> highest abs_frame_id consumed from "live".
+        self._observed: dict = {}
         # on_complete() summary counters — reset per scan in on_scan_start;
         # see on_complete's docstring for why they exist.
         self._transitions_emitted = 0
@@ -316,6 +337,8 @@ class ContactQualityMonitor:
         self._light_window.clear()
         self._latches.clear()
         self._active_cams = _cams_from_masks(meta)
+        self._history = {}
+        self._observed = {}
         self._transitions_emitted = 0
         self._observations_processed = 0
         self._cameras_seen = set()
@@ -344,6 +367,28 @@ class ContactQualityMonitor:
     def consume(self, channel: str, batch) -> None:
         if channel != "live":
             return
+        fids = batch.abs_frame_ids if batch.abs_frame_ids is not None else batch.frame_ids
+        try:
+            self._consume_rows(batch, fids)
+        finally:
+            # Advance even for rows that carried nothing to evaluate: the
+            # history is just as final through them.
+            self._advance_observed(batch, fids)
+
+    def _advance_observed(self, batch, fids) -> None:
+        if fids is None or batch.cam_ids is None:
+            return
+        # Stale rows carry epoch-shifted advisory ids; one must not push a
+        # camera's watermark past frames it has not delivered yet.
+        for i, side_idx, cam_id, _ft in batch.iter_rows(exclude={"stale"}):
+            if not (0 <= side_idx < len(_SIDE_NAMES)):
+                continue
+            key = (_SIDE_NAMES[side_idx], cam_id)
+            fid = int(fids[i])
+            if fid > self._observed.get(key, -1):
+                self._observed[key] = fid
+
+    def _consume_rows(self, batch, fids) -> None:
         if batch.subtracted_mean is None or batch.mean_dc_rt is None:
             return
         low_light_rt = batch.low_light_rt
@@ -360,7 +405,7 @@ class ContactQualityMonitor:
                 if not math.isfinite(value):
                     continue
                 self._observe(
-                    side, cam_id, REASON_AMBIENT_LIGHT,
+                    int(fids[i]), side, cam_id, REASON_AMBIENT_LIGHT,
                     is_ambient_light(value, self._thresholds, cam_id),
                     value, self._dark_debounce, self._dark_debounce,
                 )
@@ -395,7 +440,7 @@ class ContactQualityMonitor:
                     # the same reason — averaging it in would mix
                     # reference frames.
                     self._observe(
-                        side, cam_id, REASON_POOR_CONTACT,
+                        int(fids[i]), side, cam_id, REASON_POOR_CONTACT,
                         True,
                         value,
                         self._light_activate_debounce,
@@ -409,14 +454,14 @@ class ContactQualityMonitor:
                 window.append(value)
                 avg = sum(window) / len(window)
                 self._observe(
-                    side, cam_id, REASON_POOR_CONTACT,
+                    int(fids[i]), side, cam_id, REASON_POOR_CONTACT,
                     is_poor_contact(avg, self._thresholds, cam_id),
                     avg,
                     self._light_activate_debounce,
                     self._light_clear_debounce,
                 )
 
-    def _observe(self, side, cam_id, reason, bad, value,
+    def _observe(self, fid, side, cam_id, reason, bad, value,
                  activate_debounce, clear_debounce) -> None:
         self._observations_processed += 1
         self._cameras_seen.add((side, cam_id))
@@ -430,6 +475,7 @@ class ContactQualityMonitor:
             return
         self._transitions_emitted += 1
         active = transition == TRANSITION_ACTIVATED
+        self._record(fid, side, cam_id)
         logger.info(
             "live CQ %s%d: %s %s (%.2f DN)",
             "L" if side == "left" else "R", cam_id + 1,
@@ -447,6 +493,39 @@ class ContactQualityMonitor:
             # other cameras), and would log a fresh traceback per batch —
             # at ~40 Hz — for as long as a broken callback keeps raising.
             logger.exception("contact-quality transition callback raised")
+
+    def _record(self, fid: int, side: str, cam_id: int) -> None:
+        verdict = join_quality(*(
+            reason for (s, c, reason), latch in self._latches.items()
+            if s == side and c == cam_id and latch.active
+        ))
+        fids, verdicts = self._history.setdefault((side, cam_id), ([], []))
+        if fids and fids[-1] >= fid:
+            # Same frame (or an out-of-order id): the later edge wins.
+            fids[-1], verdicts[-1] = max(fids[-1], fid), verdict
+        else:
+            fids.append(fid)
+            verdicts.append(verdict)
+
+    def observed_through(self, side: str, cam_id: int) -> int:
+        """Highest ``abs_frame_id`` of this camera consumed from the live
+        channel, or -1 before its first frame. :meth:`verdict_at` is final
+        for any of its frames at or below it."""
+        return self._observed.get((side, int(cam_id)), -1)
+
+    def verdict_at(self, side: str, cam_id: int, frame_id: int) -> Optional[str]:
+        """The verdict latched for one camera as of ``frame_id``, as a
+        ``quality`` flag list: ``"ok"``, ``"poor_contact"``,
+        ``"ambient_light"`` or ``"poor_contact;ambient_light"``. None for a
+        camera outside the scan mask."""
+        if self._active_cams and (side, int(cam_id)) not in self._active_cams:
+            return None
+        entry = self._history.get((side, int(cam_id)))
+        if not entry:
+            return REASON_OK
+        fids, verdicts = entry
+        i = bisect.bisect_right(fids, int(frame_id)) - 1
+        return verdicts[i] if i >= 0 else REASON_OK
 
     def on_complete(self) -> None:
         # A silent scan is ambiguous without this: "contact was good
