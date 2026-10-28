@@ -210,6 +210,29 @@ def test_a_restore_failure_is_reported():
     assert result.restored and result.restore_problems
 
 
+def test_a_failed_run_puts_the_stock_trigger_config_back():
+    """The run's scans leave the 2400 us skip held on the console; after the
+    RATE_LL restore it must not be what a direct trigger start would run."""
+    rig = Rig(SPREAD)
+    result, _, iface = _run(rig, max_iterations=1)
+    assert result.restored and result.restore_problems == ()
+    assert rig.console.trigger_configs == [iface.resolve_trigger_config()]
+    assert rig.console.trigger_configs[-1]["LaserPulseSkipDelayUsec"] == 1800
+
+
+def test_a_passed_run_leaves_the_trigger_config_alone():
+    rig = Rig(SPREAD)
+    result, _, _ = _run(rig)
+    assert result.passed and rig.console.trigger_configs == []
+
+
+def test_a_rejected_trigger_reset_is_a_restore_problem():
+    rig = Rig(SPREAD)
+    rig.console.reject_trigger = True
+    result, _, _ = _run(rig, max_iterations=1)
+    assert any(p.startswith("trigger config reset failed") for p in result.restore_problems)
+
+
 def test_invalid_settings_raise_before_any_io():
     rig = Rig(SPREAD)
     wf, _ = _workflow(rig)
@@ -285,10 +308,20 @@ def test_settings_from_a_failed_run_are_never_applied():
 
 def test_restore_defaults_restores_laser_and_cameras():
     rig = Rig(SPREAD)
-    result, wf, _ = _run(rig)
+    result, wf, iface = _run(rig)
     assert wf.restore_defaults(0xFF, 0) == []
     assert rig.console.restores == 1
     assert [rig.left.gain_code(p) for p in range(8)] == list(FW_DEFAULT_GAIN_CODES)
+    assert rig.console.trigger_configs == [iface.resolve_trigger_config()]
+
+
+def test_restore_defaults_reports_a_rejected_trigger_reset():
+    rig = Rig(SPREAD)
+    _, wf, _ = _run(rig)
+    rig.console.reject_trigger = True
+    problems = wf.restore_defaults(0xFF, 0)
+    assert problems == ["trigger config reset failed: the console rejected the stock "
+                        "trigger config"]
 
 
 def test_motion_interface_exposes_one_workflow():

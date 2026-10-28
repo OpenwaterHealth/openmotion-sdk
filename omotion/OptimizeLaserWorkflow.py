@@ -335,7 +335,7 @@ class OptimizeLaserWorkflow:
         passed = status is not None and status.passed and not canceled and error is None
         restore_problems: tuple[str, ...] = ()
         if not passed:
-            restore_problems = tuple(actuator.restore(cams))
+            restore_problems = tuple(actuator.restore(cams)) + tuple(self._reset_trigger_config())
         result = OptimizeResult(
             status=status, settings=controller.settings if passed else None,
             records=tuple(controller.records), csv_path=log.path if log else None,
@@ -429,9 +429,31 @@ class OptimizeLaserWorkflow:
 
     def restore_defaults(self, left_camera_mask: int, right_camera_mask: int) -> list[str]:
         """Laser driver, safety limits and cameras back to their defaults
-        (``apply_laser_power`` plus the sensor firmware's camera settings).
-        Returns what could not be restored; empty means all of it."""
-        return self.actuator().restore(cameras_from_masks(left_camera_mask, right_camera_mask))
+        (``apply_laser_power`` plus the sensor firmware's camera settings),
+        and the stock trigger config back on the console. Returns what could
+        not be restored; empty means all of it."""
+        problems = self.actuator().restore(cameras_from_masks(left_camera_mask, right_camera_mask))
+        return problems + self._reset_trigger_config()
+
+    def _reset_trigger_config(self) -> list[str]:
+        """Send the interface's stock trigger config (not started).
+
+        The console keeps the last trigger config it was sent, which after an
+        Optimize Laser scan carries the 2400 us dark skip. Every scan path
+        re-sends its own config first, but a direct trigger start would run
+        the held one under the restored RATE_LL and latch E-202 on the first
+        dark frame (bench, 2026-10-28). Returns what failed (empty = done).
+        """
+        iface = self._interface
+        console = iface.console
+        try:
+            applied = console.set_trigger_json(data=iface.resolve_trigger_config())
+        except Exception as e:
+            return [f"trigger config reset failed: {e}"]
+        if applied is None and not getattr(getattr(console, "uart", None), "demo_mode", False):
+            return ["trigger config reset failed: the console rejected the stock trigger config"]
+        logger.info("Optimize Laser: stock trigger config restored")
+        return []
 
     # ---- helpers ----------------------------------------------------------
 

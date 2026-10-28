@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from omotion.config import DEFAULT_TRIGGER_CONFIG
 from omotion.data.fpga_model import FPGA_MODEL
 from omotion.exposure.actuator import FW_DEFAULT_EXPOSURE_ROWS, FW_DEFAULT_GAIN_CODES
 from omotion.pipeline.batch import FrameBatch
@@ -64,6 +65,8 @@ class FakeConsole:
         self.store: dict = {}
         self.writes: list = []              # (name, value) in order
         self.restores = 0
+        self.trigger_configs: list = []     # set_trigger_json payloads, in order
+        self.reject_trigger = False
         for name, value in self.flash.items():
             self.set(name, value)
 
@@ -91,6 +94,10 @@ class FakeConsole:
 
     def firmware_owns_safety_state(self):
         return self.owns
+
+    def set_trigger_json(self, data):
+        self.trigger_configs.append(dict(data))
+        return None if self.reject_trigger else dict(data)
 
     def read_i2c_packet(self, *, mux_index, channel, device_addr, reg_addr, read_len):
         data = self.store.get((mux_index, channel, device_addr, reg_addr))
@@ -285,3 +292,6 @@ class FakeInterface:
         self.console = rig.console
         self.left, self.right = rig.left, rig.right
         self.scan_workflow = FakeScanWorkflow(rig, **scan_kwargs)
+
+    def resolve_trigger_config(self, override=None):
+        return {**DEFAULT_TRIGGER_CONFIG, **(override or {})}
