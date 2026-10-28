@@ -296,7 +296,7 @@ def test_fixed_knobs_never_move():
     assert ctrl.settings.gains[cam] == 1.0
 
 
-def test_pulse_width_stays_inside_envelope_limits():
+def test_pulse_width_stays_inside_narrower_limits():
     limits = HardwareLimits(pulse_width_max_us=600.0)
     settings = OptimizeLaserSettings(pulse_width_bounds=Bounds(100, 600))
     cam = (0, 0)

@@ -21,7 +21,7 @@ from omotion.exposure.settings import (
 
 pytestmark = pytest.mark.unit
 
-ENVELOPE_LIMITS = HardwareLimits(pulse_width_max_us=600.0)   # console-fw >= 1.8.2-rc.4
+NARROW_LIMITS = HardwareLimits(pulse_width_max_us=600.0)
 
 
 def _errors(**changes):
@@ -39,7 +39,7 @@ def test_defaults_are_valid():
 
 def test_effective_pulse_width_max_fits_inside_exposure():
     assert HardwareLimits().effective_pulse_width_max_us == pytest.approx(2096.0)
-    assert ENVELOPE_LIMITS.effective_pulse_width_max_us == 600.0
+    assert NARROW_LIMITS.effective_pulse_width_max_us == 600.0
 
 
 def test_pulse_width_hard_cap_holds_whatever_the_limits_say():
@@ -60,11 +60,11 @@ def test_pulse_width_past_the_exposure_window_is_rejected():
     assert _has(errs, "pulse width upper bound 2200 us is above the hardware maximum 2096")[0]
 
 
-def test_envelope_firmware_rejects_long_pulses():
-    errs = OptimizeLaserSettings().errors(ENVELOPE_LIMITS)
+def test_narrower_limits_reject_long_pulses():
+    errs = OptimizeLaserSettings().errors(NARROW_LIMITS)
     assert _has(errs, "above the hardware maximum 600")[0], errs
     assert OptimizeLaserSettings(
-        pulse_width_bounds=Bounds(100, 600)).errors(ENVELOPE_LIMITS) == []
+        pulse_width_bounds=Bounds(100, 600)).errors(NARROW_LIMITS) == []
 
 
 @pytest.mark.parametrize("field, bounds, fragment", [

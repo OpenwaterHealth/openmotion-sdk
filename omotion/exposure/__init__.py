@@ -2,8 +2,10 @@
 
 Pure algorithm, no hardware I/O: :mod:`.estimate` (saturation-aware frame
 brightness), :mod:`.settings` (the settings menu, hardware limits, gain
-ladder) and :mod:`.controller` (the multi-camera controller). The workflow
-that applies settings to a device and captures frames builds on these.
+ladder), :mod:`.controller` (the multi-camera controller) and
+:mod:`.firmware` (which console firmware may take the extended laser
+limits). The workflow that applies settings to a device and captures frames
+builds on these.
 """
 
 from .controller import (
@@ -16,6 +18,7 @@ from .controller import (
     OptimizeStatus,
 )
 from .estimate import SignalEstimate, censored_gamma_mean, estimate_signal
+from .firmware import ExtendedLimitsRefused, extended_limits_problem, require_extended_limits
 from .settings import (
     ABSOLUTE_MAX_CURRENT_MA,
     ABSOLUTE_MAX_PULSE_WIDTH_US,
@@ -39,6 +42,7 @@ __all__ = [
     "CameraStatus",
     "ExposureController",
     "ExposureSettings",
+    "ExtendedLimitsRefused",
     "GainLadder",
     "GainMode",
     "GainPriority",
@@ -52,4 +56,6 @@ __all__ = [
     "StartPoint",
     "censored_gamma_mean",
     "estimate_signal",
+    "extended_limits_problem",
+    "require_extended_limits",
 ]

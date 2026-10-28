@@ -8,9 +8,9 @@ clamp, because a silently-adjusted laser limit is exactly what this check
 exists to stop.
 
 :class:`HardwareLimits` carries what the connected hardware accepts. It is
-an input rather than a constant because the console firmware decides it:
-console-fw 1.8.2-rc.4 and later compile in a safety envelope that refuses
-TA pulse widths above 600 us, whereas older firmware accepts up to the
+an input rather than a constant because the exposure and the console decide
+it. Console firmware with the 1.8.2-rc.3 safety envelope refuses the
+extended limits outright (:mod:`.firmware`); older firmware accepts up to the
 trigger's 2200 us. Two caps hold whatever a caller passes:
 :data:`ABSOLUTE_MAX_PULSE_WIDTH_US` and :data:`ABSOLUTE_MAX_CURRENT_MA`.
 """
@@ -86,9 +86,9 @@ class Bounds:
 class HardwareLimits:
     """What the connected hardware accepts, plus the brightness model's facts.
 
-    Defaults describe console firmware without the 1.8.2 safety envelope and
-    the app's longest exposure (244 rows x 9 us). For envelope firmware pass
-    ``pulse_width_max_us=600``.
+    Defaults describe console firmware without the 1.8.2 safety envelope (the
+    only firmware :func:`.firmware.require_extended_limits` lets through) and
+    the app's longest exposure (244 rows x 9 us).
     """
 
     gain_min: float = 1.0
