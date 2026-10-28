@@ -613,6 +613,17 @@ class ScanDBSink:
     CSVs written by CsvSink (fed by Tee("raw")) are the only raw record.
     Consequence: corrected rows trail the scan by up to one dark interval
     (~15 s), and an unclean shutdown loses that tail.
+
+    **Contact quality (bloodflow-app#589).** With a ``cq_source`` (a
+    :class:`~omotion.contact_quality.ContactQualityMonitor`; ScanWorkflow
+    passes the one the request attaches), each per-camera row's ``quality``
+    flags also carry the verdict the monitor had latched for that camera at
+    that frame: ``poor_contact`` and/or ``ambient_light``. Within a batch the
+    live channel reaches the monitor *after* the final channel reaches this
+    sink (``Tee("live")`` is the last stage), so a row is held until the
+    monitor has observed its camera's frame. The sink then also subscribes
+    to "live", only to release held rows at the next batch. Reduced-mode
+    side-average rows never get a verdict.
     """
 
     channels = {"final", "diagnostics"}
@@ -623,9 +634,15 @@ class ScanDBSink:
 
     _SIDE_STR_TO_INT = {"left": 0, "right": 1}
 
-    def __init__(self, db_path: str, *, batch_size: int = 200) -> None:
+    def __init__(self, db_path: str, *, batch_size: int = 200,
+                 cq_source=None) -> None:
         self._db_path = db_path
         self._batch_size = max(1, int(batch_size))
+        self._cq_source = cq_source
+        if cq_source is not None:
+            self.channels = ScanDBSink.channels | {"live"}
+        # Rows waiting for cq_source to observe their frame.
+        self._cq_pending: list = []
         self._db = None
         self._session_id: Optional[int] = None
         self._meta: Optional[ScanMetadata] = None
@@ -642,6 +659,7 @@ class ScanDBSink:
         self._closed = False
         self._diag = {}
         self._rows_written = 0
+        self._cq_pending = []
         label = f"{meta.scan_id}_{meta.subject_id}"
         self._db = ScanDatabase(db_path=self._db_path)
         # data_semantics distinguishes final-branch sessions from legacy
@@ -672,6 +690,10 @@ class ScanDBSink:
             self._consume_final(payload)
         elif channel == "diagnostics":
             self._consume_diagnostic(payload)
+        elif channel == "live" and self._cq_pending:
+            self._release_cq_pending()
+            if len(self._buffer) >= self._batch_size:
+                self._flush()
 
     def on_complete(self) -> None:
         if self._closed:
@@ -679,6 +701,7 @@ class ScanDBSink:
         self._closed = True
         import time
         try:
+            self._release_cq_pending(final=True)
             self._flush()
             if self._db is not None and self._session_id is not None:
                 if self._rows_written == 0:
@@ -760,6 +783,8 @@ class ScanDBSink:
         if not frames:
             return
         reduced = bool(self._meta.reduced_mode) if self._meta is not None else False
+        # Side-average rows get no verdict, so reduced mode never holds rows.
+        out = self._buffer if (reduced or self._cq_source is None) else self._cq_pending
 
         import math
 
@@ -788,7 +813,7 @@ class ScanDBSink:
             contrast_v = _round(getattr(f, "contrast", None))
             if bfi is None and bvi is None and mean_v is None and contrast_v is None:
                 continue  # nothing finite to record for this frame
-            self._buffer.append({
+            out.append({
                 "session_id": self._session_id,
                 "cam_id": cam_id,
                 "side": side_int,
@@ -802,8 +827,31 @@ class ScanDBSink:
                 "quality": join_quality(getattr(f, "quality", None)),
             })
 
+        self._release_cq_pending()
         if len(self._buffer) >= self._batch_size:
             self._flush()
+
+    def _release_cq_pending(self, *, final: bool = False) -> None:
+        """Add the verdict to every held row whose frame the CQ source has
+        observed (every held row when ``final``) and move it to the insert
+        buffer."""
+        if not self._cq_pending:
+            return
+        src = self._cq_source
+        keep = []
+        for row in self._cq_pending:
+            side = "left" if row["side"] == 0 else "right"
+            if not final and row["frame_id"] > src.observed_through(side, row["cam_id"]):
+                keep.append(row)
+                continue
+            try:
+                verdict = src.verdict_at(side, row["cam_id"], row["frame_id"])
+            except Exception:
+                logger.exception("ScanDBSink: contact-quality lookup failed")
+                verdict = None
+            row["quality"] = join_quality(row["quality"], verdict)
+            self._buffer.append(row)
+        self._cq_pending = keep
 
     def _flush(self) -> None:
         if not self._buffer or self._db is None:

@@ -8,7 +8,11 @@ the same order, so one set of flags is always stored as the same string
 
   * ``ts_corrected``: the frame's timestamp was re-anchored (§5.4);
   * ``nan_filled``: a placeholder for a frame that never arrived (§5.4);
-  * ``low_light``: an unlit camera (§5.8.4, #341).
+  * ``low_light``: an unlit camera (§5.8.4, #341);
+  * ``poor_contact`` / ``ambient_light``: the live contact-quality warning
+    latched for the camera at that frame, i.e. what the operator was shown
+    (``omotion.contact_quality.ContactQualityMonitor``, bloodflow-app#589).
+    Stamped by ScanDBSink on per-camera rows only.
 
 A flag not listed here sorts after these, in the order it was first seen.
 
@@ -24,8 +28,11 @@ SEP = ";"
 TS_CORRECTED = "ts_corrected"
 NAN_FILLED = "nan_filled"
 LOW_LIGHT = "low_light"
+POOR_CONTACT = "poor_contact"
+AMBIENT_LIGHT = "ambient_light"
 
-_ORDER = {flag: i for i, flag in enumerate((TS_CORRECTED, NAN_FILLED, LOW_LIGHT))}
+_ORDER = {flag: i for i, flag in enumerate(
+    (TS_CORRECTED, NAN_FILLED, LOW_LIGHT, POOR_CONTACT, AMBIENT_LIGHT))}
 
 
 def parse(value) -> list[str]:

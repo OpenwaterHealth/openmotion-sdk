@@ -297,3 +297,124 @@ def test_session_data_has_quality_column(tmp_path):
     columns = {row[1] for row in cursor.fetchall()}
     assert "quality" in columns
     db.close()
+
+
+# ---------------------------------------------------------------------------
+# Contact-quality verdict in quality (bloodflow-app#589)
+# ---------------------------------------------------------------------------
+
+class _FakeCqSource:
+    """Stands in for ContactQualityMonitor: a verdict per (side, cam, frame)
+    and a per-camera observed-through watermark the test moves by hand."""
+
+    def __init__(self, verdicts=None):
+        self.verdicts = verdicts or {}
+        self.observed = {}
+
+    def observed_through(self, side, cam_id):
+        return self.observed.get((side, cam_id), -1)
+
+    def verdict_at(self, side, cam_id, frame_id):
+        return self.verdicts.get((side, cam_id, frame_id), "ok")
+
+
+def _qualities(db_path):
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute(
+        "SELECT side, cam_id, frame_id, quality FROM session_data"
+        " ORDER BY side, cam_id, frame_id").fetchall()
+    conn.close()
+    return rows
+
+
+def _meta_two_sides():
+    return ScanMetadata(
+        scan_id="cq", subject_id="subj", operator="op",
+        started_at_iso="2026-10-28T00:00:00Z", duration_sec=300,
+        left_camera_mask=0x01, right_camera_mask=0x01, reduced_mode=False,
+    )
+
+
+def test_scan_db_sink_subscribes_to_live_only_with_a_cq_source():
+    assert "live" not in ScanDBSink(db_path=":memory:").channels
+    sink = ScanDBSink(db_path=":memory:", cq_source=_FakeCqSource())
+    assert sink.channels == {"final", "diagnostics", "live"}
+
+
+def test_scan_db_sink_adds_the_verdict_to_the_pipeline_flags(tmp_path):
+    db_path = str(tmp_path / "scan.db")
+    src = _FakeCqSource({("left", 0, 11): "poor_contact"})
+    src.observed[("left", 0)] = 20
+    sink = ScanDBSink(db_path=db_path, cq_source=src)
+    sink.on_scan_start(_meta_simple())
+    sink.consume("final", _interval([
+        _frame(10, quality="ts_corrected"),
+        _frame(11, quality="ts_corrected"),
+        _frame(12),
+    ]))
+    sink.on_complete()
+    assert [r[3] for r in _qualities(db_path)] == [
+        "ts_corrected", "ts_corrected;poor_contact", "ok",
+    ]
+
+
+def test_scan_db_sink_holds_a_row_until_its_camera_is_observed(tmp_path):
+    """The final interval reaches the sink before the monitor has seen the
+    batch's live frames. A row must wait for its own camera's watermark;
+    the other side being further along does not count."""
+    db_path = str(tmp_path / "scan.db")
+    src = _FakeCqSource()
+    src.observed[("left", 0)] = 40      # left ran ahead
+    sink = ScanDBSink(db_path=db_path, cq_source=src, batch_size=1)
+    sink.on_scan_start(_meta_two_sides())
+    sink.consume("final", _interval([
+        _frame(39, side="right"), _frame(40, side="right"),
+    ]))
+    assert _qualities(db_path) == []    # right not observed yet: held
+
+    src.observed[("right", 0)] = 39
+    src.verdicts[("right", 0, 40)] = "poor_contact"
+    sink.consume("live", object())      # the next batch releases what is final
+    assert _qualities(db_path) == [(1, 0, 39, "ok")]
+
+    src.observed[("right", 0)] = 42
+    sink.consume("live", object())
+    assert _qualities(db_path)[-1] == (1, 0, 40, "poor_contact")
+    sink.on_complete()
+
+
+def test_scan_db_sink_releases_every_held_row_at_scan_end(tmp_path):
+    db_path = str(tmp_path / "scan.db")
+    src = _FakeCqSource({("left", 0, 10): "ambient_light"})
+    sink = ScanDBSink(db_path=db_path, cq_source=src)
+    sink.on_scan_start(_meta_simple())
+    sink.consume("final", _interval([_frame(10), _frame(11)]))
+    sink.on_complete()
+    assert [r[3] for r in _qualities(db_path)] == ["ambient_light", "ok"]
+
+
+def test_scan_db_sink_keeps_pipeline_flags_outside_the_scan_mask(tmp_path):
+    """verdict_at returns None for a camera the monitor doesn't watch."""
+    db_path = str(tmp_path / "scan.db")
+
+    class _Unwatched(_FakeCqSource):
+        def verdict_at(self, side, cam_id, frame_id):
+            return None
+
+    sink = ScanDBSink(db_path=db_path, cq_source=_Unwatched())
+    sink.on_scan_start(_meta_simple())
+    sink.consume("final", _interval([_frame(10, quality="low_light")]))
+    sink.on_complete()
+    assert [r[3] for r in _qualities(db_path)] == ["low_light"]
+
+
+def test_scan_db_sink_gives_side_average_rows_no_verdict(tmp_path):
+    """Reduced mode (Clinical) stores only side averages; they keep the
+    pipeline flags and are never held."""
+    db_path = str(tmp_path / "scan.db")
+    src = _FakeCqSource({("left", -1, 10): "poor_contact"})
+    sink = ScanDBSink(db_path=db_path, cq_source=src, batch_size=1)
+    sink.on_scan_start(_meta_reduced())
+    sink.consume("final", _interval([_frame(10, cam_id=-1, quality="low_light")]))
+    assert [r[3] for r in _qualities(db_path)] == ["low_light"]   # not held
+    sink.on_complete()

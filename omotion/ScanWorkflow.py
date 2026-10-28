@@ -407,6 +407,7 @@ class ScanWorkflow:
             CsvSink as PipelineCsvSink, DiagnosticsLogSink, ScanDBSink, ScanMetadata,
         )
         from omotion.pipeline.pedestal import SensorPedestals, pedestal_for_fw
+        from omotion.contact_quality import ContactQualityMonitor
 
         # Clear the prior scan's outcome up front so a refusal below (busy, or
         # a pre-flight failure) never reports a stale error from an earlier run.
@@ -551,7 +552,14 @@ class ScanWorkflow:
                     with self._lock:
                         self._running = False
                     return False
-                default_sinks.append(ScanDBSink(db_path=scan_db_path))
+                # A live contact-quality monitor attached by the caller also
+                # feeds the record: each per-camera row's quality flags carry
+                # the warning the operator was shown (bloodflow-app#589).
+                cq_monitor = next(
+                    (s for s in request.sinks if isinstance(s, ContactQualityMonitor)),
+                    None,
+                )
+                default_sinks.append(ScanDBSink(db_path=scan_db_path, cq_source=cq_monitor))
             # Telemetry CSV: per-scan snapshots from ConsoleTelemetryPoller.
             # Not a pipeline sink — the poller is its own daemon thread that
             # predates the sink-based architecture, so we register a listener

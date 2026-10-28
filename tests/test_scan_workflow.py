@@ -1000,3 +1000,42 @@ def test_configure_failure_skips_security_uid_refresh():
 
     assert not result.ok
     sensor.refresh_id_cache.assert_not_called()
+
+
+def _db_sinks(motion):
+    from omotion.pipeline.sinks import ScanDBSink
+    return [s for s in motion.scan_workflow._runner.sinks if isinstance(s, ScanDBSink)]
+
+
+def test_start_scan_wires_an_attached_cq_monitor_into_the_db_sink(tmp_path):
+    """bloodflow-app#589: a ContactQualityMonitor on the request becomes the
+    ScanDBSink's cq_source, so each stored row's quality carries the verdict."""
+    from omotion.contact_quality import CQThresholds, ContactQualityMonitor
+    motion = _build_motion_with_data_dir(
+        None, scan_db_path=str(tmp_path / "scans.db"))
+    monitor = ContactQualityMonitor(
+        thresholds=CQThresholds.from_sequences([3.0] * 8, [15.0] * 8),
+        on_transition=lambda *a: None,
+    )
+    request = ScanRequest(
+        subject_id="x", duration_sec=1,
+        left_camera_mask=0xFF, right_camera_mask=0, reduced_mode=False,
+        sinks=[monitor],
+    )
+    motion.scan_workflow.start_scan(request)
+    db_sinks = _db_sinks(motion)
+    assert len(db_sinks) == 1
+    assert db_sinks[0]._cq_source is monitor
+
+
+def test_start_scan_db_sink_has_no_cq_source_without_a_monitor(tmp_path):
+    motion = _build_motion_with_data_dir(
+        None, scan_db_path=str(tmp_path / "scans.db"))
+    request = ScanRequest(
+        subject_id="x", duration_sec=1,
+        left_camera_mask=0xFF, right_camera_mask=0, reduced_mode=False,
+    )
+    motion.scan_workflow.start_scan(request)
+    db_sinks = _db_sinks(motion)
+    assert len(db_sinks) == 1
+    assert db_sinks[0]._cq_source is None

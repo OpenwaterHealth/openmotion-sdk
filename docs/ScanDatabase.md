@@ -151,10 +151,23 @@ Notes:
   * `low_light`: an unlit camera. The frame sat at its dark level, so
     `bfi` and `contrast` are NULL; `mean` (near 0) and `bvi` are still computed.
     See `SciencePipeline.md` §5.8.4.
+  * `poor_contact`, `ambient_light`: the live contact-quality warning that was
+    raised for this camera at this frame, i.e. what the operator was shown.
+    With the default debounce (the bloodflow-app's too), `poor_contact` is
+    raised once the rolling light average has sat below the camera's light
+    threshold for 10 consecutive light frames (about 0.25 s), and cleared
+    after 80 consecutive good ones (about 2 s); an unlit frame counts as poor
+    contact.
+    `ambient_light` is judged on dark frames only (about every 15 s), so it is
+    raised and cleared one dark frame at a time. Both are written only when
+    the scan ran with a live `ContactQualityMonitor` (the bloodflow-app always
+    attaches one), and only on per-camera rows. See `SciencePipeline.md` §11.3.
 
   Flags are always listed in that order, so the same set of flags is always
-  the same string. A side-average row (`cam_id = -1`) carries every flag of
-  its cameras. `omotion.pipeline.quality_flags` parses and joins the lists.
+  the same string, for example `ts_corrected;poor_contact`. A side-average row
+  (`cam_id = -1`) carries every pipeline flag of its cameras but never a
+  contact-quality flag. `omotion.pipeline.quality_flags` parses and joins the
+  lists.
 * `timestamp_s` is **seconds since scan start**, not firmware-clock seconds.
 * `cam_id` is **0-indexed**. The corrected CSV column names use 1-indexed
   cameras (e.g. `bfi_l3` is camera 3 (1-indexed) = `cam_id=2` (0-indexed)).
