@@ -62,6 +62,9 @@ FRAME_RATE_HZ = 40.0
 WARMUP_FRAMES = 9
 # Light frames past the ones needed, so a short scan never runs out.
 SPARE_FRAMES = 10
+# on_not_converged answers (anything else stops and restores).
+CONTINUE = "continue"
+ACCEPT = "accept"
 
 FW_DEFAULT_GAINS = tuple(float(g) for g in CAMERA_GAIN_MAP)
 
@@ -138,7 +141,9 @@ class OptimizeResult:
 
     ``status`` is the controller's verdict, None when the run stopped early
     (``canceled`` or ``error``). ``settings`` is what the device holds now:
-    the final settings after a pass, None after a restore.
+    the final settings after a pass, None after a restore. ``accepted``: the
+    run did not converge and the caller chose to keep its last settings
+    (``on_not_converged``), which then count as a pass.
     """
 
     config: OptimizeLaserSettings
@@ -154,11 +159,12 @@ class OptimizeResult:
     error: Optional[str] = None
     restored: bool = False
     restore_problems: tuple[str, ...] = ()
+    accepted: bool = False
 
     @property
     def passed(self) -> bool:
-        return (self.status is not None and self.status.passed and not self.canceled
-                and self.error is None and self.settings is not None)
+        return (self.status is not None and (self.status.passed or self.accepted)
+                and not self.canceled and self.error is None and self.settings is not None)
 
     @property
     def iterations(self) -> int:
@@ -252,6 +258,7 @@ class OptimizeLaserWorkflow:
         log_path: str | None = None,
         on_iteration: Callable[[IterationRecord], None] | None = None,
         stop_evt: threading.Event | None = None,
+        on_not_converged: Callable[[IterationRecord], str] | None = None,
     ) -> OptimizeResult:
         """Optimize the cameras in the masks. Returns how it ended; raises
         only ``ValueError`` for invalid settings or masks (nothing written).
@@ -262,6 +269,12 @@ class OptimizeLaserWorkflow:
         ``threshold_guess``: this laser unit's stored threshold, if any.
         ``log_path``: CSV log to write. ``on_iteration`` is called with each
         record on this thread; an exception in it is logged and ignored.
+        ``on_not_converged`` is asked, on this thread and with the trigger
+        off, when the run hits its iteration limit without settling (e.g. a
+        passing range too narrow): it returns :data:`CONTINUE` (another
+        ``max_iterations``), :data:`ACCEPT` (keep the last settings, which
+        then count as a pass) or anything else to stop and restore. Without
+        it, such a run restores.
         """
         settings.validate(self.limits)
         cams = tuple(cameras_from_masks(left_camera_mask, right_camera_mask))
@@ -272,13 +285,14 @@ class OptimizeLaserWorkflow:
         try:
             return self._run(settings, cams, left_camera_mask, right_camera_mask, ladder,
                              initial_gains, threshold_guess, knee_guess, max_iterations,
-                             log_path, on_iteration, stop_evt or threading.Event())
+                             log_path, on_iteration, stop_evt or threading.Event(),
+                             on_not_converged)
         finally:
             self._run_lock.release()
 
     def _run(self, settings, cams, left_mask, right_mask, ladder, initial_gains,
              threshold_guess, knee_guess, max_iterations, log_path, on_iteration,
-             stop_evt) -> OptimizeResult:
+             stop_evt, on_not_converged=None) -> OptimizeResult:
         limits = self.limits
         actuator = self.actuator()
         base = dict(config=settings, exposure_us=limits.exposure_us, cameras=cams)
@@ -305,7 +319,7 @@ class OptimizeLaserWorkflow:
                 return OptimizeResult(status=None, settings=None, baseline=baseline,
                                       error=f"cannot write the Optimize Laser log: {e}", **base)
         t0 = time.monotonic()
-        canceled, error = False, None
+        canceled, error, accepted = False, None, False
         try:
             actuator.loosen_limits(baseline, settings.current_bounds.high)
             while not controller.done:
@@ -327,12 +341,24 @@ class OptimizeLaserWorkflow:
                         on_iteration(record)
                     except Exception:
                         logger.exception("Optimize Laser on_iteration callback raised")
+                if (controller.status is OptimizeStatus.NOT_CONVERGED
+                        and on_not_converged is not None and not stop_evt.is_set()):
+                    choice = self._ask(on_not_converged, record)
+                    if stop_evt.is_set():
+                        canceled = True
+                    elif choice == CONTINUE:
+                        controller.resume(max_iterations)
+                    elif choice == ACCEPT:
+                        accepted = True
+                        logger.warning("Optimize Laser: did not converge; the caller accepted "
+                                       "the last settings")
         except Exception as e:
             logger.exception("Optimize Laser aborted")
             error = str(e)
 
         status = controller.status if controller.done else None
-        passed = status is not None and status.passed and not canceled and error is None
+        passed = (status is not None and (status.passed or accepted)
+                  and not canceled and error is None)
         restore_problems: tuple[str, ...] = ()
         if not passed:
             restore_problems = tuple(actuator.restore(cams)) + tuple(self._reset_trigger_config())
@@ -341,16 +367,25 @@ class OptimizeLaserWorkflow:
             records=tuple(controller.records), csv_path=log.path if log else None,
             learned_threshold_ma=controller.learned_threshold(), baseline=baseline,
             canceled=canceled, error=error, restored=not passed,
-            restore_problems=restore_problems, **base)
+            restore_problems=restore_problems, accepted=accepted and passed, **base)
+        outcome = (status.value + (" (accepted)" if result.accepted else "") if status
+                   else ("canceled" if canceled else "error"))
         if log is not None:
-            log.close({"result": status.value if status else ("canceled" if canceled else "error"),
-                       "error": error or "", "iterations": result.iterations,
-                       "restored": result.restored,
+            log.close({"result": outcome, "error": error or "",
+                       "iterations": result.iterations, "restored": result.restored,
+                       "elapsed_s": round(time.monotonic() - t0, 2),
                        "learned_threshold_ma": _num(result.learned_threshold_ma, 1)})
-        logger.info("Optimize Laser done: %s after %d iteration(s)%s",
-                    status.value if status else ("canceled" if canceled else "error"),
+        logger.info("Optimize Laser done: %s after %d iteration(s)%s", outcome,
                     result.iterations, ", defaults restored" if result.restored else "")
         return result
+
+    @staticmethod
+    def _ask(on_not_converged, record) -> str:
+        try:
+            return on_not_converged(record)
+        except Exception:
+            logger.exception("Optimize Laser on_not_converged callback raised; stopping")
+            return "stop"
 
     def _iterate(self, actuator, controller, left_mask, right_mask,
                  stop_evt) -> dict[Camera, CameraObservation] | None:

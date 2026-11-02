@@ -16,6 +16,8 @@ from omotion.exposure.actuator import FW_DEFAULT_GAIN_CODES, LaserCameraActuator
 from omotion.exposure.controller import OptimizeStatus
 from omotion.exposure.settings import OptimizeLaserSettings
 from omotion.OptimizeLaserWorkflow import (
+    ACCEPT,
+    CONTINUE,
     CSV_COLUMNS,
     DARK_SKIP_US,
     OptimizeLaserWorkflow,
@@ -208,6 +210,62 @@ def test_a_restore_failure_is_reported():
     rig = Rig(SPREAD, console=FakeConsole(restore_ok=False))
     result, _, _ = _run(rig, max_iterations=1)
     assert result.restored and result.restore_problems
+
+
+def test_not_converged_asks_and_accept_keeps_the_last_settings(tmp_path):
+    rig = Rig(SPREAD)
+    asked = []
+    result, wf, _ = _run(rig, max_iterations=1, log_path=str(tmp_path / "opt.csv"),
+                         on_not_converged=lambda r: asked.append(r) or ACCEPT)
+    assert len(asked) == 1 and asked[0].status is OptimizeStatus.NOT_CONVERGED
+    assert result.passed and result.accepted
+    assert result.status is OptimizeStatus.NOT_CONVERGED
+    # Kept as the device holds them: what the last scan ran with, limits
+    # still widened, nothing restored.
+    assert result.settings == asked[0].settings
+    assert not result.restored and rig.console.restores == 0
+    assert rig.console.get("EE_RATE_LL") == pytest.approx(22400.0)
+    wf.scan_overrides(result)
+    assert "# result: not_converged (accepted)" in (tmp_path / "opt.csv").read_text()
+
+
+def test_not_converged_continue_runs_more_iterations():
+    rig = Rig(SPREAD)
+    asked = []
+
+    def ask(record):
+        asked.append(record)
+        return CONTINUE if len(asked) < 5 else "stop"
+
+    result, _, _ = _run(rig, max_iterations=1, on_not_converged=ask)
+    assert result.iterations > 1 and result.iterations == len(asked) + (1 if result.passed else 0)
+    assert result.passed and result.status is OptimizeStatus.ON_TARGET and not result.accepted
+
+
+@pytest.mark.parametrize("answer", ["stop", None, RuntimeError("dialog crashed")])
+def test_not_converged_stop_restores(answer):
+    rig = Rig(SPREAD)
+
+    def ask(record):
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    result, _, _ = _run(rig, max_iterations=1, on_not_converged=ask)
+    assert not result.passed and not result.accepted
+    assert result.restored and rig.console.restores == 1
+
+
+def test_cancel_while_the_question_is_open_restores():
+    rig = Rig(SPREAD)
+    stop = threading.Event()
+
+    def ask(record):
+        stop.set()
+        return ACCEPT
+
+    result, _, _ = _run(rig, max_iterations=1, stop_evt=stop, on_not_converged=ask)
+    assert result.canceled and not result.passed and result.restored
 
 
 def test_a_failed_run_puts_the_stock_trigger_config_back():
