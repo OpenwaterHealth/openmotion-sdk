@@ -69,8 +69,8 @@ logger = logging.getLogger("openmotion.sdk.exposure")
 
 Camera = tuple[int, int]    # (side: 0 left / 1 right, position 0..7 = camera 1..8)
 
-NEAR_POSITIONS = frozenset({0, 7})      # cameras 1 & 8
-FAR_POSITIONS = frozenset({3, 4})       # cameras 4 & 5
+NEAR_POSITIONS = frozenset({3, 4})      # cameras 4 & 5, nearest the laser
+FAR_POSITIONS = frozenset({0, 7})       # cameras 1 & 8
 
 FALLBACK_DROP = 16.0            # brightness cut for a frame too clipped to fit
 THRESHOLD_GUESS_MA = 2500.0     # default lasing threshold (varies unit to unit)
@@ -251,6 +251,8 @@ class ExposureController:
         self.records: list[IterationRecord] = []
         self.done = False
         self.status: OptimizeStatus | None = None
+        # The next settings a NOT_CONVERGED iteration had chosen, for resume().
+        self._pending: tuple | None = None
 
     # ---- public state -----------------------------------------------------
 
@@ -327,6 +329,10 @@ class ExposureController:
         done = status is not None
         if not done:
             self._gains, self._pw, self._current = gains, pw, current
+        elif status is OptimizeStatus.NOT_CONVERGED:
+            # Kept for resume(); settings stay at what this frame used, which
+            # is what the device holds (and what "accept" keeps).
+            self._pending = (gains, pw, current)
 
         statuses = self._camera_statuses(meas, used, done)
         record = IterationRecord(
@@ -348,6 +354,25 @@ class ExposureController:
                          "gains %s", self.iteration, nxt.pulse_width_us, nxt.current_ma,
                          sorted(set(nxt.gains.values())))
         return record
+
+    def resume(self, extra_iterations: int) -> None:
+        """Keep iterating after NOT_CONVERGED (the caller's choice, e.g. a
+        passing range too narrow to settle in the iteration limit): allow
+        ``extra_iterations`` more, continue from the settings the last
+        iteration had chosen, and reopen the current search."""
+        if self.status is not OptimizeStatus.NOT_CONVERGED:
+            raise RuntimeError("only a run that did not converge can continue")
+        extra = int(extra_iterations)
+        if extra < 1:
+            raise ValueError(f"extra iterations must be at least 1, got {extra_iterations!r}")
+        self.max_iterations = self.iteration + extra
+        if self._pending is not None:
+            self._gains, self._pw, self._current = self._pending
+        self._pending = None
+        self._current_steps = 0
+        self._current_exhausted = False
+        self.done, self.status = False, None
+        logger.info("Optimize Laser continuing: up to %d more iteration(s)", extra)
 
     def learned_threshold(self) -> float | None:
         """Estimate this unit's lasing threshold from the current search.

@@ -52,9 +52,9 @@ class GainMode(str, Enum):
 
 
 class GainPriority(str, Enum):
-    NEAR = "near"           # cameras 1 & 8 drive the shared laser knobs
-    FAR = "far"             # cameras 4 & 5
-    NONE = "none"           # all cameras
+    NEAR = "near"           # cameras 4 & 5 (nearest the laser) drive the shared laser knobs
+    FAR = "far"             # cameras 1 & 8
+    NONE = "none"           # every camera in the run's masks
 
 
 DEFAULT_ORDER = (Knob.GAIN, Knob.PULSE_WIDTH, Knob.CURRENT)

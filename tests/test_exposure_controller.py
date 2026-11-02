@@ -144,21 +144,32 @@ POSITION_BRIGHTNESS = [400, 3000, 8000, 20000, 20000, 8000, 3000, 400]
 SPREAD = {(s, p): POSITION_BRIGHTNESS[p] * (1.0 if s == 0 else 1.3) for s, p in ALL_CAMS}
 
 
-def test_near_priority_keeps_cameras_1_and_8_on_target():
-    ctrl = ExposureController(OptimizeLaserSettings(gain_priority="near"), ALL_CAMS)
+def test_far_priority_keeps_cameras_1_and_8_on_target():
+    ctrl = ExposureController(OptimizeLaserSettings(gain_priority="far"), ALL_CAMS)
     run(ctrl, SPREAD)
-    near = [c for c in ALL_CAMS if c[1] in (0, 7)]
-    far = [c for c in ALL_CAMS if c[1] in (3, 4)]
+    far = [c for c in ALL_CAMS if c[1] in (0, 7)]
+    near = [c for c in ALL_CAMS if c[1] in (3, 4)]
     assert ctrl.status is OptimizeStatus.PARTIAL
-    assert_on_target(ctrl, near)
-    # The laser dims only as far as the near cameras allow (the dimmer,
+    assert_on_target(ctrl, far)
+    # The laser dims only as far as the far cameras allow (the dimmer,
     # left pair ends at full gain), which brings the too-bright middle
     # cameras as close as they can get.
-    assert max(ctrl.settings.gains[c] for c in near) == 16.0
+    assert max(ctrl.settings.gains[c] for c in far) == 16.0
     assert ctrl.settings.pulse_width_us < PW_MAX
     status = ctrl.camera_status
-    assert all(status[c] is CameraStatus.TOO_BRIGHT for c in far)
-    assert all(ctrl.settings.gains[c] == 1.0 for c in far)
+    assert all(status[c] is CameraStatus.TOO_BRIGHT for c in near)
+    assert all(ctrl.settings.gains[c] == 1.0 for c in near)
+
+
+def test_priority_positions():
+    """Near = cameras 4 & 5 (nearest the laser), far = 1 & 8, none = every
+    camera in the run (the Scan Settings masks)."""
+    some = [(0, 0), (0, 3), (0, 4), (1, 7), (1, 5)]
+    pick = {p: ExposureController(OptimizeLaserSettings(gain_priority=p), some).priority_cameras
+            for p in ("near", "far", "none")}
+    assert pick["near"] == ((0, 3), (0, 4))
+    assert pick["far"] == ((0, 0), (1, 7))
+    assert pick["none"] == tuple(sorted(some))
 
 
 def test_priority_is_ignored_when_every_camera_can_reach_target():
@@ -172,16 +183,16 @@ def test_priority_is_ignored_when_every_camera_can_reach_target():
     assert len(set(results.values())) == 1, results
 
 
-def test_far_priority_dims_the_laser_for_cameras_4_and_5():
-    ctrl = ExposureController(OptimizeLaserSettings(gain_priority="far"), ALL_CAMS)
+def test_near_priority_dims_the_laser_for_cameras_4_and_5():
+    ctrl = ExposureController(OptimizeLaserSettings(gain_priority="near"), ALL_CAMS)
     run(ctrl, SPREAD)
-    near = [c for c in ALL_CAMS if c[1] in (0, 7)]
-    far = [c for c in ALL_CAMS if c[1] in (3, 4)]
+    far = [c for c in ALL_CAMS if c[1] in (0, 7)]
+    near = [c for c in ALL_CAMS if c[1] in (3, 4)]
     assert ctrl.status is OptimizeStatus.PARTIAL
-    assert_on_target(ctrl, far)
+    assert_on_target(ctrl, near)
     assert ctrl.settings.pulse_width_us < PW_MAX
-    assert all(ctrl.camera_status[c] is CameraStatus.TOO_DIM for c in near)
-    assert all(ctrl.settings.gains[c] == 16.0 for c in near)
+    assert all(ctrl.camera_status[c] is CameraStatus.TOO_DIM for c in far)
+    assert all(ctrl.settings.gains[c] == 16.0 for c in far)
 
 
 def test_every_camera_on_target_when_the_spread_fits_in_gain():
@@ -382,16 +393,54 @@ def test_pulsatility_wider_than_the_band_does_not_fake_an_exit():
     assert not ctrl.status.passed
 
 
+def test_resume_after_not_converged_keeps_iterating():
+    cam = (0, 0)
+    ctrl = ExposureController(OptimizeLaserSettings(in_range_points=4), [cam], max_iterations=8)
+    run(ctrl, {cam: 5000.0}, pulsatility=0.25)
+    assert ctrl.status is OptimizeStatus.NOT_CONVERGED and ctrl.iteration == 8
+    # The device holds what the last frame used; resume moves on from the
+    # settings that iteration had chosen.
+    held = ctrl.settings
+    assert held == ctrl.records[-1].settings
+    ctrl.resume(3)
+    assert not ctrl.done and ctrl.status is None and ctrl.max_iterations == 11
+    rec = ctrl.update({cam: CameraObservation([_flat(TARGET)] * ctrl.frames_needed)})
+    assert rec.iteration == 9 and ctrl.done and ctrl.status is OptimizeStatus.ON_TARGET
+
+
+def test_resume_only_after_not_converged():
+    cam = (0, 0)
+    ctrl = ExposureController(OptimizeLaserSettings(), [cam])
+    with pytest.raises(RuntimeError):
+        ctrl.resume(5)
+    ctrl = ExposureController(OptimizeLaserSettings(in_range_points=4), [cam], max_iterations=2)
+    run(ctrl, {cam: 5000.0}, pulsatility=0.25)
+    with pytest.raises(ValueError):
+        ctrl.resume(0)
+
+
 def test_missing_camera_reports_no_data_without_blocking():
+    # Camera 4 (near, the default priority) delivers; camera 1 doesn't.
     cams = [(0, 0), (0, 3)]
     ctrl = ExposureController(OptimizeLaserSettings(), cams)
     rng = np.random.default_rng(3)
     while not ctrl.done:
         s = ctrl.settings
-        mean = 6000.0 * s.gains[(0, 0)] / 16 * (s.pulse_width_us - TRUNC) / (PW_MAX - TRUNC)
-        ctrl.update({(0, 0): CameraObservation([speckle_frame(rng, mean, 4, 0, 20_000)])})
+        mean = 6000.0 * s.gains[(0, 3)] / 16 * (s.pulse_width_us - TRUNC) / (PW_MAX - TRUNC)
+        ctrl.update({(0, 3): CameraObservation([speckle_frame(rng, mean, 4, 0, 20_000)])})
     assert ctrl.status is OptimizeStatus.PARTIAL
-    assert ctrl.camera_status[(0, 3)] is CameraStatus.NO_DATA
+    assert ctrl.camera_status[(0, 0)] is CameraStatus.NO_DATA
+
+
+def test_a_missing_priority_camera_does_not_converge():
+    cams = [(0, 0), (0, 3)]
+    ctrl = ExposureController(OptimizeLaserSettings(gain_priority="far"), cams)
+    rng = np.random.default_rng(3)
+    while not ctrl.done:
+        s = ctrl.settings
+        mean = 6000.0 * s.gains[(0, 3)] / 16 * (s.pulse_width_us - TRUNC) / (PW_MAX - TRUNC)
+        ctrl.update({(0, 3): CameraObservation([speckle_frame(rng, mean, 4, 0, 20_000)])})
+    assert ctrl.status is OptimizeStatus.NOT_CONVERGED
 
 
 def test_update_after_done_raises():
