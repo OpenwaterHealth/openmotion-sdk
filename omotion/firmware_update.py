@@ -353,8 +353,10 @@ class UpdateInterruptedError(FirmwareUpdateError):
                                  dfu_serial=e.dfu_serial)
 
     ``in_dfu`` says whether the unit was still on USB in the ROM loader when
-    update() gave up. If not, it dropped off USB: if it is still powered,
-    reconnecting its USB cable brings the ROM loader back.
+    update() gave up. If not, it dropped off USB. A console that is still
+    powered comes back in the ROM loader once its USB cable is reconnected. A
+    sensor does not: its USB runs through the console, and it restarts whenever
+    that link drops, so it has most likely started the half-written image.
     """
 
     def __init__(self, message: str, *, image_path: Path, kind: FirmwareKind | None,
@@ -904,11 +906,29 @@ class FirmwareUpdater:
     @staticmethod
     def _interrupted(job: _Job, target: Path, serial: str | None, last, attempts: int,
                      *, in_dfu: bool) -> UpdateInterruptedError:
-        if in_dfu:
+        # A sensor's USB runs through the console, and the sensor restarts
+        # whenever that link drops (bench, 2026-11-03): for a sensor, unplugging
+        # the system's cable is a power loss.
+        sensor = job.kind is FirmwareKind.SENSOR
+        if in_dfu and sensor:
+            message = (
+                f"the firmware write failed {attempts} time(s) ({last}). The sensor is "
+                "still in update mode with incomplete firmware: do NOT power off the "
+                "system or unplug its USB cable, which restarts the sensor into the "
+                "incomplete firmware. Retry the update to finish it"
+            )
+        elif in_dfu:
             message = (
                 f"the firmware write failed {attempts} time(s) ({last}). The unit is still "
                 "in update mode with incomplete firmware: do NOT power it off or unplug "
                 "it. Retry the update to finish it"
+            )
+        elif sensor:
+            message = (
+                f"the sensor left update mode during the firmware write ({last}), so its "
+                "firmware is incomplete. A sensor restarts when its USB connection drops, "
+                "so it has most likely restarted into the incomplete firmware and needs "
+                "bench recovery. If it is back in update mode, retry the update to finish it"
             )
         else:
             message = (

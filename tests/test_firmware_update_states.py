@@ -45,6 +45,7 @@ BASE = 0x08000000
 SLOT = 0x08020000
 BARE_METAL_IMAGE = b"\x00\x00\x08\x24\x01\x04\x00\x08" + b"\xa5" * 56
 SENSOR = FirmwareKind.SENSOR
+CONSOLE = FirmwareKind.CONSOLE
 BOOTLOADER_ALTS = ["@Internal Flash/0x08000000/01*128Ka,04*128Kg,11*128Ka"]
 
 
@@ -460,18 +461,42 @@ def test_a_write_that_keeps_failing_is_reported_as_interrupted(images, failure):
     assert e.in_dfu and e.attempts == 3
     assert e.image_path == images["baremetal"] and e.kind is SENSOR
     assert e.dfu_serial == "ROM-UID"
-    assert "do NOT power it off" in str(e)
+    assert "do NOT power off the system or unplug its USB cable" in str(e)
+
+
+def test_a_console_left_in_update_mode_must_not_be_powered_off_or_unplugged(images):
+    unit = _rom_unit(fail_downloads=99)
+
+    with pytest.raises(UpdateInterruptedError) as exc:
+        _quick(unit).update(FakeHandle(unit), images["baremetal"], kind=CONSOLE)
+
+    assert exc.value.in_dfu
+    assert "do NOT power it off or unplug it" in str(exc.value)
 
 
 def test_a_unit_that_drops_off_usb_is_not_retried_blind(images):
     unit = _rom_unit(fail_downloads=1, drops_off_usb=True)
 
     with pytest.raises(UpdateInterruptedError) as exc:
-        _quick(unit).update(FakeHandle(unit), images["baremetal"], kind=SENSOR)
+        _quick(unit).update(FakeHandle(unit), images["baremetal"], kind=CONSOLE)
 
     assert not exc.value.in_dfu and exc.value.attempts == 1
     assert _steps(unit) == ["download"]
-    assert "reconnect its USB cable" in str(exc.value)
+    assert "reconnect its USB cable and retry" in str(exc.value)
+
+
+def test_a_sensor_that_drops_off_usb_is_not_sent_to_reconnect_its_cable(images):
+    """A sensor restarts whenever the console's USB link drops (bench,
+    2026-11-03), so reconnecting the cable cannot bring its ROM loader back."""
+    unit = _rom_unit(fail_downloads=1, drops_off_usb=True)
+
+    with pytest.raises(UpdateInterruptedError) as exc:
+        _quick(unit).update(FakeHandle(unit), images["baremetal"], kind=SENSOR)
+
+    message = str(exc.value)
+    assert not exc.value.in_dfu and exc.value.kind is SENSOR
+    assert "restarted into the incomplete firmware and needs bench recovery" in message
+    assert "reconnect" not in message
 
 
 def test_the_retry_count_is_the_updaters_to_set(images):

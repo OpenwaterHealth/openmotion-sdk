@@ -542,11 +542,14 @@ except BootloaderChangeRequired as e:
   default 3) while the unit stays in the ROM loader. If every attempt fails,
   `update()` raises `UpdateInterruptedError`. The unit is still in update mode
   with incomplete firmware: it must not be powered off, or it needs bench
-  recovery. Retry from the same state:
+  recovery. For a sensor, unplugging the system's USB cable counts as a power
+  loss: the sensor's USB runs through the console, and it restarts whenever
+  that link drops. Retry from the same state:
 
   ```python
   except UpdateInterruptedError as e:
-      # e.in_dfu is False if the unit dropped off USB: reconnect it first.
+      # e.in_dfu is False if the unit dropped off USB. Reconnect a console first;
+      # a sensor restarts when its USB link drops and most likely needs bench recovery.
       FirmwareUpdater().update(None, e.image_path, kind=e.kind, dfu_serial=e.dfu_serial)
   ```
 
