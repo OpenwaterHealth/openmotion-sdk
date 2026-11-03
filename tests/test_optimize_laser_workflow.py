@@ -347,7 +347,7 @@ def test_reapply_puts_the_settings_back_after_a_reconnect():
     for pos in range(8):
         rig.left.regs[pos][0x3508], rig.left.regs[pos][0x3509] = 16, 0
 
-    wf.reapply(result)
+    wf.reapply(result, 0xFF, 0)
 
     s = result.settings
     assert rig.console.get("TA_PULSE_WIDTH") == pytest.approx(s.pulse_width_us, abs=0.32)
@@ -356,12 +356,52 @@ def test_reapply_puts_the_settings_back_after_a_reconnect():
     assert all(rig.left.gain_code(p) == s.gain_codes[(0, p)] for p in range(8))
 
 
+def test_reapply_leaves_out_the_cameras_the_scan_powered_off():
+    """A scan on fewer cameras than the run powers the others off, and a
+    write to one fails (bench, 2026-11-02: run 0x66, scan 0x0F)."""
+    rig = Rig(SPREAD)
+    result, wf, _ = _run(rig)
+    fake_apply_laser_power(rig.console)
+    rig.left.fail = {(pos, reg) for pos in range(4, 8)
+                     for reg in (0x3501, 0x3502, 0x3508, 0x3509)}
+    rig.left.writes.clear()
+
+    wf.reapply(result, 0x0F, 0)
+
+    s = result.settings
+    assert rig.console.get("TA_PULSE_WIDTH") == pytest.approx(s.pulse_width_us, abs=0.32)
+    assert all(rig.left.gain_code(p) == s.gain_codes[(0, p)] for p in range(4))
+    assert {pos for pos, _, _ in rig.left.writes} == {0, 1, 2, 3}
+
+
+def test_reapply_does_not_need_a_sensor_the_scan_left_out():
+    rig = Rig(SPREAD)
+    result, wf, _ = _run(rig)
+    fake_apply_laser_power(rig.console)
+    rig.left.connected = False
+    rig.left.writes.clear()
+
+    wf.reapply(result, 0, 0xFF)     # the run never saw the right side
+
+    s = result.settings
+    assert rig.console.get("TA_PULSE_WIDTH") == pytest.approx(s.pulse_width_us, abs=0.32)
+    assert rig.left.writes == [] and rig.right.writes == []
+
+
+def test_reapply_refuses_a_disconnected_sensor_the_scan_uses():
+    rig = Rig(SPREAD)
+    result, wf, _ = _run(rig)
+    rig.left.connected = False
+    with pytest.raises(RuntimeError, match="left sensor not connected"):
+        wf.reapply(result, 0x0F, 0)
+
+
 def test_settings_from_a_failed_run_are_never_applied():
     result, wf, _ = _run(Rig(SPREAD), max_iterations=1)
     with pytest.raises(ValueError):
         wf.scan_overrides(result)
     with pytest.raises(ValueError):
-        wf.reapply(result)
+        wf.reapply(result, 0xFF, 0)
 
 
 def test_restore_defaults_restores_laser_and_cameras():
