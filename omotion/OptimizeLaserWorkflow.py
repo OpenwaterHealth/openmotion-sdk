@@ -449,18 +449,24 @@ class OptimizeLaserWorkflow:
             "calibration_override": {"i_max": 2.0 * result.config.target_mean},
         }
 
-    def reapply(self, result: OptimizeResult) -> None:
+    def reapply(self, result: OptimizeResult, left_camera_mask: int,
+                right_camera_mask: int) -> None:
         """Put a passed run's settings back on the device before a scan or a
         CQ check (a console reconnect resets the laser driver to baseline).
-        Same preflight and limit order as the run; raises on any problem."""
+        Same preflight and limit order as the run; raises on any problem.
+
+        Only the run's cameras that are in these masks are written: a scan on
+        fewer cameras powers the others off, and a write to one fails."""
         if not result.passed:
             raise ValueError("Optimize Laser did not pass; there are no settings to apply")
+        scanned = set(cameras_from_masks(left_camera_mask, right_camera_mask))
         actuator = self.actuator()
-        self._check_ready(result.cameras)
+        self._check_ready(scanned.intersection(result.cameras))
         baseline = actuator.preflight(result.config, self.limits)
         actuator.loosen_limits(baseline, result.config.current_bounds.high)
         s = result.settings
-        actuator.apply(s.gain_codes, s.pulse_width_us, s.current_ma, result.exposure_us)
+        gain_codes = {cam: code for cam, code in s.gain_codes.items() if cam in scanned}
+        actuator.apply(gain_codes, s.pulse_width_us, s.current_ma, result.exposure_us)
 
     def restore_defaults(self, left_camera_mask: int, right_camera_mask: int) -> list[str]:
         """Laser driver, safety limits and cameras back to their defaults
