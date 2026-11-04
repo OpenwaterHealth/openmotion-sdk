@@ -10,27 +10,40 @@ report generator. The checks mirror the test app's Console and Sensor pages
 Console
   comms      ping, echo
   info       firmware version, serial number, device id, board rev id
-  temps      MCU / Safety / TA temperature within --temp-min..--temp-max
+  temps      MCU / Safety / TA board temperature (MAX31875 sensors) within
+             per-sensor limits (TEMP_LIMITS_C); --temp-limit overrides one
   i2c        PDU (0x20/0x48/0x4B on mux 1 ch 0 + PDU MON read),
              TA / Seed / Safety EE / Safety OPT FPGA (0x41 on mux 1 ch 4-7),
-             TEC (DAC setpoint + status read)
+             TEC (DAC setpoint + status read; a latched TEC trip is a FAIL -
+             the firmware refuses trigger start while it is set - and the
+             laser temperature from the TEC thermistor, the reading the trip
+             acts on, must be below the 40 C trip point)
   odometer   system minutes + laser pulses
   indicator  step the RGB indicator through every state, read each back,
-             then restore the original state
+             then restore the original state; a second check sends the
+             out-of-range state 4 and expects the firmware to refuse it
+             (KNOWN on console 1.8.2 and earlier, see KNOWN_ANOMALIES)
   fan        drive --fan-speed, all three tachs >= --fan-min-rpm; the fan is
              left at --fan-speed (the bloodflow app runs it at 100)
-  fpga       version register of each FPGA; write / read back / restore of one
-             current-limit register per FPGA (skipped while the trigger runs)
+  fpga       version register of each FPGA; one full-width write to a
+             firmware-owned register per FPGA, which the firmware must REFUSE
+             with OW_ERROR and the value left unchanged (console 1.8.2+
+             Release/Debug images own the safety state; a successful write is
+             itself the failure). Run only when boot-info reports a console
+             that owns the safety state and is not a Factory image; skipped
+             while the trigger runs.
 
 Sensor (left / right)
   comms      ping, echo
   info       firmware version, serial number, device id
-  temp       sensor (IMU) temperature within --temp-min..--temp-max
+  temp       sensor (IMU) temperature within TEMP_LIMITS_C["imu"]
   imu        accelerometer + gyroscope read, accelerometer non-zero
-  nvcm       NVCM boot probe on all 8 cameras (PROGRAMMED = pass)
+  nvcm       NVCM pin-drive boot probe on all 8 cameras (PROGRAMMED = pass;
+             INCONCLUSIVE when the firmware omits the verdict byte)
   capture    one histogram frame from each of the 8 cameras
 
-Close the test app first - USB access is exclusive. Cameras are left powered.
+Close the test app first - USB access is exclusive. Cameras are left powered
+and the fan at --fan-speed; both are recorded under "left_as" in the result.
 
 Progress is printed as each check runs (--progress jsonl emits one JSON event
 per line on stdout instead, for a wrapping GUI); the result document is
@@ -42,7 +55,11 @@ Usage:
   python scripts/hardware_unit_test.py --skip-capture -o result.json
   python scripts/hardware_unit_test.py --progress jsonl
 
-Exit code: 0 all checks passed, 1 a check failed, 2 could not start.
+Status per check: PASS, FAIL, SKIP, or KNOWN - a failure that matches a
+recorded firmware anomaly on the affected versions (KNOWN_ANOMALIES). KNOWN is
+reported but does not fail the run.
+
+Exit code: 0 no check failed, 1 a check failed, 2 could not start.
 """
 
 import argparse
@@ -54,6 +71,8 @@ import logging
 import math
 import os
 import platform
+import re
+import struct
 import sys
 import time
 import traceback
@@ -65,14 +84,46 @@ _SDK_ROOT = os.path.abspath(os.path.join(_THIS_DIR, ".."))
 if _SDK_ROOT not in sys.path:
     sys.path.insert(0, _SDK_ROOT)
 
-from omotion.config import OW_RESP, TEST_PATTERN_DISABLED  # noqa: E402
+from omotion.config import (  # noqa: E402
+    OW_CONTROLLER, OW_CTRL_I2C_WR, OW_CTRL_SET_IND, OW_ERROR, OW_RESP,
+    TEST_PATTERN_DISABLED)
+from omotion.console_telemetry_conversions import (  # noqa: E402
+    tec_thermistor_voltage_to_celsius)
 
 SCHEMA = "openmotion.hardware_unit_test/1"
-PASS, FAIL, SKIP = "PASS", "FAIL", "SKIP"
+PASS, FAIL, SKIP, KNOWN = "PASS", "FAIL", "SKIP", "KNOWN"
+
+# Failures that match a recorded firmware anomaly. A check listed here that
+# fails on a firmware version at or below "through" is reported KNOWN, not
+# FAIL; on later firmware it is an ordinary FAIL (the fix regressed).
+KNOWN_ANOMALIES = {
+    "console.indicator.reject": {
+        "through": (1, 8, 2),
+        "note": ("console fw if_commands.c OW_CTRL_SET_IND range check tests "
+                 "uartResp->reserved (always 0) instead of cmd->reserved, so state 4 "
+                 "is stored and all indicator LEDs go off; cosmetic"),
+    },
+}
+
+# Laser (TEC thermistor) trip point, C: console fw safety_envelope.h
+# SAFETY_TEC_TRIP_C. uart_comms.c tec_trip_evaluate() compares the thermistor
+# sense voltage against it and opens the safety disconnect.
+TEC_TRIP_C = 40.0
 
 ECHO_PAYLOAD = b"Hello FROM Test Application!"
 FAN_SPINUP_S = 3.0
 INDICATOR_STATES = (1, 2, 3, 0)  # IND1, IND2, IND3, OFF
+INDICATOR_INVALID = 4            # first out-of-range state; firmware must refuse it
+
+# Per-sensor board temperature windows, C. Lower bound is the 15 C ambient
+# minimum of TR-00052 s4.3. These are the MAX31875 board sensors, not the laser:
+# the TEC trip acts on the TEC thermistor, which the TEC check reads.
+TEMP_LIMITS_C = {
+    "mcu": (15.0, 70.0),
+    "safety": (15.0, 60.0),
+    "ta": (15.0, 60.0),
+    "imu": (15.0, 60.0),
+}
 CAMERAS = 8
 
 # Console I2C topology (Console.qml PDU / TA / Seed / Safety buttons).
@@ -87,36 +138,36 @@ class Fpga:
     name: str
     channel: int      # console mux 1 channel
     version_reg: int  # 4 bytes: REV, MINOR, MAJOR, ID
-    rw_reg: int       # 16-bit plain-storage register for the write/read-back check
-    rw_reg_name: str
+    rw_reg: int       # firmware-owned register for the refused-write check
+    rw_reg_name: str  # name in console-fw Core/Src/fpga_register_map.c
+    rw_width: int     # data_len in that map; the firmware checks the length first
 
 
-# Write/read-back registers come from each FPGA's src/registers.v, not the test
-# app's fpga_model.json (stale for Seed and Safety). Each is plain 16-bit
-# storage with no update strobe, so no DAC or driver is touched. Keep off the
-# Seed modulate-frequency block 0x0A-0x0D: a write to 0x0C assigns
-# modulate_frequency[23:0], so its reset value cannot be restored over I2C.
+# Refused-write registers, named and sized as in the console firmware's
+# fpga_register_map.c. The width matters: fpga_passthrough_write_problem()
+# refuses a wrong length with "length does not match the register" BEFORE it
+# reaches the ownership rule, so a short write would pass for the wrong
+# reason. TA_PWM_MON_CL is CFG_KEY_SAFETY; SEED_DDS_CTRL is unlisted (owned);
+# EE/OPT_PULSE_WIDTH_UL are 4-byte CFG_KEY_SAFETY limits.
 FPGAS = (
-    Fpga("ta", "TA", 4, 0x14, 0x0A, "PWM_MON_CURRENT_LIMIT"),
-    Fpga("seed", "Seed", 5, 0x13, 0x00, "MODULATE_PHASE"),
-    Fpga("safety_ee", "Safety EE", 6, 0x25, 0x04, "PULSE_WIDTH_UPPER_LIMIT[15:0]"),
-    Fpga("safety_opt", "Safety OPT", 7, 0x25, 0x04, "PULSE_WIDTH_UPPER_LIMIT[15:0]"),
+    Fpga("ta", "TA", 4, 0x14, 0x0A, "TA_PWM_MON_CL", 2),
+    Fpga("seed", "Seed", 5, 0x13, 0x00, "SEED_DDS_CTRL", 2),
+    Fpga("safety_ee", "Safety EE", 6, 0x25, 0x04, "EE_PULSE_WIDTH_UL", 4),
+    Fpga("safety_opt", "Safety OPT", 7, 0x25, 0x04, "OPT_PULSE_WIDTH_UL", 4),
 )
 
-# Test values for the register write. Both sit above the production TA monitor
-# limit and safety pulse-width upper limit, so while written they only loosen
-# a limit and cannot trip a fault latch.
-RW_PATTERN = bytes([0xA5, 0xA5])
-RW_PATTERN_ALT = bytes([0x5A, 0x5A])
+# Byte repeated to the register width for the refused write. The check runs
+# only where boot-info says the console owns the safety state and is not a
+# Factory image, so the write is never applied; if it ever were (a regression),
+# the original value is written back at once. SEED_DDS_CTRL is a control word,
+# not a limit, so the gating is what keeps this write off older firmware.
+RW_PATTERN_BYTE = 0xA5
 
 # OW_FACTORY_NVCM_CHECK blob: 27 fixed bytes, 16 B per NVCM row read, then
 # (sensor-fw #91) one pin-drive boot verdict byte.
 _NVCM_FIXED_LEN = 27
 _NVCM_ROW_LEN = 16
 _NVCM_STEP_STATUS = 1 << 3
-# Fallback timing split: NVCM boot skips programming (~0.1 s), a blank part
-# is SRAM-loaded (>10 s).
-SRAM_LOAD_THRESHOLD_S = 2.0
 
 _B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
@@ -134,6 +185,13 @@ class Outcome:
     passed: bool
     message: str = ""
     data: dict = field(default_factory=dict)
+
+
+def _version_tuple(version) -> tuple[int, ...] | None:
+    """(major, minor, patch) from a firmware version string such as 'v1.8.2'
+    or '1.8.2-rc.5'; None if it has no such triple."""
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)", str(version or ""))
+    return tuple(int(x) for x in m.groups()) if m else None
 
 
 @dataclass
@@ -170,13 +228,13 @@ def _base58(raw: bytes) -> str:
 
 
 def _temp_outcome(celsius, args, source: str) -> Outcome:
+    lo, hi = args.temp_limits[source]
     value = _finite(celsius)
-    ok = value is not None and args.temp_min <= value <= args.temp_max
-    data = {"celsius": value, "min_c": args.temp_min, "max_c": args.temp_max,
-            "source": source}
+    ok = value is not None and lo <= value <= hi
+    data = {"celsius": value, "min_c": lo, "max_c": hi, "source": source}
     if value is None:
         return Outcome(False, f"invalid reading {celsius!r}", data)
-    limits = "" if ok else f" (outside {args.temp_min:g}-{args.temp_max:g} C)"
+    limits = "" if ok else f" (outside {lo:g}-{hi:g} C)"
     return Outcome(ok, f"{value:.1f} C{limits}", data)
 
 
@@ -303,14 +361,24 @@ def console_checks(console, info: dict, args) -> list[Check]:
     def tec():
         setpoint = console.tec_voltage()
         vout, temp_set, current, voltage, good = console.tec_status()
+        # Laser temperature: the TEC thermistor reading the trip compares, as
+        # the SDK telemetry converts it (ScanWorkflow tec_temp_c).
+        laser_c = _finite(tec_thermistor_voltage_to_celsius(float(vout)))
         data = {"dac_setpoint_v": setpoint, "vout_v": float(vout),
                 "temp_set_v": float(temp_set), "tec_current_v": float(current),
-                "tec_voltage_v": float(voltage), "tec_good": bool(good)}
-        if not isinstance(setpoint, float):
+                "tec_voltage_v": float(voltage), "tec_good": bool(good),
+                "laser_temp_c": laser_c, "tec_trip_c": TEC_TRIP_C}
+        if not isinstance(setpoint, (int, float)) or isinstance(setpoint, bool):
             return Outcome(False, f"TEC DAC read failed ({setpoint!r})", data)
-        msg = f"setpoint {setpoint:.3f} V, status read"
+        laser = "laser temp n/a (no R-T table)" if laser_c is None else f"laser {laser_c:.1f} C"
+        msg = f"setpoint {setpoint:.3f} V, {laser}"
         if not good:
-            msg += "; TEC trip flagged (tec_good=False)"
+            # trigger.c Trigger_Start(): _safety_trigger_interlock refuses a
+            # start until tec_trip_evaluate has seen 200 clean polls.
+            return Outcome(False, msg + "; TEC trip latched (tec_good=False) - "
+                           "trigger start is refused while it is set", data)
+        if laser_c is not None and laser_c >= TEC_TRIP_C:
+            return Outcome(False, msg + f"; at or above the {TEC_TRIP_C:g} C TEC trip", data)
         return Outcome(True, msg, data)
 
     def odometer():
@@ -334,10 +402,43 @@ def console_checks(console, info: dict, args) -> list[Check]:
         finally:
             console.set_rgb_led(original)
         wrong = [s for s, got in readback.items() if got != s]
-        msg = ("all states read back" if not wrong
-               else "read-back mismatch for state(s) " + ", ".join(map(str, wrong)))
+        if wrong:
+            # if_commands.c OW_CTRL_SET_IND: while a laser-safety fault is
+            # latched the write is acknowledged but not applied - the fault
+            # blink owns the LED until the latch clears.
+            msg = ("read-back mismatch for state(s) " + ", ".join(map(str, wrong))
+                   + " - the write was acknowledged but not applied; a latched "
+                   "laser-safety fault owns the LED (fault blink)")
+        else:
+            msg = "all states read back"
         return Outcome(not wrong, msg, {"original": original,
                                         "readback": {str(k): v for k, v in readback.items()}})
+
+    def indicator_reject():
+        """Negative check: an out-of-range indicator state must be refused.
+
+        The SDK's set_rgb_led() validates 0-3 itself, so the raw packet is
+        sent here. On 1.8.2 the firmware's range check reads the wrong field
+        (if_commands.c:238 tests uartResp->reserved, not cmd->reserved), so
+        the state is accepted - this check documents that."""
+        original = console.get_rgb_led()
+        if original not in (0, 1, 2, 3):
+            return Outcome(False, f"indicator read failed ({original})")
+        try:
+            r = console.uart.send_packet(id=None, packetType=OW_CONTROLLER,
+                                         command=OW_CTRL_SET_IND,
+                                         reserved=INDICATOR_INVALID)
+            console.uart.clear_buffer()
+            refused = r is not None and r.packetType == OW_ERROR
+            after = console.get_rgb_led()
+        finally:
+            console.set_rgb_led(original)
+        data = {"sent": INDICATOR_INVALID, "refused": refused, "read_back": after,
+                "original": original}
+        if refused:
+            return Outcome(True, f"state {INDICATOR_INVALID} refused (OW_ERROR)", data)
+        return Outcome(False, f"state {INDICATOR_INVALID} was ACCEPTED (read back {after}); "
+                       "the firmware range check tests the wrong field", data)
 
     def fan():
         if console.set_fan_speed(args.fan_speed) != args.fan_speed:
@@ -371,42 +472,88 @@ def console_checks(console, info: dict, args) -> list[Check]:
             trigger["running"] = cfg.get("TriggerStatus") == 2  # same test as the app
         return trigger["running"]
 
+    def write_lock_skip_reason() -> str | None:
+        """Why the refused-write checks must not run on this console, or None.
+        Read once from OW_CMD_BOOT_INFO: before console 1.8.2 the host owns
+        these registers and the write would land; a Factory image accepts
+        writes to owned registers by design (bench provisioning)."""
+        if "lock_skip" not in trigger:
+            boot = console.get_boot_info()
+            if boot is None or not boot.firmware_owns_safety_state:
+                why = ("console does not report firmware-owned safety state "
+                       "(boot-info v1, firmware before 1.8.2) - write not attempted")
+            elif boot.factory_image:
+                why = "Factory image - owned registers are writable by design"
+            else:
+                why = None
+            trigger["lock_skip"] = why
+            info["factory_image"] = None if boot is None else boot.factory_image
+        return trigger["lock_skip"]
+
+    def raw_i2c_write(bus: dict, payload: bytes) -> bool:
+        """OW_CTRL_I2C_WR sent directly: True if the firmware ACCEPTED the
+        write, False if it answered OW_ERROR. Any other outcome (no reply,
+        transport error) raises, so a comm failure is a FAIL, never a
+        'refused'. MotionConsole.write_i2c_packet returns False for both."""
+        header = struct.pack("BBBBB", bus["mux_index"], bus["channel"],
+                             bus["device_addr"], bus["reg_addr"], len(payload))
+        r = console.uart.send_packet(id=None, packetType=OW_CONTROLLER,
+                                     command=OW_CTRL_I2C_WR, data=header + payload)
+        console.uart.clear_buffer()
+        if r is None:
+            raise RuntimeError("no reply to OW_CTRL_I2C_WR")
+        if r.packetType == OW_ERROR:
+            return False
+        if r.packetType == OW_RESP:
+            return True
+        raise RuntimeError(f"unexpected reply type 0x{r.packetType:02X} to OW_CTRL_I2C_WR")
+
     def fpga_register(fpga: Fpga):
         def fn():
             if args.skip_fpga_write:
                 raise Skip("--skip-fpga-write")
+            reason = write_lock_skip_reason()
+            if reason:
+                raise Skip(reason)
             if trigger_running():
                 raise Skip("trigger is running - FPGA registers left untouched")
             bus = dict(mux_index=FPGA_MUX, channel=fpga.channel,
                        device_addr=FPGA_ADDR, reg_addr=fpga.rw_reg)
+            width = fpga.rw_width
 
             def read() -> bytes | None:
-                data, length = console.read_i2c_packet(**bus, read_len=2)
-                return bytes(data[:2]) if data is not None and length >= 2 else None
+                data, length = console.read_i2c_packet(**bus, read_len=width)
+                return bytes(data[:width]) if data is not None and length >= width else None
 
             original = read()
             if original is None:
                 return Outcome(False, "initial register read failed")
-            pattern = RW_PATTERN if original != RW_PATTERN else RW_PATTERN_ALT
-            try:
-                wrote = console.write_i2c_packet(**bus, data=pattern)
-                readback = read()
-            finally:
-                restored = console.write_i2c_packet(**bus, data=original)
-            restored = restored and read() == original
+            pattern = bytes([RW_PATTERN_BYTE]) * width
+            # Console 1.8.2 Release firmware owns the safety state: a host
+            # write to one of these registers is refused (OW_ERROR, nothing
+            # written, "firmware-owned safety register"). The lock-down is
+            # what this check verifies: a refused full-width write with an
+            # unchanged read-back is the PASS, a successful write is the
+            # failure. No restore is attempted - it would be refused as well.
+            wrote = raw_i2c_write(bus, pattern)
+            readback = read()
             data = {"register": fpga.rw_reg_name, "reg_addr": f"0x{fpga.rw_reg:02X}",
-                    "original": original.hex(), "written": pattern.hex(),
+                    "width": width, "original": original.hex(), "written": pattern.hex(),
                     "read_back": readback.hex() if readback else None,
-                    "restored": restored}
-            problems = []
-            if not wrote:
-                problems.append("write rejected")
-            elif readback != pattern:
-                problems.append(f"read back {data['read_back']}, wrote {pattern.hex()}")
-            if not restored:
-                problems.append(f"original value {original.hex()} NOT restored")
-            msg = "; ".join(problems) or f"{fpga.rw_reg_name} wrote {pattern.hex()}, read back, restored"
-            return Outcome(not problems, msg, data)
+                    "write_refused": not wrote}
+            if wrote:
+                data["restored"] = raw_i2c_write(bus, original) and read() == original
+                return Outcome(False, f"{fpga.rw_reg_name} write of {pattern.hex()} was "
+                               "ACCEPTED - register is not locked down"
+                               + ("" if data["restored"] else
+                                  f"; original {original.hex()} NOT restored"), data)
+            if readback is None:
+                return Outcome(False, "write refused (OW_ERROR) but the read-back failed", data)
+            if readback != original:
+                return Outcome(False, f"write refused but register changed: "
+                               f"{original.hex()} -> {data['read_back']}", data)
+            return Outcome(True, f"{fpga.rw_reg_name} {width}-byte write refused, "
+                           f"value {original.hex()} unchanged", data)
         return fn
 
     m = "console"
@@ -424,11 +571,13 @@ def console_checks(console, info: dict, args) -> list[Check]:
         Check(m, "console.tec", "TEC", "peripheral", tec),
         Check(m, "console.odometer", "Odometer", "odometer", odometer),
         Check(m, "console.indicator", "Indicator", "indicator", indicator),
+        Check(m, "console.indicator.reject", "Indicator rejects state 4", "indicator",
+              indicator_reject),
         Check(m, "console.fan", "Fan", "fan", fan),
     ]
     checks += [Check(m, f"console.fpga_version.{f.key}", f"{f.name} FPGA version",
                      "fpga_version", fpga_version(f)) for f in FPGAS]
-    checks += [Check(m, f"console.fpga_rw.{f.key}", f"{f.name} FPGA register R/W",
+    checks += [Check(m, f"console.fpga_rw.{f.key}", f"{f.name} FPGA write refused",
                      "fpga_register", fpga_register(f)) for f in FPGAS]
     return checks
 
@@ -437,15 +586,16 @@ def console_checks(console, info: dict, args) -> list[Check]:
 # Sensor
 # ---------------------------------------------------------------------------
 
-def _nvcm_verdict_from_blob(blob: bytes) -> tuple[str, str] | None:
+def _nvcm_verdict_from_blob(blob: bytes) -> tuple[str, str]:
     """Verdict from the pin-drive boot byte sensor-fw #91 appends to the
-    OW_FACTORY_NVCM_CHECK blob; None when the byte is absent (older firmware).
-    Mirrors openmotion-test-app utils/nvcm_verdict.interpret_check_blob."""
+    OW_FACTORY_NVCM_CHECK blob (always present on 1.8.3). Mirrors
+    openmotion-test-app utils/nvcm_verdict.interpret_check_blob."""
+    missing = "INCONCLUSIVE", "boot-verdict byte missing from the NVCM blob"
     if len(blob) < _NVCM_FIXED_LEN + 1:
-        return None
+        return missing
     verdict_off = _NVCM_FIXED_LEN + _NVCM_ROW_LEN * blob[26]
     if len(blob) <= verdict_off:
-        return None
+        return missing
     booted = blob[verdict_off]
     if booted == 1:
         return "PROGRAMMED", "NVCM design booted and drove the camera bus (pin probe)"
@@ -457,17 +607,6 @@ def _nvcm_verdict_from_blob(blob: bytes) -> tuple[str, str] | None:
         return "BLANK", ("no NVCM boot (pin probe) - Done fuse is burned but the image "
                          "does not boot; this part cannot be NVCM-flashed again")
     return "BLANK", "no NVCM boot (pin probe) - NVCM blank"
-
-
-def _nvcm_verdict_from_timing(reset_ok: bool, program_ok: bool, elapsed_s: float):
-    """Pre-#91 fallback: a non-forced program skips in ~0.1 s when NVCM boots."""
-    if not reset_ok:
-        return "INCONCLUSIVE", "FPGA reset failed - camera absent/unpowered?"
-    if not program_ok:
-        return "NO RESPONSE", f"FPGA programming failed after {elapsed_s:.1f} s"
-    if elapsed_s < SRAM_LOAD_THRESHOLD_S:
-        return "PROGRAMMED", f"NVCM design booted - SRAM load skipped ({elapsed_s:.2f} s)"
-    return "BLANK", f"NVCM did not boot - firmware SRAM-loaded the FPGA ({elapsed_s:.1f} s)"
 
 
 def sensor_checks(side: str, sensor, info: dict, args) -> list[Check]:
@@ -495,20 +634,13 @@ def sensor_checks(side: str, sensor, info: dict, args) -> list[Check]:
             time.sleep(0.3)
             # The probe runs on the firmware's active camera, so the mux switch
             # must be confirmed - a silent failure would re-probe the last camera.
-            verdict, method = None, "pin_probe"
-            if getattr(sensor.switch_camera(cam_idx), "packetType", None) == OW_RESP:
-                time.sleep(0.1)
-                verdict = _nvcm_verdict_from_blob(sensor.nvcm_check(boot_test=False))
-            if verdict is None:
-                method = "program_timing"
-                reset_ok = sensor.reset_camera_sensor(mask)
-                t0 = time.perf_counter()
-                program_ok = sensor.program_fpga(mask, False) if reset_ok else False
-                verdict = _nvcm_verdict_from_timing(reset_ok, program_ok,
-                                                    time.perf_counter() - t0)
-            name, detail = verdict
+            if getattr(sensor.switch_camera(cam_idx), "packetType", None) != OW_RESP:
+                return Outcome(False, "camera select (switch_camera) failed",
+                               {"verdict": "INCONCLUSIVE", "method": "pin_probe"})
+            time.sleep(0.1)
+            name, detail = _nvcm_verdict_from_blob(sensor.nvcm_check(boot_test=False))
             return Outcome(name == "PROGRAMMED", f"{name} - {detail}",
-                           {"verdict": name, "detail": detail, "method": method})
+                           {"verdict": name, "detail": detail, "method": "pin_probe"})
         return fn
 
     def capture(cam_idx: int):
@@ -534,6 +666,11 @@ def sensor_checks(side: str, sensor, info: dict, args) -> list[Check]:
                 time.sleep(0.1)
                 if not sensor.camera_configure_registers(camera_position=mask):
                     return Outcome(False, "camera register configure failed", data)
+            # auto_upload=True only means program_fpga(manual_process=False),
+            # i.e. OW_FPGA_PROG_SRAM reserved=1 -> firmware program_fpga(): an
+            # NVCM boot detect, no host bitstream. The Debug-only host-upload
+            # path (reserved=0 / OW_FPGA_BITSTREAM, sensor-fw #136) is never
+            # taken, and the camera is already programmed above anyway.
             result = sensor.get_camera_histogram(
                 camera_id=cam_idx, test_pattern_id=TEST_PATTERN_DISABLED, auto_upload=True)
             if not result:
@@ -544,7 +681,9 @@ def sensor_checks(side: str, sensor, info: dict, args) -> list[Check]:
                 return Outcome(False, "histogram capture failed" + detail, data)
             bins = list(result[0][:1024])
             if bins:
-                bins[0] = max(0, bins[0] - 6)  # firmware sentinel in bin 0 (as the test app)
+                # UA-02 spurious counts land on the idle-bus bin 0; the test
+                # app subtracts the same constant. An approximation.
+                bins[0] = max(0, bins[0] - 6)
             total = sum(bins)
             mean = sum(i * b for i, b in enumerate(bins)) / total if total else 0.0
             data.update(bins=len(bins), total_counts=total, mean=round(mean, 2))
@@ -588,7 +727,7 @@ class TextProgress:
 
     def test_end(self, index: int, total: int, result: dict) -> None:
         message = f"  {result['message']}" if result["message"] else ""
-        self.out.write(f"{result['status']:<4} ({result['duration_s']:.2f} s){message}\n")
+        self.out.write(f"{result['status']:<5} ({result['duration_s']:.2f} s){message}\n")
         self.out.flush()
 
     def done(self, report: dict, path: str) -> None:
@@ -596,10 +735,11 @@ class TextProgress:
         for name, module in report["modules"].items():
             s = module["summary"]
             print(f"  {name:<7} {s['result']:<4}  {s['passed']} passed, {s['failed']} failed, "
-                  f"{s['skipped']} skipped", file=self.out)
+                  f"{s['skipped']} skipped, {s['known']} known", file=self.out)
         s = report["summary"]
         print(f"\nOVERALL {s['result']} - {s['passed']}/{s['total']} passed, "
-              f"{s['failed']} failed, {s['skipped']} skipped", file=self.out)
+              f"{s['failed']} failed, {s['skipped']} skipped, {s['known']} known",
+              file=self.out)
         print(f"Result written to {path}", file=self.out, flush=True)
 
     def error(self, message: str) -> None:
@@ -637,9 +777,23 @@ class JsonlProgress:
 # ---------------------------------------------------------------------------
 
 def _summarize(tests: list[dict]) -> dict:
-    counts = {status: sum(t["status"] == status for t in tests) for status in (PASS, FAIL, SKIP)}
+    counts = {status: sum(t["status"] == status for t in tests)
+              for status in (PASS, FAIL, SKIP, KNOWN)}
     return {"result": FAIL if counts[FAIL] else PASS, "total": len(tests),
-            "passed": counts[PASS], "failed": counts[FAIL], "skipped": counts[SKIP]}
+            "passed": counts[PASS], "failed": counts[FAIL], "skipped": counts[SKIP],
+            "known": counts[KNOWN]}
+
+
+def _known_anomaly(check: Check, module: dict) -> str | None:
+    """The KNOWN_ANOMALIES note if this failure is the recorded anomaly on an
+    affected firmware version, else None."""
+    entry = KNOWN_ANOMALIES.get(check.id)
+    if entry is None:
+        return None
+    version = _version_tuple(module["info"].get("firmware_version"))
+    if version is None or version > entry["through"]:
+        return None
+    return entry["note"]
 
 
 def run_checks(checks: list[Check], modules: dict, progress) -> None:
@@ -657,6 +811,10 @@ def run_checks(checks: list[Check], modules: dict, progress) -> None:
                 outcome = check.fn()
                 status = PASS if outcome.passed else FAIL
                 message, data = outcome.message, outcome.data
+                known = None if outcome.passed else _known_anomaly(check, module)
+                if known:
+                    status = KNOWN
+                    data = {**data, "known_anomaly": known}
             except Skip as skip:
                 status, message = SKIP, str(skip)
             except Exception as exc:  # a raising SDK call is a failed check, not a crash
@@ -684,10 +842,14 @@ def build_report(modules: dict, args, started_at: str, elapsed_s: float,
         "sdk_version": sdk_version,
         "host": {"hostname": platform.node(), "platform": platform.platform(),
                  "python": platform.python_version()},
-        "settings": {"temp_min_c": args.temp_min, "temp_max_c": args.temp_max,
+        "settings": {"temp_limits_c": {k: {"min": lo, "max": hi}
+                                       for k, (lo, hi) in args.temp_limits.items()},
                      "fan_speed_pct": args.fan_speed, "fan_min_rpm": args.fan_min_rpm,
                      "fpga_write": not args.skip_fpga_write, "nvcm": not args.skip_nvcm,
                      "capture": not args.skip_capture},
+        "left_as": {"cameras_powered": bool(modules.keys() - {"console"})
+                    and not (args.skip_nvcm and args.skip_capture),
+                    "fan_speed_pct": args.fan_speed if "console" in modules else None},
         "summary": _summarize(all_tests),
         "modules": modules,
     }
@@ -705,21 +867,30 @@ def parse_args(argv=None) -> argparse.Namespace:
                     help="progress format on stdout (default: text)")
     ap.add_argument("--timeout", type=float, default=15.0,
                     help="seconds to wait for each module to connect (default: 15)")
-    ap.add_argument("--temp-min", type=float, default=20.0, help="min passing temp, C")
-    ap.add_argument("--temp-max", type=float, default=100.0, help="max passing temp, C")
+    ap.add_argument("--temp-limit", action="append", default=[], metavar="SENSOR=MIN:MAX",
+                    help="override one temperature window, C; SENSOR is mcu, safety, ta or imu "
+                         "(defaults: " + ", ".join(f"{k}={lo:g}:{hi:g}"
+                                                   for k, (lo, hi) in TEMP_LIMITS_C.items()) + ")")
     ap.add_argument("--fan-speed", type=int, default=100, choices=range(0, 101),
                     metavar="0-100", help="fan duty for the fan check (default: 100)")
     ap.add_argument("--fan-min-rpm", type=int, default=4000,
                     help="min passing RPM per fan (default: 4000, the test app's limit)")
     ap.add_argument("--skip-fpga-write", action="store_true",
-                    help="skip the FPGA register write/read-back checks")
+                    help="skip the FPGA refused-write checks")
     ap.add_argument("--skip-nvcm", action="store_true", help="skip the camera NVCM checks")
     ap.add_argument("--skip-capture", action="store_true",
                     help="skip the camera frame-capture checks")
     ap.add_argument("--include-histograms", action="store_true",
                     help="store each captured 1024-bin histogram in the result")
     ap.add_argument("--verbose", action="store_true", help="show SDK debug logging")
-    return ap.parse_args(argv)
+    args = ap.parse_args(argv)
+    args.temp_limits = dict(TEMP_LIMITS_C)
+    for spec in args.temp_limit:
+        m = re.fullmatch(r"(mcu|safety|ta|imu)=([-\d.]+):([-\d.]+)", spec.strip())
+        if not m:
+            ap.error(f"--temp-limit {spec!r}: expected SENSOR=MIN:MAX")
+        args.temp_limits[m.group(1)] = (float(m.group(2)), float(m.group(3)))
+    return args
 
 
 def main(argv=None) -> int:
