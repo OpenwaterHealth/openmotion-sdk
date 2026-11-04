@@ -11,7 +11,9 @@ __all__ = ["DFUProgress", "ProgressCallback", "RawProgressCallback", "progress_a
 
 @dataclass(frozen=True)
 class DFUProgress:
-    #: "erase", "download", "verify", "wait" or "power_cycle".
+    #: "erase", "download", "verify", "wait", "power_cycle", or "retry" (a failed
+    #: bare-metal write is being redone; ``message`` says which attempt and
+    #: that the unit must not be powered off).
     phase: str
     percent: int | None
     bytes_written: int | None

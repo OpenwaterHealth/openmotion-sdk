@@ -35,6 +35,7 @@ from omotion import (
     FirmwareUpdateError,
     FirmwareUpdater,
     MotionInterface,
+    UpdateInterruptedError,
 )
 from omotion.dfu import STM32DFU, DFUProgress
 from omotion.firmware_update import find_release_images, stlink_probes
@@ -233,6 +234,14 @@ def main() -> int:
         except BootloaderChangeRequired as exc:
             print(f"[FAIL]  {exc}")
             print("        Missing: " + ", ".join(_FLAG_FOR.get(n, n) for n in exc.needs))
+            return 1
+        except UpdateInterruptedError as exc:
+            print(f"[FAIL]  {exc}")
+            print(f"        The {label} is in the STM32 ROM loader with incomplete "
+                  "firmware. Leave it powered; to")
+            print("        finish the write, from Python: FirmwareUpdater().update(None, "
+                  f"r'{exc.image_path}', kind=FirmwareKind('{product}'), "
+                  f"dfu_serial={exc.dfu_serial!r})")
             return 1
         except FirmwareUpdateError as exc:
             print(f"[FAIL]  {exc}")

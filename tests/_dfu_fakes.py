@@ -103,6 +103,7 @@ class FakeUsbDevice:
         self.image_written = False  # a data block was programmed
         self.requests = []          # ("DNLOAD", block, length), ("GETSTATUS",), ("reset",), ...
         self.short_upload = False   # return one byte less than asked
+        self.corrupt_upload = False # flip the first byte of every flash read
         self.fail_with = None       # exception to raise from every transfer
         self.stuck_busy = False     # never leave dfuDNLOAD-BUSY
         self.gone_after_manifest = None  # exception for every transfer after the leave
@@ -180,7 +181,10 @@ class FakeUsbDevice:
         if self.pointer == VERSION_ADDR:
             return self.version.encode().ljust(64, b"\x00")[:length]
         off = self.pointer - FLASH_BASE + (block - 2) * self.xfer
-        return bytes(self.flash[off:off + length])
+        data = bytes(self.flash[off:off + length])
+        if self.corrupt_upload and data:
+            data = bytes([data[0] ^ 0xFF]) + data[1:]
+        return data
 
     def read(self, address, length):
         off = address - FLASH_BASE
@@ -236,12 +240,23 @@ class FakeDfuUnit:
     ``wait_for_device``; both are this one object, which also plays the unit:
     it resets after a download, runs the updater, and boots the application.
     Everything that would touch flash is recorded in ``calls``.
+
+    Failure injection for the bare-metal write: ``fail_downloads`` makes that
+    many downloads fail part-way (a USB error), ``corrupt_reads`` makes that
+    many read-backs differ, and ``drops_off_usb`` makes a failed download take
+    the unit off USB as well.
     """
 
     def __init__(self, mode="bootloader", version="1.2.0", *, installed_fw_version=0,
                  appears=True, in_dfu=False, refuse_download=False, app_boots=True,
-                 updater=None, updater_outcome="upgraded"):
+                 updater=None, updater_outcome="upgraded", serial=None,
+                 fail_downloads=0, corrupt_reads=0, drops_off_usb=False):
         self.mode = mode
+        self.serial = serial
+        self.fail_downloads = fail_downloads
+        self.corrupt_reads = corrupt_reads
+        self.drops_off_usb = drops_off_usb
+        self.connects = 0
         self.version = version
         self.installed_fw_version = installed_fw_version
         self.appears = appears
@@ -264,14 +279,18 @@ class FakeDfuUnit:
         self.disconnect()
 
     def wait_for_device(self, timeout_s, present=True, serial=None):
-        return self.in_dfu == present
+        return self._visible(serial) == present
+
+    def _visible(self, serial):
+        return self.in_dfu and (serial is None or serial == self.serial)
 
     # -- the STM32DFU instance surface -------------------------------------
     def connect(self, serial=None):
         from omotion.dfu import DFUDeviceNotFoundError
 
-        if not self.in_dfu:
+        if not self._visible(serial):
             raise DFUDeviceNotFoundError("No DFU device found")
+        self.connects += 1
 
     def disconnect(self):
         pass
@@ -304,14 +323,21 @@ class FakeDfuUnit:
         if progress_cb:
             progress_cb(1, 1)
 
-    def download(self, address, data, progress_cb=None, pre_erased=False):
+    def download(self, address, data, progress_cb=None, pre_erased=False, manifest=True):
         from omotion.dfu import DFUError
 
         if self.refuse_download:
             raise DFUError("Device error: errVENDOR in state dfuERROR")
         self.calls.append(("download", address, bytes(data), pre_erased))
+        if self.fail_downloads:
+            self.fail_downloads -= 1
+            if self.drops_off_usb:
+                self.in_dfu = False
+            raise DFUError("USB transfer failed: [Errno 5] Input/Output Error")
         if progress_cb:
             progress_cb(len(data), len(data))
+        if not manifest:
+            return                              # still in DFU, waiting to be verified
         self.in_dfu = False                     # the unit resets
         if self.updater is not None and bytes(data) == self.updater:
             if self.updater_outcome == "upgraded":
@@ -324,11 +350,25 @@ class FakeDfuUnit:
             self.app_running = self.app_boots
             self.in_dfu = self.mode == "bootloader" and not self.app_boots
 
+    def verify(self, address, data, progress_cb=None):
+        from omotion.dfu import DFUVerifyError
+
+        self.calls.append(("verify", address, bytes(data)))
+        if self.corrupt_reads:
+            self.corrupt_reads -= 1
+            raise DFUVerifyError(f"Verify mismatch at {address + 16:#010x}: "
+                                 "expected 0xa5, got 0xff")
+        if progress_cb:
+            progress_cb(len(data), len(data))
+        return True
+
     def leave_dfu(self):
         self.calls.append(("leave",))
         if self.in_dfu:                         # else it already reset: nobody to hear it
             self.in_dfu = False
-            self.app_running = True
+            # The ROM loader jumps into the new image, which hangs on a sensor
+            # module (app_boots=False) until a power cycle.
+            self.app_running = self.app_boots if self.mode == "rom" else True
 
     # -- for assertions ----------------------------------------------------
     def app_present(self, kind, handle):

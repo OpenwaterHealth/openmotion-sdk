@@ -391,7 +391,7 @@ The SDK uses a layered catch-log-reraise pattern: each layer catches hardware ex
 | `JedecError` | `jedecParser` | JEDEC file format violation |
 | `FpgaUpdateError` | `FPGAProgrammer` | FPGA programming sequence failure |
 | `FileNotFoundError` | `usb_backend` | Missing libusb DLL |
-| `FirmwareUpdateError` | `FirmwareUpdater` | Update refused or failed; subclasses `BootloaderChangeRequired`, `ImageRejectedError`, `UpdaterRefusedError` |
+| `FirmwareUpdateError` | `FirmwareUpdater` | Update refused or failed; subclasses `BootloaderChangeRequired`, `ImageRejectedError`, `UpdaterRefusedError`, `UpdateInterruptedError` (bare-metal write failed; the unit is still in the ROM loader) |
 | `DFUError` | `dfu.STM32DFU` | DFU protocol or USB failure (re-raised as `FirmwareUpdateError` by `FirmwareUpdater`) |
 
 USB timeout errnos (110 on Linux, 10060 on Windows) are suppressed inside read loops and treated as normal idle conditions. Errno 32 (broken pipe) and 19/5 (IO/no-device) trigger disconnect callbacks.
