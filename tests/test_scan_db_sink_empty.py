@@ -74,3 +74,31 @@ def test_rows_written_reset_between_scans(tmp_path):
         assert db.get_session_by_label("20260615_000000_subjX") is not None
     finally:
         db.close()
+
+
+def test_extra_session_meta_is_merged_without_replacing_sdk_keys(tmp_path):
+    """sdk#335: the laser optimizer records its settings in session_meta."""
+    import json
+    db_path = str(tmp_path / "scans.db")
+    meta = _meta()
+    meta.extra_session_meta = {
+        "laser_optimizer": {"near_gain": 8, "pulse_width_us": 1339},
+        "scan_id": "must-not-win",
+    }
+    sink = ScanDBSink(db_path)
+    sink.on_scan_start(meta)
+    frame = SimpleNamespace(
+        cam_id=-1, side="left", abs_frame_id=1, t=0.1,
+        bfi=1.0, bvi=2.0, mean=3.0, contrast=0.4, quality="ok",
+    )
+    sink.consume("final", SimpleNamespace(frames=[frame]))
+    sink.on_complete()
+    db = ScanDatabase(db_path)
+    try:
+        sess = db.get_session_by_label("20260615_000000_subjX")
+        stored = sess["session_meta"]
+        stored = json.loads(stored) if isinstance(stored, str) else stored
+        assert stored["laser_optimizer"] == {"near_gain": 8, "pulse_width_us": 1339}
+        assert stored["scan_id"] == "20260615_000000"
+    finally:
+        db.close()

@@ -22,6 +22,27 @@ from ..pedestal import SensorPedestals, adc_gain_for_pedestal
 from .dark import CorrectedInterval
 
 
+def gain_map_2x8(camera_gain_map) -> np.ndarray:
+    """Normalize a camera gain map to shape (2, 8): [side][cam_id].
+
+    Accepts the stock per-position map (8,), applied to both sides, or a
+    per-side map (2, 8) — what a scan that writes its own analog gains (the
+    laser optimizer, sdk#335) passes so the Poisson term uses the gains the
+    cameras actually ran at. Raises ``ValueError`` for any other shape or a
+    non-finite / non-positive gain.
+    """
+    arr = np.asarray(camera_gain_map, dtype=np.float32)
+    if arr.shape == (8,):
+        arr = np.tile(arr, (2, 1))
+    if arr.shape != (2, 8):
+        raise ValueError(
+            f"camera gain map has shape {arr.shape}; expected (8,) or (2, 8)"
+        )
+    if not np.all(np.isfinite(arr)) or np.any(arr <= 0):
+        raise ValueError(f"camera gain map must be finite and > 0, got {arr.tolist()}")
+    return arr
+
+
 class ShotNoiseCorrectionStage:
     name = "shot_noise_correction"
 
@@ -39,8 +60,10 @@ class ShotNoiseCorrectionStage:
             adc_gain_for_pedestal(pedestals.left),
             adc_gain_for_pedestal(pedestals.right),
         )
-        self._gain_map = np.asarray(camera_gain_map, dtype=np.float32).reshape(1, 1, 8)
-        self._gain_map_flat = np.asarray(camera_gain_map, dtype=np.float32).ravel()
+        # (2, 8) per side and camera; broadcast as (1, 2, 8) on the realtime
+        # path, indexed [side_idx, cam_pos] on the event path.
+        self._gain_map_2d = gain_map_2x8(camera_gain_map)
+        self._gain_map = self._gain_map_2d.reshape(1, 2, 8)
 
     def process(self, batch: FrameBatch) -> FrameBatch:
         self._process_realtime(batch)
@@ -94,7 +117,7 @@ class ShotNoiseCorrectionStage:
                 side_idx = 0 if f.side == "left" else 1
                 cam_pos = int(f.cam_id) % 8
                 adc_gain = self._adc_gain_scalar[side_idx]
-                g_cam = float(self._gain_map_flat[cam_pos])
+                g_cam = float(self._gain_map_2d[side_idx, cam_pos])
 
                 mean = float(f.mean)
                 if not np.isfinite(mean):
