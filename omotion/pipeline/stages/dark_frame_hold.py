@@ -173,12 +173,11 @@ class DarkFrameHoldStage:
         temp_c = _interp("temp_c") if right1.temp_c is not None else None
 
         # A dark row interpolated from unlit neighbours is unlit too (#341):
-        # its NaN BFI/BVI then carries a matching flag instead of "ok".
+        # it carries the flag and, like every unlit row, no BVI.
         neighbours = (left2, left1, right1, right2)
-        quality = (LOW_LIGHT
-                   if any(n is not None and has_quality(n.quality, LOW_LIGHT)
-                          for n in neighbours)
-                   else OK)
+        unlit = any(n is not None and has_quality(n.quality, LOW_LIGHT)
+                    for n in neighbours)
+        quality = LOW_LIGHT if unlit else OK
 
         return EnrichedCorrectedFrame(
             abs_frame_id=d_prev_abs,
@@ -189,7 +188,7 @@ class DarkFrameHoldStage:
             std=_interp("std"),
             contrast=_interp("contrast"),
             bfi=_interp("bfi"),
-            bvi=_interp("bvi"),
+            bvi=float("nan") if unlit else _interp("bvi"),
             quality=quality,
             temp_c=temp_c,
         )

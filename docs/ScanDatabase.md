@@ -148,9 +148,13 @@ Notes:
   `ts_corrected;low_light`. A row with no flag reads `ok`. The flags are:
   * `ts_corrected`: the frame's timestamp was re-anchored;
   * `nan_filled`: a placeholder for a frame that never arrived;
-  * `low_light`: an unlit camera. The frame sat at its dark level, so
-    `bfi` and `contrast` are NULL; `mean` (near 0) and `bvi` are still computed.
-    See `SciencePipeline.md` §5.8.4.
+  * `low_light`: an unlit camera. The frame sat at its dark level, so `bvi`
+    is NULL (from the near-0 mean it would read 10, the top of the scale).
+    `mean`, `contrast` and `bfi` are stored as computed: `contrast` and `bfi`
+    are often NULL anyway, and otherwise far outside a lit camera's range
+    (BFI down to the −10⁴ range). Filter on this flag. A side-average row
+    counts the camera toward `contrast`, `bfi` and `mean`, but not `bvi`.
+    See `SciencePipeline.md` §5.8.4–5.8.5.
   * `poor_contact`, `ambient_light`: the live contact-quality warning that was
     raised for this camera at this frame, i.e. what the operator was shown.
     With the default debounce (the bloodflow-app's too), `poor_contact` is

@@ -326,14 +326,11 @@ class LinearInterpolation:
 
             quality = lf.quality
             if lf.low_light:
-                # Unlit frame (covered sensor, decoupled fiber). Its mean
-                # above the dark baseline is a real ~0 reading and is kept,
-                # but there is no speckle signal: std is undefined, and with
-                # it contrast and BFI downstream. Without this, a mean
-                # scattering just above 0 divided into the residual std gave
-                # BFI in the -10^5 range (#341). BVI is still computed from
-                # the mean; the quality flag marks the frame as unlit.
-                std = float("nan")
+                # Unlit frame (covered sensor, decoupled fiber): its raw mean
+                # sits at the dark level. The flag marks it; mean, std and
+                # downstream contrast and BFI are kept as computed, and
+                # BfiBviStage blanks BVI, which would otherwise read the top
+                # of the scale from the ~0 mean (#341).
                 quality = join_quality(quality, LOW_LIGHT)
 
             corrected_frames.append(CorrectedFrame(
