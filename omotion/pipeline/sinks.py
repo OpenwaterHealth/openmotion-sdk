@@ -15,6 +15,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Optional, Protocol, runtime_checkable
 
 from omotion.config import HISTO_SIZE_WORDS
+from omotion.pipeline.quality_flags import join as join_quality
 
 logger = logging.getLogger("openmotion.sdk.pipeline.sinks")
 
@@ -798,7 +799,7 @@ class ScanDBSink:
                 "mean": mean_v,
                 "contrast": contrast_v,
                 "temp": _round(getattr(f, "temp_c", None)),
-                "quality": str(getattr(f, "quality", "ok") or "ok"),
+                "quality": join_quality(getattr(f, "quality", None)),
             })
 
         if len(self._buffer) >= self._batch_size:

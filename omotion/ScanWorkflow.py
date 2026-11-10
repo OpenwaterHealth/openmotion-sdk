@@ -25,6 +25,7 @@ from omotion.Calibration import Calibration
 
 if TYPE_CHECKING:
     from omotion.MotionInterface import MotionInterface
+    from omotion.contact_quality import CQSettings
 
 logger = logging.getLogger(f"{_log_root}.ScanWorkflow" if _log_root else "ScanWorkflow")
 
@@ -145,6 +146,13 @@ class ScanRequest:
     # Pipeline sinks list — will be injected by the runner at start_scan time.
     # Normally managed by the SDK at MotionInterface construction (data_dir, scan_db_path).
     sinks: list = field(default_factory=list)
+    # Live contact-quality settings (omotion.contact_quality.CQSettings).
+    # When set, the pipeline runs a ContactQualityStage: each raise/clear
+    # edge is published on the "contact_quality" channel (attach a
+    # ContactQualityTransitionSink to receive it) and the verdict latched
+    # for each camera at each frame is added to the per-camera corrected
+    # frames' quality flags (bloodflow-app#589). None = not evaluated.
+    contact_quality: "CQSettings | None" = None
     # Skip injecting default storage sinks (CSV, DB). Set to True when
     # a caller supplies all sinks via the sinks list.
     skip_default_storage: bool = False
@@ -407,10 +415,22 @@ class ScanWorkflow:
             CsvSink as PipelineCsvSink, DiagnosticsLogSink, ScanDBSink, ScanMetadata,
         )
         from omotion.pipeline.pedestal import SensorPedestals, pedestal_for_fw
+        from omotion.contact_quality import ContactQualityMonitor
 
         # Clear the prior scan's outcome up front so a refusal below (busy, or
         # a pre-flight failure) never reports a stale error from an earlier run.
         self._last_scan_error = None
+        if any(isinstance(s, ContactQualityMonitor) for s in request.sinks):
+            # Not a sink any more (bloodflow-app#589): the runner would never
+            # feed it, and live contact-quality warnings would go silently
+            # dead, the failure #364 was about.
+            self._last_scan_error = (
+                "ContactQualityMonitor is not a sink: pass ScanRequest."
+                "contact_quality=CQSettings(...) and attach a "
+                "ContactQualityTransitionSink instead"
+            )
+            logger.error("start_scan refused: %s", self._last_scan_error)
+            return False
 
         # Laser safety limits (sdk#310): refuse a laser scan while the last
         # apply_laser_power did not verify them. A laser-off scan never
@@ -494,6 +514,7 @@ class ScanWorkflow:
             pedestals=pedestals,
             raw_save_max_duration_s=request.raw_save_max_duration_s,
             telemetry=telemetry_aggregator,
+            contact_quality=request.contact_quality,
         )
 
         # ── Auto-inject default sinks ──────────────────────────────────────

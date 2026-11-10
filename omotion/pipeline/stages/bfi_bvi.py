@@ -19,6 +19,7 @@ from typing import Any
 import numpy as np
 
 from ..batch import FrameBatch, IntervalClosed
+from ..quality_flags import LOW_LIGHT, has as has_quality
 from .dark import (
     CorrectedInterval, EnrichedCorrectedFrame, EnrichedCorrectedInterval,
 )
@@ -95,7 +96,12 @@ class BfiBviStage:
                     bfi = (1.0 - (contrast - c_min) / c_span) * 10.0
                 else:
                     bfi = contrast * 10.0
-                if i_span > 0:
+                if has_quality(f.quality, LOW_LIGHT):
+                    # Unlit frame (#341): its ~0 mean would map to the top
+                    # of the BVI scale, so it stores no BVI. Contrast and BFI
+                    # are kept as computed; the low_light flag marks them.
+                    bvi = float("nan")
+                elif i_span > 0:
                     bvi = (1.0 - (f.mean - i_min) / i_span) * 10.0
                 else:
                     bvi = f.mean * 10.0

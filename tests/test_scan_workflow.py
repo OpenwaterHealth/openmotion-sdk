@@ -1000,3 +1000,52 @@ def test_configure_failure_skips_security_uid_refresh():
 
     assert not result.ok
     sensor.refresh_id_cache.assert_not_called()
+
+
+def _stage_names(motion):
+    return [s.name for s in motion.scan_workflow._runner.pipeline.stages]
+
+
+def test_start_scan_runs_contact_quality_in_the_pipeline(tmp_path):
+    """bloodflow-app#589: ScanRequest.contact_quality puts a
+    ContactQualityStage right before the live tee."""
+    from omotion.contact_quality import CQSettings, CQThresholds
+    motion = _build_motion_with_data_dir(
+        None, scan_db_path=str(tmp_path / "scans.db"))
+    request = ScanRequest(
+        subject_id="x", duration_sec=1,
+        left_camera_mask=0xFF, right_camera_mask=0, reduced_mode=False,
+        contact_quality=CQSettings(
+            thresholds=CQThresholds.from_sequences([3.0] * 8, [15.0] * 8)),
+    )
+    assert motion.scan_workflow.start_scan(request)
+    assert _stage_names(motion)[-2:] == ["contact_quality", "tee:live"]
+
+
+def test_start_scan_without_contact_quality_has_no_stage(tmp_path):
+    motion = _build_motion_with_data_dir(
+        None, scan_db_path=str(tmp_path / "scans.db"))
+    request = ScanRequest(
+        subject_id="x", duration_sec=1,
+        left_camera_mask=0xFF, right_camera_mask=0, reduced_mode=False,
+    )
+    assert motion.scan_workflow.start_scan(request)
+    assert "contact_quality" not in _stage_names(motion)
+
+
+def test_start_scan_refuses_a_contact_quality_monitor_sink(tmp_path):
+    """The monitor is no longer a sink: attached as one it would never be
+    fed and the live warning would go silently dead (#364)."""
+    from omotion.contact_quality import CQThresholds, ContactQualityMonitor
+    motion = _build_motion_with_data_dir(
+        None, scan_db_path=str(tmp_path / "scans.db"))
+    monitor = ContactQualityMonitor(
+        thresholds=CQThresholds.from_sequences([3.0] * 8, [15.0] * 8))
+    request = ScanRequest(
+        subject_id="x", duration_sec=1,
+        left_camera_mask=0xFF, right_camera_mask=0, reduced_mode=False,
+        sinks=[monitor],
+    )
+    assert motion.scan_workflow.start_scan(request) is False
+    assert "contact_quality=CQSettings" in motion.scan_workflow.last_scan_error
+    assert not motion.scan_workflow.running

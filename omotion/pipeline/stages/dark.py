@@ -19,6 +19,7 @@ import numpy as np
 
 from ..batch import DarkIntegrityWarning, FrameBatch, IntervalClosed, TerminalDarkResult
 from ..pedestal import SensorPedestals
+from ..quality_flags import LOW_LIGHT, join as join_quality
 
 
 logger = logging.getLogger("openmotion.sdk.pipeline.stages.dark")
@@ -201,7 +202,7 @@ class CorrectedFrame:
     raw_var:       float     # u2 - u1^2 (raw variance before dark sub)
     dark_var:      float     # interpolated dark baseline variance
     contrast:      Optional[float] = None  # set by ShotNoiseCorrectionStage
-    quality:       str = "ok"  # the row's batch.quality, or "low_light" (unlit, #341)
+    quality:       str = "ok"  # flag list: the row's batch.quality, plus low_light (unlit, #341)
     temp_c:        Optional[float] = None  # on-chip camera temperature (°C)
 
 
@@ -325,15 +326,12 @@ class LinearInterpolation:
 
             quality = lf.quality
             if lf.low_light:
-                # Unlit frame (covered sensor, decoupled fiber). Its mean
-                # above the dark baseline is a real ~0 reading and is kept,
-                # but there is no speckle signal: std is undefined, and with
-                # it contrast and BFI downstream. Without this, a mean
-                # scattering just above 0 divided into the residual std gave
-                # BFI in the -10^5 range (#341). BVI is still computed from
-                # the mean; the quality flag marks the frame as unlit.
-                std = float("nan")
-                quality = "low_light"
+                # Unlit frame (covered sensor, decoupled fiber): its raw mean
+                # sits at the dark level. The flag marks it; mean, std and
+                # downstream contrast and BFI are kept as computed, and
+                # BfiBviStage blanks BVI, which would otherwise read the top
+                # of the scale from the ~0 mean (#341).
+                quality = join_quality(quality, LOW_LIGHT)
 
             corrected_frames.append(CorrectedFrame(
                 abs_frame_id=lf.abs_frame_id, t=lf.t,

@@ -44,6 +44,7 @@ from omotion.config import (
     CAMS_PER_MODULE,
     CAPTURE_HZ,
 )
+from omotion.pipeline.quality_flags import NAN_FILLED, has as has_quality
 
 if TYPE_CHECKING:
     from omotion.MotionInterface import MotionInterface
@@ -1016,7 +1017,7 @@ class _CalibrationCollectorSink:
                 # (e.g. zero-light contrast) must still flow through so the
                 # gate fails on them loudly — do not relax this into
                 # NaN-aware averaging downstream.
-                if str(getattr(f, "quality", "ok")) == "nan_filled":
+                if has_quality(getattr(f, "quality", None), NAN_FILLED):
                     continue
                 self.corrected_samples.append(Sample(
                     side=f.side,
