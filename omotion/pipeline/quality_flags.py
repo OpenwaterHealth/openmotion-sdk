@@ -11,8 +11,8 @@ the same order, so one set of flags is always stored as the same string
   * ``low_light``: an unlit camera (§5.8.4, #341);
   * ``poor_contact`` / ``ambient_light``: the live contact-quality warning
     latched for the camera at that frame, i.e. what the operator was shown
-    (``omotion.contact_quality.ContactQualityMonitor``, bloodflow-app#589).
-    Stamped by ScanDBSink on per-camera rows only.
+    (bloodflow-app#589). Stamped by ContactQualityStage on per-camera
+    frames only, when the scan request sets ``contact_quality``.
 
 A flag not listed here sorts after these, in the order it was first seen.
 

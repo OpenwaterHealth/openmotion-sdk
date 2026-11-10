@@ -291,17 +291,15 @@ def _monitor(events, **kwargs):
     )
 
 
-def test_monitor_satisfies_sink_protocol_on_the_live_channel():
-    """channels is otherwise completely untested: a class-attribute typo —
-    e.g. frozenset({"final"}) instead of frozenset({"live"}) — leaves every
-    other test in this file green, because every other test constructs the
-    monitor and calls consume("live", ...) directly, bypassing the runner's
-    channel-based dispatch entirely. In a real scan the runner would simply
-    never route a single batch to the monitor. This is exactly the
-    never-wired-up failure shape the whole feature exists to correct."""
+def test_monitor_is_not_a_sink():
+    """A full scan runs the monitor inside the pipeline (ContactQualityStage,
+    bloodflow-app#589); the stage feeds it every batch. Attached as a sink as
+    well it would never be fed, and ScanWorkflow refuses that request rather
+    than let the live warning go silently dead. The channel wiring that
+    replaced it is covered in tests/test_pipeline/test_contact_quality_stage.py."""
     mon = _monitor([])
-    assert isinstance(mon, Sink)
-    assert "live" in mon.channels
+    assert not isinstance(mon, Sink)
+    assert not hasattr(mon, "channels")
 
 
 def test_monitor_reports_poor_contact_when_light_drops():

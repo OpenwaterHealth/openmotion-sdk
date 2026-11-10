@@ -1,9 +1,8 @@
-"""ContactQualityMonitor's verdict history (bloodflow-app#589).
+"""ContactQualityMonitor's verdict history and edge queue (bloodflow-app#589).
 
-ScanDBSink writes each corrected row up to one dark interval after the live
-frame went by, so it asks the monitor what the verdict *was* at that frame
-(``verdict_at``), and only once the monitor has seen that camera's frame
-(``observed_through``).
+ContactQualityStage stamps each corrected frame with what the verdict *was*
+at that frame (``verdict_at``), and publishes the edges it queued
+(``take_transitions``).
 """
 
 import numpy as np
@@ -88,40 +87,13 @@ def test_verdict_is_none_outside_the_scan_mask():
     assert mon.verdict_at("right", 0, 1) is None
 
 
-def test_observed_through_is_per_camera():
-    """One sensor's batches must not mark the other's frames as observed."""
-    mon = _monitor(_FakeMeta(left_camera_mask=0x03, right_camera_mask=0x01))
-    assert mon.observed_through("left", 0) == -1
-    mon.consume("live", _batch(0, [7, 8, 9], [60, 60, 60]))
-    assert mon.observed_through("left", 0) == 9
-    assert mon.observed_through("left", 1) == -1
-    assert mon.observed_through("right", 0) == -1
-    mon.consume("live", _batch(1, [7], [60]))
-    assert mon.observed_through("right", 0) == 7
-
-
-def test_observed_through_counts_rows_with_nothing_to_evaluate():
-    """A warmup or non-finite row still means the history is final there."""
-    mon = _monitor()
-    mon.consume("live", _batch(0, [3, 4], [np.nan, np.nan], frame_types=["warmup", "light"]))
-    assert mon.observed_through("left", 0) == 4
-
-
-def test_stale_rows_do_not_advance_observed_through():
-    """Stale rows carry epoch-shifted advisory ids."""
-    mon = _monitor()
-    mon.consume("live", _batch(0, [3], [60]))
-    mon.consume("live", _batch(0, [9999], [60], frame_types=["stale"]))
-    assert mon.observed_through("left", 0) == 3
-
-
 def test_on_scan_start_resets_the_history():
     mon = _monitor()
     mon.consume("live", _batch(0, [10], [5]))
     assert mon.verdict_at("left", 0, 10) == "poor_contact"
     mon.on_scan_start(_FakeMeta())
     assert mon.verdict_at("left", 0, 10) == "ok"
-    assert mon.observed_through("left", 0) == -1
+    assert mon.take_transitions() == []
 
 
 @pytest.mark.parametrize("fid", [12, 13])
@@ -131,3 +103,13 @@ def test_edges_on_one_frame_keep_the_later_state(fid):
     mon.consume("live", _batch(0, [12], [5]))
     mon.consume("live", _batch(0, [12], [60]))   # re-delivered, recovered
     assert mon.verdict_at("left", 0, fid) == "ok"
+
+
+def test_take_transitions_hands_out_each_edge_once():
+    mon = _monitor()
+    mon.consume("live", _batch(0, [10, 11, 12], [60, 5, 60]))
+    edges = mon.take_transitions()
+    assert [(t.reason, t.active, t.abs_frame_id) for t in edges] == [
+        ("poor_contact", True, 11), ("poor_contact", False, 12),
+    ]
+    assert mon.take_transitions() == []

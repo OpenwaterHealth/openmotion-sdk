@@ -8,14 +8,18 @@ Two consumers share this module:
   uses the same rolling-window mean as :class:`ContactQualityMonitor`.
   Rolls both conditions into a single precedence-ordered verdict via
   :func:`evaluate_reason`.
-* :class:`ContactQualityMonitor` — the live sink attached to a full scan.
-  For the dark signal, tracks only the *current* reading rather than a
-  running max — the light-signal rolling window is unchanged from the
-  one-shot check. Debounces each condition independently and reports edges
-  through a callback.
+* :class:`ContactQualityMonitor` — the live evaluator of a full scan, run
+  inside the pipeline by
+  :class:`~omotion.pipeline.stages.contact_quality.ContactQualityStage`
+  (``ScanRequest.contact_quality``). For the dark signal, tracks only the
+  *current* reading rather than a running max — the light-signal rolling
+  window is unchanged from the one-shot check. Debounces each condition
+  independently; the stage publishes its edges on the ``"contact_quality"``
+  channel (:class:`ContactQualityTransitionSink` hands them to a callback)
+  and stamps the verdict into the corrected record.
 
-Both read the same two DN-scale signals off the ``"live"`` channel and apply
-the same two predicates, so the *ambient-light* and *poor-contact* verdicts
+Both read the same two DN-scale realtime signals (what a scan publishes on
+the ``"live"`` channel) and apply the same two predicates, so the *ambient-light* and *poor-contact* verdicts
 cannot drift apart between the preflight check and the live monitor.
 ``REASON_NO_SIGNAL`` is deliberately preflight-only: the live monitor skips
 readings from frames that never arrived at all (non-finite with no
@@ -219,12 +223,41 @@ def _cams_from_masks(meta) -> set:
     return cams
 
 
-class ContactQualityMonitor:
-    """Live contact-quality sink — reports per-camera transitions mid-scan.
+# Channel ContactQualityStage publishes ContactQualityTransition events on.
+CONTACT_QUALITY_CHANNEL = "contact_quality"
 
-    Attach by appending an instance to ``ScanRequest.sinks``. Subscribes to
-    the ``"live"`` channel and reads the same two DN signals as the one-shot
-    check:
+
+@dataclass(frozen=True)
+class CQSettings:
+    """Live contact-quality settings for a full scan, passed as
+    ``ScanRequest.contact_quality``. The fields mean what the
+    :class:`ContactQualityMonitor` keyword arguments of the same names do."""
+    thresholds: CQThresholds
+    rolling_window: int = 10
+    light_activate_debounce: int = 10
+    light_clear_debounce: int = 80
+    dark_debounce: int = 1
+
+
+@dataclass(frozen=True)
+class ContactQualityTransition:
+    """One raise or clear edge of a camera's contact-quality verdict."""
+    side: str           # "left" / "right"
+    cam_id: int         # 0..7
+    reason: str         # REASON_POOR_CONTACT or REASON_AMBIENT_LIGHT
+    value: float        # the DN reading behind the edge
+    active: bool        # True = raised, False = cleared
+    abs_frame_id: int   # the frame that caused it
+
+
+class ContactQualityMonitor:
+    """Live contact-quality evaluator — per-camera latched verdicts mid-scan.
+
+    Not a sink: a full scan runs it inside the pipeline
+    (:class:`~omotion.pipeline.stages.contact_quality.ContactQualityStage`,
+    enabled by ``ScanRequest.contact_quality``), which feeds it every batch
+    through :meth:`consume` and reads the edges and the verdict history back.
+    It reads the same two DN signals as the one-shot check:
 
       * ``frame_type == "dark"`` rows -> ``subtracted_mean``
         (``mean_raw - pedestal``), measuring ambient light against the
@@ -252,8 +285,10 @@ class ContactQualityMonitor:
     consumers average light readings over an identical
     ``deque(maxlen=rolling_window)`` and threshold the mean the same way.
 
-    ``on_transition(side, cam_id, reason, value, active)`` fires on edges
-    only. ``reason`` is ``REASON_AMBIENT_LIGHT`` or ``REASON_POOR_CONTACT``;
+    Each edge is queued as a :class:`ContactQualityTransition`
+    (:meth:`take_transitions`) and, when given,
+    ``on_transition(side, cam_id, reason, value, active)`` is called too.
+    Edges only. ``reason`` is ``REASON_AMBIENT_LIGHT`` or ``REASON_POOR_CONTACT``;
     ``REASON_NO_SIGNAL`` is deliberately never reported here — total loss of
     frames is the camera-dropout watchdog's job, and reporting it as poor
     contact would send the operator to fix the wrong thing.
@@ -266,31 +301,24 @@ class ContactQualityMonitor:
     scheduled roughly every ``dark_interval`` frames — about 15 s apart at
     the default. Do not tune one against the other assuming a shared clock.
 
-    The callback is invoked on the pipeline runner thread. A GUI consumer
-    must marshal to its own thread. Exceptions from the callback are logged
-    and swallowed so a broken consumer cannot disable the sink.
+    Everything runs on the pipeline runner thread. A GUI consumer of
+    ``on_transition`` must marshal to its own thread. Exceptions from the
+    callback are logged and swallowed.
 
     **Verdict history (bloodflow-app#589).** Every edge is also recorded
     against the ``abs_frame_id`` of the frame that caused it, so
     :meth:`verdict_at` can answer "what was this camera's latched verdict at
-    frame N" after the fact. :class:`~omotion.pipeline.sinks.ScanDBSink`
-    uses it to add the verdict to each per-camera row's ``quality`` flags.
-    It writes a row up to one dark interval (~15 s) after the live frame
-    went by, so it needs the verdict as of that frame, not the current one.
-    :meth:`observed_through` tells it, per camera, how far the history is
-    final. It is per camera, not one value for the scan: the live source
-    delivers each sensor's frames in its own batches (and a CSV replay
-    yields all of one side first), so one side can run ahead of the other.
-    Both are read on the runner thread, like everything else here.
+    frame N" after the fact. ContactQualityStage uses it to add the verdict
+    to the quality flags of the per-camera corrected frames closing in the
+    batch it just judged. Every one of those frames arrived in that batch or
+    an earlier one, so the answer is final.
     """
-
-    channels = frozenset({"live"})
 
     def __init__(
         self,
         *,
         thresholds: CQThresholds,
-        on_transition: Callable[[str, int, str, float, bool], None],
+        on_transition: Optional[Callable[[str, int, str, float, bool], None]] = None,
         rolling_window: int = 10,
         light_activate_debounce: int = 10,
         light_clear_debounce: int = 80,
@@ -314,8 +342,8 @@ class ContactQualityMonitor:
         # (side, cam_id) -> ([abs_frame_id, ...], [verdict flags, ...]), one
         # entry per edge, ascending frame id.
         self._history: dict = {}
-        # (side, cam_id) -> highest abs_frame_id consumed from "live".
-        self._observed: dict = {}
+        # Edges not yet handed out by take_transitions().
+        self._pending: list = []
         # on_complete() summary counters — reset per scan in on_scan_start;
         # see on_complete's docstring for why they exist.
         self._transitions_emitted = 0
@@ -327,7 +355,7 @@ class ContactQualityMonitor:
         self._latches.clear()
         self._active_cams = _cams_from_masks(meta)
         self._history = {}
-        self._observed = {}
+        self._pending = []
         self._transitions_emitted = 0
         self._observations_processed = 0
         self._cameras_seen = set()
@@ -357,25 +385,7 @@ class ContactQualityMonitor:
         if channel != "live":
             return
         fids = batch.abs_frame_ids if batch.abs_frame_ids is not None else batch.frame_ids
-        try:
-            self._consume_rows(batch, fids)
-        finally:
-            # Advance even for rows that carried nothing to evaluate: the
-            # history is just as final through them.
-            self._advance_observed(batch, fids)
-
-    def _advance_observed(self, batch, fids) -> None:
-        if fids is None or batch.cam_ids is None:
-            return
-        # Stale rows carry epoch-shifted advisory ids; one must not push a
-        # camera's watermark past frames it has not delivered yet.
-        for i, side_idx, cam_id, _ft in batch.iter_rows(exclude={"stale"}):
-            if not (0 <= side_idx < len(_SIDE_NAMES)):
-                continue
-            key = (_SIDE_NAMES[side_idx], cam_id)
-            fid = int(fids[i])
-            if fid > self._observed.get(key, -1):
-                self._observed[key] = fid
+        self._consume_rows(batch, fids)
 
     def _consume_rows(self, batch, fids) -> None:
         if batch.subtracted_mean is None or batch.mean_dc_rt is None:
@@ -465,11 +475,17 @@ class ContactQualityMonitor:
         self._transitions_emitted += 1
         active = transition == TRANSITION_ACTIVATED
         self._record(fid, side, cam_id)
+        self._pending.append(ContactQualityTransition(
+            side=side, cam_id=int(cam_id), reason=reason, value=float(value),
+            active=active, abs_frame_id=int(fid),
+        ))
         logger.info(
             "live CQ %s%d: %s %s (%.2f DN)",
             "L" if side == "left" else "R", cam_id + 1,
             reason, "RAISED" if active else "CLEARED", value,
         )
+        if self._on_transition is None:
+            return
         try:
             self._on_transition(side, cam_id, reason, value, active)
         except Exception:
@@ -496,11 +512,11 @@ class ContactQualityMonitor:
             fids.append(fid)
             verdicts.append(verdict)
 
-    def observed_through(self, side: str, cam_id: int) -> int:
-        """Highest ``abs_frame_id`` of this camera consumed from the live
-        channel, or -1 before its first frame. :meth:`verdict_at` is final
-        for any of its frames at or below it."""
-        return self._observed.get((side, int(cam_id)), -1)
+    def take_transitions(self) -> list:
+        """The edges (:class:`ContactQualityTransition`) since the last
+        call, oldest first."""
+        pending, self._pending = self._pending, []
+        return pending
 
     def verdict_at(self, side: str, cam_id: int, frame_id: int) -> Optional[str]:
         """The verdict latched for one camera as of ``frame_id``, as a
@@ -528,3 +544,36 @@ class ContactQualityMonitor:
             self._transitions_emitted, len(self._cameras_seen),
             self._observations_processed,
         )
+
+
+class ContactQualityTransitionSink:
+    """Hands live contact-quality edges to a callback (bloodflow-app#364).
+
+    ContactQualityStage (``ScanRequest.contact_quality``) publishes each edge
+    on the ``"contact_quality"`` channel. Attach this to ``ScanRequest.sinks``
+    to receive them as ``on_transition(side, cam_id, reason, value, active)``.
+
+    The callback is invoked on the pipeline runner thread. A GUI consumer
+    must marshal to its own thread. Exceptions from it are logged and
+    swallowed, so a broken consumer costs one log line per edge.
+    """
+
+    channels = frozenset({CONTACT_QUALITY_CHANNEL})
+
+    def __init__(self, on_transition: Callable[[str, int, str, float, bool], None]) -> None:
+        self._on_transition = on_transition
+
+    def on_scan_start(self, meta) -> None:
+        pass
+
+    def consume(self, channel: str, payload) -> None:
+        if channel != CONTACT_QUALITY_CHANNEL:
+            return
+        try:
+            self._on_transition(payload.side, payload.cam_id, payload.reason,
+                                payload.value, payload.active)
+        except Exception:
+            logger.exception("contact-quality transition callback raised")
+
+    def on_complete(self) -> None:
+        pass

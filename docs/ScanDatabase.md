@@ -164,8 +164,8 @@ Notes:
     contact.
     `ambient_light` is judged on dark frames only (about every 15 s), so it is
     raised and cleared one dark frame at a time. Both are written only when
-    the scan ran with a live `ContactQualityMonitor` (the bloodflow-app always
-    attaches one), and only on per-camera rows. See `SciencePipeline.md` §11.3.
+    the scan request set `contact_quality` (the bloodflow-app always does), and
+    only on per-camera rows. See `SciencePipeline.md` §5.12 and §11.3.
 
   Flags are always listed in that order, so the same set of flags is always
   the same string, for example `ts_corrected;poor_contact`. A side-average row

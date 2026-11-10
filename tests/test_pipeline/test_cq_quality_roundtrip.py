@@ -1,17 +1,17 @@
 """Contact quality in the stored record, end to end (bloodflow-app#589).
 
-A synthetic two-sided scan runs through ``default_pipeline()`` with a live
-``ContactQualityMonitor`` and a ``ScanDBSink`` wired to it, as ScanWorkflow
-does when the request attaches a monitor. One camera per side loses contact
-for a stretch of frames, with the warning raised and cleared in the same
-batch that closes a dark interval.
+A synthetic two-sided scan runs through ``default_pipeline()`` with
+``contact_quality`` set, as ScanWorkflow builds it from
+``ScanRequest.contact_quality``, and a plain ``ScanDBSink``. One camera per
+side loses contact for a stretch of frames, with the warning raised and
+cleared in the same batch that closes a dark interval: the case a sink-side
+stamp got wrong (sdk#291), because the interval reached the sink before that
+batch's frames reached the evaluator.
 
-Every stored row must carry the verdict the monitor had latched for that
-camera *when it observed that frame*. The expected value is recorded right
-after each observation, independently of the monitor's history, so the
-test cannot agree with itself. The earlier version (sdk#291) kept one
-watermark for both sensors; with single-side batches it stamped a side's
-rows before the monitor had seen them, and this test fails on that.
+Every stored row must carry the verdict latched for that camera at that
+frame. The expected value is rebuilt from the edges the stage published on
+the "contact_quality" channel, not read from the monitor's history, and the
+dim frames themselves are the ground truth for which rows are flagged.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ import numpy as np
 import pytest
 
 from omotion.config import CAMERA_GAIN_MAP
-from omotion.contact_quality import CQThresholds, ContactQualityMonitor
+from omotion.contact_quality import CONTACT_QUALITY_CHANNEL, CQSettings, CQThresholds
 from omotion.pipeline.batch import FrameBatch
 from omotion.pipeline.factory import default_pipeline
 from omotion.pipeline.pedestal import SensorPedestals, adc_gain_for_pedestal
@@ -63,19 +63,29 @@ def _camera(cam_id: int, mean_dn: float) -> Camera:
                   read_sigma=17.0 if gain == 16 else 4.4, mean_dn=mean_dn)
 
 
-class _RecordingMonitor(ContactQualityMonitor):
-    """Records, right after each observation, the verdict then latched."""
+class _EdgeRecorder:
+    """Collects the edges published on the "contact_quality" channel."""
+    channels = {CONTACT_QUALITY_CHANNEL}
 
-    def __init__(self, **kw):
-        super().__init__(**kw)
-        self.seen: dict = {}
+    def __init__(self):
+        self.edges = []
 
-    def _observe(self, fid, side, cam_id, *args):
-        super()._observe(fid, side, cam_id, *args)
-        self.seen[(side, cam_id, fid)] = join(*(
-            reason for (s, c, reason), latch in self._latches.items()
-            if s == side and c == cam_id and latch.active
-        ))
+    def on_scan_start(self, meta):
+        pass
+
+    def consume(self, channel, payload):
+        self.edges.append(payload)
+
+    def on_complete(self):
+        pass
+
+    def verdict(self, side, cam_id, fid):
+        """The latched verdict at ``fid``, replaying this camera's edges."""
+        active = set()
+        for e in self.edges:
+            if e.side == side and e.cam_id == cam_id and e.abs_frame_id <= fid:
+                (active.add if e.active else active.discard)(e.reason)
+        return join(*active)
 
 
 def _batches(scan: Scan, order: str) -> list[FrameBatch]:
@@ -124,16 +134,15 @@ def test_rows_carry_the_verdict_latched_at_their_frame(tmp_path, order):
         noise_floor_threshold=scan.noise_floor_threshold,
         discard_count=scan.discard_count, dark_interval=scan.dark_interval,
         raw_save_max_duration_s=0,
+        contact_quality=CQSettings(
+            thresholds=CQThresholds.from_sequences([1e9] * 8, [LIGHT_THRESHOLD_DN] * 8),
+            rolling_window=1, light_activate_debounce=1, light_clear_debounce=1,
+        ),
     )
-    monitor = _RecordingMonitor(
-        thresholds=CQThresholds.from_sequences([1e9] * 8, [LIGHT_THRESHOLD_DN] * 8),
-        on_transition=lambda *a: None,
-        rolling_window=1, light_activate_debounce=1, light_clear_debounce=1,
-    )
+    recorder = _EdgeRecorder()
     db_path = str(tmp_path / "scan.db")
-    db_sink = ScanDBSink(db_path=db_path, cq_source=monitor)
     ScanRunner(source=_ListSource(meta, _batches(scan, order)), pipeline=pipeline,
-               sinks=[db_sink, monitor]).run()
+               sinks=[ScanDBSink(db_path=db_path), recorder]).run()
 
     conn = sqlite3.connect(db_path)
     rows = conn.execute(
@@ -143,10 +152,10 @@ def test_rows_carry_the_verdict_latched_at_their_frame(tmp_path, order):
     conn.close()
 
     assert rows, "no corrected rows persisted"
+    assert recorder.edges, "no contact-quality edge was published"
     for side_int, cam_id, fid, quality in rows:
         side = ("left", "right")[side_int]
-        assert (side, cam_id, fid) in monitor.seen, (side, cam_id, fid)
-        assert quality == monitor.seen[(side, cam_id, fid)], (side, cam_id, fid)
+        assert quality == recorder.verdict(side, cam_id, fid), (side, cam_id, fid)
 
     by_cam = {}
     for side_int, cam_id, fid, quality in rows:
