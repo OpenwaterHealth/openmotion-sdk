@@ -93,7 +93,7 @@ Stages produce events when something doesn't fit cleanly into per-frame arrays. 
 
 | Event | Producer | Routed to |
 |---|---|---|
-| `LiveEmit(channel, payload)` | `Tee` stages, `SideAverageStage` (realtime path, `"live_side"`) | The named channel's sinks |
+| `LiveEmit(channel, payload)` | `Tee` stages, `SideAverageStage` (realtime path, `"live_side"`), `ContactQualityStage` (`"contact_quality"`) | The named channel's sinks |
 | `IntervalClosed(corrected_batch)` | `DarkCorrectionStage` (per-camera; enriched + stencilled downstream), `SideAverageStage` (reduced-mode `cam_id=-1` side averages) | `"final"` channel sinks |
 | `DarkIntegrityWarning(...)` | `DarkIntegrityGuard` (inside DarkCorrectionStage) | `"diagnostics"` |
 | `StencilFallback(...)` | `DarkFrameQuadraticStencil` (inside DarkFrameHoldStage) | `"diagnostics"` |
@@ -142,6 +142,8 @@ BfiBviStage
 DarkFrameHoldStage
 SideAverageStage             (reduced mode; emits LiveEmit "live_side" +
                               cam_id=-1 IntervalClosed → "final")
+ContactQualityStage          (when ScanRequest.contact_quality is set; emits
+                              LiveEmit "contact_quality", stamps quality)
 Tee("live", filter=ft not in {"warmup","stale"})
 ```
 
@@ -497,7 +499,7 @@ std           = √corrected_var
 
 The two clamps to zero prevent imaginary standard deviations when dark subtraction over-corrects due to statistical fluctuations. The result is a `CorrectedFrame(abs_frame_id, t, side, cam_id, mean, std, raw_u1, raw_var, dark_var)`.
 
-**Unlit frames.** A light frame whose raw mean sits at the dark level, `u1 ≤ pedestal + 5` DN, was not lit: a covered sensor, a lifted sensor or a decoupled fiber. This is the same dark-like test the realtime path applies (`low_light_rt`, §11.3), and `DarkCorrectionStage` makes it once per frame for both paths. Such a frame keeps its `mean`, because a value near 0 is a real reading. It gets `std = NaN`, since there is no speckle signal to measure, and `quality = "low_light"`. Downstream, its contrast and BFI are NaN; BVI is still computed from the mean (§5.8.5).
+**Unlit frames.** A light frame whose raw mean sits at the dark level, `u1 ≤ pedestal + 5` DN, was not lit: a covered sensor, a lifted sensor or a decoupled fiber. This is the same dark-like test the realtime path applies (`low_light_rt`, §11.3), and `DarkCorrectionStage` makes it once per frame for both paths. Such a frame keeps its `mean` (a value near 0 is a real reading) and its `std`, and `low_light` is added to its `quality` flags (a `;`-separated list, `omotion.pipeline.quality_flags`). Downstream, its contrast and BFI are computed like any frame's; its BVI is NaN (§5.8.5).
 
 #### 5.8.5 Enrichment — shot-noise correction + BFI/BVI calibration
 
@@ -508,7 +510,7 @@ For one corrected frame `f`:
 ```
 g_cam         = CAMERA_GAIN_MAP[cam_id % 8]
 
-if not isfinite(f.mean) or not isfinite(f.std):  # NaN-fill row, or unlit (§5.8.4)
+if not isfinite(f.mean):                          # NaN-fill row
     f.std, contrast = NaN, NaN                    # (see "invalid input" below)
 else:
     shot_var  = ADC_GAIN · max(0, f.mean) · g_cam
@@ -521,18 +523,20 @@ else:
 
 bfi           = (1 − (contrast − c_min) / (c_max − c_min)) · 10
 bvi           = (1 − (f.mean   − i_min) / (i_max − i_min)) · 10
+                if "low_light" not in f.quality else NaN   # unlit (§5.8.4)
 ```
 
 When `c_min == c_max` (degenerate calibration), the fallback is identity scaling: `bfi = contrast · 10`, `bvi = mean · 10`.
 
-**Invalid input never becomes a finite reading.** A frame with no usable signal yields `contrast = NaN`, so `bfi` comes out NaN and `ScanDBSink` stores it as NULL. Four distinct inputs reach that state:
+**Invalid input never becomes a finite reading.** A frame with no usable signal yields `contrast = NaN`, so `bfi` comes out NaN and `ScanDBSink` stores it as NULL. Three distinct inputs reach that state:
 
 1. a NaN-fill row standing in for a dropped frame (non-finite mean),
 2. a camera whose dark-subtracted mean is `≤ 0`,
 3. a frame whose measured variance falls **below the Poisson floor** (`f.std² < shot_var`). That is unphysical — the speckle variance cannot be resolved, so it is reported unresolvable rather than clamped to zero.
-4. an **unlit** frame (`quality = "low_light"`, §5.8.4).
 
-`bvi` is computed from the mean in every case except 1, which has no mean. For an unlit frame (case 4) that gives BVI near 10, the top of the scale; the `low_light` quality flag is what marks it as unlit. Case 2 is almost always also case 4, because a mean at or below the dark baseline is at the dark level. Case 4 closes the gap that cases 2 and 3 left: when an unlit frame's mean scattered slightly *above* zero with a little residual variance, `std / mean` came out in the hundreds, so BFI landed around −10⁴. A fiber-unplugged bench scan stored about 2,100 such BFI values, down to −114,060 (issue #341).
+`bvi` is computed from the mean in every case except 1, which has no mean.
+
+**Unlit frames are stored as computed, except BVI** (`quality` flag `low_light`, §5.8.4; decided 2026-11-09, issue #341). Case 2 is almost always an unlit frame. But an unlit frame's mean scatters around zero, and where it lands slightly *above* zero with a little residual variance, none of the three cases applies: `std / mean` comes out in the tens to thousands and BFI far below zero. A fiber-unplugged bench scan stored about 2,100 such BFI values, down to −114,060. They are kept, contrast and BFI alike, and the `low_light` flag marks them; anything that reads the stored record should filter on it. BVI is the one value an unlit frame never stores: from its ~0 mean it would read near 10, the top of the scale, on every row. A stencilled dark row next to unlit frames (§5.8.6) is flagged `low_light` and stores no BVI either.
 
 Case 3 matters as much as cases 1 and 2: clamping to `√0 = 0` produced `contrast = 0.0` from a *positive* mean, sailing past any `mean <= 0` guard. On a pitch-dark bench scan (fiber unplugged, 9456 corrected frames) cases 1+2 accounted for 3200 frames and case 3 for a further **4151** — 44% of the scan reported as maximal flow. Emitting `0.0` instead (as the batch path did before issue #114) placed the frame at `C_min`, i.e. the *calibrated maximum*: `bfi = (1 + c_min/c_span) · 10` — 10.0 at default calibration, indistinguishable from real top-of-scale flow and silently averaged into the reduced-mode side average by `SideAverageStage`'s `nanmean`. A *measured* contrast of exactly 0 is still a real observation and still maps to BFI 10.0; only missing/undefined values are NaN. Constants:
 
@@ -635,11 +639,26 @@ The calibration object passed to `default_pipeline()` must expose `c_min`, `c_ma
 The reduced-mode per-side average is a **purely spatial** mean across the enabled cameras at one capture instant (the shared `spatial_side_average` helper) — never a temporal/rolling average. The live USB path delivers one camera per frame row, so the stage gathers a capture's cameras (sharing a `frame_id`) and emits **one value per capture per side**. One stage implements both paths:
 
 - **Realtime path** — averages the realtime `bfi_live`/`bvi_live` → `LiveEmit(channel="live_side", SideAverageSample(t, frame_id, side, bfi, bvi))`. Drives the live reduced-mode display (immediate, best-effort). After `DarkFrameHoldStage`, so dark intervals hold steady.
-- **Corrected path** — gathers the per-`(side,cam)` `EnrichedCorrectedInterval` events (`IntervalClosed`), averages the dark-corrected BFI/BVI/mean/contrast per capture, and emits one synthetic `IntervalClosed` per side whose `EnrichedCorrectedFrame`s carry **`cam_id=-1`** — the side-average convention. These ride the ordinary `"final"` channel: `ScanDBSink` persists them as the reduced-mode record (skipping per-camera frames in reduced mode), and `CsvSink` reads them for the reduced corrected CSV. A `low_light` (unlit, §5.8.4) camera drops out of the BFI and contrast averages, since those are NaN, but still counts toward BVI and mean. The side row inherits the worst `quality` of its cameras (`ok` < `ts_corrected` < `low_light` < `nan_filled`), so an unlit camera stays visible in the record.
+- **Corrected path** — gathers the per-`(side,cam)` `EnrichedCorrectedInterval` events (`IntervalClosed`), averages the dark-corrected BFI/BVI/mean/contrast per capture, and emits one synthetic `IntervalClosed` per side whose `EnrichedCorrectedFrame`s carry **`cam_id=-1`** — the side-average convention. These ride the ordinary `"final"` channel: `ScanDBSink` persists them as the reduced-mode record (skipping per-camera frames in reduced mode), and `CsvSink` reads them for the reduced corrected CSV. A `low_light` (unlit, §5.8.4) camera drops out of the BVI average, since its BVI is NaN, but counts toward contrast, BFI and mean wherever those are defined, so it can pull the side BFI far below zero. The side row's `quality` lists every flag of its cameras, so an unlit camera stays visible in the record.
 
 Both paths finalize a capture/window when the next begins and flush the last at `on_scan_stop`. The live and corrected averages differ by design — realtime display vs corrected record. Enabled cameras come from `metadata.left_camera_mask` / `right_camera_mask`.
 
-### 5.12 Tee("live")
+### 5.12 ContactQualityStage (optional)
+
+Added by `default_pipeline(contact_quality=CQSettings(...))`, which `ScanWorkflow` passes from `ScanRequest.contact_quality`; omitted otherwise. It runs the live contact-quality evaluator, `ContactQualityMonitor` (§11.3), over every batch's realtime values, then:
+
+- publishes each raise or clear edge as `LiveEmit("contact_quality", ContactQualityTransition(side, cam_id, reason, value, active, abs_frame_id))`. `ContactQualityTransitionSink(on_transition)` turns those into the caller's callback, which is the live warning the operator sees;
+- adds the verdict latched for each camera at each frame (`poor_contact`, `ambient_light`) to the `quality` flags of the per-camera corrected frames that close in this batch (bloodflow-app#589).
+
+It sits after `SideAverageStage` and right before `Tee("live")`:
+
+- The realtime values it reads are final there. Before #589 the monitor was a sink reading the same batch off `"live"`.
+- An interval that closes in this batch holds frames that arrived in this batch or an earlier one. The stage judges the batch before it stamps, so every frame gets a final verdict. A sink could not do that without holding rows back, because the runner dispatches a batch's `"final"` intervals before its `"live"` payload.
+- The reduced-mode side-average frames (`cam_id = -1`) already exist and are skipped, so the verdict never folds into a side row.
+
+`on_scan_stop` stamps the intervals of the terminal dark flush.
+
+### 5.13 Tee("live")
 
 Emits the FrameBatch on the `"live"` channel after filtering out warmup and stale frames. This is the per-frame live stream consumed by the bloodflow-app's `_LivePlotSink` (realtime BFI/BVI/mean/contrast traces — later overwritten in place by the `"final"`-channel refinement, see §8.3), `ContactQualityWorkflow` (DN-scale ambient-light + poor-contact thresholding — see §11.2), and `CalibrationWorkflow` (dark-frame collection).
 
@@ -652,8 +671,9 @@ Sinks subscribe to channels by declaring a `channels: set[str]` attribute. The r
 | Channel | Payload | Cadence | Source | Typical consumers |
 |---|---|---|---|---|
 | `"raw"` | `FrameBatch` (full, including warmup and quarantined rows) | Per batch (~10–100 frames) | `Tee("raw")` | `CsvSink` (raw per-cam CSV — **the only raw record**; the scan DB does not store raw histograms) |
-| `"live"` | `FrameBatch` (excluding warmup/stale) | Per batch | `Tee("live")` | bloodflow-app `_LivePlotSink` (realtime per-frame plot — later overwritten by `"final"` corrections, see §8.3), `ContactQualityWorkflow._ContactQualitySink` (DN thresholding), `ContactQualityMonitor` (live per-camera edge detection, see §11.3), `CalibrationWorkflow._CalibrationCollectorSink` (dark frames) |
+| `"live"` | `FrameBatch` (excluding warmup/stale) | Per batch | `Tee("live")` | bloodflow-app `_LivePlotSink` (realtime per-frame plot — later overwritten by `"final"` corrections, see §8.3), `ContactQualityWorkflow._ContactQualitySink` (DN thresholding), `CalibrationWorkflow._CalibrationCollectorSink` (dark frames) |
 | `"live_side"` | `SideAverageSample` | Per capture per side (reduced mode only) | `SideAverageStage` (realtime path) | bloodflow-app `_LivePlotSink` (reduced-mode live trace) |
+| `"contact_quality"` | `ContactQualityTransition` | Per raise/clear edge | `ContactQualityStage` (§5.12) | `ContactQualityTransitionSink` → bloodflow-app live contact-quality warning |
 | `"final"` | `EnrichedCorrectedInterval` | Per closed dark interval (~1 per `dark_interval/40` seconds; default ~15 s) | `IntervalClosed` from `DarkCorrectionStage` (per-camera; enriched + stencilled by downstream stages) and `SideAverageStage` (reduced-mode `cam_id=-1` side averages) | `CsvSink` (corrected CSV), `ScanDBSink` (`session_data` — the DB's only science record), bloodflow-app `_FinalBatchSink` (overwrites the realtime points plotted from `"live"` with interval-corrected BFI/BVI/mean/contrast), `CalibrationWorkflow` (corrected light samples) |
 | `"diagnostics"` | Integrity and lifecycle `BatchEvent`s, including packet corrections, anomalies, and quarantines | As they occur | Stages append to `batch.events`; the runner also routes out-of-band events here | `DiagnosticsLogSink` (always injected — WARNING logs + scan-end summary), `ScanDBSink` (integrity summary → `session_meta`), bloodflow-app `_TriggerStateSink` |
 
@@ -887,7 +907,7 @@ After the scan, `result()` evaluates per camera: `no_signal` if no light samples
 
 ### 11.3 ContactQualityMonitor — live per-camera edge detection
 
-`omotion/contact_quality.py` defines `ContactQualityMonitor` with `channels = {"live"}`. It shares `is_ambient_light` and `is_poor_contact` — the same two predicates `_ContactQualitySink` now applies through `evaluate_reason` (§11.2) — so the *ambient-light* and *poor-contact* verdicts cannot drift apart between the preflight check and the live monitor. That is a guarantee about threshold semantics, not about always agreeing at a given instant: accumulation (below) and debouncing mean a camera can legitimately read differently between the two consumers at any one moment.
+`omotion/contact_quality.py` defines `ContactQualityMonitor`, the live evaluator. It is not a sink: a full scan runs it inside the pipeline as `ContactQualityStage` (§5.12) when `ScanRequest.contact_quality` is set, and `ScanWorkflow` refuses a request that attaches a monitor as a sink, where it would never be fed. It shares `is_ambient_light` and `is_poor_contact` — the same two predicates `_ContactQualitySink` now applies through `evaluate_reason` (§11.2) — so the *ambient-light* and *poor-contact* verdicts cannot drift apart between the preflight check and the live monitor. That is a guarantee about threshold semantics, not about always agreeing at a given instant: accumulation (below) and debouncing mean a camera can legitimately read differently between the two consumers at any one moment.
 
 **The light path is a three-way read, not a two-way one.** A finite `mean_dc_rt` is thresholded normally — rolling-window average against `is_poor_contact`, same as the one-shot check. A non-finite `mean_dc_rt` means one of two structurally different things, and `DarkCorrectionStage` tells them apart via `batch.low_light_rt`:
 
@@ -910,9 +930,11 @@ Treating the two alike inverts the detection window this feature exists for: a s
 
 `REASON_NO_SIGNAL` is never reported live — it is preflight-only. Total loss of frames belongs to the consumer's camera-dropout watchdog; reporting it as a contact-quality fault would send the operator to fix the wrong thing. In the preflight it means the camera delivered no light frames; an unlit camera is `poor_contact` in both consumers.
 
-`on_transition(side, cam_id, reason, value, active)` fires on edges only — once per genuine activate/clear, not once per frame — and runs on the pipeline runner thread, so a GUI consumer must marshal to its own thread. The monitor catches and logs callback exceptions itself: an uncaught one would unwind the rest of that `consume()` call — abandoning every remaining row in the batch after the one that raised, silently skipping the other cameras — and log a fresh traceback per batch, at ~40 Hz, for as long as the callback keeps raising. This is not patching a runner gap — `_safe_consume` (`omotion/pipeline/runner.py`) already logs and continues past a raising sink without disabling it — the monitor's own `try/except` just contains the damage to a single row.
+Each edge is queued as a `ContactQualityTransition` (`take_transitions()`), which the stage publishes on `"contact_quality"`; a `ContactQualityTransitionSink` delivers it as `on_transition(side, cam_id, reason, value, active)`. The monitor can also take `on_transition` directly; that callback fires on edges only — once per genuine activate/clear, not once per frame — and runs on the pipeline runner thread, so a GUI consumer must marshal to its own thread. The monitor catches and logs callback exceptions itself: an uncaught one would unwind the rest of that `consume()` call — abandoning every remaining row in the batch after the one that raised, silently skipping the other cameras — and log a fresh traceback per batch, at ~40 Hz, for as long as the callback keeps raising. This is not patching a runner gap — `_safe_consume` (`omotion/pipeline/runner.py`) already logs and continues past a raising sink without disabling it — the monitor's own `try/except` just contains the damage to a single row.
 
-All three consumers are pure sinks — they add no pipeline stages, do not modify FrameBatch fields, and can be turned off by simply not constructing them.
+**Verdict history (bloodflow-app#589).** The monitor also records every edge against the `abs_frame_id` of the frame that caused it, so `verdict_at(side, cam_id, frame_id)` returns what the operator was being shown for that camera at that frame: `ok`, `poor_contact`, `ambient_light`, or both as a `quality` flag list. `ContactQualityStage` uses it to stamp the per-camera corrected frames (§5.12). `ScanDBSink` stores those flags in `session_data.quality`, and the export carries them in `quality_l1` … `quality_r8`.
+
+The first two consumers are pure sinks — they add no pipeline stages, do not modify FrameBatch fields, and can be turned off by simply not constructing them. The live monitor runs as a stage because it writes into the corrected frames; leaving `ScanRequest.contact_quality` unset turns it off.
 
 ---
 

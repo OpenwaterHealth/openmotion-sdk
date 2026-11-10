@@ -263,6 +263,9 @@ DarkFrameHoldStage          — hold last light BFI/BVI across dark frames
 SideAverageStage            — reduced-mode per-side spatial average:
                               realtime → "live_side"; corrected → cam_id=-1
                               IntervalClosed intervals on "final"
+ContactQualityStage         — optional (ScanRequest.contact_quality): live
+                              contact-quality edges → "contact_quality";
+                              verdict added to per-camera corrected frames
 Tee("live")                 — corrected per-frame FrameBatch to "live" sinks
 ```
 

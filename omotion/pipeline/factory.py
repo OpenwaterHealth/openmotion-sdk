@@ -33,7 +33,8 @@ def default_pipeline(*,
                      dark_interval: int = 600,
                      realtime_dark_history_size: int = 4,
                      raw_save_max_duration_s: Optional[float] = None,
-                     telemetry: Optional[Any] = None) -> Pipeline:
+                     telemetry: Optional[Any] = None,
+                     contact_quality: Optional[Any] = None) -> Pipeline:
     """Build the canonical pipeline. See SciencePipeline.md for the algorithm.
 
     Args:
@@ -45,6 +46,11 @@ def default_pipeline(*,
             raw tee) so every frame — including the raw CSV record — carries
             the pdc/tcm/tcl context at its capture time. None (default)
             omits the stage (replay sources, tests, no console telemetry).
+        contact_quality: Optional omotion.contact_quality.CQSettings. When
+            provided, a ContactQualityStage runs right before Tee("live"): it
+            publishes live contact-quality edges on the "contact_quality"
+            channel and adds the verdict to the per-camera corrected frames'
+            quality flags. None (default) omits it.
     """
 
     def not_warmup_or_stale(frame_type: str) -> bool:
@@ -107,7 +113,16 @@ def default_pipeline(*,
             left_camera_mask=metadata.left_camera_mask,
             right_camera_mask=metadata.right_camera_mask,
         ),
-        Tee("live", emit_if_any=not_warmup_or_stale),
     ])
+
+    # Live contact quality (bloodflow-app#364, #589). After SideAverageStage
+    # so the side-average frames exist and are left unstamped; before
+    # Tee("live") so it judges the batch before stamping the intervals that
+    # close in it.
+    if contact_quality is not None:
+        from .stages.contact_quality import ContactQualityStage
+        stages.append(ContactQualityStage(contact_quality, metadata=metadata))
+
+    stages.append(Tee("live", emit_if_any=not_warmup_or_stale))
 
     return Pipeline(stages)

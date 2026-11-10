@@ -97,14 +97,12 @@ class ShotNoiseCorrectionStage:
                 g_cam = float(self._gain_map_flat[cam_pos])
 
                 mean = float(f.mean)
-                if not np.isfinite(mean) or not np.isfinite(f.std):
+                if not np.isfinite(mean):
                     # NaN-fill row for a dropped frame: there is no
                     # measurement. The builtin max(0.0, NaN) returns 0.0
                     # (NaN comparisons are False), which used to launder the
                     # gap into a zero-shot-noise frame; propagate NaN like the
-                    # realtime path's np.maximum does (issue #114). A NaN std
-                    # with a finite mean is an unlit frame flagged by
-                    # LinearInterpolation (#341): no speckle to measure.
+                    # realtime path's np.maximum does (issue #114).
                     f.std = float("nan")
                     f.contrast = float("nan")
                     continue

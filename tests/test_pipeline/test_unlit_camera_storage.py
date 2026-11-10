@@ -1,17 +1,21 @@
-"""An unlit camera never stores a contrast or BFI (issue #341).
+"""What the stored record keeps for an unlit camera (issue #341).
 
 A covered sensor or decoupled fiber delivers dark frames where light frames
 are scheduled. The realtime path recognises them (``low_light_rt``) and
-shows nothing. The stored path used to correct them like any other frame:
-the dark-subtracted mean scatters around zero, and whenever it landed
-slightly positive with a residual variance left over, contrast = std / mean
-came out in the hundreds and BFI in the -10^4 range, while BVI = map(~0 mean)
-pinned at 10.0 on every row. A fiber-unplugged bench scan stored about 2,100
-such BFI values (down to -114,060), and in reduced mode they were averaged
-into the side average ScanDBSink persists.
+shows nothing. The stored path flags them ``low_light`` and then:
 
-BVI is still computed from the mean (near 10 for an unlit camera); the
-``low_light`` quality flag is what marks the row.
+* keeps the mean (near 0, a real reading);
+* keeps contrast and BFI as computed. The dark-subtracted mean scatters
+  around zero, so wherever it lands slightly positive with residual
+  variance, contrast = std / mean comes out far above any lit value and BFI
+  far below zero. A fiber-unplugged bench scan stored about 2,100 such BFI
+  values, down to -114,060. Ethan's rule (2026-11-09): store them anyway;
+  the flag marks them;
+* stores no BVI. Mapped from the ~0 mean it would read the top of the
+  scale, 10.0, on every row.
+
+In reduced mode the side average counts the unlit camera toward contrast,
+BFI and mean, and leaves it out of BVI.
 """
 
 from __future__ import annotations
@@ -62,16 +66,30 @@ def _rows(result, cam_id):
     return [f for f in result.final if f.cam_id == cam_id]
 
 
-def test_covered_camera_stores_no_contrast_or_bfi():
+def test_covered_camera_stores_no_bvi():
     rows = _rows(run(_covered_scan(), CAL), COVERED)
     assert rows, "the covered camera produced no stored rows"
     for f in rows:
         assert f.quality == "low_light", f.abs_frame_id
-        assert np.isnan(f.contrast) and np.isnan(f.bfi), f
-        # The ~0 mean is a real reading and stays in the record, and BVI is
-        # still computed from it: near the top of the scale.
+        assert np.isnan(f.bvi), f
+        # The ~0 mean is a real reading and stays in the record.
         assert np.isfinite(f.mean) and abs(f.mean) < 1.0
-        assert f.bvi == pytest.approx(10.0, abs=0.05)
+
+
+def test_covered_camera_keeps_contrast_and_bfi_as_computed():
+    """Contrast and BFI are not blanked: BFI follows the stored contrast
+    through the calibration, however far out of range that puts it."""
+    rows = _rows(run(_covered_scan(), CAL), COVERED)
+    finite = [f for f in rows if np.isfinite(f.contrast)]
+    assert finite, "no unlit frame kept a contrast"
+    c_min, c_span = 0.0, 0.4
+    for f in finite:
+        assert f.bfi == pytest.approx((1 - (f.contrast - c_min) / c_span) * 10)
+        assert f.contrast > 1.0   # far above any lit camera's ~0.3
+    # Where contrast is undefined (mean <= 0 or below the shot-noise floor,
+    # the #114 guards), BFI is too.
+    for f in rows:
+        assert np.isfinite(f.bfi) == np.isfinite(f.contrast), f
 
 
 def test_lit_cameras_are_untouched():
@@ -85,7 +103,7 @@ def test_lit_cameras_are_untouched():
             assert abs(f.bfi) < 20
 
 
-def test_side_average_drops_the_covered_camera_from_bfi_only():
+def test_side_average_drops_the_covered_camera_from_bvi_only():
     result = run(_covered_scan(reduced_mode=True), CAL)
     side = {f.abs_frame_id: f for f in _rows(result, -1)}
     assert side, "no reduced-mode side average was emitted"
@@ -95,11 +113,16 @@ def test_side_average_drops_the_covered_camera_from_bfi_only():
             every.setdefault(f.abs_frame_id, []).append(f)
             if cam != COVERED:
                 lit.setdefault(f.abs_frame_id, []).append(f)
+    counted = 0
     for fid, s in side.items():
-        assert s.bfi == pytest.approx(np.mean([f.bfi for f in lit[fid]]))
-        assert s.bvi == pytest.approx(np.mean([f.bvi for f in every[fid]]))
+        assert s.bvi == pytest.approx(np.mean([f.bvi for f in lit[fid]]))
         assert s.mean == pytest.approx(np.mean([f.mean for f in every[fid]]))
+        # nanmean: the covered camera counts wherever its contrast is defined.
+        assert s.contrast == pytest.approx(np.nanmean([f.contrast for f in every[fid]]))
+        assert s.bfi == pytest.approx(np.nanmean([f.bfi for f in every[fid]]))
+        counted += np.isfinite([f.contrast for f in every[fid]]).sum() == len(every[fid])
         assert s.quality == "low_light"  # the unlit camera stays visible
+    assert counted, "the covered camera never counted toward the side contrast"
 
 
 def test_dim_but_lit_camera_still_reports():
