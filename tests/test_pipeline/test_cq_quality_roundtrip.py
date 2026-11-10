@@ -176,3 +176,65 @@ def test_rows_carry_the_verdict_latched_at_their_frame(tmp_path, order):
     for fid, quality in right1.items():
         assert exported[fid]["quality_r2"] == quality, fid
     assert all(r["quality_l3"] == "" for r in exported.values())   # outside the mask
+
+
+class _FinalCollector:
+    """Every corrected frame on the "final" channel, stored or not."""
+    channels = {"final"}
+
+    def __init__(self):
+        self.frames = []
+
+    def on_scan_start(self, meta):
+        pass
+
+    def consume(self, channel, payload):
+        self.frames.extend(payload.frames)
+
+    def on_complete(self):
+        pass
+
+
+def test_clinical_scan_warns_but_stores_no_verdict(tmp_path):
+    """Reduced mode (Clinical): the stage still runs, so the live warning
+    fires and the per-camera frames are judged, but scans.db keeps only the
+    side-average rows, and those never carry a contact-quality flag."""
+    scan = Scan([_camera(c, 60.0) for c in CAMS], n_frames=N_FRAMES)
+    mask = sum(1 << c for c in CAMS)
+    meta = ScanMetadata(scan_id="clin", subject_id="s", operator="o",
+                        started_at_iso="", duration_sec=0,
+                        left_camera_mask=mask, right_camera_mask=mask,
+                        reduced_mode=True)
+    pipeline = default_pipeline(
+        metadata=meta, calibration=CAL,
+        pedestals=SensorPedestals(left=scan.pedestal, right=scan.pedestal),
+        noise_floor_threshold=scan.noise_floor_threshold,
+        discard_count=scan.discard_count, dark_interval=scan.dark_interval,
+        raw_save_max_duration_s=0,
+        contact_quality=CQSettings(
+            thresholds=CQThresholds.from_sequences([1e9] * 8, [LIGHT_THRESHOLD_DN] * 8),
+            rolling_window=1, light_activate_debounce=1, light_clear_debounce=1,
+        ),
+    )
+    recorder, final = _EdgeRecorder(), _FinalCollector()
+    db_path = str(tmp_path / "scan.db")
+    ScanRunner(source=_ListSource(meta, _batches(scan, "interleaved")), pipeline=pipeline,
+               sinks=[ScanDBSink(db_path=db_path), recorder, final]).run()
+
+    # The live warning: raised and cleared on exactly the two dim cameras.
+    assert sorted((e.side, e.cam_id, e.active) for e in recorder.edges) == [
+        ("left", 0, False), ("left", 0, True), ("right", 1, False), ("right", 1, True),
+    ]
+    # The per-camera frames were judged on the "final" channel...
+    dim = {(f.side, f.cam_id, f.abs_frame_id) for f in final.frames
+           if f.cam_id >= 0 and POOR_CONTACT in parse(f.quality)}
+    assert dim == {(side, cam, fid) for (side, cam), frames in DIM.items()
+                   for fid in frames
+                   if any(f.side == side and f.cam_id == cam and f.abs_frame_id == fid
+                          for f in final.frames)}
+    # ...but only the side averages are stored, with no verdict in them.
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute("SELECT cam_id, quality FROM session_data").fetchall()
+    conn.close()
+    assert rows and {cam for cam, _ in rows} == {-1}
+    assert not any(POOR_CONTACT in parse(q) or "ambient_light" in parse(q) for _, q in rows)
