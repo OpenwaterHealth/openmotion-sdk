@@ -1,6 +1,6 @@
 """NoiseFloorStage — zero histogram bins below a count threshold.
 
-See docs/SciencePipeline.md §5.
+See docs/SciencePipeline.md §5.5 NoiseFloorStage.
 """
 
 from __future__ import annotations

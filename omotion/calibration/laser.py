@@ -129,16 +129,20 @@ PULSE_WIDTH_STEP_US = 10
 MAX_PULSE_WIDTH_US = 600
 TEMPORARY_PULSE_WIDTH_LIMIT_US = 660
 
+# Within the console firmware's safety envelope (safety_envelope.h): the DRIVE CL
+# values are its ceilings (EE 5000, OPT 7200), the widest a console accepts, and
+# TA_CURRENT_DRV starts one CURRENT_STEP_MA below the 5000 mA EE rating, which
+# the safety FPGA holds as 4999.68 mA (2688 x 1.86).
 DEFAULT_USER_CONFIG = MappingProxyType({
     "TA_PULSE_WIDTH": 500,
-    "TA_CURRENT_DRV": 5000,
+    "TA_CURRENT_DRV": 4950,
     "SEED_CW_GAIN": 140,
     "EE_PULSE_WIDTH_UL": 550,
     "EE_RATE_LL": 23125,
-    "EE_DRIVE_CL": 9999,
+    "EE_DRIVE_CL": 5000,
     "OPT_PULSE_WIDTH_UL": 550,
     "OPT_RATE_LL": 23125,
-    "OPT_DRIVE_CL": 9999,
+    "OPT_DRIVE_CL": 7200,
     "TEC_TRIP": 40,
 })
 

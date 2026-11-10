@@ -307,10 +307,10 @@ def test_current_configuration_is_checkpointed_before_invalid_field_fails():
 @pytest.mark.parametrize(
     ("name", "actual", "passed"),
     [
-        ("TA_CURRENT_DRV", 4900.0, True),
-        ("TA_CURRENT_DRV", 5100.0, True),
-        ("TA_CURRENT_DRV", 4899.999, False),
-        ("TA_CURRENT_DRV", 5100.001, False),
+        ("TA_CURRENT_DRV", 4851.0, True),
+        ("TA_CURRENT_DRV", 5049.0, True),
+        ("TA_CURRENT_DRV", 4850.999, False),
+        ("TA_CURRENT_DRV", 5049.001, False),
         ("TA_PULSE_WIDTH", 490.0, True),
         ("TA_PULSE_WIDTH", 510.0, True),
         ("TA_PULSE_WIDTH", 489.999, False),
@@ -686,3 +686,30 @@ def test_console_only_declaration_skips_the_normal_scan_and_passes():
     assert any(
         "not applicable" in event.stage.lower() for event in result.events
     )
+
+
+def test_release_image_that_refuses_safety_keys_stops_at_setup():
+    """Console firmware that owns the safety state accepts the WI-00015 safety
+    keys only on a Factory image (console-fw PTR-2026-1-5 change)."""
+    from omotion.fpga_attest import FACTORY_IMAGE_REQUIRED
+
+    bench = FakeSafetyBench()
+    bench.preflight = replace(bench.preflight, safety_keys_writable=False)
+
+    result, bench, _ = _run(bench)
+
+    assert result.status is ProcedureStatus.FAILED
+    assert result.failure_kind is FailureKind.SETUP
+    assert result.failure_reason == FACTORY_IMAGE_REQUIRED
+    assert bench.mutations == []
+    assert bench.trigger_starts == 0
+
+
+@pytest.mark.parametrize("writable", [True, None])
+def test_factory_image_or_older_firmware_passes_the_safety_key_guard(writable):
+    bench = FakeSafetyBench()
+    bench.preflight = replace(bench.preflight, safety_keys_writable=writable)
+
+    result, _, _ = _run(bench)
+
+    assert result.failure_kind is not FailureKind.SETUP

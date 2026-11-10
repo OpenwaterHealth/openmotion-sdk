@@ -727,3 +727,63 @@ def test_real_nan_stats_still_fail_the_gate():
     assert len(rows) == 1
     assert math.isnan(rows[0].avg_contrast)
     assert rows[0].contrast_test == "FAIL"
+
+
+# ---------------------------------------------------------------------------
+# One-side baseline (#117): the side not being calibrated carries its
+# baseline row forward; only the calibrated side gets new values.
+# ---------------------------------------------------------------------------
+
+def _console_calibration():
+    """A stored calibration with rows that are distinguishable from both
+    the SDK defaults and anything the fake samples below would compute."""
+    import numpy as np
+    from omotion.Calibration import Calibration
+    return Calibration(
+        c_min=np.zeros((2, 8)),
+        c_max=np.array([[0.31] * 8, [0.37] * 8]),
+        i_min=np.zeros((2, 8)),
+        i_max=np.array([[222.0] * 8, [333.0] * 8]),
+        source="console",
+    )
+
+
+def test_right_only_compute_carries_left_row_from_baseline():
+    """A right-only run must leave the left module's stored calibration
+    exactly as read from the console, and compute only the right row."""
+    import numpy as np
+    from omotion.CalibrationWorkflow import _compute_calibration_from_samples
+    from omotion.config import CALIBRATION_I_MAX_MULTIPLIER
+
+    samples = [
+        _light("right", cam, mean=200.0, contrast=0.4, frame_id=fid)
+        for cam in range(8) for fid in (10, 11)
+    ]
+    cal = _compute_calibration_from_samples(
+        samples, left_camera_mask=0x00, right_camera_mask=0xFF,
+        baseline=_console_calibration(),
+    )
+    np.testing.assert_array_equal(cal.c_max[0], np.full(8, 0.31))
+    np.testing.assert_array_equal(cal.i_max[0], np.full(8, 222.0))
+    np.testing.assert_allclose(cal.c_max[1], np.full(8, 0.4))
+    np.testing.assert_allclose(
+        cal.i_max[1], np.full(8, CALIBRATION_I_MAX_MULTIPLIER * 200.0))
+
+
+def test_compute_without_baseline_falls_back_to_sdk_defaults():
+    """No baseline means a never-calibrated console: the un-measured rows
+    are the SDK defaults, which is the documented fallback."""
+    import numpy as np
+    from omotion.Calibration import Calibration
+    from omotion.CalibrationWorkflow import _compute_calibration_from_samples
+
+    samples = [
+        _light("right", cam, mean=200.0, contrast=0.4, frame_id=10)
+        for cam in range(8)
+    ]
+    cal = _compute_calibration_from_samples(
+        samples, left_camera_mask=0x00, right_camera_mask=0xFF,
+    )
+    defaults = Calibration.default()
+    np.testing.assert_array_equal(cal.c_max[0], defaults.c_max[0])
+    np.testing.assert_array_equal(cal.i_max[0], defaults.i_max[0])

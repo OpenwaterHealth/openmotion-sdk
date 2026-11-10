@@ -654,38 +654,38 @@ def test_camera_stream_enable_disable(any_sensor):
 # 3.9 Single-frame histogram capture
 # ===========================================================================
 
+# The one-shot capture (OW_CAMERA_SINGLE_HISTOGRAM) makes its own FSIN pulse;
+# the aggregator FSIN generator must be OFF for it. With the generator on, the
+# firmware's frame handler runs every period and clears the capture-complete
+# flag, so the capture or the following get fails at random.
 @pytest.mark.slow
 def test_single_histogram_raw_bytes(any_sensor):
-    """Full bring-up: power → program_fpga → configure → FSIN → capture → get histogram."""
+    """Full bring-up: power → program_fpga → configure → capture → get histogram."""
     _bring_up_camera(any_sensor)
-    any_sensor.enable_aggregator_fsin()
     try:
         assert any_sensor.camera_capture_histogram(0x01) is True
         raw = any_sensor.camera_get_histogram(0x01)
         assert isinstance(raw, (bytes, bytearray))
         assert len(raw) == 4100, f"Expected 4100 bytes, got {len(raw)}"
     finally:
-        any_sensor.disable_aggregator_fsin()
         _tear_down_camera(any_sensor)
 
 
 @pytest.mark.slow
 def test_single_histogram_parsed(any_sensor):
     _bring_up_camera(any_sensor)
-    any_sensor.enable_aggregator_fsin()
     try:
-        any_sensor.camera_capture_histogram(0x01)
+        assert any_sensor.camera_capture_histogram(0x01) is True
         raw = any_sensor.camera_get_histogram(0x01)
         assert raw is not None and len(raw) == 4100, (
             f"camera_get_histogram returned {len(raw) if raw else 0} bytes "
-            "(expected 4100) — check FSIN / FPGA state"
+            "(expected 4100) — check FPGA state"
         )
         histogram, temperature_c = _decode_raw_histogram(raw)
         assert len(histogram) == 1024
         assert histogram.dtype == np.uint32
         assert isinstance(temperature_c, float)
     finally:
-        any_sensor.disable_aggregator_fsin()
         _tear_down_camera(any_sensor)
 
 

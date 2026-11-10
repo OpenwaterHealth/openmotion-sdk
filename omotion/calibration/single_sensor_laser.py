@@ -121,6 +121,10 @@ class PreflightSnapshot:
     ophir_ready: bool
     ophir_setting_evidence: tuple[OphirSettingEvidence, ...]
     ophir_failure_reason: str | None = None
+    safety_keys_writable: bool | None = None
+    """False on console firmware that refuses the safety config keys (a
+    Release or Debug image with boot-info v2); True on a Factory image; None
+    on older firmware, which has no such check."""
 
 
 @dataclass(frozen=True)

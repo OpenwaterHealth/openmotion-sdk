@@ -76,14 +76,14 @@ def valid_safety_config(**changes):
     """The ten-key WI-00015 user configuration, overridable per key."""
     config = {
         "TA_PULSE_WIDTH": 500,
-        "TA_CURRENT_DRV": 5000,
+        "TA_CURRENT_DRV": 4950,
         "SEED_CW_GAIN": 140,
         "EE_PULSE_WIDTH_UL": 550,
         "EE_RATE_LL": 23125,
-        "EE_DRIVE_CL": 9999,
+        "EE_DRIVE_CL": 5000,
         "OPT_PULSE_WIDTH_UL": 550,
         "OPT_RATE_LL": 23125,
-        "OPT_DRIVE_CL": 9999,
+        "OPT_DRIVE_CL": 7200,
         "TEC_TRIP": 40,
     }
     config.update(changes)

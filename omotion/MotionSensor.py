@@ -28,6 +28,7 @@ from omotion.config import (
     OW_CMD_BOOT_INFO,
     OW_CMD_PING,
     OW_CMD_RESET,
+    OW_CMD_RESET_HISTORY,
     OW_CMD_TOGGLE_LED,
     OW_CMD_VERSION,
     OW_CTRL_FAN_CTL,
@@ -77,6 +78,12 @@ from omotion.config import (
 )
 from omotion.i2c_packet import I2C_Packet
 from omotion.boot_mode import BootMode, parse_boot_info
+from omotion.reset_history import (
+    ABNORMAL_SHUTDOWNS,
+    describe_shutdown,
+    format_reset_history,
+    parse_reset_history,
+)
 from omotion.GitHubReleases import GitHubReleases
 from omotion.MotionProcessing import bytes_to_integers
 from omotion.utils import calculate_file_crc, log_i2c_health
@@ -609,6 +616,29 @@ class MotionSensor(SignalWrapper):
         if r is None or r.packetType in _ERROR_TYPES:
             return BootMode.UNKNOWN
         return parse_boot_info(bytes(r.data[: r.data_len]) if r.data else b"")
+
+    def get_reset_history(self) -> dict | None:
+        """How this module's previous session ended, plus its reset counters.
+
+        Queries OW_CMD_RESET_HISTORY (openmotion-sensor-fw#137) and decodes the
+        reply with :func:`omotion.reset_history.parse_reset_history`; see that
+        module for the fields. The record lives in the firmware's ``.noinit``
+        RAM, so ``last_shutdown`` answers "why did it drop?" on the first
+        connect after the module comes back. Read-only and printf-independent.
+
+        Returns None when the firmware predates the command (it answers
+        OW_UNKNOWN), on a garbled reply, or when the read fails. Never raises.
+        """
+        if self.demo_mode:
+            return None
+        try:
+            r = self._send(packetType=OW_CMD, command=OW_CMD_RESET_HISTORY)
+        except Exception as e:
+            logger.debug("%s: reset history read failed: %s", self.name, e)
+            return None
+        if r is None or r.packetType in _ERROR_TYPES:
+            return None
+        return parse_reset_history(bytes(r.data[: r.data_len]) if r.data else b"")
 
     def read_serial_number(self) -> str | None:
         """Read the sensor module hardware serial number (None if unprogrammed/error)."""
@@ -2022,7 +2052,8 @@ class MotionSensor(SignalWrapper):
     def log_device_info(self, label: str | None = None) -> None:
         """Log a ``====``-guarded, side-labeled block with everything we need
         to identify this sensor: firmware version, hardware ID, serial number,
-        and all 8 camera UIDs.
+        how its previous session ended (:meth:`get_reset_history`), and all 8
+        camera UIDs.
 
         ``label`` is the side ("left"/"right") supplied by
         :meth:`omotion.MotionInterface.log_sensor_info`; it tags the block so
@@ -2030,6 +2061,12 @@ class MotionSensor(SignalWrapper):
         emitted as a single log record so it stays intact even when both
         sensors log concurrently (camera UIDs that failed to read are shown
         as ``<none>`` rather than dropped, so a dead camera stays visible).
+
+        The app calls this on every sensor connect, including the reconnect
+        after a mid-scan drop, so the shutdown line answers "why did it go
+        away?". A shutdown that means something went wrong (watchdog, fault,
+        ECC) is repeated as a separate WARNING line so it shows up in a
+        failure grep of the log.
         """
         title = (label or "sensor").upper()
         try:
@@ -2037,6 +2074,7 @@ class MotionSensor(SignalWrapper):
             hw_id      = self.get_cached_hardware_id() or self.get_hardware_id()
             serial     = self.read_serial_number() or "unprogrammed"
             uids       = self._cached_camera_uids or {}
+            history    = self.get_reset_history()
             rule = "=" * 60
             lines = [
                 rule,
@@ -2044,12 +2082,24 @@ class MotionSensor(SignalWrapper):
                 f"  firmware = {fw_version}",
                 f"  hw_id    = {hw_id}",
                 f"  serial   = {serial}",
-                "  camera UIDs:",
             ]
+            if history is None:
+                lines.append(
+                    "  shutdown = unavailable (firmware predates "
+                    "OW_CMD_RESET_HISTORY, or the read failed)"
+                )
+            else:
+                lines.extend(f"  {line}" for line in format_reset_history(history))
+            lines.append("  camera UIDs:")
             for cam in range(8):
                 lines.append(f"    cam{cam} = {uids.get(cam) or '<none>'}")
             lines.append(rule)
             logger.info("\n".join(lines))
+            if history is not None and history["last_shutdown"] in ABNORMAL_SHUTDOWNS:
+                logger.warning(
+                    "%s sensor: last shutdown was %s (boot %d since power-on)",
+                    title, describe_shutdown(history), history["boot_count"],
+                )
         except Exception as e:
             logger.warning("%s sensor: failed to read device info: %s", title, e)
 

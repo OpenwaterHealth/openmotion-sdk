@@ -2,7 +2,9 @@
 """
 enter_dfu.py
 
-Put a chosen MOTION device (console or left/right sensor) into DFU mode.
+Put a chosen MOTION device (console or left/right sensor) into DFU mode and
+report what it is running there: our bootloader and its version, or the STM32
+ROM loader of a unit without a bootloader.
 
 Usage
 -----
@@ -16,6 +18,10 @@ import sys
 import time
 
 from omotion import MotionInterface
+from omotion.dfu import STM32DFU, DFUError
+
+# How long the unit gets to re-enumerate as a DFU device (0483:DF11).
+DFU_APPEAR_TIMEOUT_S = 20.0
 
 
 def parse_cli() -> argparse.Namespace:
@@ -51,10 +57,30 @@ def _wait_for_handle(handle, timeout: float) -> bool:
     return handle.is_connected()
 
 
+def _report_dfu_device() -> None:
+    """Say what is on the other end of the DFU device."""
+    try:
+        if not STM32DFU.wait_for_device(DFU_APPEAR_TIMEOUT_S, present=True):
+            print(f"   [WARN]  No DFU device appeared within {DFU_APPEAR_TIMEOUT_S:.0f}s.")
+            return
+        with STM32DFU() as dfu:
+            dfu.connect()
+            mode, alts = dfu.detect_mode()
+            print(f"   DFU mode   : {mode}")
+            for alt in alts:
+                print(f"     alt      : {alt}")
+            if mode == "bootloader":
+                print(f"   Bootloader : {dfu.read_version()}")
+            elif mode == "rom":
+                print("   Bootloader : none (STM32 ROM loader; bare-metal unit)")
+    except DFUError as exc:
+        print(f"   [WARN]  Could not read the DFU device: {exc}")
+
+
 def main() -> int:
     args = parse_cli()
 
-    print("[*] Starting MOTION interface …")
+    print("[*] Starting MOTION interface ...")
     interface = MotionInterface()
     interface.start()
 
@@ -70,7 +96,7 @@ def main() -> int:
             label = "right sensor"
 
         if not _wait_for_handle(target, args.timeout):
-            print(f"❌  {label} not connected (waited {args.timeout:.1f}s).")
+            print(f"[FAIL]  {label} not connected (waited {args.timeout:.1f}s).")
             return 1
 
         if not args.no_confirm:
@@ -81,18 +107,20 @@ def main() -> int:
                 print("Aborted.")
                 return 0
 
-        print(f"[+] Requesting DFU mode from {label} …")
+        print(f"[+] Requesting DFU mode from {label} ...")
         try:
             ok = target.enter_dfu()
         except Exception as exc:
-            print(f"   ❌  Exception: {exc}")
+            print(f"   [FAIL]  Exception: {exc}")
             return 1
 
-        if ok:
-            print("   ✅  DFU mode requested successfully. Device should re-enumerate as DFU.")
-            return 0
-        print("   ❌  Device did not report success.")
-        return 1
+        if not ok:
+            print("   [FAIL]  Device did not report success.")
+            return 1
+
+        print("   [OK]  DFU mode requested. Waiting for the DFU device ...")
+        _report_dfu_device()
+        return 0
     finally:
         interface.stop()
 

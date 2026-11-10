@@ -15,6 +15,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Callable, Mapping, Protocol
 
+from omotion.fpga_attest import FACTORY_IMAGE_REQUIRED
+
 from .laser import (
     DeviceIdentity,
     EnergyMeasurement,
@@ -329,6 +331,8 @@ class LaserWorkflowBase:
             raise ProcedureFailure(
                 FailureKind.SETUP, "Console must be responsive before continuing."
             )
+        if getattr(preflight, "safety_keys_writable", None) is False:
+            raise ProcedureFailure(FailureKind.SETUP, FACTORY_IMAGE_REQUIRED)
         for identity, label in serial_identities:
             if not validate_serial(identity.serial).passed:
                 raise ProcedureFailure(

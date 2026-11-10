@@ -5,7 +5,7 @@ with a console module and sensor modules permanently attached.
 
 ## Prerequisites
 
-- Ubuntu 22.04 LTS (recommended) or Windows 10/11
+- Ubuntu 22.04 LTS (recommended) or Windows 11
 - Python 3.12
 - libusb 1.0 (`sudo apt install libusb-1.0-0`)
 - A console module attached via USB VCP

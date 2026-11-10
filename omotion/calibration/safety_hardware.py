@@ -139,6 +139,9 @@ class MotionSafetyCalibrationBench(MotionConsoleBenchBase):
             topology=self._topology_snapshot(),
             console_identity=console_identity,
             console_responsive=console_responsive,
+            safety_keys_writable=(
+                self._console_safety_keys_writable() if console_responsive else None
+            ),
         )
 
     def start_trigger(self) -> None:

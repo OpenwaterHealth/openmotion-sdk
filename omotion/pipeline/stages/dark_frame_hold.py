@@ -10,7 +10,7 @@ frame's values for that camera, so the live trace holds steady through the dark
 interval instead of spiking.
 
 Batch path: for IntervalClosed events carrying EnrichedCorrectedInterval, the
-stage applies the 4-point quadratic stencil (§8.4) to compute corrected values
+stage applies the 4-point quadratic stencil (§5.8.6) to compute corrected values
 for the leading dark frame D_prev and prepends it to the interval. This gives
 the "final" sinks a complete, gapless time series.
 
@@ -47,7 +47,7 @@ class DarkFrameHoldStage:
         self._stencil = DarkFrameQuadraticStencil()
         # Ring buffer (≤2 entries) of the last two EnrichedCorrectedFrames from
         # the previous interval, keyed by (side, cam_id). Used as the left
-        # neighbours v(D-1) and v(D-2) for the quadratic stencil (§8.4).
+        # neighbours v(D-1) and v(D-2) for the quadratic stencil (§5.8.6).
         self._prev_interval_tail: dict[tuple[str, int], list[EnrichedCorrectedFrame]] = {}
 
     def process(self, batch: FrameBatch) -> FrameBatch:
@@ -133,7 +133,7 @@ class DarkFrameHoldStage:
     ) -> Optional[EnrichedCorrectedFrame]:
         """Compute the stencil-interpolated corrected value for the dark frame D_prev.
 
-        Uses the quadratic 4-point stencil (§8.4):
+        Uses the quadratic 4-point stencil (§5.8.6):
             v(D) = (-1/6)*v(D-2) + (2/3)*v(D-1) + (2/3)*v(D+1) + (-1/6)*v(D+2)
 
         Left neighbours  v(D-1), v(D-2) come from self._prev_interval_tail[key].

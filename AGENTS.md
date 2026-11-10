@@ -68,7 +68,7 @@ Windows USB behavior depends on WinUSB/libusb drivers. Driver files live under
 - Versioning uses `setuptools_scm` from git tags such as `v1.2.3` or `1.2.3`.
 - Release notes and PyPI guidance live in `PYPI_SETUP.md` and `docs/Releasing.md`.
 - Keep package data rules in `pyproject.toml` in sync when adding bundled
-  binaries, config, bitstreams, or dfu-util assets.
+  binaries, config, bitstreams, or key files.
 
 ## Editing Guidance
 

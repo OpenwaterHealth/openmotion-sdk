@@ -53,7 +53,7 @@ class FakeDualBench:
         self.stop_count = 0
         self.pre_existing_config = {"customer_key": 17}
         self.registers = {
-            "TA_CURRENT_DRV": 5000.0,
+            "TA_CURRENT_DRV": 4950.0,
             "TA_PULSE_WIDTH": 500.0,
             "SEED_CW_GAIN": 140.0,
             "EE_PULSE_WIDTH_UL": 550.0,
@@ -323,8 +323,8 @@ def test_downward_tuning_targets_higher_side_without_reprompting_during_sweep():
     assert round_one.target_uj == 380
     assert "higher energy reading" in round_one.reason
     assert [write for write in bench.register_writes if write[0] == "TA_CURRENT_DRV"] == [
-        ("TA_CURRENT_DRV", 4950.0),
         ("TA_CURRENT_DRV", 4900.0),
+        ("TA_CURRENT_DRV", 4850.0),
     ]
     assert [item.to_side for item in placements.requests] == [
         "left",
@@ -332,7 +332,7 @@ def test_downward_tuning_targets_higher_side_without_reprompting_during_sweep():
         "left",
         "right",
     ]
-    assert result.requested_final_config["TA_CURRENT_DRV"] == 4900
+    assert result.requested_final_config["TA_CURRENT_DRV"] == 4850
     assert result.requested_final_config["EE_PULSE_WIDTH_UL"] == 550
 
 
@@ -435,7 +435,7 @@ def test_final_active_setting_outside_two_percent_prevents_passing_config_write(
             valid_measurement(340),
             valid_measurement(360),
         ],
-        register_read_queues={"TA_CURRENT_DRV": [5000.0, 5100.001]},
+        register_read_queues={"TA_CURRENT_DRV": [4950.0, 5049.001]},
     )
     result, _, _ = run_workflow(bench)
     assert result.status is ProcedureStatus.FAILED
@@ -460,7 +460,7 @@ def test_final_configuration_requires_exact_immediate_complete_readback():
     result, _, _ = run_workflow(bench)
     assert result.status is ProcedureStatus.FAILED
     assert result.failure_kind is FailureKind.CONFIGURATION
-    assert result.requested_final_config["TA_CURRENT_DRV"] == 5000
+    assert result.requested_final_config["TA_CURRENT_DRV"] == 4950
     assert result.final_config_readback["TA_CURRENT_DRV"] == 4999
     assert len(bench.user_configuration_writes) == 2
 
@@ -513,7 +513,7 @@ def test_failed_sweep_retains_round_target_reason_and_completed_steps():
     assert active_round.target_uj == 380
     assert "higher energy reading" in active_round.reason
     assert len(active_round.steps) == 1
-    assert active_round.steps[0].requested_value == 4950
+    assert active_round.steps[0].requested_value == 4900
 
 
 def test_later_upward_round_at_600_below_300_is_immediate_ncr():
@@ -560,7 +560,7 @@ def test_downward_current_floor_without_acceptable_candidate_is_ncr():
     assert result.status is ProcedureStatus.FAILED_NCR
     assert result.failure_kind is FailureKind.NCR
     current_writes = [value for name, value in bench.register_writes if name == "TA_CURRENT_DRV"]
-    assert current_writes[0] == 4950
+    assert current_writes[0] == 4900
     assert 2000 in current_writes
     assert all(value >= 2000 for value in current_writes)
     assert len(bench.user_configuration_writes) == 1
@@ -640,3 +640,16 @@ def test_final_trigger_stop_failure_changes_pending_pass_to_failed():
     assert result.trigger_cleanup_failure == "Trigger stop failed."
     assert result.requested_final_config is not None
     assert recorder.checkpoints[-1] == result
+
+
+def test_dual_preflight_on_a_release_image_that_refuses_safety_keys_stops_at_setup():
+    from omotion.fpga_attest import FACTORY_IMAGE_REQUIRED
+
+    bench = FakeDualBench()
+    bench.snapshot = replace(bench.snapshot, safety_keys_writable=False)
+    result, recorder, placements = run_workflow(bench)
+    assert result.status is ProcedureStatus.FAILED
+    assert result.failure_kind is FailureKind.SETUP
+    assert result.failure_reason == FACTORY_IMAGE_REQUIRED
+    assert bench.user_configuration_writes == []
+    assert "measure_energy" not in bench.calls

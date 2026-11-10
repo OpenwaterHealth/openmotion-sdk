@@ -21,6 +21,7 @@ from omotion.config import (
     OW_ACK,
     OW_CMD_ECHO,
     OW_CMD_NOP,
+    CONSOLE_MAX_PAYLOAD,
     OW_DATA,
     OW_END_BYTE,
     OW_ERROR,
@@ -44,6 +45,7 @@ class MotionUart:
         demo_mode: bool = False,
         desc: str = "VCP",
         on_io_error: Optional[Callable[[Optional[int], str], None]] = None,
+        max_payload: int = CONSOLE_MAX_PAYLOAD,
     ):
         self.vid = vid
         self.pid = pid
@@ -57,6 +59,9 @@ class MotionUart:
         self.serial: Optional[serial.Serial] = None
         self._io_lock = threading.RLock()
         self.on_io_error = on_io_error
+        # Largest payload the device accepts; a longer one is refused in
+        # send_packet rather than NAKed by the firmware.
+        self.max_payload = max_payload
         # Minimum spacing between the end of one command and the TX of the
         # next — console firmware drops commands sent back-to-back (see
         # send_packet).
@@ -246,6 +251,11 @@ class MotionUart:
                     raise ValueError("Data must be bytes or bytearray")
                 payload = data
                 payload_length = len(payload)
+                if payload_length > self.max_payload:
+                    raise ValueError(
+                        f"Payload of {payload_length} bytes exceeds the "
+                        f"{self.max_payload}-byte limit"
+                    )
             else:
                 payload_length = 0
                 payload = b""

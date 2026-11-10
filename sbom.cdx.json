@@ -77,6 +77,30 @@
     },
     {
       "type": "library",
+      "bom-ref": "pkg:pypi/cryptography@50.0.1",
+      "name": "cryptography",
+      "version": "50.0.1",
+      "purl": "pkg:pypi/cryptography@50.0.1",
+      "scope": "required"
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/cffi@2.0.0",
+      "name": "cffi",
+      "version": "2.0.0",
+      "purl": "pkg:pypi/cffi@2.0.0",
+      "scope": "required"
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/pycparser@3.0",
+      "name": "pycparser",
+      "version": "3.0",
+      "purl": "pkg:pypi/pycparser@3.0",
+      "scope": "required"
+    },
+    {
+      "type": "library",
       "bom-ref": "pkg:pypi/keyboard@0.13.5",
       "name": "keyboard",
       "version": "0.13.5",

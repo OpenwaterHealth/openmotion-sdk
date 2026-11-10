@@ -208,16 +208,25 @@ next clock anchor. Each frame's
    step (slack: 12 ms or 10 % of the claimed duration, whichever is larger).
    This admits bounded real packet loss but rejects a shared off-by-one frame
    id whose timestamp stayed on the ordinary cadence.
-4. **Forward step > 8** → the first returning row is quarantined even if its
-   timestamp agrees, and is held only as an isolated resynchronization
-   candidate only when the source-packet delivery monitor independently saw
-   that enabled camera disappear for more than eight captures and then
-   return. If the next row advances by exactly one frame and 25 ms, the pair
-   supplies enough evidence to re-anchor the resumed camera. Otherwise
-   the candidate is discarded and the prior accepted state remains intact.
-   This prevents one jointly corrupted counter/timestamp pair (for example
-   `frame_id +64`, `timestamp +1.6 s`) from shifting the epoch permanently,
-   while allowing a real camera outage to recover without wedging the scan.
+4. **Forward step > 8, or any step the clock contradicts** → quarantined. If
+   the device clock places the frame at an absolute id whose low byte is its
+   wire id (`clock_abs + round(elapsed / 25 ms)`, ±1 for crystal drift over
+   long gaps), that id is held as a resynchronization candidate. If the next
+   row advances by exactly one frame and 25 ms, the stream re-anchors there
+   with the epoch taken from the clock; otherwise the candidate is discarded
+   and the prior accepted state remains intact. A corrupted frame id fails the
+   first test (its low byte won't match the clock); one jointly corrupted
+   counter/timestamp pair (for example `frame_id +64`, `timestamp +1.6 s`)
+   fails the second, because the next clean row doesn't continue it. A real
+   gap of any length, one camera or a whole module, passes both, and only
+   its first resumed row is lost. Before #286 this path also required the
+   source-packet delivery monitor to have seen that camera go missing, which
+   a whole-module gap never shows (there are no packets at all), so a
+   module-wide skip of more than eight frames locked the side out until the
+   8-bit id wrapped (6.4 s) and left its absolute ids 256 low for the rest of
+   the scan. The epoch also comes from the clock for gaps past 127 frames,
+   which the 8-bit id alone cannot express (a gap of 256·n + 1 frames reads
+   as a single +1 step).
 
 There is an unavoidable boundary: a small counter jump (2–8) accompanied by
 the exactly matching clock jump is indistinguishable from real bounded packet
@@ -249,7 +258,7 @@ retain them intentionally, preserving the wire evidence needed in post.
 
 | Condition | `frame_type` |
 |---|---|
-| unwrapper rejected the frame (rules 1–2 above), or leading stale run | `"stale"` |
+| unwrapper rejected the frame (rule 1 or 4 above), or leading stale run | `"stale"` |
 | `abs_id ≤ d` | `"warmup"` |
 | `abs_id == d + 1` OR (`abs_id > d + 1` AND `(abs_id - 1) mod Δ == 0`) | `"dark"` |
 | otherwise | `"light"` |
@@ -266,8 +275,8 @@ poller; omitted for replays and tests).
 Stamps each frame with the most recent `TelemetrySample` at-or-before the
 frame's capture time: `pdc[i]` (photodiode current, mA), `tcm[i]` (MCU
 trigger count), `tcl[i]` (laser trigger count). Frames before the first
-sample get `pdc = NaN`, `tcm = tcl = 0` — the CSV writers render those as
-blank cells.
+sample get `pdc = NaN`, `tcm = tcl = 0`. The raw CSV writes the NaN `pdc` as
+a blank cell but the zero counters as `0.0` (§8.1).
 
 **Clock bridging.** Frame timestamps are sensor-firmware clock normalised
 to scan start; telemetry samples carry host `time.time()`. The stage
@@ -670,6 +679,8 @@ The runner consumes `for batch in source`, so any object that yields `FrameBatch
 
 Per-side packet queues feed per-side reader threads that run `omotion.MotionProcessing.parse_histogram_stream`. Its packet callback assigns one per-side packet ordinal to all samples in the parsed packet. Complete packets accumulate into `FrameBatch`es (default `batch_size_frames=10`, with a `flush_interval_s=0.25` time-based flush) and are pushed to a shared batch queue that the runner iterates; a batch boundary never splits a packet.
 
+The runner runs every stage and sink inline, so while it is busy (a dark-interval close with its DB writes, a GC pause, a slow disk) nothing drains the queues behind it. Each per-side packet queue therefore holds `PACKET_BUFFER_SECONDS` (10 s) of raw USB reads, sized for uncompressed packets, so a stall backs up there instead of stopping the USB reads; the sensor itself buffers only ~5 frames. Each side logs the queue's high-water mark when streaming stops and warns once it passed half full (#116).
+
 `close()` follows a strict shutdown sequence to avoid losing the firmware's terminal dark frame:
 
 1. `stop_streaming()` + `drain_final()` on each side's `StreamInterface`. Drained chunks are pushed into the per-side packet queue while the parser thread is still running, so the parser consumes them on its next iteration.
@@ -679,7 +690,7 @@ Per-side packet queues feed per-side reader threads that run `omotion.MotionProc
 
 ### 7.2 CsvReplaySource
 
-**Used by:** offline analysis, regression testing, the `view_corrected_scan.py` script.
+**Used by:** offline analysis and regression testing. (To *look at* a scan rather than re-run the pipeline over it, use `scripts/visualize_scan.py`, which reads the finished CSVs directly.)
 
 Replays a raw-histogram CSV produced by `CsvSink` (one CSV per side, optionally one or both). Schema: `cam_id, frame_id, timestamp_s, type, 0..1023, temperature, sum, tcm, tcl, pdc`. Yields `FrameBatch`es of `batch_size_frames` (default 100) per side, in order. Because the legacy schema has no packet-id column, replay reconstructs packet boundaries in row order: a timestamp change or repeated camera starts the next packet. The repeated-camera rule preserves boundaries during a timestamp freeze.
 
@@ -725,12 +736,14 @@ The runner calls `on_scan_start(metadata)` on every sink before the first batch,
 
 Writes the two legacy CSV families. File creation is lazy on first `consume()`.
 
-- **Raw CSV** — one file per side, named `{scan_id}_{subject_id}_{side}_mask{XX}_raw.csv`. Schema: `cam_id, frame_id, timestamp_s, type, 0..1023, temperature, sum, tcm, tcl, pdc`. Each frame's `type` column is the `frame_type` written by FrameClassificationStage (`"warmup" | "dark" | "light" | "stale"`). Quarantined stale rows are retained here as wire evidence, while science/live consumers exclude them. Telemetry columns (`tcm`, `tcl`, `pdc`) carry TelemetryIngestStage's per-frame stamps (§5.2); cells are blank when no telemetry sample preceded the frame or no aggregator was wired (replays of pre-telemetry scans stay column-compatible).
-- **Corrected CSV** — one file per scan, named `{scan_id}_corrected.csv`.
+- **Raw CSV** — one file per side, named `{scan_id}_{subject_id}_{side}_mask{XX}_raw.csv`. Schema: `cam_id, frame_id, timestamp_s, type, 0..1023, temperature, sum, tcm, tcl, pdc`. Each frame's `type` column is the `frame_type` written by FrameClassificationStage (`"warmup" | "dark" | "light" | "stale"`). Quarantined stale rows are retained here as wire evidence, while science/live consumers exclude them. Telemetry columns (`tcm`, `tcl`, `pdc`) carry TelemetryIngestStage's per-frame stamps (§5.2), written as floats (`4010.0`). Before the first telemetry sample `pdc` is blank and `tcm`/`tcl` are `0.0`; all three are blank when no aggregator was wired (replays of pre-telemetry scans stay column-compatible). `frame_id` is the wire 8-bit counter and `timestamp_s` the pre-repair wire timestamp (§5.4).
+- **Corrected CSV** — one file per scan, named `{scan_id}_{subject_id}.csv` (`{scan_id}.csv` when `subject_id` is empty; there is no `_corrected` suffix — the `_raw` suffix already tells the two apart). `frame_id` is the absolute (unwrapped) frame id; metric values and `timestamp_s` are rounded to 9 decimals. A metric the pipeline could not compute (NaN) is written as `nan`; slots for masked-off cameras, and `temp` where no firmware stamp was available, stay blank.
   - **Normal mode** (82 columns): `frame_id, timestamp_s, {bfi,bvi,mean,contrast,temp}_{l,r}{1..8}`. Per-frame rows are accumulated in `_corrected_acc` until every expected `(side, cam)` slot has contributed a `mean`; only then is the row written.
   - **Reduced mode** (6 columns): `frame_id, timestamp_s, bfi_left, bfi_right, bvi_left, bvi_right`. Each `EnrichedCorrectedFrame` writes into the row's `bfi_{side}`/`bvi_{side}` slot based on `frame.side`; a row is flushed once both expected sides have contributed (or only one, if the other's camera mask is zero).
 
 On `on_complete`, any partial accumulator rows are flushed verbatim (with blanks for the missing slots) so no completed frames are lost.
+
+The bloodflow-app's History → Export CSV is not written by `CsvSink`: `materialize_corrected_csv` (`omotion/SessionPlayback.py`) rebuilds the same layout from `session_data`. Its output differs in that a NULL (NaN) value is a blank cell rather than `nan`, `timestamp_s` carries the DB's 6-decimal rounding, reduced-mode values are rounded to 6 decimals, and `include_quality=True` (normal mode only; the app always passes it) appends `quality_l1..quality_r8`. In reduced mode a side value stored as NULL currently comes out as `0.0`, not blank. The app documents every CSV column for users in `docs/csv-formats.md` in the bloodflow-app repository.
 
 ### 8.2 ScanDBSink
 
@@ -823,7 +836,8 @@ Two independent telemetry paths exist, both fed by the long-lived
 - **Telemetry CSV (outside the pipeline)** — the `_TelemetryCsvWriter`
   listener writes one row per snapshot to
   `{scan_id}_{subject_id}_telemetry.csv` (full snapshot: TEC, PDU,
-  safety, counters). Not a pipeline sink; no channel.
+  safety, counters — 50 columns, listed in `_TELEMETRY_HEADERS` in
+  `omotion/ScanWorkflow.py`). Not a pipeline sink; no channel.
 
 The aggregator and the CSV writer are independent listeners; closing one
 does not affect the other.

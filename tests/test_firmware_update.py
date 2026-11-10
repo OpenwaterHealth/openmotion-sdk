@@ -116,41 +116,44 @@ def test_download_firmware_uses_release_by_tag(tmp_path):
 
 
 def test_updater_happy_path(tmp_path):
-    from omotion.boot_mode import BootMode
+    from _dfu_fakes import FakeDfuUnit, FakeHandle
+    from omotion.firmware_update import UpdateAction
 
-    handle = MagicMock()
-    handle.enter_dfu.return_value = True
-    dfu = MagicMock()
-    dfu.wait_for_dfu_device.return_value = True
-    dfu.detect_boot_mode.return_value = BootMode.BARE_METAL
-    dfu.flash_bin.return_value = MagicMock(success=True)
+    image = tmp_path / "fw.bin"
+    image.write_bytes(bytes([0x00, 0x00, 0x08, 0x24]) + bytes([0xA5]) * 60)
+    unit = FakeDfuUnit(mode="rom")
+    handle = FakeHandle(unit)
 
-    updater = FirmwareUpdater(programmer=dfu)
-    result = updater.update(handle, tmp_path / "fw.bin")
+    updater = FirmwareUpdater(dfu=unit, app_present=unit.app_present)
+    result = updater.update(handle, image)
 
     assert result.success is True
-    handle.enter_dfu.assert_called_once()
-    dfu.flash_bin.assert_called_once()
+    assert result.action is UpdateAction.BARE_METAL_APP
+    assert handle.enter_dfu_calls == 1
     # A bare-metal device is flashed at the base of flash, never the slot.
-    assert dfu.flash_bin.call_args.kwargs["address"] == "0x08000000"
+    assert unit.downloads == [(0x08000000, image.read_bytes())]
 
 
 def test_updater_raises_if_enter_dfu_rejected(tmp_path):
+    from _dfu_fakes import FakeDfuUnit
+
     handle = MagicMock()
     handle.enter_dfu.return_value = False
-    updater = FirmwareUpdater(programmer=MagicMock())
+    unit = FakeDfuUnit()
+    updater = FirmwareUpdater(dfu=unit)
     with pytest.raises(FirmwareUpdateError):
         updater.update(handle, tmp_path / "fw.bin")
+    assert unit.calls == []
 
 
 def test_updater_raises_if_dfu_never_appears(tmp_path):
-    handle = MagicMock()
-    handle.enter_dfu.return_value = True
-    dfu = MagicMock()
-    dfu.wait_for_dfu_device.return_value = False
-    updater = FirmwareUpdater(programmer=dfu)
+    from _dfu_fakes import FakeDfuUnit, FakeHandle
+
+    unit = FakeDfuUnit(appears=False)
+    updater = FirmwareUpdater(dfu=unit)
     with pytest.raises(FirmwareUpdateError):
-        updater.update(handle, tmp_path / "fw.bin")
+        updater.update(FakeHandle(unit), tmp_path / "fw.bin")
+    assert unit.calls == []
 
 
 # ---------------------------------------------------------------------------

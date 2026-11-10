@@ -84,6 +84,43 @@ def interface():
     return iface
 
 
+def _same_calibration(a: Calibration, b: Calibration) -> bool:
+    return (
+        a.source == b.source
+        and np.array_equal(a.c_min, b.c_min) and np.array_equal(a.c_max, b.c_max)
+        and np.array_equal(a.i_min, b.i_min) and np.array_equal(a.i_max, b.i_max)
+    )
+
+
+def _console_block(*, left_c_max=0.31, left_i_max=222.0,
+                   right_c_max=0.37, right_i_max=333.0) -> dict:
+    """A stored calibration JSON block whose rows are distinguishable from
+    the SDK defaults and from what the fake scan computes (C_max 0.4,
+    I_max 400)."""
+    return {"calibration": {
+        "C_min": [[0.0] * 8, [0.0] * 8],
+        "C_max": [[left_c_max] * 8, [right_c_max] * 8],
+        "I_min": [[0.0] * 8, [0.0] * 8],
+        "I_max": [[left_i_max] * 8, [right_i_max] * 8],
+    }}
+
+
+def _console_holds(interface, json_data) -> None:
+    """Make the (demo-mode) console answer read_config with this JSON."""
+    from omotion.MotionConfig import MotionConfig
+    interface.console.read_config = MagicMock(
+        side_effect=lambda: MotionConfig(json_data=dict(json_data)))
+
+
+def _run_to_completion(interface, request, timeout=60.0) -> CalibrationResult:
+    done = threading.Event()
+    holder: dict = {}
+    assert interface.start_calibration(
+        request, on_complete_fn=lambda r: (holder.update(r=r), done.set()))
+    assert done.wait(timeout=timeout), "calibration didn't complete"
+    return holder["r"]
+
+
 def _make_fake_scan_workflow(interface, left, right):
     """Patch interface.scan_workflow so start_scan synthesises corrected
     samples through the sink contract used by the new pipeline (Phase E).
@@ -464,7 +501,7 @@ def test_fail_verdict_never_writes(interface, request_obj, thresholds):
     # The proposed calibration lived in the in-memory cache for the
     # validation scan only; afterwards the cache must hold the console's
     # own calibration again.
-    assert interface.get_calibration() is prior
+    assert _same_calibration(interface.get_calibration(), prior)
 
 
 def test_pass_verdict_writes_once_after_validation(interface, request_obj):
@@ -528,7 +565,7 @@ def test_write_failure_after_pass_is_error_and_restores_cache(
     assert r.outcome is CalibrationOutcome.ERROR
     assert r.calibration_written is False
     assert "usb gone" in r.error
-    assert interface.get_calibration() is prior
+    assert _same_calibration(interface.get_calibration(), prior)
 
 
 def test_watchdog_timeout_outcome_is_timed_out(interface, request_obj):
@@ -640,3 +677,154 @@ def test_gate_failure_skips_validation_scan(interface, request_obj):
     assert len(scan_count) == 1, "validation scan ran despite gate failure"
     assert applied == [], "proposed calibration applied despite gate failure"
     assert holder["r"].passed is False
+
+
+# ---------------------------------------------------------------------------
+# One-side runs carry the other side forward from a FRESH console read,
+# never from the SDK cache (#281: a right-only run was writing SDK
+# defaults over the left module's stored calibration whenever the cache
+# had not been loaded from the console, or had been reset to defaults by
+# a transient read failure).
+# ---------------------------------------------------------------------------
+
+def _right_only(request_obj):
+    from dataclasses import replace
+    return replace(request_obj, left_camera_mask=0x00, right_camera_mask=0xFF)
+
+
+def _capture_written(interface) -> dict:
+    """Stub interface.write_calibration to record the arrays it is handed
+    and hand back a console-sourced Calibration, like the real one."""
+    captured: dict = {}
+
+    def _write(c_min, c_max, i_min, i_max):
+        captured.update(c_min=c_min, c_max=c_max, i_min=i_min, i_max=i_max)
+        return Calibration(c_min=c_min, c_max=c_max, i_min=i_min, i_max=i_max,
+                           source="console")
+
+    interface.write_calibration = MagicMock(side_effect=_write)
+    return captured
+
+
+def test_right_only_run_carries_left_row_from_console_not_cache(
+    interface, request_obj,
+):
+    """The user-reported case: the left module was calibrated earlier, the
+    host never loaded the console calibration into the SDK cache (or the
+    cache was reset to defaults), and the operator calibrates the right
+    side only. The written block must keep the console's left row."""
+    _make_fake_scan_workflow(interface, _LEFT, _RIGHT)
+    _console_holds(interface, _console_block())
+    assert interface.get_calibration().source == "default"   # cache never loaded
+    captured = _capture_written(interface)
+
+    r = _run_to_completion(interface, _right_only(request_obj))
+
+    assert r.passed and r.calibration_written
+    interface.write_calibration.assert_called_once()
+    # Left row: exactly what the console stored, not the SDK defaults.
+    np.testing.assert_array_equal(captured["c_max"][0], np.full(8, 0.31))
+    np.testing.assert_array_equal(captured["i_max"][0], np.full(8, 222.0))
+    # Right row: freshly computed from the fake scan (contrast 0.4, mean 200).
+    np.testing.assert_allclose(captured["c_max"][1], np.full(8, 0.4))
+    np.testing.assert_allclose(captured["i_max"][1], np.full(8, 400.0))
+
+
+def test_right_only_run_prefers_fresh_console_read_over_stale_cache(
+    interface, request_obj,
+):
+    """A cache that holds an older console calibration is not the baseline
+    either: the EEPROM is re-read at run time."""
+    _make_fake_scan_workflow(interface, _LEFT, _RIGHT)
+    _console_holds(interface, _console_block(left_c_max=0.29, left_i_max=210.0))
+    interface.refresh_calibration()                     # cache <- old values
+    _console_holds(interface, _console_block(left_c_max=0.31, left_i_max=222.0))
+    captured = _capture_written(interface)
+
+    r = _run_to_completion(interface, _right_only(request_obj))
+
+    assert r.passed
+    np.testing.assert_array_equal(captured["c_max"][0], np.full(8, 0.31))
+    np.testing.assert_array_equal(captured["i_max"][0], np.full(8, 222.0))
+
+
+def test_right_only_run_on_never_calibrated_console_carries_sdk_defaults(
+    interface, request_obj,
+):
+    """A console with no calibration block is the one case where SDK
+    defaults are the right thing to carry forward for the left module."""
+    _make_fake_scan_workflow(interface, _LEFT, _RIGHT)
+    _console_holds(interface, {"EE_THRESH": [1, 2, 3]})   # no calibration key
+    captured = _capture_written(interface)
+
+    r = _run_to_completion(interface, _right_only(request_obj))
+
+    assert r.passed
+    defaults = Calibration.default()
+    np.testing.assert_array_equal(captured["c_max"][0], defaults.c_max[0])
+    np.testing.assert_array_equal(captured["i_max"][0], defaults.i_max[0])
+    np.testing.assert_allclose(captured["c_max"][1], np.full(8, 0.4))
+
+
+def test_right_only_run_refuses_when_console_calibration_unreadable(
+    interface, request_obj,
+):
+    """If the console cannot be read, the run must not guess: it ends as
+    ERROR before any scan and writes nothing — the alternative was writing
+    SDK defaults over the left module's stored calibration."""
+    from omotion.CalibrationWorkflow import CalibrationOutcome
+    _make_fake_scan_workflow(interface, _LEFT, _RIGHT)
+    interface.console.read_config = MagicMock(return_value=None)  # device error
+    scans = []
+    sw = interface.scan_workflow
+    fake_start = sw.start_scan
+    sw.start_scan = lambda req: (scans.append(req), fake_start(req))[1]
+    interface.write_calibration = MagicMock()
+
+    r = _run_to_completion(interface, _right_only(request_obj))
+
+    assert r.outcome is CalibrationOutcome.ERROR
+    assert r.calibration_written is False
+    assert "could not be read" in r.error
+    interface.write_calibration.assert_not_called()
+    assert scans == []                       # failed fast, before phase 1
+    assert os.path.exists(r.json_path)       # manifest still records the run
+
+
+def test_both_sides_run_also_refuses_when_console_unreadable(
+    interface, request_obj,
+):
+    """Deliberately no mask special-casing: an unreadable console fails
+    every run the same way, even one that would overwrite both rows."""
+    from omotion.CalibrationWorkflow import CalibrationOutcome
+    _make_fake_scan_workflow(interface, _LEFT, _RIGHT)
+    interface.console.read_config = MagicMock(return_value=None)
+    interface.write_calibration = MagicMock()
+
+    r = _run_to_completion(interface, request_obj)   # masks 0xFF / 0xFF
+
+    assert r.outcome is CalibrationOutcome.ERROR
+    interface.write_calibration.assert_not_called()
+
+
+def test_run_reads_console_before_first_scan(interface, request_obj):
+    """The baseline read happens before the calibration scan so an
+    unreadable console fails fast, and the compute step uses that read."""
+    _make_fake_scan_workflow(interface, _LEFT, _RIGHT)
+    order = []
+    _console_holds(interface, _console_block())
+    real_read = interface.console.read_config
+    interface.console.read_config = MagicMock(
+        side_effect=lambda: (order.append("console_read"), real_read())[1])
+    sw = interface.scan_workflow
+    fake_start = sw.start_scan
+    sw.start_scan = lambda req: (order.append("scan"), fake_start(req))[1]
+    interface.write_calibration = MagicMock(
+        side_effect=lambda *a: (order.append("eeprom_write"),
+                                Calibration(*a, source="console"))[1])
+
+    r = _run_to_completion(interface, _right_only(request_obj))
+
+    assert r.passed
+    assert order[:2] == ["console_read", "scan"]
+    assert order[-1] == "eeprom_write"

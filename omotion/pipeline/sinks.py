@@ -1,9 +1,9 @@
 """Sink protocol + ScanMetadata.
 
 Concrete sink implementations (CsvSink, ScanDBSink) live below the
-protocol definitions. The live-plot UI sink lives in the bloodflow-app
-(`motion_connector.py` — `_LivePlotSink` for the `"live"` channel and
-`_FinalBatchSink` for the `"final"` channel) rather than in the SDK.
+protocol definitions. The app-side sinks (e.g. the live-plot UI sink,
+`_LivePlotSink`) live in the bloodflow-app's `motion_connector.py` rather
+than in the SDK.
 """
 
 from __future__ import annotations
@@ -154,7 +154,8 @@ class CsvSink:
     """Channel-based CSV sink for the pipeline.
 
     Channels:
-        "raw"   — per-frame raw histograms (gated by meta.write_raw_csv)
+        "raw"   — per-frame raw histograms (only when the pipeline includes
+                  ``Tee("raw")``)
         "final" — per-interval corrected output
 
     Raw file naming:       ``{scan_id}_{subject_id}_{side}_mask{XX}_raw.csv``
@@ -183,8 +184,9 @@ class CsvSink:
         # When False, the corrected CSV ({scan_id}_{subject}.csv) is not
         # written — the scan DB's session_data is the system of record
         # for per-cam BFI/BVI instead. Raw histogram CSV handling (the
-        # "raw" channel, separately gated by meta.write_raw_csv) is
-        # unaffected. The SDK runner forces this True when no scan DB is
+        # "raw" channel, gated by whether the pipeline includes Tee("raw")
+        # and by its optional max_duration_s cap) is unaffected.
+        # ScanWorkflow.start_scan forces this True when no scan DB is
         # configured so there's always at least one persisted record.
         self._write_corrected = bool(write_corrected)
         self._meta: Optional[ScanMetadata] = None
