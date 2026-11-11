@@ -42,8 +42,20 @@ SAFETY_PULSE_WIDTH_UL_US = ABSOLUTE_MAX_PULSE_WIDTH_US   # above the longest pul
 # The 2400 us dark skip leaves 25000 - 2400 = 22600 us from the displaced dark
 # pulse to the next one at 40 Hz; real consoles hold 23125 (stock 22500).
 SAFETY_RATE_LL_US = 22400.0                              # raw 70000
-# What the WI-15 laser calibration swept with; above any 5000 mA peak.
-SAFETY_DRIVE_CL = 9999.0                                 # raw 5376
+# Above any 5000 mA peak (the WI-15 laser calibration swept with 9999).
+#
+# The raw value's low byte must be 0xFF. The safety FPGA takes the 16-bit
+# limit one byte at a time, low byte first (registers.v, 0x10 then 0x11),
+# and once a laser pulse has fired its peak check compares the last pulse's
+# held peak against the limit on every clock (power_peak_check.v never
+# leaves CHECK). So for a moment the limit is old-high-byte : new-low-byte.
+# With 9999 mA (raw 0x1500) a console calibrated to 3900 mA went
+# 0x07F4 -> 0x0700 -> 0x1500: 1792 was under the held peak of 1845 and EE
+# latched POWER_PEAK_CURRENT_LIMIT_FAIL with the trigger off (bench,
+# 2026-11-10; both numbers read back from the FPGA's trip capture). A low
+# byte of 0xFF makes the in-between value at least the old limit.
+SAFETY_DRIVE_CL_RAW = 0x14FF
+SAFETY_DRIVE_CL = SAFETY_DRIVE_CL_RAW * 1.86             # 9997.5 mA
 
 # The TA driver compare underflows below 55 ticks (17.6 us) and leaves the
 # drive latched on (driver_control.v); never write a width that short.
@@ -208,9 +220,8 @@ class LaserCameraActuator:
             logger.warning("Optimize Laser: safety limits loosened (volatile): %s",
                            ", ".join(f"{n} -> {v:g}" for n, v in plan))
         if latched:
-            # Bench, 2026-11-10: on a console calibrated to 3900 mA the
-            # limit writes themselves latched EE peak-current (trigger off,
-            # before any pulse). A latched interlock inhibits the TA, so
+            # A limit write can latch the interlock by itself (see
+            # SAFETY_DRIVE_CL). A latched interlock inhibits the TA, so
             # every scan after it would come back dark and read as "too
             # dim": stop here and say what happened.
             raise RuntimeError(

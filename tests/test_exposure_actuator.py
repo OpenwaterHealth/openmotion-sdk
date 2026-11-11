@@ -132,6 +132,19 @@ def test_loosen_raises_drive_cl_above_the_units_calibrated_current():
     assert console.get("OPT_DRIVE_CL") == pytest.approx(SAFETY_DRIVE_CL, abs=1.86)
 
 
+def test_raising_drive_cl_never_passes_through_a_lower_limit():
+    """The safety FPGA takes the limit low byte first, so between the two
+    bytes it holds old-high : new-low. Bench, 2026-11-10: 0x07F4 -> 0x1500
+    went through 0x0700, under the held peak, and EE latched."""
+    actuator, console, _ = _actuator(FakeConsole(values=CALIBRATED_REGISTERS))
+    before = {s: int(round(console.get(f"{s}_DRIVE_CL") / 1.86)) for s in ("EE", "OPT")}
+    actuator.loosen_limits(actuator.preflight(SETTINGS, LIMITS), 5000.0)
+    for side, old in before.items():
+        new = int(round(console.get(f"{side}_DRIVE_CL") / 1.86))
+        between = (old & 0xFF00) | (new & 0x00FF)
+        assert new & 0xFF == 0xFF and between >= old, (side, hex(old), hex(new))
+
+
 def test_loosen_leaves_drive_cl_when_the_current_never_rises():
     actuator, console, _ = _actuator(FakeConsole(values=CALIBRATED_REGISTERS))
     actuator.loosen_limits(actuator.preflight(SETTINGS, LIMITS), 4400.0)
