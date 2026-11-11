@@ -203,9 +203,20 @@ class LaserCameraActuator:
         with self._locked():
             for name, value in plan:
                 self._write(name, value)
+            latched = self._latched() if plan else []
         if plan:
             logger.warning("Optimize Laser: safety limits loosened (volatile): %s",
                            ", ".join(f"{n} -> {v:g}" for n, v in plan))
+        if latched:
+            # Bench, 2026-11-10: on a console calibrated to 3900 mA the
+            # limit writes themselves latched EE peak-current (trigger off,
+            # before any pulse). A latched interlock inhibits the TA, so
+            # every scan after it would come back dark and read as "too
+            # dim": stop here and say what happened.
+            raise RuntimeError(
+                "safety fault latched while the limits were being loosened ("
+                + ", ".join(latched) + "; wrote " + ", ".join(n for n, _ in plan)
+                + "); power-cycle the console")
         return [name for name, _ in plan]
 
     # ---- each iteration ---------------------------------------------------
@@ -241,6 +252,17 @@ class LaserCameraActuator:
                                 + str(getattr(self._console, "laser_limits_error", "") or "?"))
         except Exception as e:
             problems.append(f"laser power restore raised: {e}")
+        # The stock values are back, but a latched interlock stays latched
+        # until the console is power-cycled, and no laser scan can run.
+        try:
+            with self._locked():
+                latched = self._latched()
+        except Exception as e:
+            latched = []
+            logger.warning("Optimize Laser restore: safety status not read: %s", e)
+        if latched:
+            problems.append("laser power restore: safety fault latched ("
+                            + ", ".join(latched) + "); power-cycle the console")
         rows = FW_DEFAULT_EXPOSURE_ROWS
         writes = {cam: camera_register_writes(rows, FW_DEFAULT_GAIN_CODES[cam[1]])
                   for cam in cameras}
@@ -257,6 +279,11 @@ class LaserCameraActuator:
         return problems
 
     # ---- helpers ----------------------------------------------------------
+
+    def _latched(self) -> list[str]:
+        """The safety status registers that hold a fault, as text."""
+        values = {n: int(self._registers.read(n)) for n in _STATUS_REGISTERS}
+        return [f"{n} = 0x{v:02X}" for n, v in values.items() if v]
 
     def _write(self, name: str, value: float) -> None:
         readback = self._registers.write(name, value)

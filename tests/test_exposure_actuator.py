@@ -233,3 +233,38 @@ def test_settings_bounds_reach_the_preflight():
     actuator, _, _ = _actuator(FakeConsole(values={"EE_PULSE_WIDTH_LL": 150.0}))
     settings = OptimizeLaserSettings(pulse_width_bounds=Bounds(200.0, 2096.0))
     actuator.preflight(settings, LIMITS)        # 200 - 17.3 us emitted clears 150 us
+
+
+# ---- a fault latched by the limit writes (bench, 2026-11-10) -----------------
+
+
+class _LatchingConsole(FakeConsole):
+    """Latches EE peak-current when a given register is written, as the bench
+    console did during loosen_limits with the trigger off."""
+
+    def __init__(self, trip_on, **kwargs):
+        super().__init__(**kwargs)
+        self._trip_on = trip_on
+
+    def write_i2c_packet(self, **kwargs):
+        ok = super().write_i2c_packet(**kwargs)
+        if self.writes and self.writes[-1][0] == self._trip_on:
+            self.set("EE_STATUS", 0x01)
+        return ok
+
+
+def test_loosen_stops_when_the_writes_latch_the_interlock():
+    console = _LatchingConsole("EE_DRIVE_CL", values=CALIBRATED_REGISTERS)
+    actuator, console, _ = _actuator(console)
+    baseline = actuator.preflight(SETTINGS, LIMITS)
+    with pytest.raises(RuntimeError, match="latched while the limits were being loosened"
+                                           ".*EE_STATUS = 0x01.*power-cycle"):
+        actuator.loosen_limits(baseline, 5000.0)
+
+
+def test_restore_reports_an_interlock_that_is_still_latched():
+    actuator, console, _ = _actuator()
+    console.set("EE_STATUS", 0x01)
+    problems = actuator.restore([(0, 0)])
+    assert len(problems) == 1 and problems[0].startswith("laser power restore")
+    assert "EE_STATUS = 0x01" in problems[0] and "power-cycle" in problems[0]
