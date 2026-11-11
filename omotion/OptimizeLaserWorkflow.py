@@ -67,6 +67,11 @@ DARK_SKIP_US = LONG_EXPOSURE_DARK_SKIP_US
 # settings or the 2400 us skip. A camera write failure alone does not block
 # a scan, because every scan reconfigures its cameras first.
 LASER_RESTORE_PROBLEMS = ("laser power restore", "trigger config reset")
+# The burst a restore fires at the stock settings before it tightens the
+# safety limits (LaserCameraActuator._settle_at_stock): 20 pulses at 40 Hz,
+# then time for the trigger stop to land before the limit writes.
+RESTORE_BURST_S = 0.5
+RESTORE_BURST_SETTLE_S = 0.3
 FRAME_RATE_HZ = 40.0
 # default_pipeline's discard_count: the first frames after the start are warmup.
 WARMUP_FRAMES = 9
@@ -262,6 +267,10 @@ class OptimizeLaserWorkflow:
         self.gate: Callable[[], Optional[str]] | None = None
         self.on_active_changed: Callable[[Optional[str]], None] | None = None
         self._active: OptimizeResult | None = None
+        # The console's own laser values, from the preflight of a run that
+        # started with nothing active (so the device was at stock).
+        self._stock: LaserBaseline | None = None
+        self._capture_stock = False
         # Every scan this interface starts asks prepare_scan first.
         register = getattr(getattr(interface, "scan_workflow", None),
                            "set_scan_preparer", None)
@@ -344,6 +353,7 @@ class OptimizeLaserWorkflow:
             # The new run replaces any active settings: its short scans must
             # not be prepared with the old ones, and it either passes (its
             # own settings become active) or restores the defaults.
+            self._capture_stock = self._active is None
             self._set_active(None)
             result = self._run(settings, cams, left_camera_mask, right_camera_mask, ladder,
                                initial_gains, threshold_guess, knee_guess, max_iterations,
@@ -367,6 +377,8 @@ class OptimizeLaserWorkflow:
         except Exception as e:
             logger.error("Optimize Laser refused: %s", e)
             return OptimizeResult(status=None, settings=None, error=str(e), **base)
+        if self._capture_stock:
+            self._stock = baseline
 
         initial = ExposureSettings(
             gain_codes={}, gains=dict(self._initial_gains(cams, initial_gains)),
@@ -426,7 +438,8 @@ class OptimizeLaserWorkflow:
                   and not canceled and error is None)
         restore_problems: tuple[str, ...] = ()
         if not passed:
-            restore_problems = tuple(actuator.restore(cams)) + tuple(self._reset_trigger_config())
+            restore_problems = (tuple(self._restore(actuator, cams))
+                                + tuple(self._reset_trigger_config()))
         result = OptimizeResult(
             status=status, settings=controller.settings if passed else None,
             records=tuple(controller.records), csv_path=log.path if log else None,
@@ -550,9 +563,31 @@ class OptimizeLaserWorkflow:
                     else self._connected_cameras())
         else:
             cams = cameras_from_masks(left_camera_mask, right_camera_mask)
-        problems = self.actuator().restore(cams) + self._reset_trigger_config()
+        problems = self._restore(self.actuator(), cams) + self._reset_trigger_config()
         self._set_active(None, reason)
         return problems
+
+    def _restore(self, actuator, cams) -> list[str]:
+        return actuator.restore(cams, stock=self._stock, burst=self._stock_burst)
+
+    def _stock_burst(self) -> None:
+        """Fire the laser briefly with the stock trigger config. The caller
+        has just put the TA pulse width and current back to stock; the
+        safety limits are still the widened ones. Raises if the console
+        won't take the config or start."""
+        iface = self._interface
+        console = iface.console
+        applied = console.set_trigger_json(data=iface.resolve_trigger_config())
+        if applied is None and not getattr(getattr(console, "uart", None), "demo_mode", False):
+            raise RuntimeError("the console rejected the stock trigger config")
+        if not console.start_trigger():
+            reason = getattr(console, "last_start_refusal_reason", None)
+            raise RuntimeError("the trigger did not start" + (f" ({reason})" if reason else ""))
+        try:
+            time.sleep(RESTORE_BURST_S)
+        finally:
+            console.stop_trigger()
+        time.sleep(RESTORE_BURST_SETTLE_S)
 
     def prepare_scan(self, left_camera_mask: int, right_camera_mask: int) -> dict | None:
         """What ``ScanWorkflow.start_scan`` calls before every scan (trigger

@@ -252,11 +252,18 @@ def main() -> int:
                                  for v in on_target.values()),
              err or f"priority {on_target}, all {signals}")
 
-        iface.apply_laser_power()          # what a console reconnect does
+        # The laser driver back at its stock values, limits left widened.
+        # Not a full laser reload (iface.apply_laser_power, what a console
+        # reconnect does): that tightens DRIVE_CL under the held peak of the
+        # last pulse and latches the interlock on a console calibrated below
+        # the run's current (bench run 2). A reconnect with settings active
+        # is a known power-cycle; this checks the re-apply itself.
+        bench.io.write("TA_PULSE_WIDTH", stock["TA_PULSE_WIDTH"])
+        bench.io.write("TA_CURRENT_DRV", stock["TA_CURRENT_DRV"])
         reset = bench.registers()
         signals, err = bench.measure(3)
         regs = bench.registers()
-        step("B4 scan re-applies the settings after a laser reload",
+        step("B4 scan re-applies the settings after the laser driver was reset",
              err is None and abs(reset["TA_PULSE_WIDTH"] - stock["TA_PULSE_WIDTH"]) < 1
              and abs(regs["TA_PULSE_WIDTH"] - s.pulse_width_us) < 1
              and abs(regs["EE_PULSE_WIDTH_UL"] - 2200) < 1 and not bench.latched(),

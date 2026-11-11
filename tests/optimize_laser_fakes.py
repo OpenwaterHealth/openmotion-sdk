@@ -67,6 +67,12 @@ class FakeConsole:
         self.restores = 0
         self.trigger_configs: list = []     # set_trigger_json payloads, in order
         self.reject_trigger = False
+        # What the safety FPGAs hold from the last pulse (they keep comparing
+        # it with DRIVE_CL), and the trigger bursts a restore fired:
+        # (TA pulse width, TA current) at each start_trigger.
+        self.held_peak_ma = 0.0
+        self.bursts: list = []
+        self.refuse_trigger_start = False
         for name, value in self.flash.items():
             self.set(name, value)
 
@@ -99,6 +105,31 @@ class FakeConsole:
         self.trigger_configs.append(dict(data))
         return None if self.reject_trigger else dict(data)
 
+    def pulse(self):
+        """A laser pulse at the current TA settings: the safety FPGAs hold
+        its peak from now on."""
+        self.held_peak_ma = self.get("TA_CURRENT_DRV")
+        self.check_held_peak()
+
+    def check_held_peak(self):
+        """Latch peak-current on a safety FPGA whose DRIVE_CL is under the
+        held peak, as the hardware does the moment the limit is written
+        (bench, 2026-11-10)."""
+        for side in ("EE", "OPT"):
+            if self.held_peak_ma > self.get(f"{side}_DRIVE_CL"):
+                self.set(f"{side}_STATUS", int(self.get(f"{side}_STATUS")) | 0x01)
+
+    def start_trigger(self):
+        if self.refuse_trigger_start or self.get("EE_STATUS") or self.get("OPT_STATUS"):
+            self.last_start_refusal_reason = "laser-safety fault latched"
+            return False
+        self.bursts.append((self.get("TA_PULSE_WIDTH"), self.get("TA_CURRENT_DRV")))
+        self.pulse()
+        return True
+
+    def stop_trigger(self):
+        return True
+
     def read_i2c_packet(self, *, mux_index, channel, device_addr, reg_addr, read_len):
         data = self.store.get((mux_index, channel, device_addr, reg_addr))
         if data is None or len(data) != read_len:
@@ -116,6 +147,7 @@ class FakeConsole:
         if name in self.clamp and value > self.clamp[name]:
             value = self.clamp[name]
         self.set(name, value)
+        self.check_held_peak()
         return True
 
 
@@ -126,6 +158,7 @@ def fake_apply_laser_power(console, lock=None):
     for name, value in console.flash.items():
         if not name.endswith("_STATUS"):
             console.set(name, value)
+    console.check_held_peak()
     if not console.restore_ok:
         console.laser_limits_error = "Laser safety limit mismatch: EE_RATE_LL"
         return False
@@ -271,6 +304,7 @@ class FakeScanWorkflow:
         if latched or n == self.fail_at:
             self.last_scan_error = latched or "sub-scan worker died"
             return True
+        self.rig.console.pulse()
         sink = request.sinks[0]
         sink.on_scan_start(None)
         frames = max(1, int(request.duration_sec * 40) - 11)

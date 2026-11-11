@@ -252,11 +252,27 @@ class LaserCameraActuator:
 
     # ---- restore ----------------------------------------------------------
 
-    def restore(self, cameras: Iterable[Camera]) -> list[str]:
+    def restore(self, cameras: Iterable[Camera], *, stock: LaserBaseline | None = None,
+                burst: Callable[[], None] | None = None) -> list[str]:
         """Put the laser driver, safety limits and the cameras back to their
         defaults. Returns what could not be restored (empty = all of it).
-        Never raises."""
+        Never raises.
+
+        ``stock`` (the console's own laser values, read before the first run)
+        and ``burst`` (fires a few pulses) make the restore safe on a console
+        whose limits are tighter than the settings just used; see
+        :meth:`_settle_at_stock`. Without them the limits go straight back.
+        """
         problems = []
+        if stock is not None and burst is not None:
+            try:
+                self._settle_at_stock(stock, burst)
+            except Exception as e:
+                # Carry on: the restore below still puts the stock values
+                # back, and reports the interlock if this cost a latch.
+                logger.error("Optimize Laser restore: could not fire at the stock "
+                             "settings before tightening the limits: %s", e)
+                problems.append(f"laser power restore: no pulse at the stock settings ({e})")
         try:
             if not self._restore_laser(self._console, lock=self._lock):
                 problems.append("laser power restore failed: "
@@ -290,6 +306,36 @@ class LaserCameraActuator:
         return problems
 
     # ---- helpers ----------------------------------------------------------
+
+    def _settle_at_stock(self, stock: LaserBaseline, burst: Callable[[], None]) -> None:
+        """Let the safety FPGAs see a pulse at the stock settings before
+        their limits are tightened.
+
+        A safety FPGA holds what it measured on the last pulse and keeps
+        comparing it with its limits (power_peak_check.v never leaves CHECK).
+        After pulses above a console's own limits, writing those limits back
+        latches the interlock at once: bench, 2026-11-10, a run at 5000 mA on
+        a console calibrated to 3900 mA latched EE peak-current on the
+        restore (trip capture: peak 2230, limit 2036). So the laser goes
+        back to stock first, a short burst replaces the held measurement,
+        and only then do the limits follow. Nothing happens when the laser
+        is already at stock.
+        """
+        with self._locked():
+            width = self._registers.read("TA_PULSE_WIDTH")
+            current = self._registers.read("TA_CURRENT_DRV")
+            if (abs(width - stock.ta_pulse_width_us) <= 1.0
+                    and abs(current - stock.ta_current_ma) <= 1.0):
+                return
+            latched = self._latched()
+            if latched:
+                raise RuntimeError("safety fault latched (" + ", ".join(latched) + ")")
+            self._write("TA_PULSE_WIDTH", stock.ta_pulse_width_us)
+            self._write("TA_CURRENT_DRV", stock.ta_current_ma)
+        logger.warning("Optimize Laser restore: laser back at %.0f us / %.0f mA; firing a "
+                       "short burst before the safety limits are tightened",
+                       stock.ta_pulse_width_us, stock.ta_current_ma)
+        burst()
 
     def _latched(self) -> list[str]:
         """The safety status registers that hold a fault, as text."""

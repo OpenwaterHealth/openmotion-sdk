@@ -274,7 +274,9 @@ def test_a_failed_run_puts_the_stock_trigger_config_back():
     rig = Rig(SPREAD)
     result, _, iface = _run(rig, max_iterations=1)
     assert result.restored and result.restore_problems == ()
-    assert rig.console.trigger_configs == [iface.resolve_trigger_config()]
+    # The restore's burst and the final reset both send the stock config.
+    stock = iface.resolve_trigger_config()
+    assert rig.console.trigger_configs and all(c == stock for c in rig.console.trigger_configs)
     assert rig.console.trigger_configs[-1]["LaserPulseSkipDelayUsec"] == 1800
 
 
@@ -410,7 +412,8 @@ def test_restore_defaults_restores_laser_and_cameras():
     assert wf.restore_defaults(0xFF, 0) == []
     assert rig.console.restores == 1
     assert [rig.left.gain_code(p) for p in range(8)] == list(FW_DEFAULT_GAIN_CODES)
-    assert rig.console.trigger_configs == [iface.resolve_trigger_config()]
+    stock = iface.resolve_trigger_config()
+    assert rig.console.trigger_configs and all(c == stock for c in rig.console.trigger_configs)
 
 
 def test_restore_defaults_reports_a_rejected_trigger_reset():
@@ -418,8 +421,12 @@ def test_restore_defaults_reports_a_rejected_trigger_reset():
     _, wf, _ = _run(rig)
     rig.console.reject_trigger = True
     problems = wf.restore_defaults(0xFF, 0)
-    assert problems == ["trigger config reset failed: the console rejected the stock "
-                        "trigger config"]
+    assert problems[-1] == ("trigger config reset failed: the console rejected the stock "
+                            "trigger config")
+    # The burst needs the same config, so it could not fire either.
+    assert [p for p in problems[:-1]] == [
+        "laser power restore: no pulse at the stock settings (the console rejected the "
+        "stock trigger config)"]
 
 
 def test_motion_interface_exposes_one_workflow():
@@ -602,3 +609,90 @@ def test_force_fault_reaches_the_restore(monkeypatch):
     wf = OptimizeLaserWorkflow(FakeInterface(rig), force_fault=lambda: True)
     wf.restore_defaults(0xFF, 0)
     assert calls == [True]
+
+
+# ---- restoring on a console whose limits are tighter than the run -----------
+#
+# Bench, 2026-11-10: a safety FPGA holds the last pulse's peak and keeps
+# comparing it with DRIVE_CL, so putting a 3900 mA console's limit back after
+# pulses at 5000 mA latched EE peak-current. The rig models that
+# (FakeConsole.check_held_peak).
+
+
+@pytest.fixture
+def no_burst_wait(monkeypatch):
+    import omotion.OptimizeLaserWorkflow as module
+    monkeypatch.setattr(module, "RESTORE_BURST_S", 0.0)
+    monkeypatch.setattr(module, "RESTORE_BURST_SETTLE_S", 0.0)
+
+
+def _calibrated_run():
+    rig = Rig(SPREAD, console=FakeConsole(values=CALIBRATED_REGISTERS))
+    result, wf, iface = _run(rig)
+    assert result.passed and result.settings.current_ma > 4400.0
+    assert rig.console.get("EE_STATUS") == 0
+    return rig, result, wf
+
+
+def test_restore_fires_at_stock_before_it_tightens_the_limits(no_burst_wait):
+    rig, _, wf = _calibrated_run()
+    console = rig.console
+
+    assert wf.restore_defaults() == []
+
+    # One burst, at the console's own laser values, while the limits were
+    # still the widened ones.
+    assert console.bursts == [(pytest.approx(530.0, abs=0.32), pytest.approx(4400.0, abs=0.16))]
+    assert console.get("EE_STATUS") == 0 and console.get("OPT_STATUS") == 0
+    assert console.get("EE_DRIVE_CL") == pytest.approx(4840.0, abs=1.86)
+    assert console.get("TA_CURRENT_DRV") == pytest.approx(4400.0, abs=0.16)
+
+
+def test_without_the_burst_the_same_restore_latches():
+    """The control: what the restore did before, and what a console
+    reconnect still does (its laser load can't fire first)."""
+    rig, _, wf = _calibrated_run()
+    problems = wf.actuator().restore([(0, p) for p in range(8)])
+    assert rig.console.bursts == []
+    assert rig.console.get("EE_STATUS") == 0x01
+    assert problems and "safety fault latched" in problems[0]
+
+
+def test_a_burst_that_cannot_start_is_reported_with_the_latch(no_burst_wait):
+    rig, _, wf = _calibrated_run()
+    rig.console.refuse_trigger_start = True
+    problems = wf.restore_defaults()
+    assert problems[0].startswith("laser power restore: no pulse at the stock settings")
+    assert any("safety fault latched" in p for p in problems)
+    assert wf.active is None
+
+
+def test_a_canceled_run_on_a_calibrated_console_restores_without_a_latch(no_burst_wait):
+    rig = Rig(SPREAD, console=FakeConsole(values=CALIBRATED_REGISTERS))
+    wf, _ = _workflow(rig)
+    stop = threading.Event()
+    result = wf.run(OptimizeLaserSettings(), left_camera_mask=0xFF, right_camera_mask=0,
+                    stop_evt=stop, on_iteration=lambda record: stop.set())
+    assert result.canceled and result.restored and result.restore_problems == ()
+    assert len(rig.console.bursts) == 1
+    assert rig.console.get("EE_STATUS") == 0
+
+
+def test_no_burst_when_the_laser_is_already_at_stock(no_burst_wait):
+    rig, _, wf = _calibrated_run()
+    assert wf.restore_defaults() == []
+    assert len(rig.console.bursts) == 1
+    assert wf.restore_defaults(0xFF, 0) == []       # nothing left to settle
+    assert len(rig.console.bursts) == 1
+
+
+def test_stock_is_what_the_console_held_before_the_first_run(no_burst_wait):
+    """A second run starts from the first run's settings; its preflight must
+    not replace the stock values the restore goes back to."""
+    rig, first, wf = _calibrated_run()
+    second = wf.run(OptimizeLaserSettings(), left_camera_mask=0xFF, right_camera_mask=0)
+    assert second.passed
+    assert wf.restore_defaults() == []
+    assert rig.console.bursts[-1] == (pytest.approx(530.0, abs=0.32),
+                                      pytest.approx(4400.0, abs=0.16))
+    assert rig.console.get("EE_STATUS") == 0
