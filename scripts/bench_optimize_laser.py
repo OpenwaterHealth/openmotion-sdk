@@ -79,6 +79,23 @@ class Bench:
                     out[label((side, pos))] = (c.get("expo_cmd"), c.get("again_x"))
         return out
 
+    def cameras_settled(self, expected: dict, timeout: float = 5.0) -> dict:
+        """The camera settings once they match ``expected``, or the last
+        reading after ``timeout``. The sensor refreshes its camera telemetry
+        about once a second, so a read right after a write can be stale."""
+        deadline = time.monotonic() + timeout
+        while True:
+            cams = self.cameras()
+            if cams == expected or time.monotonic() >= deadline:
+                return cams
+            time.sleep(0.5)
+
+    def idle(self, timeout: float = 15.0) -> None:
+        """Wait for the previous scan's worker to finish its teardown."""
+        deadline = time.monotonic() + timeout
+        while self.iface.scan_workflow.running and time.monotonic() < deadline:
+            time.sleep(0.1)
+
     def latched(self) -> list[str]:
         return [f"{n}=0x{int(self.io.read(n)):02X}" for n in STATUS if int(self.io.read(n))]
 
@@ -92,6 +109,7 @@ class Bench:
         left = self.left if left is None else left
         right = self.right if right is None else right
         sink = _OptimizeLaserSink(cameras_from_masks(left, right), 40)
+        self.idle()
         try:
             run_collection_scan(self.iface.scan_workflow, sink, subject_id="_bench",
                                 duration_sec=seconds, left_camera_mask=left,
@@ -107,6 +125,7 @@ class Bench:
     def stored_scan(self, seconds: int, subject: str) -> tuple[bool, str | None, str | None]:
         """A scan with the default storage (scan DB); returns (ok, error, label)."""
         wf = self.iface.scan_workflow
+        self.idle()
         req = ScanRequest(subject_id=subject, duration_sec=seconds,
                           left_camera_mask=self.left, right_camera_mask=self.right,
                           write_corrected_csv=False, write_telemetry_csv=False,
@@ -130,6 +149,7 @@ def optimize(bench: Bench, settings, *, cancel_after: int | None = None):
         if cancel_after is not None and record.iteration >= cancel_after:
             stop.set()
 
+    bench.idle()
     log_path = os.path.join(bench.out, f"optimize-{time.strftime('%Y%m%d_%H%M%S')}.csv")
     t0 = time.monotonic()
     result = bench.iface.optimize_laser_workflow.run(
@@ -285,6 +305,7 @@ def main() -> int:
             on_complete_fn=lambda r: (configured.update(ok=r.ok, error=r.error), done.set()))
         done.wait(180)
 
+        bench.idle()
         try:
             cq = iface.contact_quality_workflow.check(
                 duration_sec=2.0, rolling_window=5,
@@ -304,7 +325,7 @@ def main() -> int:
         signals, err = bench.measure(3)
         workflow.gate = None
         ok, diff = bench.same_as(stock)
-        cams = bench.cameras()
+        cams = bench.cameras_settled(stock_cams)
         step("C1 gate drop: scan runs at stock",
              err is None and workflow.active is None and ok and cams == stock_cams
              and dropped == ["bench: settings may not be used"] and not bench.latched(),
@@ -312,7 +333,7 @@ def main() -> int:
 
         result, seconds = optimize(bench, settings, cancel_after=2)
         ok, diff = bench.same_as(stock)
-        cams = bench.cameras()
+        cams = bench.cameras_settled(stock_cams)
         step("C2 canceled run restores the defaults",
              result.canceled and result.restored and not result.restore_problems
              and workflow.active is None and ok and cams == stock_cams and not bench.latched(),
@@ -323,7 +344,7 @@ def main() -> int:
         passed = result.passed
         problems = workflow.restore_defaults()
         ok, diff = bench.same_as(stock)
-        cams = bench.cameras()
+        cams = bench.cameras_settled(stock_cams)
         step("C3 run, then Restore default laser settings",
              passed and not problems and workflow.active is None and ok
              and cams == stock_cams and not bench.latched(),
