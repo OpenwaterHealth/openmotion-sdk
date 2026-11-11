@@ -475,3 +475,130 @@ def test_sink_without_a_dark_has_no_observation():
     sink = _OptimizeLaserSink([(0, 0)], frames_needed=1)
     sink.consume("raw", _batch([(0, 0, "light", 300)]))
     assert sink.observations() == {}
+
+
+# ---- active settings and the scan preparer ----------------------------------
+
+
+def test_a_passed_run_becomes_active_and_a_failed_one_does_not():
+    changes = []
+    wf, _ = _workflow(Rig(SPREAD))
+    wf.on_active_changed = changes.append
+    result = wf.run(OptimizeLaserSettings(), left_camera_mask=0xFF, right_camera_mask=0)
+    assert result.passed and wf.active is result
+    assert changes == [None]
+
+    result = wf.run(OptimizeLaserSettings(), left_camera_mask=0xFF, right_camera_mask=0,
+                    max_iterations=1)
+    assert not result.passed and wf.active is None      # the old settings went with the run
+    assert changes == [None, None]
+
+
+def test_the_workflow_registers_its_preparer_with_the_scan_workflow():
+    class _Scans:
+        def set_scan_preparer(self, preparer):
+            self.preparer = preparer
+
+    rig = Rig(SPREAD)
+    iface = FakeInterface(rig)
+    iface.scan_workflow = _Scans()
+    wf = OptimizeLaserWorkflow(iface, actuator_factory=_actuator_factory)
+    assert iface.scan_workflow.preparer == wf.prepare_scan
+
+
+def test_prepare_scan_is_a_no_op_without_active_settings():
+    rig = Rig(SPREAD)
+    wf, _ = _workflow(rig)
+    writes = len(rig.console.writes)
+    assert wf.prepare_scan(0xFF, 0) is None
+    assert len(rig.console.writes) == writes
+
+
+def test_prepare_scan_reapplies_and_returns_the_request_overrides():
+    import json
+
+    rig = Rig(SPREAD)
+    result, wf, _ = _run(rig)
+    fake_apply_laser_power(rig.console)         # what a console reconnect does
+
+    prepared = wf.prepare_scan(0xFF, 0)
+
+    s = result.settings
+    assert rig.console.get("TA_PULSE_WIDTH") == pytest.approx(s.pulse_width_us, abs=0.32)
+    assert rig.console.get("EE_RATE_LL") == pytest.approx(22400.0)
+    assert prepared["trigger_config"]["LaserPulseSkipDelayUsec"] == DARK_SKIP_US
+    assert prepared["calibration_override"] == {"i_max": 2 * TARGET}
+    record = prepared["extra_session_meta"]["optimize_laser"]
+    assert record["status"] == "on_target" and record["iterations"] == result.iterations
+    assert record["pulse_width_us"] == s.pulse_width_us
+    assert record["gains"] == {f"L{p + 1}": s.gains[(0, p)] for p in range(8)}
+    assert record["dark_skip_us"] == DARK_SKIP_US
+    json.dumps(record)                          # plain JSON types only
+    ScanRequest(subject_id="s", duration_sec=1, left_camera_mask=0xFF,
+                right_camera_mask=0, **prepared)
+
+
+def test_prepare_scan_refuses_the_scan_when_the_reapply_fails():
+    rig = Rig(SPREAD)
+    result, wf, _ = _run(rig)
+    rig.left.connected = False
+    with pytest.raises(RuntimeError, match="could not be re-applied"):
+        wf.prepare_scan(0xFF, 0)
+    assert wf.active is result                  # still active: the operator decides
+
+
+def test_a_gate_reason_restores_the_defaults_and_the_scan_runs_stock():
+    rig = Rig(SPREAD)
+    changes = []
+    _, wf, _ = _run(rig)
+    wf.on_active_changed = changes.append
+    wf.gate = lambda: "Optimize Laser needs engineering mode."
+
+    assert wf.prepare_scan(0xFF, 0) is None
+    assert wf.active is None
+    assert rig.console.restores == 1
+    assert [rig.left.gain_code(p) for p in range(8)] == list(FW_DEFAULT_GAIN_CODES)
+    assert changes == ["Optimize Laser needs engineering mode."]
+
+
+def test_a_gate_drop_whose_laser_restore_fails_refuses_the_scan():
+    rig = Rig(SPREAD)
+    _, wf, _ = _run(rig)
+    rig.console.reject_trigger = True
+    wf.gate = lambda: "Turn off Force laser fail first."
+    with pytest.raises(RuntimeError, match="Could not restore the laser defaults"):
+        wf.prepare_scan(0xFF, 0)
+    assert wf.active is None
+
+
+def test_a_gate_that_raises_drops_the_settings():
+    rig = Rig(SPREAD)
+    _, wf, _ = _run(rig)
+
+    def gate():
+        raise ValueError("boom")
+    wf.gate = gate
+    assert wf.prepare_scan(0xFF, 0) is None
+    assert wf.active is None and rig.console.restores == 1
+
+
+def test_restore_defaults_without_masks_uses_the_active_cameras_and_drops_them():
+    rig = Rig(SPREAD)
+    _, wf, _ = _run(rig)
+    assert wf.restore_defaults() == []
+    assert wf.active is None
+    assert [rig.left.gain_code(p) for p in range(8)] == list(FW_DEFAULT_GAIN_CODES)
+
+
+def test_force_fault_reaches_the_restore(monkeypatch):
+    import omotion.laser as laser
+    calls = []
+
+    def fake(console, force_fault=False, lock=None):
+        calls.append(force_fault)
+        return True
+    monkeypatch.setattr(laser, "apply_laser_power", fake)
+    rig = Rig(SPREAD)
+    wf = OptimizeLaserWorkflow(FakeInterface(rig), force_fault=lambda: True)
+    wf.restore_defaults(0xFF, 0)
+    assert calls == [True]

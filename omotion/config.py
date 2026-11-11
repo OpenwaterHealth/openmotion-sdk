@@ -354,6 +354,14 @@ class MuxChannel(IntEnum):
 # been hardcoding everywhere — extracted so changing the standard
 # 40 Hz pulse pattern is a one-file edit.
 # ---------------------------------------------------------------------------
+# Dark-frame skip for exposures the stock 1800 us skip no longer clears
+# (above ~1700 us): the displaced dark pulse starts at 100 + 2400 = 2500 us,
+# after the longest exposure (2196 us) ends. It cuts the post-dark pulse gap
+# to 22600 us at 40 Hz, so RATE_LL has to be lowered first or the safety
+# FPGAs latch. Optimize Laser uses it; bloodflow-app's motion_config keeps
+# the same number (a test there compares the two).
+LONG_EXPOSURE_DARK_SKIP_US = 2400
+
 DEFAULT_TRIGGER_CONFIG: dict = {
     "TriggerStatus":           2,     # 2 = laser ON, 1 = OFF
     "TriggerFrequencyHz":      40,

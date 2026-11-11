@@ -1126,3 +1126,78 @@ def test_bad_overrides_refuse_the_scan_before_it_starts(kwargs):
     assert motion.scan_workflow._thread is None
     assert motion.scan_workflow.running is False
     assert motion.scan_workflow.last_scan_error.startswith("scan request rejected:")
+
+
+# ---------------------------------------------------------------------------
+# Scan preparer (Optimize Laser's active settings) and extra session meta
+# ---------------------------------------------------------------------------
+
+def test_scan_preparer_overrides_reach_the_pipeline_and_the_session_meta(tmp_path):
+    import numpy as np
+    from omotion.pipeline.sinks import ScanDBSink
+    from omotion.pipeline.stages.bfi_bvi import BfiBviStage
+    from omotion.pipeline.stages.shot_noise import ShotNoiseCorrectionStage
+
+    motion = _build_motion_with_data_dir(None, scan_db_path=str(tmp_path / "scans.db"))
+    seen = []
+    gains = np.full((2, 8), 3.0)
+
+    def preparer(left, right):
+        seen.append((left, right))
+        return {"trigger_config": {"LaserPulseSkipDelayUsec": 2400},
+                "camera_gains": gains,
+                "calibration_override": {"i_max": 400.0},
+                "extra_session_meta": {"optimize_laser": {"status": "on_target"},
+                                       "scan_id": "never replaces an SDK key"}}
+
+    motion.scan_workflow.set_scan_preparer(preparer)
+    request = ScanRequest(subject_id="x", duration_sec=1, left_camera_mask=0x0F,
+                          right_camera_mask=0, trigger_config={"TriggerFrequencyHz": 30})
+    assert motion.scan_workflow.start_scan(request)
+    motion.scan_workflow.await_complete(timeout_sec=5)
+
+    assert seen == [(0x0F, 0)]
+    np.testing.assert_array_equal(
+        _pipeline_stage(motion, ShotNoiseCorrectionStage)._gain_map_2d, gains)
+    np.testing.assert_array_equal(_pipeline_stage(motion, BfiBviStage)._i_max,
+                                  np.full((1, 2, 8), 400.0))
+    db_sink = next(s for s in motion.scan_workflow._runner.sinks if isinstance(s, ScanDBSink))
+    assert db_sink._session_meta["optimize_laser"] == {"status": "on_target"}
+    assert db_sink._session_meta["scan_id"] != "never replaces an SDK key"
+    # The caller's request is left as it was.
+    assert request.trigger_config == {"TriggerFrequencyHz": 30}
+    assert request.camera_gains is None and request.extra_session_meta is None
+
+
+def test_scan_preparer_returning_none_changes_nothing():
+    import numpy as np
+    from omotion.config import CAMERA_GAIN_MAP
+    from omotion.pipeline.stages.shot_noise import ShotNoiseCorrectionStage
+
+    motion = _build_motion_with_data_dir(None)
+    motion.scan_workflow.set_scan_preparer(lambda left, right: None)
+    assert motion.scan_workflow.start_scan(_override_request())
+    motion.scan_workflow.await_complete(timeout_sec=5)
+    np.testing.assert_array_equal(
+        _pipeline_stage(motion, ShotNoiseCorrectionStage)._gain_map_2d,
+        np.tile(CAMERA_GAIN_MAP, (2, 1)))
+
+
+def test_scan_preparer_that_raises_refuses_the_scan():
+    motion = _build_motion_with_data_dir(None)
+
+    def preparer(left, right):
+        raise RuntimeError("The Optimize Laser settings could not be re-applied (x).")
+
+    motion.scan_workflow.set_scan_preparer(preparer)
+    assert motion.scan_workflow.start_scan(_override_request()) is False
+    assert motion.scan_workflow._thread is None
+    assert motion.scan_workflow.running is False
+    assert "could not be re-applied" in motion.scan_workflow.last_scan_error
+
+
+def test_optimize_laser_workflow_hooks_the_real_scan_workflow():
+    motion = _build_motion_with_data_dir(None)
+    assert motion.scan_workflow._scan_preparer is None
+    wf = motion.optimize_laser_workflow
+    assert motion.scan_workflow._scan_preparer == wf.prepare_scan

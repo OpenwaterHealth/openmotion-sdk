@@ -353,6 +353,8 @@ class MotionInterface:
 
         Its short scans go through :attr:`scan_workflow`, so a run can't
         overlap a scan or a CQ check. Pre-envelope console firmware only.
+        Creating it registers its ``prepare_scan`` with :attr:`scan_workflow`,
+        so a passed run's settings are re-applied before every later scan.
         """
         if self._optimize_laser_workflow is None:
             from omotion.OptimizeLaserWorkflow import OptimizeLaserWorkflow

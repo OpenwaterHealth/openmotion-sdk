@@ -14,11 +14,17 @@ first write. The run raises ``PULSE_WIDTH_UL``, lowers ``RATE_LL`` (for the
 raises ``DRIVE_CL``. These are volatile register writes: a console power-cycle
 or :meth:`OptimizeLaserWorkflow.restore_defaults` puts them back.
 
-A run that passes leaves the device at its final settings; scans then take
-:meth:`OptimizeLaserWorkflow.scan_overrides`, and the caller re-applies the
-settings (:meth:`OptimizeLaserWorkflow.reapply`) before each scan, since a
-reconnect resets the laser driver. A run that fails, is canceled or errors
-restores the defaults before returning.
+A run that passes leaves the device at its final settings and makes them
+:attr:`OptimizeLaserWorkflow.active`. From then on every scan the interface's
+``ScanWorkflow`` starts (app scans, contact-quality checks, calibration,
+scripts) goes through :meth:`OptimizeLaserWorkflow.prepare_scan` first: the
+settings are re-applied, since a reconnect resets the laser driver and each
+scan reconfigures its cameras, and the request takes the matching trigger
+config, gains, BVI calibration and a ``session_meta.optimize_laser`` record.
+A scan whose re-apply fails is refused. They stay active until
+:meth:`OptimizeLaserWorkflow.restore_defaults`, the next run, or a
+:attr:`OptimizeLaserWorkflow.gate` that says they may no longer be used. A run
+that fails, is canceled or errors restores the defaults before returning.
 """
 
 from __future__ import annotations
@@ -35,7 +41,7 @@ from typing import Callable, Mapping, Optional
 
 import numpy as np
 
-from omotion.config import CAMERA_GAIN_MAP
+from omotion.config import CAMERA_GAIN_MAP, LONG_EXPOSURE_DARK_SKIP_US
 from omotion.exposure.actuator import LaserBaseline, LaserCameraActuator
 from omotion.exposure.controller import (
     DEFAULT_MAX_ITERATIONS,
@@ -56,7 +62,11 @@ logger = logging.getLogger("openmotion.sdk.exposure")
 
 # Dark skip for every scan at the long exposure: the displaced dark pulse
 # starts at 100 + 2400 = 2500 us, after a 2196 us exposure ends.
-DARK_SKIP_US = 2400
+DARK_SKIP_US = LONG_EXPOSURE_DARK_SKIP_US
+# restore() problems that mean the laser side may still hold optimized
+# settings or the 2400 us skip. A camera write failure alone does not block
+# a scan, because every scan reconfigures its cameras first.
+LASER_RESTORE_PROBLEMS = ("laser power restore", "trigger config reset")
 FRAME_RATE_HZ = 40.0
 # default_pipeline's discard_count: the first frames after the start are warmup.
 WARMUP_FRAMES = 9
@@ -223,24 +233,72 @@ class OptimizeLaserWorkflow:
 
     ``run`` blocks; call it from a worker thread. It shares the scan lock
     with every other scan, so it can't overlap a scan or a CQ check.
+
+    A caller may set three attributes, all optional:
+
+    ``force_fault``: ``() -> bool``. When set, restores load the laser
+    through ``apply_laser_power(force_fault=force_fault())``, like the app's
+    other laser loads (its Force laser fail test flag).
+
+    ``gate``: ``() -> str | None``. Asked before each scan while settings
+    are active. A reason means they may no longer be used (the app: clinical
+    mode, engineering mode off, Force laser fail armed): the defaults are
+    restored and the scan runs at them.
+
+    ``on_active_changed``: ``(reason: str | None) -> None``. Called after
+    :attr:`active` changes, on whatever thread changed it. ``reason`` is the
+    gate's text when the gate dropped the settings, else None.
     """
 
     def __init__(self, interface, *, lock=None, limits: HardwareLimits | None = None,
-                 actuator_factory: Callable[..., LaserCameraActuator] | None = None):
+                 actuator_factory: Callable[..., LaserCameraActuator] | None = None,
+                 force_fault: Callable[[], bool] | None = None):
         self._interface = interface
         self._lock = lock
         self.limits = limits or HardwareLimits()
         self._actuator_factory = actuator_factory or LaserCameraActuator
         self._run_lock = threading.Lock()
+        self.force_fault = force_fault
+        self.gate: Callable[[], Optional[str]] | None = None
+        self.on_active_changed: Callable[[Optional[str]], None] | None = None
+        self._active: OptimizeResult | None = None
+        # Every scan this interface starts asks prepare_scan first.
+        register = getattr(getattr(interface, "scan_workflow", None),
+                           "set_scan_preparer", None)
+        if callable(register):
+            register(self.prepare_scan)
 
     @property
     def running(self) -> bool:
         return self._run_lock.locked()
 
+    @property
+    def active(self) -> OptimizeResult | None:
+        """The passed run whose settings scans use now, or None."""
+        return self._active
+
+    def _set_active(self, result: OptimizeResult | None, reason: str | None = None) -> None:
+        if result is self._active:
+            return
+        self._active = result
+        if self.on_active_changed is not None:
+            try:
+                self.on_active_changed(reason)
+            except Exception:
+                logger.exception("Optimize Laser on_active_changed callback raised")
+
     def actuator(self) -> LaserCameraActuator:
         iface = self._interface
+        kwargs = {}
+        if self.force_fault is not None:
+            from omotion.laser import apply_laser_power
+
+            def restore_laser(console, lock=None):
+                return apply_laser_power(console, force_fault=bool(self.force_fault()),
+                                         lock=lock)
+            kwargs["restore_laser"] = restore_laser
         return self._actuator_factory(iface.console, {0: iface.left, 1: iface.right},
-                                      lock=self._lock)
+                                      lock=self._lock, **kwargs)
 
     # ---- the run ----------------------------------------------------------
 
@@ -283,10 +341,17 @@ class OptimizeLaserWorkflow:
         if not self._run_lock.acquire(blocking=False):
             raise RuntimeError("Optimize Laser is already running")
         try:
-            return self._run(settings, cams, left_camera_mask, right_camera_mask, ladder,
-                             initial_gains, threshold_guess, knee_guess, max_iterations,
-                             log_path, on_iteration, stop_evt or threading.Event(),
-                             on_not_converged)
+            # The new run replaces any active settings: its short scans must
+            # not be prepared with the old ones, and it either passes (its
+            # own settings become active) or restores the defaults.
+            self._set_active(None)
+            result = self._run(settings, cams, left_camera_mask, right_camera_mask, ladder,
+                               initial_gains, threshold_guess, knee_guess, max_iterations,
+                               log_path, on_iteration, stop_evt or threading.Event(),
+                               on_not_converged)
+            if result.passed:
+                self._set_active(result)
+            return result
         finally:
             self._run_lock.release()
 
@@ -468,13 +533,109 @@ class OptimizeLaserWorkflow:
         gain_codes = {cam: code for cam, code in s.gain_codes.items() if cam in scanned}
         actuator.apply(gain_codes, s.pulse_width_us, s.current_ma, result.exposure_us)
 
-    def restore_defaults(self, left_camera_mask: int, right_camera_mask: int) -> list[str]:
+    def restore_defaults(self, left_camera_mask: int | None = None,
+                         right_camera_mask: int | None = None, *,
+                         reason: str | None = None) -> list[str]:
         """Laser driver, safety limits and cameras back to their defaults
         (``apply_laser_power`` plus the sensor firmware's camera settings),
         and the stock trigger config back on the console. Returns what could
-        not be restored; empty means all of it."""
-        problems = self.actuator().restore(cameras_from_masks(left_camera_mask, right_camera_mask))
-        return problems + self._reset_trigger_config()
+        not be restored; empty means all of it.
+
+        Without masks, the cameras are the active run's, or every camera on a
+        connected sensor when nothing is active. The active settings are
+        dropped either way: re-applying them over a console whose restore
+        half-failed would compound it."""
+        if left_camera_mask is None or right_camera_mask is None:
+            cams = (self._active.cameras if self._active is not None
+                    else self._connected_cameras())
+        else:
+            cams = cameras_from_masks(left_camera_mask, right_camera_mask)
+        problems = self.actuator().restore(cams) + self._reset_trigger_config()
+        self._set_active(None, reason)
+        return problems
+
+    def prepare_scan(self, left_camera_mask: int, right_camera_mask: int) -> dict | None:
+        """What ``ScanWorkflow.start_scan`` calls before every scan (trigger
+        off): None when no settings are active, else the settings are
+        re-applied and the scan's request overrides returned
+        (:meth:`scan_overrides` plus a ``session_meta.optimize_laser``
+        record).
+
+        Raises ``RuntimeError`` when the scan must not start: the re-apply
+        failed (its 2400 us dark skip under an unwidened ``RATE_LL`` would
+        latch the safety interlock, E-202), or the gate dropped the settings
+        and the laser side could not be restored.
+        """
+        result = self._active
+        if result is None or self.running:
+            return None
+        reason = self._gate_reason()
+        if reason:
+            logger.warning("Optimize Laser settings dropped before this scan: %s", reason)
+            blocking = [p for p in self.restore_defaults(reason=reason)
+                        if p.startswith(LASER_RESTORE_PROBLEMS)]
+            if blocking:
+                raise RuntimeError("Could not restore the laser defaults: "
+                                   + "; ".join(blocking)
+                                   + ". Power-cycle the console to be sure.")
+            return None
+        try:
+            self.reapply(result, left_camera_mask, right_camera_mask)
+        except Exception as e:
+            logger.error("Optimize Laser settings could not be re-applied: %s", e)
+            raise RuntimeError(
+                f"The Optimize Laser settings could not be re-applied ({e}). "
+                "Restore the default laser settings or run Optimize Laser again.") from e
+        logger.warning("OPTIMIZE LASER SETTINGS ACTIVE for this scan: %s us / %.0f mA",
+                       result.settings.pulse_width_us, result.settings.current_ma)
+        return {**self.scan_overrides(result),
+                "extra_session_meta": {"optimize_laser": self.session_record(result)}}
+
+    def session_record(self, result: OptimizeResult) -> dict:
+        """A passed run's settings as plain JSON types, for the
+        ``session_meta.optimize_laser`` of every scan that runs at them."""
+        if not result.passed:
+            raise ValueError("Optimize Laser did not pass; its settings are not active")
+        s, cfg = result.settings, result.config
+
+        def label(cam):
+            return f"{('L', 'R')[cam[0]]}{cam[1] + 1}"
+
+        return {
+            "status": result.status.value,
+            "accepted": result.accepted,
+            "iterations": result.iterations,
+            "method": getattr(cfg.method, "value", cfg.method),
+            "target_mean_dn": float(cfg.target_mean),
+            "passing_range_dn": float(cfg.passing_range),
+            "exposure_us": float(result.exposure_us),
+            "pulse_width_us": float(s.pulse_width_us),
+            "emitted_pulse_width_us": round(
+                float(s.pulse_width_us) - self.limits.pulse_truncation_us, 1),
+            "current_ma": round(float(s.current_ma), 2),
+            "dark_skip_us": DARK_SKIP_US,
+            "bvi_i_max_dn": 2.0 * float(cfg.target_mean),
+            "gains": {label(c): float(g) for c, g in sorted(s.gains.items())},
+            "gain_codes": {label(c): int(g) for c, g in sorted(s.gain_codes.items())},
+            "log": os.path.basename(result.csv_path) if result.csv_path else "",
+        }
+
+    def _gate_reason(self) -> str | None:
+        if self.gate is None:
+            return None
+        try:
+            return self.gate() or None
+        except Exception as e:
+            # A gate that can't answer must not leave widened limits in use.
+            logger.exception("Optimize Laser gate raised")
+            return f"the Optimize Laser gate failed ({e})"
+
+    def _connected_cameras(self) -> list[Camera]:
+        iface = self._interface
+        return [(side, pos)
+                for side, sensor in enumerate((iface.left, iface.right))
+                if sensor is not None and sensor.is_connected()
+                for pos in range(8)]
 
     def _reset_trigger_config(self) -> list[str]:
         """Send the interface's stock trigger config (not started).

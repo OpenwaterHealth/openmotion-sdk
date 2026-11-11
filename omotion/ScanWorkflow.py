@@ -1,6 +1,7 @@
 import concurrent.futures
 import datetime
 import csv
+import dataclasses
 import logging
 import math
 import os
@@ -181,6 +182,10 @@ class ScanRequest:
     # {"i_max": 400.0}. Unlike set_realtime_calibration it does not outlive
     # the scan. None -> the installed calibration.
     calibration_override: dict | None = None
+    # Extra keys merged into the scan DB's session_meta (JSON-serializable),
+    # e.g. the Optimize Laser settings a scan ran at. They never replace the
+    # SDK's own keys (scan_id, sdk_flags, ...).
+    extra_session_meta: dict | None = None
     # Called (with the exception) when the scan worker thread aborts AFTER
     # start_scan returned True — e.g. a critical sink failing in on_scan_start
     # because the scan DB became unwritable in the race window past the
@@ -201,6 +206,28 @@ class ConfigureRequest:
 class ConfigureResult:
     ok: bool
     error: str
+
+
+def _with_prepared_overrides(request: "ScanRequest", prepared: dict) -> "ScanRequest":
+    """``request`` with a scan preparer's overrides applied (a copy).
+
+    The preparer's trigger keys win: they are what keeps the device's
+    widened limits and the trigger schedule consistent. Gains and the
+    calibration override apply unless the caller set its own, and session
+    meta keys are added without replacing the caller's.
+    """
+    return dataclasses.replace(
+        request,
+        trigger_config={**(request.trigger_config or {}),
+                        **(prepared.get("trigger_config") or {})},
+        camera_gains=(request.camera_gains if request.camera_gains is not None
+                      else prepared.get("camera_gains")),
+        calibration_override=(request.calibration_override
+                              if request.calibration_override is not None
+                              else prepared.get("calibration_override")),
+        extra_session_meta={**(prepared.get("extra_session_meta") or {}),
+                            **(request.extra_session_meta or {})} or None,
+    )
 
 
 def run_collection_scan(
@@ -307,6 +334,9 @@ class ScanWorkflow:
         # CalibrationWorkflow) check this after await_complete to decide
         # whether the scan succeeded.
         self._last_scan_error: str | None = None
+        # Called by start_scan with the request's (left, right) masks before
+        # anything starts; see set_scan_preparer.
+        self._scan_preparer = None
         self._last_scan_canceled: bool = False
         # Label of the scan-DB session for the most recent start_scan, set
         # synchronously when the scan's metadata is built. Lets callers bind
@@ -399,6 +429,20 @@ class ScanWorkflow:
             auto_upload=bool(auto_upload),
         )
 
+    def set_scan_preparer(self, preparer) -> None:
+        """Register ``preparer(left_camera_mask, right_camera_mask)``, which
+        start_scan calls before every scan, trigger off.
+
+        It puts back device settings that must hold for the scan and returns
+        the ``ScanRequest`` overrides that go with them (``trigger_config``,
+        ``camera_gains``, ``calibration_override``, ``extra_session_meta``),
+        or None when it has nothing active. If it raises, the scan is refused
+        with its message. Optimize Laser registers its
+        ``OptimizeLaserWorkflow.prepare_scan``. One preparer at a time; None
+        removes it.
+        """
+        self._scan_preparer = preparer
+
     def start_scan(
         self,
         request: ScanRequest,
@@ -457,6 +501,23 @@ class ScanWorkflow:
             self._last_scan_error = limits_error
             return False
 
+        # Device settings some other workflow keeps active (Optimize Laser):
+        # re-apply them and take their request overrides here, for every
+        # scan path at once (app scans, contact-quality checks, calibration,
+        # scripts). A scan that ran without them would put a 2400 us dark
+        # skip under the stock RATE_LL, or stock gains under optimized
+        # light, so a failure refuses the scan.
+        if self._scan_preparer is not None and not self._running:
+            try:
+                prepared = self._scan_preparer(
+                    request.left_camera_mask, request.right_camera_mask)
+            except Exception as e:
+                logger.error("start_scan refused: %s", e)
+                self._last_scan_error = str(e)
+                return False
+            if prepared:
+                request = _with_prepared_overrides(request, prepared)
+
         # Per-scan gain and calibration overrides: resolve them before
         # anything starts, so a bad value refuses the scan rather than
         # processing it with the stock gains or calibration.
@@ -497,6 +558,7 @@ class ScanWorkflow:
             left_camera_mask=request.left_camera_mask,
             right_camera_mask=request.right_camera_mask,
             reduced_mode=request.reduced_mode,
+            extra_session_meta=request.extra_session_meta,
         )
         # Mirror ScanDBSink.on_scan_start's label so callers can bind to this
         # exact session row (must match f"{scan_id}_{subject_id}" there).

@@ -115,7 +115,7 @@ class LaserCameraActuator:
     def __init__(self, console, sensors: Mapping[int, object], *, registers=None,
                  restore_laser: Callable | None = None, lock=None):
         if registers is None:
-            from omotion.calibration.motion_bench import FpgaRegisterIO
+            from omotion.fpga_registers import FpgaRegisterIO
             registers = FpgaRegisterIO(console)
         if restore_laser is None:
             from omotion.laser import apply_laser_power as restore_laser
