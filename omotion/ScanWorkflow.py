@@ -1080,6 +1080,9 @@ class ScanWorkflow:
                 # controls whether the OTHER (unused) cameras get powered down.
                 _emit_log("Powering on cameras before programming FPGAs...")
                 needs_settle = False
+                # Cameras this call takes from off to on. Their registers are
+                # always written below, whatever the status byte says.
+                fresh_masks: dict[str, int] = {}
                 for side, mask, sensor in active:
                     try:
                         on_mask = mask & 0xFF
@@ -1108,11 +1111,12 @@ class ScanWorkflow:
                                 raise RuntimeError(
                                     f"Failed to power on cameras on {side} (mask 0x{on_mask:02X})."
                                 )
-                            if all(
-                                power_status[i]
+                            fresh_masks[side] = sum(
+                                1 << i
                                 for i in range(8)
-                                if on_mask & (1 << i)
-                            ):
+                                if on_mask & (1 << i) and not power_status[i]
+                            )
+                            if not fresh_masks[side]:
                                 _emit_log(
                                     f"{side}: cameras already powered (mask 0x{on_mask:02X})"
                                 )
@@ -1191,7 +1195,12 @@ class ScanWorkflow:
                                 f"{side} camera {pos1} not READY for FPGA/config."
                             )
                         programmed = bool(status & (1 << 1))
-                        configured = bool(status & (1 << 2))
+                        # A camera powered up by this call always gets its
+                        # registers written. Only a camera that stayed powered
+                        # since it was last configured may skip the write.
+                        configured = bool(status & (1 << 2)) and not (
+                            fresh_masks.get(side, 0) & cam_mask_single
+                        )
 
                         if programmed:
                             _emit_log(
