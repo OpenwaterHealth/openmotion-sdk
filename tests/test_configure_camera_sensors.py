@@ -225,10 +225,30 @@ def test_power_status_failure_falls_back_to_settle(sleeps):
         wf, ConfigureRequest(left_camera_mask=0xFF, right_camera_mask=0x00)
     )
     assert result.ok, result.error
-    # Unknown power state must be treated as off: settle, but still skip
-    # the (status-confirmed) programmed cameras.
+    # Unknown power state must be treated as off: settle and write every
+    # camera's registers, but still skip the (status-confirmed) programmed
+    # cameras.
     assert sleeps.count(0.5) == 1
     assert left.named("program") == []
+    assert len(left.named("configure")) == 8
+
+
+def test_freshly_powered_camera_is_always_configured(sleeps):
+    # A camera this call powers on gets its registers written even when the
+    # status byte claims it is configured. Programming still follows the
+    # status bit.
+    left = _FakeSensor(
+        status={0: READY | PROGRAMMED | CONFIGURED,
+                1: READY | PROGRAMMED | CONFIGURED},
+        powered=[True] + [False] * 7,
+    )
+    wf = ScanWorkflow(_FakeInterface(left, _Disconnected()))
+    result, _ = _run_configure(
+        wf, ConfigureRequest(left_camera_mask=0x03, right_camera_mask=0x00)
+    )
+    assert result.ok, result.error
+    assert left.named("program") == []
+    assert left.named("configure") == [("configure", 0x02)]
 
 
 def test_power_off_unused_cameras_still_powers_down_others(sleeps):
