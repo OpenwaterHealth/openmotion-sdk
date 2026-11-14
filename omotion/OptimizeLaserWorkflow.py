@@ -41,7 +41,7 @@ from typing import Callable, Mapping, Optional
 
 import numpy as np
 
-from omotion.config import CAMERA_GAIN_MAP, LONG_EXPOSURE_DARK_SKIP_US
+from omotion.config import CAMERA_GAIN_MAP
 from omotion.exposure.actuator import LaserBaseline, LaserCameraActuator
 from omotion.exposure.controller import (
     DEFAULT_MAX_ITERATIONS,
@@ -62,7 +62,7 @@ logger = logging.getLogger("openmotion.sdk.exposure")
 
 # Dark skip for every scan at the long exposure: the displaced dark pulse
 # starts at 100 + 2400 = 2500 us, after a 2196 us exposure ends.
-DARK_SKIP_US = LONG_EXPOSURE_DARK_SKIP_US
+DARK_SKIP_US = 2400
 # restore() problems that mean the laser side may still hold optimized
 # settings or the 2400 us skip. A camera write failure alone does not block
 # a scan, because every scan reconfigures its cameras first.

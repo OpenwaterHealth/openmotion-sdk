@@ -6,8 +6,6 @@ import math
 from types import MappingProxyType
 from typing import Iterable, Literal
 
-from omotion.fpga_registers import SettingReadback  # noqa: F401  (moved; re-exported)
-
 
 SensorSide = Literal["left", "right"]
 REQUIRED_CONSOLE_FPGA_CONTROLLERS = (
@@ -56,6 +54,13 @@ class CriterionResult:
     name: str
     passed: bool
     detail: str
+
+
+@dataclass(frozen=True)
+class SettingReadback:
+    name: str
+    requested: float
+    actual: float
 
 
 @dataclass(frozen=True)

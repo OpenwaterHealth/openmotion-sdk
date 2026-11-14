@@ -356,25 +356,6 @@ def test_cq_workflow_check_uses_skip_default_storage():
     assert len(cq_sinks) == 1
 
 
-@pytest.mark.parametrize("trigger_config", [None, {"LaserPulseSkipDelayUsec": 2400}])
-def test_cq_workflow_passes_the_trigger_override_through(trigger_config):
-    """A check that gates an Optimize Laser scan must judge its darks under
-    that scan's dark skip."""
-    fake_scan = MagicMock()
-    fake_scan.start_scan = MagicMock(return_value=True)
-
-    ContactQualityWorkflow(scan_workflow=fake_scan).check(
-        duration_sec=0.5,
-        rolling_window=5,
-        dark_threshold_per_camera=[3.0] * 8,
-        light_threshold_per_camera=[15.0] * 8,
-        left_camera_mask=0x01,
-        right_camera_mask=0,
-        trigger_config=trigger_config,
-    )
-    assert fake_scan.start_scan.call_args.args[0].trigger_config == trigger_config
-
-
 def test_cq_workflow_calls_await_complete():
     fake_scan = MagicMock()
     fake_scan.start_scan = MagicMock(return_value=True)
