@@ -33,6 +33,9 @@ class ScanMetadata:
     left_camera_mask:  int
     right_camera_mask: int
     reduced_mode:      bool
+    # Extra keys for the scan DB's session_meta (JSON-serializable), from
+    # ScanRequest.extra_session_meta. They never replace the SDK's own keys.
+    extra_session_meta: Optional[dict] = None
 
 
 @runtime_checkable
@@ -660,6 +663,8 @@ class ScanDBSink:
                 "right_camera_mask": meta.right_camera_mask,
             },
         }
+        for key, value in (getattr(meta, "extra_session_meta", None) or {}).items():
+            self._session_meta.setdefault(key, value)
         self._session_id = self._db.create_session(
             session_label=label,
             session_start=time.time(),

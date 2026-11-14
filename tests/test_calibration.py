@@ -191,3 +191,54 @@ def test_serialize_rejects_non_monotonic():
             np.zeros((2, 8)), np.zeros((2, 8)),  # C_max == C_min
             np.zeros((2, 8)), np.full((2, 8), 250.0),
         )
+
+
+# ── with_overrides: one scan's calibration_override ──────────────────────────
+
+
+def test_with_overrides_replaces_only_the_named_arrays():
+    base = Calibration.default()
+    cal = base.with_overrides({"i_max": 400.0})
+    np.testing.assert_array_equal(cal.i_max, np.full((2, 8), 400.0))
+    np.testing.assert_array_equal(cal.c_min, base.c_min)
+    np.testing.assert_array_equal(cal.c_max, base.c_max)
+    np.testing.assert_array_equal(cal.i_min, base.i_min)
+    assert cal.source == "override"
+
+
+def test_with_overrides_leaves_the_original_untouched():
+    base = Calibration.default()
+    cal = base.with_overrides({"i_max": 400.0})
+    cal.i_max[0, 0] = 1.0                       # writable, and not a view of base
+    np.testing.assert_array_equal(base.i_max, _REF_I_MAX)
+    assert base.source == "default"
+
+
+def test_with_overrides_accepts_per_camera_arrays():
+    i_max = np.arange(16, dtype=float).reshape(2, 8) + 100.0
+    np.testing.assert_array_equal(Calibration.default().with_overrides({"i_max": i_max}).i_max,
+                                  i_max)
+    per_position = np.linspace(200.0, 270.0, 8)   # (8,) applies to both sides
+    np.testing.assert_array_equal(
+        Calibration.default().with_overrides({"i_max": per_position}).i_max,
+        np.tile(per_position, (2, 1)))
+
+
+@pytest.mark.parametrize("empty", [None, {}])
+def test_with_no_overrides_returns_the_same_calibration(empty):
+    base = Calibration.default()
+    assert base.with_overrides(empty) is base
+
+
+@pytest.mark.parametrize("overrides, match", [
+    ({"I_max": 400.0}, "unknown"),
+    ({"i_max": np.ones((2, 7))}, "number or"),
+    ({"i_max": "lots"}, "number or"),
+    ({"i_max": float("nan")}, "NaN or inf"),
+    ({"i_max": 0.0}, "I_max not above I_min"),          # equals the default I_min
+    ({"i_min": 500.0}, "I_max not above I_min"),        # above the default I_max
+    ({"c_max": 0.0}, "C_max not above C_min"),
+])
+def test_with_overrides_rejects_bad_values(overrides, match):
+    with pytest.raises(ValueError, match=match):
+        Calibration.default().with_overrides(overrides)
