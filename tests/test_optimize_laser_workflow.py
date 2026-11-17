@@ -20,11 +20,12 @@ from omotion.OptimizeLaserWorkflow import (
     CONTINUE,
     CSV_COLUMNS,
     DARK_SKIP_US,
+    OPTIMIZE_SCAN_TIMING,
     OptimizeLaserWorkflow,
     _OptimizeLaserSink,
 )
 from omotion.pipeline.batch import FrameBatch
-from omotion.ScanWorkflow import ScanRequest
+from omotion.ScanWorkflow import ScanRequest, ScanTiming
 
 from optimize_laser_fakes import (
     CALIBRATED_REGISTERS,
@@ -476,6 +477,37 @@ def test_sink_keeps_the_first_light_frames_after_a_dark():
     assert [int(np.argmax(h)) for h in obs[(0, 0)].histograms] == [300, 310]
     assert len(obs[(1, 3)].histograms) == 1
     assert sink.light_frame_counts() == {(0, 0): 2, (1, 3): 1}
+
+
+def test_sink_is_complete_once_every_camera_has_its_frames():
+    sink = _OptimizeLaserSink([(0, 0), (1, 3)], frames_needed=2)
+    assert not sink.complete()
+    sink.consume("raw", _batch([(0, 0, "dark", 64), (0, 0, "light", 300),
+                                (0, 0, "light", 300), (1, 3, "dark", 64),
+                                (1, 3, "light", 200)]))
+    assert not sink.complete()                     # (1, 3) has one of two
+    sink.consume("raw", _batch([(1, 3, "light", 200)]))
+    assert sink.complete()
+
+
+def test_short_scans_use_the_short_teardown_and_stop_early():
+    wf, iface = _workflow(Rig(SPREAD))
+    wf.run(OptimizeLaserSettings(), left_camera_mask=0xFF, right_camera_mask=0)
+    requests = iface.scan_workflow.requests
+    assert requests
+    for request in requests:
+        assert request.timing == OPTIMIZE_SCAN_TIMING
+        assert callable(request.stop_when)
+    assert not OPTIMIZE_SCAN_TIMING.report_terminal_fsync
+
+
+def test_short_scan_timing_and_early_stop_can_be_turned_off():
+    wf, iface = _workflow(Rig(SPREAD))
+    wf.scan_timing, wf.stop_early = None, False
+    wf.run(OptimizeLaserSettings(), left_camera_mask=0xFF, right_camera_mask=0)
+    for request in iface.scan_workflow.requests:
+        assert request.timing == ScanTiming()
+        assert request.stop_when is None
 
 
 def test_sink_without_a_dark_has_no_observation():

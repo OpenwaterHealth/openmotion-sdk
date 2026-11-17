@@ -281,3 +281,46 @@ def test_restore_reports_an_interlock_that_is_still_latched():
     problems = actuator.restore([(0, 0)])
     assert len(problems) == 1 and problems[0].startswith("laser power restore")
     assert "EE_STATUS = 0x01" in problems[0] and "power-cycle" in problems[0]
+
+
+def _camera_writes(sensors):
+    return sum(len(s.writes) for s in sensors.values())
+
+
+def test_apply_skips_registers_it_already_wrote():
+    actuator, console, sensors = _actuator()
+    codes = {(0, 0): 64, (0, 3): 37}
+    actuator.apply(codes, 1500.0, 4321.0, 2196.0)
+    laser, cams = len(console.writes), _camera_writes(sensors)
+    assert cams == 8                                   # 2 cameras x 4 registers
+
+    actuator.apply(codes, 1500.0, 4321.0, 2196.0)      # nothing changed
+    assert len(console.writes) == laser
+    assert _camera_writes(sensors) == cams
+
+    actuator.apply({(0, 0): 64, (0, 3): 40}, 1500.0, 4400.0, 2196.0)
+    assert [n for n, _ in console.writes[laser:]] == ["TA_CURRENT_DRV"]
+    assert _camera_writes(sensors) == cams + 1         # 37 -> 40 changes only 0x3509
+    assert sensors[0].gain_code(3) == 40
+    assert console.get("TA_CURRENT_DRV") == pytest.approx(4400.0, abs=0.16)
+
+
+def test_apply_writes_everything_again_after_a_restore():
+    actuator, console, sensors = _actuator()
+    actuator.apply({(0, 0): 64}, 1500.0, 4321.0, 2196.0)
+    actuator.restore([(0, 0)])
+    n = len(console.writes)
+    actuator.apply({(0, 0): 64}, 1500.0, 4321.0, 2196.0)
+    assert [w for w, _ in console.writes[n:]] == ["TA_PULSE_WIDTH", "TA_CURRENT_DRV"]
+    assert sensors[0].gain_code(0) == 64
+    assert sensors[0].exposure_rows(0) == 244
+
+
+def test_apply_writes_everything_again_after_a_failed_write():
+    actuator, console, sensors = _actuator(fail={(2, 0x3508)})
+    with pytest.raises(RuntimeError):
+        actuator.apply({(0, 0): 64, (0, 2): 64}, 1500.0, 4321.0, 2196.0)
+    n = len(console.writes)
+    with pytest.raises(RuntimeError):
+        actuator.apply({(0, 0): 64, (0, 2): 64}, 1500.0, 4321.0, 2196.0)
+    assert [w for w, _ in console.writes[n:]] == ["TA_PULSE_WIDTH", "TA_CURRENT_DRV"]

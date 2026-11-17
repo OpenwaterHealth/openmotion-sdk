@@ -56,7 +56,7 @@ from omotion.exposure.controller import (
 )
 from omotion.exposure.estimate import histogram_mean
 from omotion.exposure.settings import GainLadder, HardwareLimits, OptimizeLaserSettings
-from omotion.ScanWorkflow import run_collection_scan
+from omotion.ScanWorkflow import ScanTiming, run_collection_scan
 
 logger = logging.getLogger("openmotion.sdk.exposure")
 
@@ -77,6 +77,18 @@ FRAME_RATE_HZ = 40.0
 WARMUP_FRAMES = 9
 # Light frames past the ones needed, so a short scan never runs out.
 SPARE_FRAMES = 10
+# Teardown for the short scans of a run. The full-scan default waits for
+# the terminal laser-off frame and drains the endpoint for it (~1.9 s per
+# scan); the sink here keeps only frames from the start of the scan, so it
+# skips that. The cameras are still disabled before the source closes, with
+# the trigger stopped first. OptimizeLaserWorkflow.scan_timing overrides it.
+OPTIMIZE_SCAN_TIMING = ScanTiming(
+    stop_settle_s=0.2,          # the deferred final FSYNC pulse lands <= ~150 ms
+    disable_settle_s=0.1,
+    drain_timeout_ms=0,         # the next scan's stale-data flush clears leftovers
+    report_terminal_fsync=False,
+    guard_poll_s=0.05,
+)
 # on_not_converged answers (anything else stops and restores).
 CONTINUE = "continue"
 ACCEPT = "accept"
@@ -145,6 +157,11 @@ class _OptimizeLaserSink:
     def observations(self) -> dict[Camera, CameraObservation]:
         return {key: CameraObservation(tuple(frames), float(np.mean(self._darks[key])))
                 for key, frames in self._lights.items() if frames}
+
+    def complete(self) -> bool:
+        """Every camera has its light frames (the scan can stop now)."""
+        lights = self._lights
+        return all(len(lights.get(key, ())) >= self._needed for key in self._cameras)
 
     def light_frame_counts(self) -> dict[Camera, int]:
         return {key: len(self._lights.get(key, ())) for key in sorted(self._cameras)}
@@ -271,6 +288,11 @@ class OptimizeLaserWorkflow:
         # started with nothing active (so the device was at stock).
         self._stock: LaserBaseline | None = None
         self._capture_stock = False
+        # Teardown timings of a run's short scans (ScanTiming); None = the
+        # full-scan default. ``stop_early``: end each short scan as soon as
+        # every camera has its frames instead of at its fixed duration.
+        self.scan_timing: ScanTiming | None = OPTIMIZE_SCAN_TIMING
+        self.stop_early = True
         # Every scan this interface starts asks prepare_scan first.
         register = getattr(getattr(interface, "scan_workflow", None),
                            "set_scan_preparer", None)
@@ -481,7 +503,9 @@ class OptimizeLaserWorkflow:
                 duration_sec=max(1.0, frames / FRAME_RATE_HZ),
                 left_camera_mask=left_mask, right_camera_mask=right_mask,
                 stop_evt=stop_evt, raise_on_error=True,
-                trigger_config=self.trigger_config(s.pulse_width_us))
+                trigger_config=self.trigger_config(s.pulse_width_us),
+                timing=self.scan_timing,
+                stop_when=sink.complete if self.stop_early else None)
         except RuntimeError as e:
             reason = scan_workflow.last_scan_error
             if reason and reason not in str(e):

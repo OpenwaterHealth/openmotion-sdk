@@ -121,6 +121,33 @@ class _TelemetryCsvWriter:
             pass
 
 
+@dataclass(frozen=True)
+class ScanTiming:
+    """Teardown and polling timings for one scan.
+
+    The defaults are what every full scan uses: they make sure the terminal
+    laser-off frame (the last FSYNC pulse, which fires up to ~150 ms after
+    the stop) reaches the pipeline and is identified as the terminal dark.
+    A short collection scan whose sink only reads frames from early in the
+    scan (Optimize Laser) does not need that tail and can use shorter ones.
+
+    ``stop_settle_s``: wait after ``stop_trigger`` before the cameras are
+    disabled. ``disable_settle_s``: wait after ``disable_camera`` before the
+    USB source is closed. ``drain_timeout_ms``: per-read timeout of the
+    source's final endpoint drain after streaming stops (0 skips the drain;
+    the next scan's stale-data flush clears anything left). ``report_terminal_fsync``:
+    read the console's final FSYNC count for terminal-dark identification.
+    ``guard_poll_s``: how often the duration guard checks for the end of
+    the scan (and ``ScanRequest.stop_when``).
+    """
+
+    stop_settle_s: float = 0.5
+    disable_settle_s: float = 0.35
+    drain_timeout_ms: int = 750
+    report_terminal_fsync: bool = True
+    guard_poll_s: float = 0.2
+
+
 @dataclass
 class ScanRequest:
     subject_id: str
@@ -193,6 +220,16 @@ class ScanRequest:
     # value can no longer carry. Fires on the worker thread, so the handler
     # must be thread-safe. See bloodflow-app issue #213.
     on_error: Callable[[BaseException], None] | None = None
+    # Teardown / polling timings (ScanTiming). The default is the full-scan
+    # teardown; short collection scans that ignore the scan's tail may pass
+    # shorter ones.
+    timing: ScanTiming = field(default_factory=ScanTiming)
+    # Ends the scan before duration_sec when it returns True: the duration
+    # guard asks it every timing.guard_poll_s once the trigger is on (e.g. a
+    # collecting sink that has all the frames it needs). duration_sec stays
+    # the upper bound. Called on the guard thread; must be cheap and must
+    # not raise (an exception is logged and treated as False).
+    stop_when: Callable[[], bool] | None = None
 
 
 @dataclass
@@ -245,6 +282,8 @@ def run_collection_scan(
     timeout_pad_s: float = 2.0,
     raise_on_error: bool = False,
     trigger_config: dict | None = None,
+    timing: "ScanTiming | None" = None,
+    stop_when: Callable[[], bool] | None = None,
 ) -> bool:
     """Run one short scan whose only sink is ``collector``, blocking until it
     finishes. This is the shared "threshold scan" engine behind both the
@@ -260,6 +299,8 @@ def run_collection_scan(
     ``RuntimeError``. Returns ``False`` when the scan was canceled, else ``True``.
     ``trigger_config`` becomes the request's per-scan trigger override (see
     ``ScanRequest.trigger_config``), e.g. Optimize Laser's longer dark skip.
+    ``timing`` / ``stop_when`` become ``ScanRequest.timing`` (None = the
+    full-scan default) and ``ScanRequest.stop_when``.
 
     Operates only on ``scan_workflow``'s public surface (``start_scan`` /
     ``await_complete`` / ``running`` / ``cancel_scan`` / ``last_scan_error`` /
@@ -276,6 +317,8 @@ def run_collection_scan(
         sinks=[collector],
         skip_default_storage=True,
         trigger_config=trigger_config,
+        timing=timing if timing is not None else ScanTiming(),
+        stop_when=stop_when,
     )
     started = scan_workflow.start_scan(request)
     if raise_on_error and not started:
@@ -731,6 +774,10 @@ class ScanWorkflow:
             right=_live_sensor(self._interface.right, request.right_camera_mask),
             batch_size_frames=request.batch_size_frames or 10,
             metadata=meta,
+            # Only a non-default drain is passed, so source stand-ins
+            # without the parameter keep working for full scans.
+            **({"drain_timeout_ms": request.timing.drain_timeout_ms}
+               if request.timing.drain_timeout_ms != ScanTiming.drain_timeout_ms else {}),
         )
         self._runner = ScanRunner(
             source=source,
@@ -846,13 +893,30 @@ class ScanWorkflow:
 
                 # ── Duration gate: stop the source when time is up ────────
                 stop_after = 0.0 if trigger_error else float(request.duration_sec)
+                timing = request.timing
+
+                def _stop_early() -> bool:
+                    if request.stop_when is None:
+                        return False
+                    try:
+                        return bool(request.stop_when())
+                    except Exception:
+                        logger.exception("ScanRequest.stop_when raised; ignoring it")
+                        return False
 
                 def _duration_guard():
                     deadline = time.monotonic() + stop_after
                     while time.monotonic() < deadline:
                         if self._stop_evt.is_set():
                             break
-                        time.sleep(0.2)
+                        if _stop_early():
+                            logger.info(
+                                "duration_guard: stop_when satisfied %.2f s into the scan",
+                                time.monotonic() - (deadline - stop_after),
+                            )
+                            break
+                        time.sleep(min(timing.guard_poll_s,
+                                       max(0.0, deadline - time.monotonic())))
                     # Cancel race: cancel_scan() already closed the source
                     # (and likely called stop_trigger) before we got here.
                     # Don't re-run stop_trigger/close on a closed source —
@@ -893,11 +957,12 @@ class ScanWorkflow:
                         # the trigger is not firing anymore — downstream
                         # trigger-state consumers must still see the close.
                         self._emit_trigger_event("OFF")
-                    time.sleep(0.5)
+                    time.sleep(timing.stop_settle_s)
                     # The deferred final FSYNC pulse (the terminal dark) has
                     # fired by now — report its index for positive terminal-
                     # dark identification in the flush.
-                    self._report_terminal_fsync()
+                    if timing.report_terminal_fsync:
+                        self._report_terminal_fsync()
                     for side, mask, _ in active_sides:
                         try:
                             self._interface.run_on_sensors(
@@ -908,7 +973,7 @@ class ScanWorkflow:
                                 "disable_camera(%s) raised in duration guard",
                                 side, exc_info=True,
                             )
-                    time.sleep(0.35)
+                    time.sleep(timing.disable_settle_s)
                     try:
                         source.close()
                     except Exception:

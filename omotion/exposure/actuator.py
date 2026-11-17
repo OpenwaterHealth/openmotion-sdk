@@ -138,6 +138,12 @@ class LaserCameraActuator:
         self._registers = registers
         self._restore_laser = restore_laser
         self._lock = lock
+        # What apply() last wrote and read back, so the next apply() skips
+        # unchanged registers (each console register write + readback costs
+        # ~80 ms; cameras keep their registers across stream off/on).
+        # Cleared by restore() and by any failed write.
+        self._written_ta: dict[str, float] = {}
+        self._written_cam: dict[Camera, dict[int, int]] = {}
 
     # ---- run start --------------------------------------------------------
 
@@ -244,11 +250,36 @@ class LaserCameraActuator:
             raise ValueError(
                 f"drive current {current_ma!r} mA outside 0..{ABSOLUTE_MAX_CURRENT_MA:g}")
         rows = exposure_rows(exposure_us)
-        writes = {cam: camera_register_writes(rows, int(code)) for cam, code in gain_codes.items()}
-        with self._locked():
-            self._write("TA_PULSE_WIDTH", pw)
-            self._write("TA_CURRENT_DRV", current)
-            self._write_cameras(writes)
+        full = {cam: camera_register_writes(rows, int(code)) for cam, code in gain_codes.items()}
+        # Only what differs from this actuator's last successful apply.
+        writes = {}
+        for cam, regs in full.items():
+            known = self._written_cam.get(cam, {})
+            changed = tuple((reg, val) for reg, val in regs if known.get(reg) != val)
+            if changed:
+                writes[cam] = changed
+        ta = [(name, value) for name, value in (("TA_PULSE_WIDTH", pw), ("TA_CURRENT_DRV", current))
+              if self._written_ta.get(name) != value]
+        try:
+            with self._locked():
+                for name, value in ta:
+                    self._write(name, value)
+                    self._written_ta[name] = value
+                self._write_cameras(writes)
+        except Exception:
+            self._forget_writes()
+            raise
+        for cam, regs in writes.items():
+            self._written_cam.setdefault(cam, {}).update(regs)
+        skipped = (2 - len(ta), sum(len(r) for r in full.values())
+                   - sum(len(r) for r in writes.values()))
+        if any(skipped):
+            logger.debug("Optimize Laser apply: skipped %d unchanged TA and %d unchanged "
+                         "camera register write(s)", *skipped)
+
+    def _forget_writes(self) -> None:
+        self._written_ta.clear()
+        self._written_cam.clear()
 
     # ---- restore ----------------------------------------------------------
 
@@ -263,6 +294,7 @@ class LaserCameraActuator:
         whose limits are tighter than the settings just used; see
         :meth:`_settle_at_stock`. Without them the limits go straight back.
         """
+        self._forget_writes()
         problems = []
         if stock is not None and burst is not None:
             try:

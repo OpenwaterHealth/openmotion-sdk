@@ -240,8 +240,11 @@ class LiveUsbSource(_BaseSource):
                  batch_size_frames: int = 10,
                  flush_interval_s: float = 0.25,
                  packet_queue_size: Optional[int] = None,
-                 metadata: ScanMetadata):
+                 metadata: ScanMetadata,
+                 drain_timeout_ms: int = 750):
         super().__init__(metadata=metadata)
+        # Per-read timeout of close()'s final endpoint drain; 0 skips it.
+        self._drain_timeout_ms = int(drain_timeout_ms)
         self._console = console
         self._sensors: dict[str, Any] = {"left": left, "right": right}
         self._batch_size = int(batch_size_frames)
@@ -348,10 +351,11 @@ class LiveUsbSource(_BaseSource):
                 histo.stop_streaming()
             except Exception:
                 logger.exception("stop_streaming(%s) raised", side_name)
-            if expected_size is None:
+            if expected_size is None or self._drain_timeout_ms <= 0:
                 return
             try:
-                final_chunks = histo.drain_final(expected_size=expected_size)
+                final_chunks = histo.drain_final(expected_size=expected_size,
+                                                 timeout_ms=self._drain_timeout_ms)
                 q = self._packet_queues.get(side_name)
                 if q is not None and final_chunks:
                     for chunk in final_chunks:

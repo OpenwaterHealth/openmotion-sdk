@@ -9,7 +9,7 @@ from unittest import mock
 
 import pytest
 
-from omotion.ScanWorkflow import ScanRequest, ScanWorkflow
+from omotion.ScanWorkflow import ScanRequest, ScanTiming, ScanWorkflow
 
 
 class _EmptySource:
@@ -1201,3 +1201,81 @@ def test_optimize_laser_workflow_hooks_the_real_scan_workflow():
     assert motion.scan_workflow._scan_preparer is None
     wf = motion.optimize_laser_workflow
     assert motion.scan_workflow._scan_preparer == wf.prepare_scan
+
+
+# ---- ScanTiming / stop_when (Optimize Laser short scans) -------------------
+
+
+def _run_to_completion(motion, request, timeout=10.0, factory=None):
+    """Run with a source that streams until it is closed, so the duration
+    guard (not an empty source) ends the scan."""
+    def _factory(*, console, left, right, batch_size_frames, metadata, **kw):
+        return _MockSource(metadata=metadata)
+
+    with mock.patch("omotion.pipeline.sources.LiveUsbSource", factory or _factory):
+        assert motion.scan_workflow.start_scan(request)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and motion.scan_workflow.running:
+            time.sleep(0.01)
+    assert not motion.scan_workflow.running, "scan did not finish"
+
+
+def test_stop_when_ends_the_scan_before_its_duration():
+    motion = _build_motion_with_data_dir(None)
+    t0 = time.monotonic()
+    request = ScanRequest(
+        subject_id="x", duration_sec=30,
+        left_camera_mask=0xFF, right_camera_mask=0,
+        skip_default_storage=True,
+        timing=ScanTiming(stop_settle_s=0.0, disable_settle_s=0.0, guard_poll_s=0.02),
+        stop_when=lambda: time.monotonic() - t0 > 0.3,
+    )
+    _run_to_completion(motion, request)
+    assert 0.3 < time.monotonic() - t0 < 2.0
+
+
+def test_stop_when_that_raises_is_ignored_until_the_duration():
+    motion = _build_motion_with_data_dir(None)
+
+    def _boom():
+        raise RuntimeError("sink bug")
+
+    t0 = time.monotonic()
+    request = ScanRequest(
+        subject_id="x", duration_sec=1,
+        left_camera_mask=0xFF, right_camera_mask=0,
+        skip_default_storage=True,
+        timing=ScanTiming(stop_settle_s=0.0, disable_settle_s=0.0, guard_poll_s=0.02),
+        stop_when=_boom,
+    )
+    _run_to_completion(motion, request)
+    assert time.monotonic() - t0 >= 1.0
+
+
+def test_short_timing_skips_the_terminal_fsync_query_and_passes_the_drain():
+    motion = _build_motion_with_data_dir(None)
+    made = {}
+
+    def _factory(*, console, left, right, batch_size_frames, metadata, **kw):
+        made.update(kw)
+        return _MockSource(metadata=metadata)
+
+    request = ScanRequest(
+        subject_id="x", duration_sec=1,
+        left_camera_mask=0xFF, right_camera_mask=0,
+        skip_default_storage=True,
+        timing=ScanTiming(stop_settle_s=0.0, disable_settle_s=0.0, drain_timeout_ms=0,
+                          report_terminal_fsync=False, guard_poll_s=0.02),
+    )
+    with mock.patch.object(motion.console, "get_fsync_pulsecount",
+                           return_value=842) as fsync:
+        _run_to_completion(motion, request, factory=_factory)
+    fsync.assert_not_called()
+    assert made == {"drain_timeout_ms": 0}
+
+
+def test_default_timing_keeps_the_full_teardown():
+    t = ScanRequest(subject_id="x", duration_sec=1, left_camera_mask=1,
+                    right_camera_mask=0).timing
+    assert (t.stop_settle_s, t.disable_settle_s, t.drain_timeout_ms,
+            t.report_terminal_fsync) == (0.5, 0.35, 750, True)
