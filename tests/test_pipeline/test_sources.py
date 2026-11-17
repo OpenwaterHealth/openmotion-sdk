@@ -203,7 +203,7 @@ def test_live_usb_source_reader_loop_builds_batches_from_packet_queue(monkeypatc
                 pass
             def stop_streaming(self):
                 pass
-            def drain_final(self, expected_size):
+            def drain_final(self, expected_size, timeout_ms=750):
                 return []
         class _FakeUart:
             def __init__(self, stream):
@@ -430,7 +430,7 @@ def test_live_usb_reader_loops_anchor_t0_per_side(monkeypatch):
                 pass
             def stop_streaming(self):
                 pass
-            def drain_final(self, expected_size):
+            def drain_final(self, expected_size, timeout_ms=750):
                 return []
         class _FakeUart:
             def __init__(self, stream):
