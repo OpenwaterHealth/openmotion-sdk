@@ -370,6 +370,83 @@ class ScanDatabase:
         for row in cursor:
             yield dict(row)
 
+    # ------------------------------------------------------------------
+    # IMU motion (bloodflow-app#783)
+    # ------------------------------------------------------------------
+
+    def insert_imu_motion_rows(self, rows: Sequence[Dict[str, Any]]) -> int:
+        """Insert IMU motion bins. Each row: session_id, side (0 left /
+        1 right), t_start_s, t_end_s, accel_dev_g, gyro_dps, n_samples,
+        time_source. One transaction; returns the number inserted."""
+        params = []
+        for row in rows:
+            _validate_side(row["side"])
+            params.append((
+                row["session_id"], row["side"],
+                float(row["t_start_s"]), float(row["t_end_s"]),
+                float(row["accel_dev_g"]), float(row["gyro_dps"]),
+                int(row["n_samples"]), str(row["time_source"]),
+            ))
+        self._connection().executemany(
+            """
+            INSERT INTO imu_motion (
+                session_id, side, t_start_s, t_end_s,
+                accel_dev_g, gyro_dps, n_samples, time_source
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            params,
+        )
+        self._connection().commit()
+        return len(params)
+
+    def iter_imu_motion(
+        self,
+        session_id: int,
+        side: Optional[int] = None,
+        t_lo: Optional[float] = None,
+        t_hi: Optional[float] = None,
+    ) -> Iterator[Dict[str, Any]]:
+        """Iterate a session's IMU motion bins, ordered by side then time.
+
+        ``side``: 0 (left) / 1 (right) / None (both). ``t_lo``/``t_hi``
+        select bins overlapping [t_lo, t_hi] (a bin [t_start_s, t_end_s)
+        that touches the range is included). Each row is a dict with
+        session_id, side, t_start_s, t_end_s, accel_dev_g, gyro_dps,
+        n_samples, time_source. Empty for sessions recorded without
+        ScanRequest.imu_motion.
+        """
+        clauses = ["session_id = ?"]
+        bindings: list[Any] = [session_id]
+        if side is not None:
+            _validate_side(side)
+            clauses.append("side = ?")
+            bindings.append(side)
+        if t_lo is not None:
+            clauses.append("t_end_s > ?")
+            bindings.append(float(t_lo))
+        if t_hi is not None:
+            clauses.append("t_start_s <= ?")
+            bindings.append(float(t_hi))
+        cursor = self._connection().execute(
+            "SELECT session_id, side, t_start_s, t_end_s, accel_dev_g, "
+            "gyro_dps, n_samples, time_source FROM imu_motion WHERE "
+            + " AND ".join(clauses) + " ORDER BY side, t_start_s, id",
+            bindings,
+        )
+        for row in cursor:
+            yield dict(row)
+
+    def get_imu_motion(
+        self,
+        session_id: int,
+        side: Optional[int] = None,
+        t_lo: Optional[float] = None,
+        t_hi: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
+        """List form of :meth:`iter_imu_motion`."""
+        return list(self.iter_imu_motion(session_id, side, t_lo, t_hi))
+
     def delete_session_data(self, session_id: int) -> int:
         cursor = self._connection().execute(
             "DELETE FROM session_data WHERE session_id = ?",

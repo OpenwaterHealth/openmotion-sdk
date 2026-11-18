@@ -219,6 +219,7 @@ class ScanRequest:
     write_telemetry_csv: bool = True
     write_camera_telemetry_csv: bool = False         # 1 Hz per-camera sensor telemetry
     write_imu_csv: bool = False      # per-scan IMU CSV aligned to timestamp_s (below)
+    imu_motion: bool = False         # live 1/8 s IMU motion bins (below)
     reduced_mode: bool = False       # per-side averaged BFI/BVI instead of per-camera
     sinks: list = field(default_factory=list)        # custom pipeline sinks (§6)
     skip_default_storage: bool = False               # don't auto-inject CSV/DB sinks
@@ -461,8 +462,25 @@ class MySink:
 | `"live_side"` | `SideAverageSample` (realtime per-side avg) | per capture, reduced mode |
 | `"final"` | `EnrichedCorrectedInterval` (dark-corrected frames; in reduced mode also the cam_id=-1 side-average intervals) | per closed dark interval (~15 s) |
 | `"diagnostics"` | `BatchEvent` (e.g. `DarkIntegrityWarning`, trigger transitions) | as they occur |
+| `"imu_motion"` | `ImuMotionBin` (alias `ImuMotionEvent`) — one side's 1/8 s IMU motion bin | 8 Hz per side, `ScanRequest.imu_motion` only; **called on the IMU thread** |
 
-`SideAverageSample` carries `t, frame_id, side, bfi, bvi`. A
+`SideAverageSample` carries `t, frame_id, side, bfi, bvi`.
+
+`ImuMotionBin` (`omotion.pipeline`) carries `side` ("left"/"right"),
+`t_start_s`, `t_end_s` (a `[start, end)` bin on the scan's `timestamp_s` axis,
+`t_start_s` a multiple of 0.125 s), `accel_dev_g` (max over the bin of
+`| |a| - 1 g |`), `gyro_dps` (max of `|omega|`, deg/s), `n_samples` and
+`time_source` ("device"/"host"). The SDK does not threshold: the app compares
+these with its own limits. Bins arrive in time order per side, possibly up to
+a second behind the histograms (samples are held until the side's first
+histogram sample anchors the time axis). `consume` runs on the IMU thread, so
+keep it quick and thread-safe (emit a Qt signal). The magnitude math is
+`omotion.imu_csv.motion_magnitude(accel_g, gyro_dps)`; with a scan DB the bins
+are stored in `imu_motion` and read back with `ScanDatabase.get_imu_motion`
+(see ScanDatabase.md); `motion_bins_from_imu_csv(path)` rebuilds them from an
+IMU CSV.
+
+A
 sink whose `on_scan_start` raises is disabled for the scan unless it sets
 `critical = True`, in which case `ScanRunner` raises `CriticalSinkError` and the
 scan aborts (this is how `ScanDBSink` guarantees no silent data loss). Pass

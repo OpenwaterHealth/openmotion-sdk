@@ -542,3 +542,35 @@ class FrameBatch:
         completed.extend(indices for _, _, indices in active.values())
         completed.sort(key=lambda indices: indices[0])
         return completed
+
+
+# Runner channel for ImuMotionBin events (bloodflow-app#783).
+IMU_MOTION_CHANNEL = "imu_motion"
+
+
+@dataclass(frozen=True)
+class ImuMotionBin(BatchEvent):
+    """Peak IMU motion of one side over one 1/8 s bin of the scan's
+    ``timestamp_s`` axis, ``[t_start_s, t_end_s)`` with ``t_start_s`` a
+    multiple of the bin width (omotion.imu_csv.MOTION_BIN_S).
+
+    Produced by ``omotion.imu_csv`` when ``ScanRequest.imu_motion`` (or
+    ``write_imu_csv``) is on. ScanRunner.dispatch_event routes it to the
+    ``"imu_motion"`` channel (IMU_MOTION_CHANNEL), not "diagnostics".
+    Sinks on that channel are called on the IMU consumer thread, not the
+    runner thread: keep ``consume`` quick and thread-safe (emit a Qt
+    signal, append to a locked buffer). Bins arrive in time order per side;
+    a side's bins may lag the histograms by up to a second when samples are
+    held for the histogram anchor.
+    """
+    side:         str      # "left" | "right"
+    t_start_s:    float
+    t_end_s:      float
+    accel_dev_g:  float    # max over the bin of | |a| - 1 g |  (g)
+    gyro_dps:     float    # max over the bin of |omega|  (deg/s, raw, no bias removal)
+    n_samples:    int
+    time_source:  str      # "device", or "host" if any sample was host-timed
+
+
+# Alias: the event name used in the app-facing docs.
+ImuMotionEvent = ImuMotionBin

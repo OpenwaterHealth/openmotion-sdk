@@ -34,7 +34,7 @@ import logging
 logger = logging.getLogger("omotion.db_schema")
 
 # Bump this whenever a migration is appended to MIGRATIONS.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class SchemaTooNewError(RuntimeError):
@@ -136,6 +136,33 @@ def _migration_002_session_data_temp(conn) -> None:
     _add_column_if_missing(conn, "session_data", "temp", "REAL")
 
 
+def _migration_003_imu_motion(conn) -> None:
+    """Per-scan IMU motion magnitude in 1/8 s bins (bloodflow-app#783):
+    one row per side per bin, written by ScanDBSink from the scan's
+    ImuMotionBin events (ScanRequest.imu_motion). Times are on the
+    session_data timestamp_s axis; [t_start_s, t_end_s)."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS imu_motion (
+            id           INTEGER PRIMARY KEY,
+            session_id   INTEGER NOT NULL REFERENCES sessions(id)
+                                  ON DELETE CASCADE,
+            side         INTEGER NOT NULL CHECK(side IN (0, 1)),
+            t_start_s    REAL    NOT NULL,
+            t_end_s      REAL    NOT NULL,
+            accel_dev_g  REAL    NOT NULL,
+            gyro_dps     REAL    NOT NULL,
+            n_samples    INTEGER NOT NULL,
+            time_source  TEXT    NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_imu_motion_session_side_time "
+        "ON imu_motion(session_id, side, t_start_s)"
+    )
+
+
 # (version, description, function) — ordered, append-only.
 #
 # Only real, used schema belongs here: every entry lands in every database in
@@ -147,6 +174,8 @@ MIGRATIONS: list[tuple[int, str, object]] = [
      _migration_001_baseline),
     (2, "session_data.temp — per-frame camera temperature",
      _migration_002_session_data_temp),
+    (3, "imu_motion — 1/8 s IMU motion magnitude bins",
+     _migration_003_imu_motion),
 ]
 
 

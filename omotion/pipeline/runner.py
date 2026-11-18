@@ -7,7 +7,10 @@ import logging
 
 import numpy as np
 
-from .batch import FrameBatch, LiveEmit, IntervalClosed, BatchEvent, PipelineError
+from .batch import (
+    FrameBatch, LiveEmit, IntervalClosed, BatchEvent, PipelineError,
+    ImuMotionBin, IMU_MOTION_CHANNEL,
+)
 from .pipeline import Pipeline
 from .sinks import Sink
 from .sources import Source
@@ -145,7 +148,8 @@ class ScanRunner:
     def dispatch_event(self, event: BatchEvent) -> None:
         """Route one event to the sinks subscribed to its channel.
 
-        LiveEmit routes to its declared channel; IntervalClosed routes to
+        LiveEmit routes to its declared channel; ImuMotionBin routes to
+        "imu_motion"; IntervalClosed routes to
         "final"; everything else (DarkIntegrityWarning, PipelineError,
         TriggerStateEvent, …) routes to "diagnostics". Also the entry point
         for out-of-band events not tied to a FrameBatch (e.g. ScanWorkflow's
@@ -153,6 +157,10 @@ class ScanRunner:
         """
         if isinstance(event, LiveEmit):
             channel, payload = event.channel, event.payload
+        elif isinstance(event, ImuMotionBin):
+            # Own channel: 8 Hz per side of routine data must not land in
+            # the diagnostics/integrity record (bloodflow-app#783).
+            channel, payload = IMU_MOTION_CHANNEL, event
         elif isinstance(event, IntervalClosed):
             channel, payload = "final", event.corrected_batch
         else:

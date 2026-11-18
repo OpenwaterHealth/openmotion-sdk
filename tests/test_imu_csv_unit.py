@@ -367,8 +367,12 @@ def test_scan_workflow_starts_imu_before_trigger_and_stops_on_cancel(tmp_path):
     events = []
 
     class _RecLogger:
-        def __init__(self, sensors, path, anchor_fn=None, fallback_t0_monotonic=None):
+        def __init__(self, sensors, path, anchor_fn=None, fallback_t0_monotonic=None,
+                     motion_fn=None):
             events.append(("init", [s for s, _ in sensors], path, anchor_fn))
+
+        def set_motion_fn(self, fn):
+            pass
 
         def start(self):
             events.append(("imu_start",))
@@ -382,7 +386,7 @@ def test_scan_workflow_starts_imu_before_trigger_and_stops_on_cancel(tmp_path):
                           write_imu_csv=True)
     wf = motion.scan_workflow
     with mock.patch("omotion.pipeline.sources.LiveUsbSource", _Src), \
-         mock.patch("omotion.imu_csv.ImuCsvLogger", _RecLogger), \
+         mock.patch("omotion.imu_csv.ImuStreamLogger", _RecLogger), \
          mock.patch.object(motion.left, "is_connected", return_value=True), \
          mock.patch.object(motion.right, "is_connected", return_value=False), \
          mock.patch.object(wf, "_resolve_active_sides", return_value=[fake_side]), \

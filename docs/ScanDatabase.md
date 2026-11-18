@@ -179,6 +179,34 @@ Notes:
   t0 captures whichever side fires first; the other side's per-row
   timestamp can therefore be offset by a few ms from its sibling's.
 
+### `imu_motion`
+
+Schema v3 (bloodflow-app#783). One row per side per 1/8 s IMU motion bin,
+written by `ScanDBSink` from the scan's `ImuMotionBin` events when the scan
+ran with `ScanRequest.imu_motion=True`. Empty for every other session.
+
+```sql
+CREATE TABLE imu_motion (
+    id           INTEGER PRIMARY KEY,
+    session_id   INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    side         INTEGER NOT NULL CHECK(side IN (0, 1)),   -- 0 left, 1 right
+    t_start_s    REAL    NOT NULL,   -- bin [t_start_s, t_end_s), multiple of 0.125
+    t_end_s      REAL    NOT NULL,
+    accel_dev_g  REAL    NOT NULL,   -- max over the bin of | |a| - 1 g |
+    gyro_dps     REAL    NOT NULL,   -- max over the bin of |omega| (deg/s)
+    n_samples    INTEGER NOT NULL,   -- IMU samples in the bin (5 at 40 Hz)
+    time_source  TEXT    NOT NULL    -- "device" or "host" (see omotion/imu_csv.py)
+);
+CREATE INDEX idx_imu_motion_session_side_time ON imu_motion(session_id, side, t_start_s);
+```
+
+Times share `session_data.timestamp_s`'s per-side zero. Read with
+`ScanDatabase.get_imu_motion(session_id, side=None, t_lo=None, t_hi=None)`
+(or the iterator `iter_imu_motion`), which returns dicts ordered by side then
+time; a time range selects bins overlapping `[t_lo, t_hi]`. The bins reach
+the DB with the corrected rows (and at scan end), and only for sessions the
+sink keeps: an empty session is deleted with its bins.
+
 ### `database_settings`
 
 A tiny key/value table for per-DB settings that have to outlive a single
@@ -328,6 +356,8 @@ Differences from the live `CsvSink` file:
   `0.0` instead of an empty cell.
 - `temp_*` cells are empty for sessions recorded before schema v2
   added `session_data.temp` (issue #221).
+- IMU motion bins (`imu_motion`, schema v3) are not part of the corrected
+  CSV; read them with `ScanDatabase.get_imu_motion`.
 
 Pre-#92 Step F sessions raise `RuntimeError` — their `frame_id` rows
 are all the sentinel `-1`, so the row layout can't be reconstructed.

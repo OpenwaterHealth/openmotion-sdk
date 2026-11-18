@@ -11,6 +11,7 @@ from __future__ import annotations
 import csv
 import logging
 import os
+import threading
 from dataclasses import asdict, dataclass
 from typing import Any, Optional, Protocol, runtime_checkable
 
@@ -615,7 +616,7 @@ class ScanDBSink:
     (~15 s), and an unclean shutdown loses that tail.
     """
 
-    channels = {"final", "diagnostics"}
+    channels = {"final", "diagnostics", "imu_motion"}
 
     # If the scan database can't be opened, abort the scan rather than run
     # it with no durable record (see ScanRunner.CriticalSinkError).
@@ -634,6 +635,13 @@ class ScanDBSink:
         self._rows_written = 0
         self._diag: dict[str, dict] = {}
         self._closed = False
+        # ImuMotionBin events (channel "imu_motion") arrive on the IMU
+        # thread; they are buffered under this lock and written on the
+        # runner thread (_flush / on_complete), so the DB connection is
+        # only ever used from one thread.
+        self._imu_lock = threading.Lock()
+        self._imu_buffer: list = []
+        self._imu_rows_written = 0
 
     def on_scan_start(self, meta: ScanMetadata) -> None:
         from omotion.ScanDatabase import ScanDatabase
@@ -642,6 +650,9 @@ class ScanDBSink:
         self._closed = False
         self._diag = {}
         self._rows_written = 0
+        with self._imu_lock:
+            self._imu_buffer = []
+        self._imu_rows_written = 0
         label = f"{meta.scan_id}_{meta.subject_id}"
         self._db = ScanDatabase(db_path=self._db_path)
         # data_semantics distinguishes final-branch sessions from legacy
@@ -672,6 +683,42 @@ class ScanDBSink:
             self._consume_final(payload)
         elif channel == "diagnostics":
             self._consume_diagnostic(payload)
+        elif channel == "imu_motion":
+            self._consume_imu_motion(payload)
+
+    def _consume_imu_motion(self, b) -> None:
+        """Buffer one ImuMotionBin (called on the IMU thread: no DB here)."""
+        side = self._SIDE_STR_TO_INT.get(getattr(b, "side", None))
+        if side is None or self._closed:
+            return
+        row = {
+            "side": side,
+            "t_start_s": round(float(b.t_start_s), 6),
+            "t_end_s": round(float(b.t_end_s), 6),
+            "accel_dev_g": round(float(b.accel_dev_g), 6),
+            "gyro_dps": round(float(b.gyro_dps), 4),
+            "n_samples": int(b.n_samples),
+            "time_source": str(b.time_source),
+        }
+        with self._imu_lock:
+            self._imu_buffer.append(row)
+
+    def _flush_imu(self) -> None:
+        """Write buffered motion bins (runner thread only)."""
+        if self._db is None or self._session_id is None:
+            return
+        with self._imu_lock:
+            rows, self._imu_buffer = self._imu_buffer, []
+        if not rows:
+            return
+        for r in rows:
+            r["session_id"] = self._session_id
+        try:
+            self._db.insert_imu_motion_rows(rows)
+            self._imu_rows_written += len(rows)
+        except Exception:
+            logger.exception("ScanDBSink: failed to insert %d IMU motion rows",
+                             len(rows))
 
     def on_complete(self) -> None:
         if self._closed:
@@ -693,6 +740,8 @@ class ScanDBSink:
                     )
                     self._db.delete_session(self._session_id)
                 else:
+                    # Session kept: persist the remaining motion bins.
+                    self._flush_imu()
                     if self._diag and self._session_meta is not None:
                         try:
                             self._db.update_session(
@@ -817,3 +866,8 @@ class ScanDBSink:
                 "ScanDBSink: failed to insert %d corrected rows", n
             )
         self._buffer = []
+        # Motion bins ride along once the session holds real data (an empty
+        # session is deleted at scan end, so writing earlier would only
+        # create rows to cascade away).
+        if self._rows_written:
+            self._flush_imu()
