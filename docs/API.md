@@ -217,6 +217,8 @@ class ScanRequest:
     expected_size: int = 32837
     write_corrected_csv: bool = True # opt out when the DB is the system of record
     write_telemetry_csv: bool = True
+    write_camera_telemetry_csv: bool = False         # 1 Hz per-camera sensor telemetry
+    write_imu_csv: bool = False      # per-scan IMU CSV aligned to timestamp_s (below)
     reduced_mode: bool = False       # per-side averaged BFI/BVI instead of per-camera
     sinks: list = field(default_factory=list)        # custom pipeline sinks (§6)
     skip_default_storage: bool = False               # don't auto-inject CSV/DB sinks
@@ -294,6 +296,7 @@ unless the console runs a Factory image.
 | `cancel_scan(join_timeout=5.0)` | User-stop with orderly teardown. |
 | `last_scan_error` (str \| None) | Error from the most recent scan, else `None`. |
 | `last_scan_canceled` (bool) | True if the most recent scan was user-canceled. |
+| `last_imu_csv_path` (str \| None) | IMU CSV of the most recent scan (`write_imu_csv`), else `None`. |
 | `current_scan_label` (str \| None) | `"{scan_id}_{subject_id}"` of the most recent scan — the DB `session_label`, valid as soon as `start_scan` returns. |
 
 `ScanResult` (the per-scan outcome object, surfaced via the legacy callback path
@@ -304,6 +307,16 @@ and the calibration workflow) carries `ok`, `error`, `canceled`,
 
 - **CSV** (if `data_dir` set): corrected, raw (duration-capped), and telemetry
   CSVs, gated by the per-scan flags. Corrected CSV is opt-in when a DB is set.
+- **IMU CSV** (`write_imu_csv=True`, needs `data_dir`, sensor fw >= 1.6.2):
+  `{scan_id}_{subject_id}_imu.csv`, both sides in one file, one row per 40 Hz
+  IMU sample. Columns: `side, imu_frame, timestamp_s, time_source, device_ms,
+  host_time_unix, ax..az, gx..gz, mx..mz` (raw counts), `accel_*_g` (raw/2048),
+  `gyro_*_dps` (raw/16.4), `temp_c`. `timestamp_s` shares the histogram rows'
+  per-side zero: `time_source=device` when the firmware line carries `ms`
+  (same TIM5 clock as histograms, exact), else `host` (host receive time
+  relative to when that side's first histogram sample arrived, ~10-20 ms).
+  Samples before the first histogram get negative times. IMU failures are
+  logged and never abort the scan. Implementation: `omotion/imu_csv.py`.
 - **Scan DB** (if `scan_db_path` set): `session_data` rows per frame — per-camera
   BFI/BVI/mean/contrast/temp in normal mode, or the per-side average (`cam_id=-1`)
   in reduced mode. This is what §5 reads back for replay.

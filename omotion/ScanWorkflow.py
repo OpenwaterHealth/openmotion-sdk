@@ -138,6 +138,12 @@ class ScanRequest:
     # {scan_id}_{subject_id}_{side}_cam{N}_telemetry.csv. Off by default —
     # opt in for drift/thermal/power investigations.
     write_camera_telemetry_csv: bool = False
+    # Per-scan IMU CSV (bloodflow-app#779): streams each active side's IMU
+    # (accel/gyro/mag/temp, 40 Hz) into {scan_id}_{subject_id}_imu.csv with
+    # timestamp_s on the same per-side axis as the histogram rows. Needs a
+    # data_dir and sensor fw >= 1.6.2. Off by default; IMU failures are
+    # logged and never abort the scan. See omotion/imu_csv.py.
+    write_imu_csv: bool = False
     # When True, the pipeline averages all active cameras per side into
     # single left/right BFI/BVI values.  The corrected CSV contains only
     # bfi_left, bfi_right, bvi_left, bvi_right columns.  Uncorrected
@@ -524,6 +530,8 @@ class ScanWorkflow:
         default_sinks: list = [DiagnosticsLogSink()]
         telemetry_writer: Optional[_TelemetryCsvWriter] = None
         camera_telemetry_logger = None  # CameraTelemetryCsvLogger, opt-in (#162)
+        imu_logger = None  # ImuCsvLogger, opt-in (bloodflow-app#779)
+        self._last_imu_csv_path = None
         if not request.skip_default_storage:
             data_dir = getattr(self._interface, "data_dir", None)
             scan_db_path = getattr(self._interface, "scan_db_path", None)
@@ -647,6 +655,35 @@ class ScanWorkflow:
         # starts so the very first start_trigger emits at ~0.
         self._scan_t0_monotonic = time.monotonic()
 
+        # IMU CSV (opt-in, default off): file opened here, stream started
+        # in the worker just before the trigger, stopped in its finally.
+        # Timestamps anchor to each side's first histogram sample via
+        # source.side_t0 (same zero as the scan's timestamp_s).
+        if (request.write_imu_csv and not request.skip_default_storage):
+            data_dir = getattr(self._interface, "data_dir", None)
+            imu_sensors = [
+                (side, s) for side, s in (
+                    ("left", _live_sensor(self._interface.left, request.left_camera_mask)),
+                    ("right", _live_sensor(self._interface.right, request.right_camera_mask)),
+                ) if s is not None
+            ]
+            if data_dir is None:
+                logger.warning("write_imu_csv requested but no data_dir; skipping IMU CSV")
+            elif imu_sensors:
+                imu_path = os.path.join(
+                    data_dir, f"{scan_id}_{request.subject_id}_imu.csv")
+                try:
+                    from omotion.imu_csv import ImuCsvLogger
+                    imu_logger = ImuCsvLogger(
+                        imu_sensors, imu_path,
+                        anchor_fn=getattr(source, "side_t0", None),
+                        fallback_t0_monotonic=self._scan_t0_monotonic,
+                    )
+                    self._last_imu_csv_path = imu_path
+                except Exception:
+                    logger.exception("failed to open IMU CSV %s", imu_path)
+                    imu_logger = None
+
         # ── Spawn worker thread ────────────────────────────────────────────
         def _worker():
             trigger_error = None  # why the trigger did not start, if it did not
@@ -706,6 +743,14 @@ class ScanWorkflow:
                             logger.error(
                                 "Failed to enable camera on %s (mask 0x%02X).", side, mask
                             )
+
+                    # Start the IMU stream before the trigger so samples
+                    # preceding the first histogram get negative times.
+                    if imu_logger is not None and not self._cancel_requested:
+                        try:
+                            imu_logger.start()
+                        except Exception:
+                            logger.exception("IMU CSV start failed; scan continues")
 
                     # (Re)send the trigger config before starting the trigger.
                     # This resets the firmware fsync counter so its laser-skip
@@ -870,6 +915,11 @@ class ScanWorkflow:
                     telemetry_writer.close()
                 if camera_telemetry_logger is not None:
                     camera_telemetry_logger.close()
+                if imu_logger is not None:
+                    try:
+                        imu_logger.stop()
+                    except Exception:
+                        logger.exception("IMU CSV stop failed")
                 if telemetry_feeder is not None:
                     telemetry_feeder.close()
                 with self._lock:
@@ -952,6 +1002,12 @@ class ScanWorkflow:
         """Error message from the most recent scan worker, or None on
         success. Cleared at the start of each new scan."""
         return self._last_scan_error
+
+    @property
+    def last_imu_csv_path(self) -> str | None:
+        """Path of the IMU CSV opened for the most recent scan
+        (``ScanRequest.write_imu_csv``), or None if none was written."""
+        return getattr(self, "_last_imu_csv_path", None)
 
     @property
     def last_scan_canceled(self) -> bool:
