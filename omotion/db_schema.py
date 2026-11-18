@@ -136,30 +136,36 @@ def _migration_002_session_data_temp(conn) -> None:
     _add_column_if_missing(conn, "session_data", "temp", "REAL")
 
 
-def _migration_003_imu_motion(conn) -> None:
-    """Per-scan IMU motion magnitude in 1/8 s bins (bloodflow-app#783):
-    one row per side per bin, written by ScanDBSink from the scan's
-    ImuMotionBin events (ScanRequest.imu_motion). Times are on the
-    session_data timestamp_s axis; [t_start_s, t_end_s)."""
+def _migration_003_imu_frame(conn) -> None:
+    """Per-frame IMU motion (bloodflow-app#783): one row per side per
+    histogram frame, written by ScanDBSink from the scan's ImuFrameMotion
+    events (ScanRequest.imu_motion). Keyed like session_data (frame_id =
+    abs_frame_id, same timestamp_s). Values average the IMU samples since
+    the side's previous frame; NULL when n_samples is 0."""
     conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS imu_motion (
+        CREATE TABLE IF NOT EXISTS imu_frame (
             id           INTEGER PRIMARY KEY,
             session_id   INTEGER NOT NULL REFERENCES sessions(id)
                                   ON DELETE CASCADE,
             side         INTEGER NOT NULL CHECK(side IN (0, 1)),
-            t_start_s    REAL    NOT NULL,
-            t_end_s      REAL    NOT NULL,
-            accel_dev_g  REAL    NOT NULL,
-            gyro_dps     REAL    NOT NULL,
+            frame_id     INTEGER NOT NULL,
+            timestamp_s  REAL    NOT NULL,
             n_samples    INTEGER NOT NULL,
-            time_source  TEXT    NOT NULL
+            accel_dev_g  REAL,
+            gyro_dps     REAL,
+            ax_g         REAL,
+            ay_g         REAL,
+            az_g         REAL,
+            gx_dps       REAL,
+            gy_dps       REAL,
+            gz_dps       REAL
         )
         """
     )
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_imu_motion_session_side_time "
-        "ON imu_motion(session_id, side, t_start_s)"
+        "CREATE INDEX IF NOT EXISTS idx_imu_frame_session_side_time "
+        "ON imu_frame(session_id, side, timestamp_s)"
     )
 
 
@@ -174,8 +180,8 @@ MIGRATIONS: list[tuple[int, str, object]] = [
      _migration_001_baseline),
     (2, "session_data.temp — per-frame camera temperature",
      _migration_002_session_data_temp),
-    (3, "imu_motion — 1/8 s IMU motion magnitude bins",
-     _migration_003_imu_motion),
+    (3, "imu_frame — per-frame IMU motion averages",
+     _migration_003_imu_frame),
 ]
 
 

@@ -544,33 +544,37 @@ class FrameBatch:
         return completed
 
 
-# Runner channel for ImuMotionBin events (bloodflow-app#783).
-IMU_MOTION_CHANNEL = "imu_motion"
+# Runner channel for ImuFrameMotion events (bloodflow-app#783).
+IMU_FRAME_CHANNEL = "imu_frame"
 
 
 @dataclass(frozen=True)
-class ImuMotionBin(BatchEvent):
-    """Peak IMU motion of one side over one 1/8 s bin of the scan's
-    ``timestamp_s`` axis, ``[t_start_s, t_end_s)`` with ``t_start_s`` a
-    multiple of the bin width (omotion.imu_csv.MOTION_BIN_S).
+class ImuFrameMotion(BatchEvent):
+    """One side's IMU motion over one histogram frame interval.
 
-    Produced by ``omotion.imu_csv`` when ``ScanRequest.imu_motion`` (or
-    ``write_imu_csv``) is on. ScanRunner.dispatch_event routes it to the
-    ``"imu_motion"`` channel (IMU_MOTION_CHANNEL), not "diagnostics".
-    Sinks on that channel are called on the IMU consumer thread, not the
-    runner thread: keep ``consume`` quick and thread-safe (emit a Qt
-    signal, append to a locked buffer). Bins arrive in time order per side;
-    a side's bins may lag the histograms by up to a second when samples are
-    held for the histogram anchor.
+    Emitted by ImuFrameStage (``ScanRequest.imu_motion``) for every
+    light/dark frame of a side whose IMU is streaming, keyed like
+    session_data: ``frame_id`` is the frame's ``abs_frame_id`` and
+    ``timestamp_s`` its (repaired) scan time. The values average the IMU
+    samples with ``prev_timestamp_s < t <= timestamp_s`` (the previous frame
+    of the same side; one nominal frame period for the first). The IMU
+    (40 Hz, own clock) and the frames (40 Hz FSIN) are not phase-locked, so
+    ``n_samples`` is usually 1 and sometimes 0 or 2; with 0, every value is
+    None. A rolling average should weight by ``n_samples``.
+
+    ScanRunner.dispatch_event routes it to the ``"imu_frame"`` channel
+    (IMU_FRAME_CHANNEL), on the runner thread like every other channel. It
+    trails the frame by up to ~1 s while the IMU catches up.
     """
-    side:         str      # "left" | "right"
-    t_start_s:    float
-    t_end_s:      float
-    accel_dev_g:  float    # max over the bin of | |a| - 1 g |  (g)
-    gyro_dps:     float    # max over the bin of |omega|  (deg/s, raw, no bias removal)
+    side:         str               # "left" | "right"
+    frame_id:     int               # abs_frame_id (session_data.frame_id)
+    timestamp_s:  float             # session_data.timestamp_s
     n_samples:    int
-    time_source:  str      # "device", or "host" if any sample was host-timed
-
-
-# Alias: the event name used in the app-facing docs.
-ImuMotionEvent = ImuMotionBin
+    accel_dev_g:  Optional[float]   # mean over samples of | |a| - 1 g |  (g)
+    gyro_dps:     Optional[float]   # mean over samples of |omega|  (deg/s)
+    ax_g:         Optional[float]   # mean accel x (g)
+    ay_g:         Optional[float]
+    az_g:         Optional[float]
+    gx_dps:       Optional[float]   # mean gyro x (deg/s, no bias removal)
+    gy_dps:       Optional[float]
+    gz_dps:       Optional[float]

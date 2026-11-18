@@ -30,13 +30,11 @@ the anchor exists, so they get negative times. If a side never produces a
 histogram sample, its held samples fall back to the scan's start time
 (``fallback_t0_monotonic``) with ``time_source=host`` when the logger stops.
 
-Motion magnitude (bloodflow-app#783): each resolved sample also lands in its
-side's 1/8 s bin (``MOTION_BIN_S``, bins aligned to multiples of 0.125 s on
-the same ``timestamp_s`` axis). A bin is emitted as an ``ImuMotionBin`` once
-a sample past its end arrives (the partial last bin at stop) with the bin's
-peak ``accel_dev_g`` and ``gyro_dps`` from ``motion_magnitude``; the app
-applies its own threshold. ``motion_bins_from_imu_csv`` rebuilds the same
-bins from a recorded IMU CSV.
+Per-frame motion (bloodflow-app#783): every resolved sample is also handed
+to ``sample_fn(side, timestamp_s, sample)``; ScanWorkflow wires that to
+``omotion.pipeline.stages.imu_frame.ImuFrameStage``, which averages the
+samples between consecutive histogram frames (``motion_magnitude`` per
+sample). The app does any rolling average and thresholding.
 
 Every failure here is logged and swallowed: the IMU path must never abort or
 stall a scan. Lifecycle mirrors ``CameraTelemetryCsvLogger``: ScanWorkflow
@@ -61,7 +59,6 @@ from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 from omotion import _log_root
-from omotion.pipeline.batch import ImuMotionBin
 
 logger = logging.getLogger(f"{_log_root}.ImuCsv" if _log_root else "ImuCsv")
 
@@ -86,9 +83,6 @@ _DEVICE_ROLLOVER_S: float = (2**32) / 100.0 / 1000.0
 # (and could printf from it), which races camera I2C mid-scan and can wedge
 # the comm interface (sdk#142). Don't start the stream on those.
 MIN_SENSOR_FW_FOR_IMU_STREAM: Tuple[int, int, int] = (1, 6, 2)
-
-# Motion-magnitude bin width (s): 5 samples at the firmware's 40 Hz.
-MOTION_BIN_S: float = 0.125
 
 IMU_CSV_HEADERS: List[str] = [
     "side", "imu_frame", "timestamp_s", "time_source", "device_ms",
@@ -276,90 +270,6 @@ def raw_motion_magnitude(accel_raw: Sequence[int], gyro_raw: Sequence[int],
                             [v / GYRO_LSB_PER_DPS for v in gyro_raw])
 
 
-def motion_bin_index(timestamp_s: float, bin_s: float = MOTION_BIN_S) -> int:
-    """Index of the bin ``[k*bin_s, (k+1)*bin_s)`` holding ``timestamp_s``."""
-    # The epsilon keeps an exact edge (0.375 / 0.125) from rounding down.
-    return math.floor(timestamp_s / bin_s + 1e-9)
-
-
-class MotionBinner:
-    """Folds one side's time-ordered samples into ``bin_s`` bins.
-
-    ``add`` returns the bin a sample completes (the first sample past the
-    open bin's end closes it; bins with no samples are skipped). ``flush``
-    closes the partial last bin.
-    """
-
-    def __init__(self, side: str, bin_s: float = MOTION_BIN_S) -> None:
-        self.side = side
-        self.bin_s = float(bin_s)
-        self._reset()
-
-    def _reset(self) -> None:
-        self._idx: Optional[int] = None
-        self._n = 0
-        self._acc = 0.0
-        self._gyr = 0.0
-        self._host = False
-
-    def add(self, timestamp_s: float, time_source: str,
-            accel_raw: Sequence[int], gyro_raw: Sequence[int],
-            ) -> List[ImuMotionBin]:
-        idx = motion_bin_index(timestamp_s, self.bin_s)
-        out: List[ImuMotionBin] = []
-        if self._idx is not None and idx != self._idx:
-            out = self.flush()
-        if self._idx is None:
-            self._idx = idx
-        acc, gyr = raw_motion_magnitude(accel_raw, gyro_raw)
-        self._n += 1
-        self._acc = max(self._acc, acc)
-        self._gyr = max(self._gyr, gyr)
-        self._host = self._host or time_source != "device"
-        return out
-
-    def flush(self) -> List[ImuMotionBin]:
-        if self._idx is None or self._n == 0:
-            self._reset()
-            return []
-        t0 = self._idx * self.bin_s
-        b = ImuMotionBin(
-            side=self.side, t_start_s=round(t0, 9),
-            t_end_s=round(t0 + self.bin_s, 9),
-            accel_dev_g=self._acc, gyro_dps=self._gyr, n_samples=self._n,
-            time_source="host" if self._host else "device",
-        )
-        self._reset()
-        return [b]
-
-
-def motion_bins_from_imu_csv(path: str, bin_s: float = MOTION_BIN_S,
-                             ) -> List[ImuMotionBin]:
-    """Rebuild the motion bins from a recorded ``*_imu.csv``.
-
-    The same bins, per side, a live scan produced; rows that don't parse are
-    skipped. Sorted by side, then time.
-    """
-    by_side: dict = {}
-    with open(path, newline="", encoding="utf-8") as fh:
-        for r in csv.DictReader(fh):
-            try:
-                by_side.setdefault(r["side"], []).append((
-                    float(r["timestamp_s"]), r["time_source"],
-                    (int(r["ax"]), int(r["ay"]), int(r["az"])),
-                    (int(r["gx"]), int(r["gy"]), int(r["gz"])),
-                ))
-            except (KeyError, TypeError, ValueError):
-                continue
-    bins: List[ImuMotionBin] = []
-    for side in sorted(by_side):
-        binner = MotionBinner(side, bin_s)
-        for ts, src, a, g in sorted(by_side[side], key=lambda x: x[0]):
-            bins.extend(binner.add(ts, src, a, g))
-        bins.extend(binner.flush())
-    return bins
-
-
 def sensor_fw_supports_imu_stream(version: Optional[str]) -> bool:
     """True when the sensor firmware samples the IMU outside the ISR."""
     try:
@@ -384,13 +294,12 @@ class _Side:
         self.fallback_warned = False
         self.rows = 0
         self.device_rows = 0
-        self.binner = MotionBinner(side)
-        self.bins = 0
 
 
 class ImuStreamLogger:
-    """Streams IMU from one or more sensors into a per-sample CSV and/or
-    1/8 s motion bins.
+    """Streams IMU from one or more sensors into a per-sample CSV and/or a
+    per-sample callback (``sample_fn``, which feeds the per-frame motion
+    averages).
 
     ``sensors`` is a sequence of ``(side, MotionSensor)``. ``anchor_fn(side)``
     returns that side's histogram zero as ``(t0_device_s, t0_host_monotonic)``
@@ -398,10 +307,11 @@ class ImuStreamLogger:
     anchors host timestamps for a side that never gets a histogram anchor
     (defaults to the time ``start()`` was called).
 
-    ``path`` is the per-sample CSV, or None for none. ``motion_fn`` (or
-    None) receives every completed ``ImuMotionBin`` on that side's consumer
-    thread, in time order per side; it must not block for long, and an
-    exception from it is logged once and swallowed.
+    ``path`` is the per-sample CSV, or None for none. ``sample_fn`` (or
+    None) is called as ``sample_fn(side, timestamp_s, ImuSample)`` for every
+    sample once its scan time is known, on that side's consumer thread, in
+    time order per side; it must be quick, and an exception from it is
+    logged once and swallowed.
 
     Nothing raises out of ``start()``/``stop()``; failures are logged.
     One USB reader per side feeds both outputs.
@@ -410,11 +320,11 @@ class ImuStreamLogger:
     def __init__(self, sensors: Sequence[Tuple[str, Any]], path: Optional[str],
                  anchor_fn: Optional[AnchorFn] = None,
                  fallback_t0_monotonic: Optional[float] = None,
-                 motion_fn: Optional[Callable[[ImuMotionBin], None]] = None,
+                 sample_fn: Optional[Callable[[str, float, "ImuSample"], None]] = None,
                  ) -> None:
         self.path = path
-        self._motion_fn = motion_fn
-        self._motion_fn_failed = False
+        self._sample_fn = sample_fn
+        self._sample_fn_failed = False
         self._anchor_fn = anchor_fn or (lambda _side: None)
         self._fallback_t0 = fallback_t0_monotonic
         self._sides = [_Side(side, s) for side, s in sensors]
@@ -430,9 +340,9 @@ class ImuStreamLogger:
             self._writer.writerow(IMU_CSV_HEADERS)
             self._fh.flush()
 
-    def set_motion_fn(self, fn: Optional[Callable[[ImuMotionBin], None]]) -> None:
-        """Replace (or with None, detach) the bin callback."""
-        self._motion_fn = fn
+    def set_sample_fn(self, fn: Optional[Callable[[str, float, "ImuSample"], None]]) -> None:
+        """Replace (or with None, detach) the per-sample callback."""
+        self._sample_fn = fn
 
     # ------------------------------------------------------------------
 
@@ -479,8 +389,8 @@ class ImuStreamLogger:
         logger.info("IMU: streaming IMU on %s -> %s", st.side, self.path)
 
     def stop(self) -> None:
-        """Stop streams, flush held samples and the last motion bins, close
-        the file (idempotent; safe to call from several threads)."""
+        """Stop streams, flush held samples, close the file (idempotent;
+        safe to call from several threads)."""
         with self._stop_lock:
             if self._stopped:
                 return
@@ -506,9 +416,8 @@ class ImuStreamLogger:
                 logger.warning("IMU: %s dropped %d malformed IMU line(s)",
                                st.side, st.parser.bad_lines)
             if st.stream is not None or st.rows:
-                logger.info("IMU: %s %d sample(s) (%d device-timed), "
-                            "%d motion bin(s)", st.side, st.rows,
-                            st.device_rows, st.bins)
+                logger.info("IMU: %s %d sample(s) (%d device-timed)",
+                            st.side, st.rows, st.device_rows)
         with self._write_lock:
             if self._fh is not None:
                 try:
@@ -564,8 +473,8 @@ class ImuStreamLogger:
             logger.exception("IMU: write failed on %s", st.side)
 
     def _drain_pending(self, st: _Side, final: bool = False) -> None:
-        """Write every held sample whose timestamp can now be resolved and
-        emit the motion bins it completes (and the open bin when ``final``).
+        """Write (and hand to ``sample_fn``) every held sample whose
+        timestamp can now be resolved.
 
         Without an anchor, samples stay held, except the oldest beyond
         ``_MAX_PENDING`` (and all of them when ``final``), which fall back to
@@ -573,15 +482,7 @@ class ImuStreamLogger:
         """
         with st.lock:
             if not st.pending:
-                tail = st.binner.flush() if final else []
-                st.bins += len(tail)
-                pending = False
-            else:
-                pending = True
-        if not pending:
-            self._emit([], tail)
-            return
-        with st.lock:
+                return
             try:
                 anchor = self._anchor_fn(st.side)
             except Exception:
@@ -596,7 +497,7 @@ class ImuStreamLogger:
                         "IMU: %s has no histogram anchor; %d IMU sample(s) "
                         "timed against scan start instead", st.side, n_fallback)
             rows: List[List[Any]] = []
-            bins: List[ImuMotionBin] = []
+            resolved: List[Tuple[float, ImuSample]] = []
             keep: List[Tuple[ImuSample, float, float]] = []
             for i, (s, host_m, host_u) in enumerate(st.pending):
                 fb = self._fallback_t0 if i < n_fallback else None
@@ -606,34 +507,32 @@ class ImuStreamLogger:
                     continue
                 ts, source = res
                 rows.append(imu_row(st.side, s, ts, source, host_u))
-                bins.extend(st.binner.add(ts, source, s.accel, s.gyro))
+                resolved.append((ts, s))
                 st.rows += 1
                 if source == "device":
                     st.device_rows += 1
             st.pending = keep
-            if final:
-                bins.extend(st.binner.flush())
-            st.bins += len(bins)
             # Deliver under the side lock so a final flush on the stopping
             # thread can't interleave with the consumer: time order per side.
-            self._emit(rows, bins)
+            self._emit(st.side, rows, resolved)
 
-    def _emit(self, rows: List[List[Any]], bins: List[ImuMotionBin]) -> None:
+    def _emit(self, side: str, rows: List[List[Any]],
+              resolved: List[Tuple[float, "ImuSample"]]) -> None:
         if rows and self._fh is not None:
             with self._write_lock:
                 if not self._fh.closed:
                     self._writer.writerows(rows)
                     self._fh.flush()
-        fn = self._motion_fn
+        fn = self._sample_fn
         if fn is None:
             return
-        for b in bins:
+        for ts, sample in resolved:
             try:
-                fn(b)
+                fn(side, ts, sample)
             except Exception:
-                if not self._motion_fn_failed:
-                    self._motion_fn_failed = True
-                    logger.exception("IMU motion callback raised (logged once)")
+                if not self._sample_fn_failed:
+                    self._sample_fn_failed = True
+                    logger.exception("IMU sample callback raised (logged once)")
 
     def __del__(self) -> None:
         try:
@@ -642,5 +541,5 @@ class ImuStreamLogger:
             pass
 
 
-# Original name (bloodflow-app#779); the logger now also produces motion bins.
+# Original name (bloodflow-app#779); the logger also feeds per-frame motion.
 ImuCsvLogger = ImuStreamLogger

@@ -368,10 +368,10 @@ def test_scan_workflow_starts_imu_before_trigger_and_stops_on_cancel(tmp_path):
 
     class _RecLogger:
         def __init__(self, sensors, path, anchor_fn=None, fallback_t0_monotonic=None,
-                     motion_fn=None):
+                     sample_fn=None):
             events.append(("init", [s for s, _ in sensors], path, anchor_fn))
 
-        def set_motion_fn(self, fn):
+        def set_sample_fn(self, fn):
             pass
 
         def start(self):

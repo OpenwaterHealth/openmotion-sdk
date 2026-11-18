@@ -29,9 +29,8 @@ from .batch import (
     TerminalDarkResult,
     PipelineError,
     TimestampMisalignmentWindow,
-    ImuMotionBin,
-    ImuMotionEvent,
-    IMU_MOTION_CHANNEL,
+    ImuFrameMotion,
+    IMU_FRAME_CHANNEL,
 )
 from .pipeline import Pipeline, Stage
 from .tee import Tee
@@ -49,7 +48,7 @@ __all__ = [
     "FrameBatch", "BatchEvent", "IntervalClosed", "LiveEmit",
     "DarkIntegrityWarning", "StencilFallback", "TerminalDarkResult",
     "PipelineError", "TimestampMisalignmentWindow",
-    "ImuMotionBin", "ImuMotionEvent", "IMU_MOTION_CHANNEL",
+    "ImuFrameMotion", "IMU_FRAME_CHANNEL",
     "Pipeline", "Stage", "Tee",
     "ScanRunner", "CriticalSinkError",
     "default_pipeline",

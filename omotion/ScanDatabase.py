@@ -371,50 +371,50 @@ class ScanDatabase:
             yield dict(row)
 
     # ------------------------------------------------------------------
-    # IMU motion (bloodflow-app#783)
+    # Per-frame IMU motion (bloodflow-app#783)
     # ------------------------------------------------------------------
 
-    def insert_imu_motion_rows(self, rows: Sequence[Dict[str, Any]]) -> int:
-        """Insert IMU motion bins. Each row: session_id, side (0 left /
-        1 right), t_start_s, t_end_s, accel_dev_g, gyro_dps, n_samples,
-        time_source. One transaction; returns the number inserted."""
+    _IMU_FRAME_COLUMNS = (
+        "session_id", "side", "frame_id", "timestamp_s", "n_samples",
+        "accel_dev_g", "gyro_dps", "ax_g", "ay_g", "az_g",
+        "gx_dps", "gy_dps", "gz_dps",
+    )
+
+    def insert_imu_frame_rows(self, rows: Sequence[Dict[str, Any]]) -> int:
+        """Insert per-frame IMU rows (keys: ``_IMU_FRAME_COLUMNS``; side is
+        0 left / 1 right; value keys may be None). One transaction; returns
+        the number inserted."""
         params = []
         for row in rows:
             _validate_side(row["side"])
-            params.append((
-                row["session_id"], row["side"],
-                float(row["t_start_s"]), float(row["t_end_s"]),
-                float(row["accel_dev_g"]), float(row["gyro_dps"]),
-                int(row["n_samples"]), str(row["time_source"]),
+            params.append(tuple(
+                row.get(c) if c not in ("session_id", "side", "frame_id",
+                                        "timestamp_s", "n_samples")
+                else row[c]
+                for c in self._IMU_FRAME_COLUMNS
             ))
+        cols = ", ".join(self._IMU_FRAME_COLUMNS)
+        marks = ", ".join("?" for _ in self._IMU_FRAME_COLUMNS)
         self._connection().executemany(
-            """
-            INSERT INTO imu_motion (
-                session_id, side, t_start_s, t_end_s,
-                accel_dev_g, gyro_dps, n_samples, time_source
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            params,
+            f"INSERT INTO imu_frame ({cols}) VALUES ({marks})", params,
         )
         self._connection().commit()
         return len(params)
 
-    def iter_imu_motion(
+    def iter_imu_frames(
         self,
         session_id: int,
         side: Optional[int] = None,
         t_lo: Optional[float] = None,
         t_hi: Optional[float] = None,
     ) -> Iterator[Dict[str, Any]]:
-        """Iterate a session's IMU motion bins, ordered by side then time.
+        """Iterate a session's per-frame IMU rows, ordered by side then time.
 
-        ``side``: 0 (left) / 1 (right) / None (both). ``t_lo``/``t_hi``
-        select bins overlapping [t_lo, t_hi] (a bin [t_start_s, t_end_s)
-        that touches the range is included). Each row is a dict with
-        session_id, side, t_start_s, t_end_s, accel_dev_g, gyro_dps,
-        n_samples, time_source. Empty for sessions recorded without
-        ScanRequest.imu_motion.
+        ``side``: 0 (left) / 1 (right) / None (both); ``t_lo``/``t_hi``:
+        inclusive ``timestamp_s`` range, like ``iter_session_data``. Each
+        row is a dict with the ``_IMU_FRAME_COLUMNS`` keys; the value keys
+        are None when ``n_samples`` is 0. Empty for sessions recorded
+        without ScanRequest.imu_motion.
         """
         clauses = ["session_id = ?"]
         bindings: list[Any] = [session_id]
@@ -423,29 +423,28 @@ class ScanDatabase:
             clauses.append("side = ?")
             bindings.append(side)
         if t_lo is not None:
-            clauses.append("t_end_s > ?")
+            clauses.append("timestamp_s >= ?")
             bindings.append(float(t_lo))
         if t_hi is not None:
-            clauses.append("t_start_s <= ?")
+            clauses.append("timestamp_s <= ?")
             bindings.append(float(t_hi))
         cursor = self._connection().execute(
-            "SELECT session_id, side, t_start_s, t_end_s, accel_dev_g, "
-            "gyro_dps, n_samples, time_source FROM imu_motion WHERE "
-            + " AND ".join(clauses) + " ORDER BY side, t_start_s, id",
+            f"SELECT {', '.join(self._IMU_FRAME_COLUMNS)} FROM imu_frame "
+            f"WHERE {' AND '.join(clauses)} ORDER BY side, timestamp_s, id",
             bindings,
         )
         for row in cursor:
             yield dict(row)
 
-    def get_imu_motion(
+    def get_imu_frames(
         self,
         session_id: int,
         side: Optional[int] = None,
         t_lo: Optional[float] = None,
         t_hi: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
-        """List form of :meth:`iter_imu_motion`."""
-        return list(self.iter_imu_motion(session_id, side, t_lo, t_hi))
+        """List form of :meth:`iter_imu_frames`."""
+        return list(self.iter_imu_frames(session_id, side, t_lo, t_hi))
 
     def delete_session_data(self, session_id: int) -> int:
         cursor = self._connection().execute(

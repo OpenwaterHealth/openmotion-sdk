@@ -144,13 +144,15 @@ class ScanRequest:
     # data_dir and sensor fw >= 1.6.2. Off by default; IMU failures are
     # logged and never abort the scan. See omotion/imu_csv.py.
     write_imu_csv: bool = False
-    # Live IMU motion magnitude (bloodflow-app#783): bins each active side's
-    # IMU into 1/8 s ImuMotionBin events (peak | |a| - 1 g | and peak |omega|)
-    # on the scan's timestamp_s axis, dispatched through the runner on the
-    # "imu_motion" channel and, with a scan DB, stored in its imu_motion
-    # table. Independent of write_imu_csv; either flag starts the one IMU
-    # stream per side. Needs sensor fw >= 1.6.2. Off by default; IMU
-    # failures are logged and never abort the scan.
+    # Per-frame IMU motion (bloodflow-app#783): for every histogram frame of
+    # each active side, average the IMU samples since that side's previous
+    # frame (mean | |a| - 1 g |, mean |omega|, mean axes) into an
+    # ImuFrameMotion event keyed like session_data (frame_id, timestamp_s),
+    # dispatched on the "imu_frame" channel and, with a scan DB, stored in
+    # its imu_frame table. Rolling averages / thresholds are the app's.
+    # Independent of write_imu_csv; either flag starts the one IMU stream
+    # per side. Needs sensor fw >= 1.6.2. Off by default; IMU failures are
+    # logged and never abort the scan.
     imu_motion: bool = False
     # When True, the pipeline averages all active cameras per side into
     # single left/right BFI/BVI values.  The corrected CSV contains only
@@ -303,7 +305,8 @@ class ScanWorkflow:
 
         # The running scan's IMU logger (ScanRequest.write_imu_csv /
         # imu_motion), or None. Stopped by _stop_imu before the source
-        # closes, so its last bins still reach the sinks.
+        # closes, so its last samples reach ImuFrameStage before the
+        # pipeline's final flush.
         self._imu_logger = None
 
         # Set by the worker thread's finally block. Callers (notably
@@ -670,8 +673,8 @@ class ScanWorkflow:
         self._scan_t0_monotonic = time.monotonic()
 
         # IMU stream (opt-in, default off): one reader per side feeding the
-        # per-sample CSV (write_imu_csv) and/or the 1/8 s motion bins
-        # (imu_motion). Built here, started in the worker just before the
+        # per-sample CSV (write_imu_csv) and/or ImuFrameStage's per-frame
+        # averages (imu_motion). Built here, started in the worker just before the
         # trigger, stopped by _stop_imu before the source closes (backstop
         # in the worker's finally). Timestamps anchor to each side's first
         # histogram sample via source.side_t0 (same zero as timestamp_s).
@@ -691,18 +694,20 @@ class ScanWorkflow:
                 ) if s is not None
             ]
             if imu_sensors:
-                runner = self._runner
-
-                def _dispatch_motion(b, _runner=runner):
-                    _runner.dispatch_event(b)
-
+                imu_stage = None
+                if request.imu_motion:
+                    # Last stage: sees post-repair timestamps and emits its
+                    # ImuFrameMotion events with the batch (runner thread).
+                    from omotion.pipeline.stages.imu_frame import ImuFrameStage
+                    imu_stage = ImuFrameStage()
+                    self._runner.pipeline.stages.append(imu_stage)
                 try:
                     from omotion.imu_csv import ImuStreamLogger
                     imu_logger = ImuStreamLogger(
                         imu_sensors, imu_path,
                         anchor_fn=getattr(source, "side_t0", None),
                         fallback_t0_monotonic=self._scan_t0_monotonic,
-                        motion_fn=_dispatch_motion if request.imu_motion else None,
+                        sample_fn=imu_stage.add_sample if imu_stage else None,
                     )
                     self._imu_logger = imu_logger
                     self._last_imu_csv_path = imu_path
@@ -884,8 +889,8 @@ class ScanWorkflow:
                                 "disable_camera(%s) raised in duration guard",
                                 side, exc_info=True,
                             )
-                    # Before source.close(): the runner is still live, so
-                    # the IMU's final motion bins reach the sinks.
+                    # Before source.close(): the IMU's last samples must
+                    # reach ImuFrameStage before the pipeline's final flush.
                     t_imu = time.monotonic()
                     self._stop_imu()
                     time.sleep(max(0.0, 0.35 - (time.monotonic() - t_imu)))
@@ -947,9 +952,8 @@ class ScanWorkflow:
                     camera_telemetry_logger.close()
                 if imu_logger is not None:
                     # Backstop for paths that skipped _stop_imu. The runner
-                    # has finished, so detach the bin callback first: sinks
-                    # are complete and must not receive late events.
-                    imu_logger.set_motion_fn(None)
+                    # has finished, so detach the stage first.
+                    imu_logger.set_sample_fn(None)
                     try:
                         imu_logger.stop()
                     except Exception:
