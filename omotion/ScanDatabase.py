@@ -272,6 +272,9 @@ class ScanDatabase:
         mean: Optional[float] = None,
         temp: Optional[float] = None,
         quality: str = "ok",
+        imu_n_samples: Optional[int] = None,
+        imu_accel_dev_g: Optional[float] = None,
+        imu_gyro_dps: Optional[float] = None,
     ) -> int:
         # frame_id defaults to the "unknown" sentinel (-1) so callers from
         # before #92 Step F still work; new callers (ScanDBSink) pass the
@@ -282,9 +285,10 @@ class ScanDatabase:
             """
             INSERT INTO session_data (
                 session_id, cam_id, side,
-                frame_id, timestamp_s, bfi, bvi, contrast, mean, temp, quality
+                frame_id, timestamp_s, bfi, bvi, contrast, mean, temp, quality,
+                imu_n_samples, imu_accel_dev_g, imu_gyro_dps
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 session_id,
@@ -298,6 +302,9 @@ class ScanDatabase:
                 mean,
                 temp,
                 quality,
+                imu_n_samples,
+                imu_accel_dev_g,
+                imu_gyro_dps,
             ),
         )
         self._connection().commit()
@@ -320,6 +327,9 @@ class ScanDatabase:
                     row.get("mean"),
                     row.get("temp"),
                     row.get("quality", "ok"),
+                    row.get("imu_n_samples"),
+                    row.get("imu_accel_dev_g"),
+                    row.get("imu_gyro_dps"),
                 )
             )
 
@@ -327,9 +337,10 @@ class ScanDatabase:
             """
             INSERT INTO session_data (
                 session_id, cam_id, side,
-                frame_id, timestamp_s, bfi, bvi, contrast, mean, temp, quality
+                frame_id, timestamp_s, bfi, bvi, contrast, mean, temp, quality,
+                imu_n_samples, imu_accel_dev_g, imu_gyro_dps
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             params,
         )
@@ -374,32 +385,6 @@ class ScanDatabase:
     # Per-frame IMU motion (bloodflow-app#783)
     # ------------------------------------------------------------------
 
-    _IMU_FRAME_COLUMNS = (
-        "session_id", "side", "frame_id", "timestamp_s", "n_samples",
-        "accel_dev_g", "gyro_dps",
-    )
-
-    def insert_imu_frame_rows(self, rows: Sequence[Dict[str, Any]]) -> int:
-        """Insert per-frame IMU rows (keys: ``_IMU_FRAME_COLUMNS``; side is
-        0 left / 1 right; value keys may be None). One transaction; returns
-        the number inserted."""
-        params = []
-        for row in rows:
-            _validate_side(row["side"])
-            params.append(tuple(
-                row.get(c) if c not in ("session_id", "side", "frame_id",
-                                        "timestamp_s", "n_samples")
-                else row[c]
-                for c in self._IMU_FRAME_COLUMNS
-            ))
-        cols = ", ".join(self._IMU_FRAME_COLUMNS)
-        marks = ", ".join("?" for _ in self._IMU_FRAME_COLUMNS)
-        self._connection().executemany(
-            f"INSERT INTO imu_frame ({cols}) VALUES ({marks})", params,
-        )
-        self._connection().commit()
-        return len(params)
-
     def iter_imu_frames(
         self,
         session_id: int,
@@ -407,15 +392,17 @@ class ScanDatabase:
         t_lo: Optional[float] = None,
         t_hi: Optional[float] = None,
     ) -> Iterator[Dict[str, Any]]:
-        """Iterate a session's per-frame IMU rows, ordered by side then time.
+        """Iterate a session's per-frame IMU motion, one row per (side,
+        frame_id), ordered by side then time.
 
-        ``side``: 0 (left) / 1 (right) / None (both); ``t_lo``/``t_hi``:
-        inclusive ``timestamp_s`` range, like ``iter_session_data``. Each
-        row is a dict with the ``_IMU_FRAME_COLUMNS`` keys; the value keys
-        are None when ``n_samples`` is 0. Empty for sessions recorded
-        without ScanRequest.imu_motion.
+        Read from session_data's ``imu_*`` columns (every camera row of a
+        side/frame carries the same values; this collapses them). ``side``:
+        0 (left) / 1 (right) / None; ``t_lo``/``t_hi``: inclusive
+        ``timestamp_s`` range. Keys: session_id, side, frame_id, timestamp_s,
+        n_samples, accel_dev_g, gyro_dps (the last two None when n_samples is
+        0). Empty for sessions recorded without ScanRequest.imu_motion.
         """
-        clauses = ["session_id = ?"]
+        clauses = ["session_id = ?", "imu_n_samples IS NOT NULL"]
         bindings: list[Any] = [session_id]
         if side is not None:
             _validate_side(side)
@@ -428,8 +415,11 @@ class ScanDatabase:
             clauses.append("timestamp_s <= ?")
             bindings.append(float(t_hi))
         cursor = self._connection().execute(
-            f"SELECT {', '.join(self._IMU_FRAME_COLUMNS)} FROM imu_frame "
-            f"WHERE {' AND '.join(clauses)} ORDER BY side, timestamp_s, id",
+            "SELECT session_id, side, frame_id, MIN(timestamp_s) AS timestamp_s, "
+            "MAX(imu_n_samples) AS n_samples, MAX(imu_accel_dev_g) AS accel_dev_g, "
+            "MAX(imu_gyro_dps) AS gyro_dps FROM session_data "
+            f"WHERE {' AND '.join(clauses)} "
+            "GROUP BY side, frame_id ORDER BY side, timestamp_s",
             bindings,
         )
         for row in cursor:

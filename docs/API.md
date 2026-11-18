@@ -476,9 +476,11 @@ the IMU samples since that side's previous frame of the two magnitudes:
 with 0 every value is `None`. Weight any rolling average by `n_samples`. The
 SDK does no smoothing or thresholding; that is the app's. Events trail their
 frame by up to ~1 s while the IMU catches up. The per-sample math is
-`omotion.imu_csv.motion_magnitude(accel_g, gyro_dps)`; with a scan DB the
-rows are stored in `imu_frame` and read back with
-`ScanDatabase.get_imu_frames` (see ScanDatabase.md).
+`omotion.imu_csv.motion_magnitude(accel_g, gyro_dps)`. The same per-frame
+values are stamped onto the corrected frames (`imu_n_samples`,
+`imu_accel_dev_g`, `imu_gyro_dps`) and so stored on the `session_data` rows;
+`ScanDatabase.get_imu_frames` reads them back one row per side/frame (see
+ScanDatabase.md).
 
 A
 sink whose `on_scan_start` raises is disabled for the scan unless it sets

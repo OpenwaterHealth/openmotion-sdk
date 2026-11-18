@@ -148,8 +148,9 @@ class ScanRequest:
     # each active side, average the IMU samples since that side's previous
     # frame (mean | |a| - 1 g |, mean |omega|) into an
     # ImuFrameMotion event keyed like session_data (frame_id, timestamp_s),
-    # dispatched on the "imu_frame" channel and, with a scan DB, stored in
-    # its imu_frame table. Rolling averages / thresholds are the app's.
+    # dispatched live on the "imu_frame" channel and stamped onto the
+    # corrected frames, so a scan DB stores it in session_data's imu_*
+    # columns. Rolling averages / thresholds are the app's.
     # Independent of write_imu_csv; either flag starts the one IMU stream
     # per side. Needs sensor fw >= 1.6.2. Off by default; IMU failures are
     # logged and never abort the scan.

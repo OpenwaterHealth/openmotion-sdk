@@ -136,32 +136,17 @@ def _migration_002_session_data_temp(conn) -> None:
     _add_column_if_missing(conn, "session_data", "temp", "REAL")
 
 
-def _migration_003_imu_frame(conn) -> None:
-    """Per-frame IMU motion (bloodflow-app#783): one row per side per
-    histogram frame, written by ScanDBSink from the scan's ImuFrameMotion
-    events (ScanRequest.imu_motion). Keyed like session_data (frame_id =
-    abs_frame_id, same timestamp_s). Values average the IMU samples since
-    the side's previous frame (accelerometer and gyroscope magnitudes
-    only); NULL when n_samples is 0."""
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS imu_frame (
-            id           INTEGER PRIMARY KEY,
-            session_id   INTEGER NOT NULL REFERENCES sessions(id)
-                                  ON DELETE CASCADE,
-            side         INTEGER NOT NULL CHECK(side IN (0, 1)),
-            frame_id     INTEGER NOT NULL,
-            timestamp_s  REAL    NOT NULL,
-            n_samples    INTEGER NOT NULL,
-            accel_dev_g  REAL,
-            gyro_dps     REAL
-        )
-        """
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_imu_frame_session_side_time "
-        "ON imu_frame(session_id, side, timestamp_s)"
-    )
+def _migration_003_session_data_imu(conn) -> None:
+    """Per-frame IMU motion on the scan rows (bloodflow-app#783): the mean
+    accelerometer and gyroscope magnitudes of the frame's side over the IMU
+    samples since that side's previous frame, stamped by ImuFrameStage
+    (ScanRequest.imu_motion). Every camera row of a side/frame carries the
+    same values. NULL on rows of scans recorded without the IMU and on all
+    pre-migration rows; imu_n_samples = 0 with NULL values when no sample
+    landed in the frame."""
+    _add_column_if_missing(conn, "session_data", "imu_n_samples", "INTEGER")
+    _add_column_if_missing(conn, "session_data", "imu_accel_dev_g", "REAL")
+    _add_column_if_missing(conn, "session_data", "imu_gyro_dps", "REAL")
 
 
 # (version, description, function) — ordered, append-only.
@@ -175,8 +160,8 @@ MIGRATIONS: list[tuple[int, str, object]] = [
      _migration_001_baseline),
     (2, "session_data.temp — per-frame camera temperature",
      _migration_002_session_data_temp),
-    (3, "imu_frame — per-frame IMU motion averages",
-     _migration_003_imu_frame),
+    (3, "session_data IMU columns — per-frame motion magnitudes",
+     _migration_003_session_data_imu),
 ]
 
 

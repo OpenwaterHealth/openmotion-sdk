@@ -21,8 +21,18 @@ side's newest frame (IMU late or stopped), or at scan stop. A side that
 never delivers an IMU sample (no IMU stream, old firmware) emits nothing.
 Warmup and stale frames are skipped, like the live tee.
 
-Placed last in the pipeline, so ``timestamp_s`` is post-repair. It only
-reads the batch; a failure here is logged and never drops the batch.
+Stamping the corrected record: every ``IntervalClosed`` event in the batch
+(the dark-corrected frames bound for the "final" channel, ~15 s after
+capture, and the reduced-mode side-average intervals) gets each frame's
+``imu_n_samples`` / ``imu_accel_dev_g`` / ``imu_gyro_dps`` set from the same
+per-frame result, keyed by (side, abs_frame_id). ScanDBSink writes them into
+session_data, so the IMU sits on the scan rows themselves. Frames of the
+interval still waiting for the IMU are averaged then with what has arrived;
+frames of a side without IMU stay None. Nothing is delayed for the IMU.
+
+Placed last in the pipeline, so ``timestamp_s`` is post-repair and every
+stage's IntervalClosed events are already in ``batch.events``. A failure
+here is logged and never drops the batch.
 """
 
 from __future__ import annotations
@@ -37,12 +47,16 @@ import numpy as np
 from omotion import _log_root
 from omotion.imu_csv import ACCEL_LSB_PER_G, GYRO_LSB_PER_DPS, motion_magnitude
 
-from ..batch import FrameBatch, ImuFrameMotion
+from ..batch import FrameBatch, ImuFrameMotion, IntervalClosed
 
 logger = logging.getLogger(
     f"{_log_root}.ImuFrameStage" if _log_root else "ImuFrameStage")
 
 _SIDE_NAMES = {0: "left", 1: "right"}
+# Per-frame results kept for stamping: frames this far (in frames) behind the
+# side's newest stamped frame are dropped. Intervals close ~15 s (600
+# frames) after capture; 2400 leaves ample margin.
+_RESULT_KEEP_FRAMES = 2400
 _SKIP_FRAME_TYPES = {"warmup", "stale"}
 
 # One IMU sample: (t, accel_dev_g, gyro_dps)
@@ -95,19 +109,27 @@ class ImuFrameStage:
             self._watermark: Dict[str, float] = {}
         self._pending: Dict[str, Dict[int, float]] = {}
         self._last: Dict[str, Tuple[int, float]] = {}
+        # (side, abs_frame_id) -> (n_samples, accel_dev_g, gyro_dps)
+        self._results: Dict[Tuple[str, int],
+                            Tuple[int, Optional[float], Optional[float]]] = {}
         self.emitted = 0
+        self.stamped = 0
 
     def process(self, batch: FrameBatch) -> FrameBatch:
         try:
             self._ingest(batch)
-            batch.events.extend(self._emit_ready(final=False))
+            out = self._emit_ready(final=False)
+            out += self._stamp_intervals(batch.events)
+            batch.events.extend(out)
         except Exception:
             logger.exception("ImuFrameStage: failed on a batch; skipped")
         return batch
 
     def on_scan_stop(self, batch: FrameBatch) -> None:
         try:
-            batch.events.extend(self._emit_ready(final=True))
+            out = self._emit_ready(final=True)
+            self._stamp_intervals(batch.events)
+            batch.events.extend(out)
         except Exception:
             logger.exception("ImuFrameStage: final flush failed")
 
@@ -133,7 +155,42 @@ class ImuFrameStage:
                 continue                       # already emitted (late row)
             self._pending.setdefault(side, {}).setdefault(fid, t)
 
-    def _emit_ready(self, final: bool) -> List[ImuFrameMotion]:
+    def _stamp_intervals(self, events) -> List[ImuFrameMotion]:
+        """Set the IMU fields on every frame of the IntervalClosed events in
+        ``events``. Returns the ImuFrameMotion events of frames that had to
+        be averaged early (still waiting for the IMU) to stamp them."""
+        intervals = [getattr(e.corrected_batch, "frames", None)
+                     for e in events if isinstance(e, IntervalClosed)]
+        intervals = [fr for fr in intervals if fr]
+        if not intervals:
+            return []
+        upto: Dict[str, float] = {}
+        for frames in intervals:
+            for f in frames:
+                side, t = getattr(f, "side", None), getattr(f, "t", None)
+                if side in self._pending and t is not None:
+                    upto[side] = max(upto.get(side, t), float(t))
+        out = self._emit_ready(final=False, force_upto=upto)
+        newest: Dict[str, int] = {}
+        for frames in intervals:
+            for f in frames:
+                key = (getattr(f, "side", None), getattr(f, "abs_frame_id", None))
+                r = self._results.get(key)
+                if r is None:
+                    continue
+                f.imu_n_samples, f.imu_accel_dev_g, f.imu_gyro_dps = r
+                self.stamped += 1
+                newest[key[0]] = max(newest.get(key[0], key[1]), key[1])
+        if newest:
+            self._results = {
+                k: v for k, v in self._results.items()
+                if k[1] >= newest.get(k[0], k[1]) - _RESULT_KEEP_FRAMES
+            }
+        return out
+
+    def _emit_ready(self, final: bool,
+                    force_upto: Optional[Dict[str, float]] = None,
+                    ) -> List[ImuFrameMotion]:
         out: List[ImuFrameMotion] = []
         for side, frames in self._pending.items():
             if not frames:
@@ -142,10 +199,12 @@ class ImuFrameStage:
                 wm = self._watermark.get(side)
             order = sorted(frames)
             newest_t = max(frames.values())
+            force_t = (force_upto or {}).get(side)
             for fid in order:
                 t = frames[fid]
                 ready = (final or (wm is not None and wm >= t)
-                         or newest_t - t > self._lag_s)
+                         or newest_t - t > self._lag_s
+                         or (force_t is not None and t <= force_t))
                 if not ready:
                     break
                 del frames[fid]
@@ -166,4 +225,6 @@ class ImuFrameStage:
                 if s[0] > lo:
                     picked.append(s)
         self._last[side] = (fid, t)
-        return average_imu_samples(side, fid, t, picked)
+        ev = average_imu_samples(side, fid, t, picked)
+        self._results[(side, fid)] = (ev.n_samples, ev.accel_dev_g, ev.gyro_dps)
+        return ev

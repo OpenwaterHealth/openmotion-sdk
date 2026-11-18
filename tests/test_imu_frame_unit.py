@@ -3,9 +3,10 @@
 Covers the pure magnitude function, ImuFrameStage's join of IMU samples to
 histogram frames (sample windows, 0/2-sample frames, waiting for the IMU,
 the lag and final flushes, skipped frame types, sides without an IMU), the
-runner's "imu_frame" routing, ScanDBSink persistence + ScanDatabase reads
-(plain and SQLCipher), the schema migration of older databases, and the
-ScanWorkflow wiring of ScanRequest.imu_motion.
+stamping of closing intervals, the runner's "imu_frame" routing, the IMU
+columns on session_data (ScanDBSink writes, get_imu_frames reads; plain and
+SQLCipher), the schema migration of older databases, and the ScanWorkflow
+wiring of ScanRequest.imu_motion.
 """
 import shutil
 import sqlite3
@@ -217,32 +218,92 @@ def test_runner_routes_frames_to_imu_frame_channel_only():
     assert sink.got == [("imu_frame", e)] and diag.got == []
 
 
+# ── stamping the corrected record ─────────────────────────────────────────
+
+def _cframe(side, fid, cam, t=None):
+    from omotion.pipeline.stages.dark import EnrichedCorrectedFrame
+    return EnrichedCorrectedFrame(abs_frame_id=fid, t=(0.025 * fid if t is None else t),
+                                  side=side, cam_id=cam, mean=100.0, std=2.0,
+                                  contrast=0.02, bfi=4.0, bvi=6.0, quality="ok")
+
+
+def _closing(frames):
+    from omotion.pipeline.batch import IntervalClosed
+    from omotion.pipeline.stages.dark import EnrichedCorrectedInterval
+    return IntervalClosed(corrected_batch=EnrichedCorrectedInterval(
+        left_abs=0, right_abs=600, frames=frames))
+
+
+def test_closing_interval_frames_are_stamped_per_side_and_frame():
+    st = ImuFrameStage()
+    st.add_sample("left", 0.010, _sample(gx=164))            # frame 1: 10 dps
+    st.add_sample("left", 0.030, _sample(az=2048 + 1024))     # frame 2: 0.5 g
+    st.add_sample("left", 0.100, _sample())
+    st.process(_batch(_frames(0, [1, 2, 3]) + _frames(1, [1, 2, 3])))
+    frames = [_cframe(s, f, c) for s in ("left", "right") for f in (1, 2, 3) for c in (1, 2)]
+    b = _batch([])
+    b.events.append(_closing(frames))
+    st.process(b)
+    left = {(f.abs_frame_id, f.cam_id): f for f in frames if f.side == "left"}
+    for cam in (1, 2):                                          # cameras share values
+        assert (left[(1, cam)].imu_n_samples, left[(1, cam)].imu_gyro_dps) == \
+            (1, pytest.approx(10.0))
+        assert left[(2, cam)].imu_accel_dev_g == pytest.approx(0.5)
+        assert (left[(3, cam)].imu_n_samples, left[(3, cam)].imu_accel_dev_g) == (0, None)
+    right = [f for f in frames if f.side == "right"]
+    assert all(f.imu_n_samples is None for f in right)          # no IMU on that side
+    assert st.stamped == 6
+
+
+def test_frames_still_waiting_for_the_imu_are_averaged_when_their_interval_closes():
+    st = ImuFrameStage(lag_s=10.0)
+    st.add_sample("left", 0.020, _sample(gx=328))
+    b = _batch(_frames(0, [1, 2]))
+    assert _events(st.process(b)) == []                         # IMU behind frame 1
+    frames = [_cframe("left", 1, 1), _cframe("left", 2, 1)]
+    b2 = _batch([])
+    b2.events.append(_closing(frames))
+    out = _events(st.process(b2))
+    assert [e.frame_id for e in out] == [1, 2]                  # forced, still sent live
+    assert frames[0].imu_gyro_dps == pytest.approx(20.0) and frames[1].imu_n_samples == 0
+
+
+def test_scan_stop_stamps_the_terminal_interval():
+    st = ImuFrameStage()
+    st.add_sample("right", 0.010, _sample(gx=164))
+    st.process(_batch(_frames(1, [1])))
+    f = _cframe("right", 1, -1)                                 # reduced-mode side row
+    flush = _batch([])
+    flush.events.append(_closing([f]))
+    st.on_scan_stop(flush)
+    assert (f.imu_n_samples, f.imu_gyro_dps) == (1, pytest.approx(10.0))
+
+
 # ── ScanDBSink + ScanDatabase ─────────────────────────────────────────────
 
-def _meta():
+def _meta(reduced=False):
     from omotion.pipeline.sinks import ScanMetadata
     return ScanMetadata(scan_id="s", subject_id="subj", operator="op",
                         started_at_iso="2026-11-18T00:00:00Z", duration_sec=10,
-                        left_camera_mask=1, right_camera_mask=1, reduced_mode=False)
+                        left_camera_mask=1, right_camera_mask=1, reduced_mode=reduced)
 
 
-def _final_interval():
-    from omotion.pipeline.stages.dark import (
-        EnrichedCorrectedFrame, EnrichedCorrectedInterval,
-    )
-    f = EnrichedCorrectedFrame(abs_frame_id=1, t=0.025, side="left", cam_id=0,
-                               mean=100.0, std=2.0, contrast=0.02, bfi=4.0,
-                               bvi=6.0, quality="ok", temp_c=None)
-    return EnrichedCorrectedInterval(left_abs=0, right_abs=600, frames=[f])
+def _stamped(side, fid, cam, n=1, acc=0.1, gyr=2.0):
+    f = _cframe(side, fid, cam)
+    if n is not None:
+        f.imu_n_samples = n
+        f.imu_accel_dev_g = None if n == 0 else acc
+        f.imu_gyro_dps = None if n == 0 else gyr
+    return f
 
 
-def _record(db_path, events):
+def _record(db_path, frames, reduced=False):
     from omotion.pipeline.sinks import ScanDBSink
+    from omotion.pipeline.stages.dark import EnrichedCorrectedInterval
     sink = ScanDBSink(db_path=str(db_path))
-    sink.on_scan_start(_meta())
-    for e in events:
-        sink.consume("imu_frame", e)
-    sink.consume("final", _final_interval())
+    sink.on_scan_start(_meta(reduced))
+    sink.consume("final", EnrichedCorrectedInterval(left_abs=0, right_abs=600,
+                                                    frames=frames))
     sink.on_complete()
 
 
@@ -250,65 +311,76 @@ _KEYS = {"session_id", "side", "frame_id", "timestamp_s", "n_samples",
          "accel_dev_g", "gyro_dps"}
 
 
-def test_db_sink_persists_frames_and_getter_filters(tmp_path):
+def test_imu_values_are_stored_on_the_session_data_rows(tmp_path):
     db_path = tmp_path / "scans.db"
-    evs = ([_ev("left", f, 0.025 * f, n=f % 3, acc=0.01 * f) for f in range(1, 9)]
-           + [_ev("right", 1, 0.025, gyr=30.0)])
-    _record(db_path, evs)
+    frames = ([_stamped("left", f, c, n=f % 3, acc=0.01 * f) for f in range(1, 9)
+               for c in (0, 1)]
+              + [_stamped("right", 1, 0, gyr=30.0), _stamped("right", 2, 0, n=None)])
+    _record(db_path, frames)
+    con = sqlite3.connect(db_path)
+    try:
+        rows = con.execute(
+            "SELECT side, frame_id, cam_id, imu_n_samples, imu_accel_dev_g, imu_gyro_dps "
+            "FROM session_data ORDER BY side, frame_id, cam_id").fetchall()
+    finally:
+        con.close()
+    assert len(rows) == 18                                      # IMU on the scan rows
+    by = {(r[0], r[1], r[2]): r[3:] for r in rows}
+    assert by[(0, 4, 0)] == by[(0, 4, 1)] == (1, 0.04, 2.0)     # cameras share values
+    assert by[(0, 3, 0)] == (0, None, None)                     # no sample in frame
+    assert by[(1, 2, 0)] == (None, None, None)                  # no IMU at all
     with ScanDatabase(db_path=str(db_path)) as db:
         sid = next(db.iter_sessions())["id"]
-        rows = db.get_imu_frames(sid)
-        assert len(rows) == len(evs) and set(rows[0]) == _KEYS
-        left = db.get_imu_frames(sid, side=0)
-        assert [r["frame_id"] for r in left] == list(range(1, 9))
-        zero = [r for r in left if r["n_samples"] == 0]
-        assert zero and all(r["accel_dev_g"] is None and r["gyro_dps"] is None
-                            for r in zero)
+        out = db.get_imu_frames(sid)
+        assert set(out[0]) == _KEYS
+        assert [(r["side"], r["frame_id"]) for r in out] == \
+            [(0, f) for f in range(1, 9)] + [(1, 1)]            # one per side/frame
         assert db.get_imu_frames(sid, side=1)[0]["gyro_dps"] == 30.0
+        zero = [r for r in out if r["n_samples"] == 0]
+        assert zero and all(r["accel_dev_g"] is None and r["gyro_dps"] is None for r in zero)
         win = db.get_imu_frames(sid, side=0, t_lo=0.05, t_hi=0.1)   # inclusive
         assert [r["frame_id"] for r in win] == [2, 3, 4]
         assert list(db.iter_imu_frames(sid, t_lo=10.0)) == []
 
 
-def test_db_sink_drops_rows_with_an_empty_session(tmp_path):
-    from omotion.pipeline.sinks import ScanDBSink
+def test_reduced_mode_side_rows_carry_the_imu(tmp_path):
     db_path = tmp_path / "scans.db"
-    sink = ScanDBSink(db_path=str(db_path))
-    sink.on_scan_start(_meta())
-    sink.consume("imu_frame", _ev())
-    sink.on_complete()
-    con = sqlite3.connect(db_path)
-    try:
-        assert con.execute("SELECT count(*) FROM sessions").fetchone()[0] == 0
-        assert con.execute("SELECT count(*) FROM imu_frame").fetchone()[0] == 0
-    finally:
-        con.close()
+    _record(db_path, [_stamped("left", 1, -1, gyr=12.5)], reduced=True)
+    with ScanDatabase(db_path=str(db_path)) as db:
+        sid = next(db.iter_sessions())["id"]
+        (r,) = db.get_imu_frames(sid)
+        assert (r["side"], r["frame_id"], r["gyro_dps"]) == (0, 1, 12.5)
 
 
-def test_deleting_a_session_cascades_to_its_frames(tmp_path):
+def test_deleting_a_session_deletes_its_imu_values(tmp_path):
     db_path = tmp_path / "scans.db"
-    _record(db_path, [_ev()])
+    _record(db_path, [_stamped("left", 1, 0)])
     with ScanDatabase(db_path=str(db_path)) as db:
         sid = next(db.iter_sessions())["id"]
         assert db.delete_session(sid)
         assert db.get_imu_frames(sid) == []
 
 
-_COLS = {"id"} | _KEYS
+_IMU_COLS = {"imu_n_samples", "imu_accel_dev_g", "imu_gyro_dps"}
 
 
-def test_v0_database_migrates_to_imu_frame(tmp_path):
+def test_v0_database_gains_the_imu_columns(tmp_path):
     dest = tmp_path / "scans.db"
     shutil.copy2(FIXTURE, dest)
     with ScanDatabase(db_path=str(dest)) as db:
         conn = db._connection()
         assert db_schema.current_version(conn) == db_schema.SCHEMA_VERSION == 3
-        cols = {r[1] for r in conn.execute("PRAGMA table_info('imu_frame')")}
-        assert cols == _COLS
+        cols = {r[1] for r in conn.execute("PRAGMA table_info('session_data')")}
+        assert _IMU_COLS <= cols
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        assert not {"imu_frame", "imu_motion"} & tables
         assert conn.execute("SELECT count(*) FROM session_data").fetchone()[0] == 200
+        sid = conn.execute("SELECT session_id FROM session_data LIMIT 1").fetchone()[0]
+        assert db.get_imu_frames(sid) == []                     # old rows: no IMU
 
 
-def test_v2_database_gains_imu_frame(tmp_path):
+def test_v2_database_gains_the_imu_columns(tmp_path):
     path = tmp_path / "scans.db"
     con = sqlite3.connect(path)
     for target, _, fn in db_schema.MIGRATIONS[:2]:
@@ -319,10 +391,12 @@ def test_v2_database_gains_imu_frame(tmp_path):
     with ScanDatabase(db_path=str(path)) as db:
         assert db_schema.current_version(db._connection()) == 3
         sid = db.create_session(session_label="x", session_start=0.0)
-        db.insert_imu_frame_rows([{"session_id": sid, "side": 1, "frame_id": 5,
-                                   "timestamp_s": 0.125, "n_samples": 0}])
+        db.insert_session_data(sid, 0, 1, 0.125, frame_id=5, bfi=1.0,
+                               imu_n_samples=2, imu_accel_dev_g=0.03,
+                               imu_gyro_dps=4.5)
         (row,) = db.get_imu_frames(sid)
-        assert row["n_samples"] == 0 and row["gyro_dps"] is None
+        assert (row["side"], row["frame_id"], row["n_samples"], row["gyro_dps"]) == \
+            (1, 5, 2, 4.5)
 
 
 @pytest.fixture
@@ -332,9 +406,9 @@ def clinical(monkeypatch):
     monkeypatch.setattr(db_key, "get_key", lambda *, create=False: FIXED_KEY)
 
 
-def test_frames_round_trip_on_an_encrypted_db(clinical, tmp_path):
+def test_imu_values_round_trip_on_an_encrypted_db(clinical, tmp_path):
     db_path = tmp_path / "scans.db"
-    _record(db_path, [_ev("left", 3, 0.075, acc=0.3)])
+    _record(db_path, [_stamped("left", 3, 0, acc=0.3)])
     with open(db_path, "rb") as fh:
         assert fh.read(16) != b"SQLite format 3\x00"
     with ScanDatabase(db_path=str(db_path)) as db:

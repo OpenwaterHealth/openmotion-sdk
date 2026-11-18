@@ -179,34 +179,32 @@ Notes:
   t0 captures whichever side fires first; the other side's per-row
   timestamp can therefore be offset by a few ms from its sibling's.
 
-### `imu_frame`
+### IMU columns on `session_data`
 
-Schema v3 (bloodflow-app#783). One row per side per histogram frame, written
-by `ScanDBSink` from the scan's `ImuFrameMotion` events when the scan ran with
-`ScanRequest.imu_motion=True`. Empty for every other session.
+Schema v3 (bloodflow-app#783) adds three nullable columns to `session_data`:
 
 ```sql
-CREATE TABLE imu_frame (
-    id           INTEGER PRIMARY KEY,
-    session_id   INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-    side         INTEGER NOT NULL CHECK(side IN (0, 1)),   -- 0 left, 1 right
-    frame_id     INTEGER NOT NULL,   -- abs_frame_id, = session_data.frame_id
-    timestamp_s  REAL    NOT NULL,   -- = session_data.timestamp_s
-    n_samples    INTEGER NOT NULL,   -- IMU samples since the side's previous frame
-    accel_dev_g  REAL,               -- mean of | |a| - 1 g |   (NULL when n_samples = 0)
-    gyro_dps     REAL                -- mean of |omega| (deg/s)
-);
-CREATE INDEX idx_imu_frame_session_side_time ON imu_frame(session_id, side, timestamp_s);
+ALTER TABLE session_data ADD COLUMN imu_n_samples   INTEGER;  -- IMU samples since the side's previous frame
+ALTER TABLE session_data ADD COLUMN imu_accel_dev_g REAL;     -- mean of | |a| - 1 g |  (g)
+ALTER TABLE session_data ADD COLUMN imu_gyro_dps    REAL;     -- mean of |omega|  (deg/s)
 ```
 
-Join to `session_data` on `(session_id, side, frame_id)`. The IMU and the
-frames are not phase-locked, so `n_samples` is usually 1, sometimes 0 or 2;
-weight rolling averages by it. Read with
-`ScanDatabase.get_imu_frames(session_id, side=None, t_lo=None, t_hi=None)` (or
-the iterator `iter_imu_frames`): dicts ordered by side then time, with an
-inclusive `timestamp_s` range. The rows reach the DB with the corrected rows
-(and at scan end), and only for sessions the sink keeps: an empty session is
-deleted with its rows.
+They are filled when the scan ran with `ScanRequest.imu_motion=True`:
+`ImuFrameStage` averages each side's IMU samples per frame and stamps the
+result onto the corrected frames when their dark interval closes, so the
+values travel with the rows `ScanDBSink` writes. The IMU is per sensor
+module, so every camera row of a side/frame carries the same values (in
+reduced mode there is one `cam_id = -1` row per side/frame). The IMU and the
+frames both run at 40 Hz on separate clocks, so `imu_n_samples` is usually 1
+and sometimes 0 or 2; with 0 the two values are NULL. All three are NULL
+for rows of scans recorded without the IMU, rows of a side with no IMU
+stream, and all pre-migration rows.
+
+`ScanDatabase.get_imu_frames(session_id, side=None, t_lo=None, t_hi=None)`
+(or the iterator `iter_imu_frames`) collapses them to one dict per
+`(side, frame_id)`, ordered by side then time, with keys `session_id, side,
+frame_id, timestamp_s, n_samples, accel_dev_g, gyro_dps` and an inclusive
+`timestamp_s` range.
 
 ### `database_settings`
 
@@ -357,8 +355,8 @@ Differences from the live `CsvSink` file:
   `0.0` instead of an empty cell.
 - `temp_*` cells are empty for sessions recorded before schema v2
   added `session_data.temp` (issue #221).
-- Per-frame IMU motion (`imu_frame`, schema v3) is not part of the
-  corrected CSV; read it with `ScanDatabase.get_imu_frames`.
+- The IMU columns (`imu_*`, schema v3) are not part of the corrected CSV;
+  read them with `ScanDatabase.get_imu_frames` or `iter_session_data`.
 
 Pre-#92 Step F sessions raise `RuntimeError` — their `frame_id` rows
 are all the sentinel `-1`, so the row layout can't be reconstructed.
