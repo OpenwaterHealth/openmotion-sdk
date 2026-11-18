@@ -19,7 +19,12 @@ import numpy as np
 import pytest
 
 from omotion import db_key, db_schema
-from omotion.imu_csv import ImuSample, motion_magnitude, raw_motion_magnitude
+import math
+
+from omotion.imu_csv import (
+    ACCEL_BASELINE_WINDOW_S, AccelBaseline, ImuSample, accel_deviation,
+    gyro_magnitude,
+)
 from omotion.pipeline.batch import IMU_FRAME_CHANNEL, FrameBatch, ImuFrameMotion
 from omotion.pipeline.stages.imu_frame import ImuFrameStage, average_imu_samples
 from omotion.ScanDatabase import ScanDatabase
@@ -28,19 +33,66 @@ FIXTURE = Path(__file__).parent / "fixtures" / "legacy_scans_v0.db"
 FIXED_KEY = "a" * 64
 
 
-# ── magnitude ─────────────────────────────────────────────────────────────
+# ── motion measures ───────────────────────────────────────────────────────
 
-def test_motion_magnitude_at_rest_in_any_orientation_is_zero():
-    assert motion_magnitude((0, 0, 1), (0, 0, 0)) == (0.0, 0.0)
-    acc, _ = motion_magnitude((0.6, 0.0, 0.8), (0, 0, 0))
-    assert acc == pytest.approx(0.0, abs=1e-12)
+def _feed(base, t0, t1, fn, rate=40.0):
+    """Feed base with fn(t) -> accel vector at rate Hz over [t0, t1);
+    returns [(t, deviation)]."""
+    out, t = [], t0
+    while t < t1 - 1e-9:
+        out.append((t, base.update(t, fn(t))))
+        t += 1.0 / rate
+    return out
 
 
-def test_motion_magnitude_values():
-    acc, gyr = motion_magnitude((0, 0, 2.0), (3.0, 4.0, 0.0))
-    assert acc == pytest.approx(1.0) and gyr == pytest.approx(5.0)
-    assert raw_motion_magnitude((0, 0, 3072), (164, 0, 0)) == \
-        (pytest.approx(0.5), pytest.approx(10.0))
+def test_tilted_gravity_plus_axis_bias_reads_zero_once_the_window_fills():
+    # Gravity 30 deg off z, plus a +15/-20/+25 mg per-axis offset: |a| != 1 g,
+    # which the old | |a| - 1 | read as ~12 mg of "motion" forever.
+    g = (0.0, math.sin(math.radians(30)), math.cos(math.radians(30)))
+    bias = (0.015, -0.020, 0.025)
+    a = tuple(x + b for x, b in zip(g, bias))
+    assert abs(math.sqrt(sum(v * v for v in a)) - 1.0) > 0.01
+    out = _feed(AccelBaseline(), 0.0, 5.0, lambda t: a)
+    assert max(d for t, d in out) == pytest.approx(0.0, abs=1e-12)
+
+
+def test_a_step_in_pose_reads_as_motion_then_decays_within_the_window():
+    base = AccelBaseline()
+    flat = (0.0, 0.0, 1.0)
+    tilted = (0.0, math.sin(math.radians(20)), math.cos(math.radians(20)))
+    _feed(base, 0.0, 3.0, lambda t: flat)
+    after = _feed(base, 3.0, 6.0, lambda t: tilted)
+    assert after[0][1] > 0.3                                # the move itself
+    assert max(d for t, d in after if t >= 3.0 + ACCEL_BASELINE_WINDOW_S)         == pytest.approx(0.0, abs=1e-9)                     # settled after 2 s
+
+
+def test_a_small_1hz_oscillation_is_detected():
+    amp = 0.02                                              # 20 mg sway along x
+    out = _feed(AccelBaseline(), 0.0, 6.0,
+                lambda t: (amp * math.sin(2 * math.pi * t), 0.0, 1.0))
+    steady = [d for t, d in out if t >= 2.0]
+    assert max(steady) == pytest.approx(amp, rel=0.1)
+    assert sum(steady) / len(steady) > amp * 0.5
+
+
+def test_window_partial_fill_and_reset():
+    base = AccelBaseline(window_s=1.0)
+    assert base.update(0.0, (0, 0, 1)) == 0.0               # first sample: own mean
+    assert base.update(0.5, (0, 0, 2)) == pytest.approx(0.5)
+    assert base.update(1.0, (0, 0, 2)) == pytest.approx(0.0)  # 0.0 dropped: (0.5, 1.0]
+    base.reset()
+    assert base.update(5.0, (1, 0, 0)) == 0.0
+
+
+def test_pure_helpers():
+    assert accel_deviation((0, 0, 1.2), (0, 0, 1.0)) == pytest.approx(0.2)
+    assert gyro_magnitude((3.0, 4.0, 0.0)) == pytest.approx(5.0)
+
+
+def _bl(samples):
+    """Deviation of each (t, az_g) through a fresh baseline, in order."""
+    base = AccelBaseline()
+    return [base.update(t, (0.0, 0.0, az)) for t, az in samples]
 
 
 # ── ImuFrameStage ─────────────────────────────────────────────────────────
@@ -87,7 +139,8 @@ def test_frame_averages_samples_since_previous_frame():
         [("left", 1, 1), ("left", 2, 2), ("left", 3, 0)]
     assert [e.timestamp_s for e in out] == pytest.approx([0.025, 0.05, 0.075])
     f2 = out[1]
-    assert f2.accel_dev_g == pytest.approx((410 / 2048 + 0.0) / 2)  # mean of magnitudes
+    d = _bl([(0.010, 1 + 205 / 2048), (0.030, 1 + 410 / 2048), (0.045, 1.0)])
+    assert f2.accel_dev_g == pytest.approx((d[1] + d[2]) / 2)  # mean per sample
     assert f2.gyro_dps == pytest.approx((10 + 20) / 2)
     assert not hasattr(f2, "ax_g")                              # magnitudes only
     f3 = out[2]
@@ -100,7 +153,8 @@ def test_first_frame_takes_one_nominal_period_and_drops_older_samples():
     st.add_sample("left", 0.990, _sample(az=2048 + 1024))
     st.add_sample("left", 1.2, _sample())
     (e,) = _events(st.process(_batch([(0, 40, 1.0, 1)])))
-    assert e.n_samples == 1 and e.accel_dev_g == pytest.approx(0.5)
+    d = _bl([(-0.5, 2.0), (0.990, 1.5)])                    # baseline still sees -0.5
+    assert e.n_samples == 1 and e.accel_dev_g == pytest.approx(d[1])
 
 
 def test_frames_wait_for_the_imu_then_emit_in_order():
@@ -248,7 +302,7 @@ def test_closing_interval_frames_are_stamped_per_side_and_frame():
     for cam in (1, 2):                                          # cameras share values
         assert (left[(1, cam)].imu_n_samples, left[(1, cam)].imu_gyro_dps) == \
             (1, pytest.approx(10.0))
-        assert left[(2, cam)].imu_accel_dev_g == pytest.approx(0.5)
+        assert left[(2, cam)].imu_accel_dev_g == pytest.approx(0.25)  # 1.5 g vs mean 1.25
         assert (left[(3, cam)].imu_n_samples, left[(3, cam)].imu_accel_dev_g) == (0, None)
     right = [f for f in frames if f.side == "right"]
     assert all(f.imu_n_samples is None for f in right)          # no IMU on that side

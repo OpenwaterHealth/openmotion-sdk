@@ -33,8 +33,8 @@ histogram sample, its held samples fall back to the scan's start time
 Per-frame motion (bloodflow-app#783): every resolved sample is also handed
 to ``sample_fn(side, timestamp_s, sample)``; ScanWorkflow wires that to
 ``omotion.pipeline.stages.imu_frame.ImuFrameStage``, which averages the
-samples between consecutive histogram frames (``motion_magnitude`` per
-sample). The app does any rolling average and thresholding.
+samples between consecutive histogram frames (per sample: ``AccelBaseline``
+for the accelerometer, ``gyro_magnitude`` for the gyroscope). The app does any rolling average and thresholding.
 
 Every failure here is logged and swallowed: the IMU path must never abort or
 stall a scan. Lifecycle mirrors ``CameraTelemetryCsvLogger``: ScanWorkflow
@@ -51,6 +51,7 @@ from __future__ import annotations
 import csv
 import json
 import math
+from collections import deque
 import logging
 import queue
 import threading
@@ -242,32 +243,61 @@ def imu_row(side: str, sample: ImuSample, timestamp_s: float,
 
 # ── motion magnitude ──────────────────────────────────────────────────────
 
-def motion_magnitude(accel_g: Sequence[float], gyro_dps: Sequence[float],
-                     ) -> Tuple[float, float]:
-    """The per-sample motion magnitudes, in scaled units.
+# Running-mean window for the accelerometer motion measure (s).
+ACCEL_BASELINE_WINDOW_S: float = 2.0
 
-    ``accel_g``: accelerometer (x, y, z) in g; ``gyro_dps``: gyroscope
-    (x, y, z) in deg/s. Returns ``(accel_dev_g, gyro_mag_dps)``:
 
-    - ``accel_dev_g = | |a| - 1 |``: how far the specific-force magnitude is
-      from 1 g. Orientation-independent, so gravity drops out without a
-      filter; ~0 at rest in any pose.
-    - ``gyro_mag_dps = |omega|``: rotation rate about any axis. No bias
-      removal (expect a few deg/s at rest).
+def accel_deviation(accel_g: Sequence[float], mean_g: Sequence[float]) -> float:
+    """``|a - a_mean|`` in g: how far one accelerometer sample is from a
+    baseline vector (the side's recent running mean)."""
+    return math.sqrt(sum((a - m) * (a - m) for a, m in zip(accel_g, mean_g)))
 
-    Pure and dependency-free so other apps (e.g. wellness) can reuse it.
-    """
-    ax, ay, az = accel_g
+
+def gyro_magnitude(gyro_dps: Sequence[float]) -> float:
+    """``|omega|`` in deg/s: rotation rate about any axis. No bias removal
+    (each chip reads ~1-2 deg/s at rest)."""
     gx, gy, gz = gyro_dps
-    return (abs(math.sqrt(ax * ax + ay * ay + az * az) - 1.0),
-            math.sqrt(gx * gx + gy * gy + gz * gz))
+    return math.sqrt(gx * gx + gy * gy + gz * gz)
 
 
-def raw_motion_magnitude(accel_raw: Sequence[int], gyro_raw: Sequence[int],
-                         ) -> Tuple[float, float]:
-    """``motion_magnitude`` from raw ICM-20948 counts (±16 g, ±2000 dps)."""
-    return motion_magnitude([v / ACCEL_LSB_PER_G for v in accel_raw],
-                            [v / GYRO_LSB_PER_DPS for v in gyro_raw])
+class AccelBaseline:
+    """Bias-free accelerometer motion measure for one sensor.
+
+    ``update(t, accel_g)`` returns ``|a - a_mean|`` (g), where ``a_mean`` is
+    the mean accelerometer vector over the samples in ``(t - window_s, t]``
+    (this sample included; until the window has filled, whatever is there).
+    Gravity and the chip's per-axis offset are in both terms, so they cancel
+    in any pose: ~1-3 mg at rest (the sensor noise). Movement, including a
+    rotation that moves gravity across the axes, shows until the window
+    catches up; a held new pose settles back to ~0 within ``window_s``. A
+    very slow drift (slower than the window) reads as still.
+
+    Samples must arrive in time order. Pure Python, no I/O, so other apps
+    (e.g. wellness) can reuse it; one instance per sensor.
+    """
+
+    def __init__(self, window_s: float = ACCEL_BASELINE_WINDOW_S) -> None:
+        self.window_s = float(window_s)
+        self.reset()
+
+    def reset(self) -> None:
+        self._win: "deque[Tuple[float, float, float, float]]" = deque()
+        self._sum = [0.0, 0.0, 0.0]
+
+    def update(self, t: float, accel_g: Sequence[float]) -> float:
+        ax, ay, az = (float(v) for v in accel_g)
+        self._win.append((float(t), ax, ay, az))
+        self._sum[0] += ax
+        self._sum[1] += ay
+        self._sum[2] += az
+        while self._win and self._win[0][0] <= t - self.window_s:
+            _, ox, oy, oz = self._win.popleft()
+            self._sum[0] -= ox
+            self._sum[1] -= oy
+            self._sum[2] -= oz
+        n = len(self._win)
+        mean = (self._sum[0] / n, self._sum[1] / n, self._sum[2] / n)
+        return accel_deviation((ax, ay, az), mean)
 
 
 def sensor_fw_supports_imu_stream(version: Optional[str]) -> bool:

@@ -146,7 +146,7 @@ class ScanRequest:
     write_imu_csv: bool = False
     # Per-frame IMU motion (bloodflow-app#783): for every histogram frame of
     # each active side, average the IMU samples since that side's previous
-    # frame (mean | |a| - 1 g |, mean |omega|) into an
+    # frame (mean |a - 2 s running mean a|, mean |omega|) into an
     # ImuFrameMotion event keyed like session_data (frame_id, timestamp_s),
     # dispatched live on the "imu_frame" channel and stamped onto the
     # corrected frames, so a scan DB stores it in session_data's imu_*

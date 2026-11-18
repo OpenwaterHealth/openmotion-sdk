@@ -235,7 +235,7 @@ class EnrichedCorrectedFrame:
     # when the interval closes (bloodflow-app#783; ScanRequest.imu_motion).
     # None when no IMU ran; n_samples 0 (values None) when no sample landed.
     imu_n_samples:   Optional[int] = None
-    imu_accel_dev_g: Optional[float] = None   # mean | |a| - 1 g |  (g)
+    imu_accel_dev_g: Optional[float] = None   # mean |a - a_mean(2 s)|  (g)
     imu_gyro_dps:    Optional[float] = None   # mean |omega|  (deg/s)
 
 

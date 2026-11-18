@@ -570,5 +570,5 @@ class ImuFrameMotion(BatchEvent):
     frame_id:     int               # abs_frame_id (session_data.frame_id)
     timestamp_s:  float             # session_data.timestamp_s
     n_samples:    int
-    accel_dev_g:  Optional[float]   # mean over samples of | |a| - 1 g |  (g)
+    accel_dev_g:  Optional[float]   # mean over samples of |a - a_mean(2 s)|  (g)
     gyro_dps:     Optional[float]   # mean over samples of |omega|  (deg/s, no bias removal)

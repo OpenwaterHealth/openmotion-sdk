@@ -469,14 +469,17 @@ class MySink:
 `ImuFrameMotion` (`omotion.pipeline`) carries `side` ("left"/"right"),
 `frame_id` (the frame's `abs_frame_id`, = `session_data.frame_id`),
 `timestamp_s` (= `session_data.timestamp_s`), `n_samples`, and the means over
-the IMU samples since that side's previous frame of the two magnitudes:
-`accel_dev_g` (`| |a| - 1 g |`, averaged per sample) and `gyro_dps`
-(`|omega|`). The per-axis values are not kept. The IMU and the frames both run at
+the IMU samples since that side's previous frame of two magnitudes:
+`accel_dev_g` (`|a - a_mean|`, each accelerometer sample against that side's
+2 s running mean, so gravity and the chip's offset cancel: ~0 at rest in any
+pose, no calibration) and `gyro_dps` (`|omega|`, no bias removal). The
+per-axis values are not kept. The IMU and the frames both run at
 40 Hz on separate clocks, so `n_samples` is usually 1 and sometimes 0 or 2;
 with 0 every value is `None`. Weight any rolling average by `n_samples`. The
 SDK does no smoothing or thresholding; that is the app's. Events trail their
 frame by up to ~1 s while the IMU catches up. The per-sample math is
-`omotion.imu_csv.motion_magnitude(accel_g, gyro_dps)`. The same per-frame
+`omotion.imu_csv.AccelBaseline` (one per sensor) and
+`omotion.imu_csv.gyro_magnitude`. The same per-frame
 values are stamped onto the corrected frames (`imu_n_samples`,
 `imu_accel_dev_g`, `imu_gyro_dps`) and so stored on the `session_data` rows;
 `ScanDatabase.get_imu_frames` reads them back one row per side/frame (see

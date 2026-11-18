@@ -185,9 +185,15 @@ Schema v3 (bloodflow-app#783) adds three nullable columns to `session_data`:
 
 ```sql
 ALTER TABLE session_data ADD COLUMN imu_n_samples   INTEGER;  -- IMU samples since the side's previous frame
-ALTER TABLE session_data ADD COLUMN imu_accel_dev_g REAL;     -- mean of | |a| - 1 g |  (g)
+ALTER TABLE session_data ADD COLUMN imu_accel_dev_g REAL;     -- mean of |a - 2 s running mean a|  (g)
 ALTER TABLE session_data ADD COLUMN imu_gyro_dps    REAL;     -- mean of |omega|  (deg/s)
 ```
+
+`imu_accel_dev_g` measures change, not tilt: each accelerometer sample is
+compared with that side's own running mean over the previous 2 s, so gravity
+and the chip's per-axis offset cancel (~1-3 mg at rest in any pose; no
+calibration). A held new pose settles back to ~0 within 2 s.
+`imu_gyro_dps` is `|omega|` with no bias removal (~1-2 deg/s at rest).
 
 They are filled when the scan ran with `ScanRequest.imu_motion=True`:
 `ImuFrameStage` averages each side's IMU samples per frame and stamps the

@@ -12,8 +12,10 @@ For each frame of a side it averages the IMU samples with
 ``prev_frame_t < t <= frame_t`` (the side's previous emitted frame; one
 nominal frame period before the first) and appends an ``ImuFrameMotion``
 event to the batch, which the runner routes to the ``"imu_frame"`` channel.
-Per sample it uses ``imu_csv.motion_magnitude``; only the two magnitudes are
-kept (accelerometer and gyroscope), not the axes.
+Per sample: the accelerometer's ``|a - a_mean|`` against that side's 2 s
+running mean (``imu_csv.AccelBaseline``: bias- and orientation-free, ~0 at
+rest) and the gyroscope's ``|omega|`` (``imu_csv.gyro_magnitude``); only
+these two magnitudes are kept, not the axes.
 
 A frame is emitted once that side's IMU has delivered a sample at or past
 the frame's time, or once the frame is more than ``lag_s`` older than the
@@ -45,7 +47,9 @@ from typing import Deque, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from omotion import _log_root
-from omotion.imu_csv import ACCEL_LSB_PER_G, GYRO_LSB_PER_DPS, motion_magnitude
+from omotion.imu_csv import (
+    ACCEL_LSB_PER_G, GYRO_LSB_PER_DPS, AccelBaseline, gyro_magnitude,
+)
 
 from ..batch import FrameBatch, ImuFrameMotion, IntervalClosed
 
@@ -93,8 +97,13 @@ class ImuFrameStage:
         Signature matches ``ImuStreamLogger(sample_fn=...)``."""
         a = [v / ACCEL_LSB_PER_G for v in sample.accel]
         g = [v / GYRO_LSB_PER_DPS for v in sample.gyro]
-        acc, gyr = motion_magnitude(a, g)
-        row: _Sample = (float(timestamp_s), acc, gyr)
+        with self._lock:
+            base = self._baselines.get(side)
+            if base is None:
+                base = self._baselines[side] = AccelBaseline()
+        # Per side, called in time order from that side's IMU thread.
+        acc = base.update(float(timestamp_s), a)
+        row: _Sample = (float(timestamp_s), acc, gyro_magnitude(g))
         with self._lock:
             self._samples.setdefault(side, deque()).append(row)
             wm = self._watermark.get(side)
@@ -107,6 +116,7 @@ class ImuFrameStage:
         with self._lock:
             self._samples: Dict[str, Deque[_Sample]] = {}
             self._watermark: Dict[str, float] = {}
+            self._baselines: Dict[str, AccelBaseline] = {}
         self._pending: Dict[str, Dict[int, float]] = {}
         self._last: Dict[str, Tuple[int, float]] = {}
         # (side, abs_frame_id) -> (n_samples, accel_dev_g, gyro_dps)

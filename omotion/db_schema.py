@@ -138,8 +138,9 @@ def _migration_002_session_data_temp(conn) -> None:
 
 def _migration_003_session_data_imu(conn) -> None:
     """Per-frame IMU motion on the scan rows (bloodflow-app#783): the mean
-    accelerometer and gyroscope magnitudes of the frame's side over the IMU
-    samples since that side's previous frame, stamped by ImuFrameStage
+    accelerometer motion (|a - 2 s running mean a|) and gyroscope magnitude
+    of the frame's side over the IMU samples since that side's previous
+    frame, stamped by ImuFrameStage
     (ScanRequest.imu_motion). Every camera row of a side/frame carries the
     same values. NULL on rows of scans recorded without the IMU and on all
     pre-migration rows; imu_n_samples = 0 with NULL values when no sample
