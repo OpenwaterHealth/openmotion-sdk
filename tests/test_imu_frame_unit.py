@@ -88,10 +88,9 @@ def test_frame_averages_samples_since_previous_frame():
     f2 = out[1]
     assert f2.accel_dev_g == pytest.approx((410 / 2048 + 0.0) / 2)  # mean of magnitudes
     assert f2.gyro_dps == pytest.approx((10 + 20) / 2)
-    assert f2.az_g == pytest.approx((1 + 410 / 2048 + 1.0) / 2)
-    assert f2.gx_dps == pytest.approx(15.0) and f2.gy_dps == 0.0
+    assert not hasattr(f2, "ax_g")                              # magnitudes only
     f3 = out[2]
-    assert f3.accel_dev_g is None and f3.ax_g is None and f3.gz_dps is None
+    assert f3.accel_dev_g is None and f3.gyro_dps is None
 
 
 def test_first_frame_takes_one_nominal_period_and_drops_older_samples():
@@ -205,10 +204,8 @@ class _Rec:
 
 
 def _ev(side="left", fid=1, t=0.025, n=1, acc=0.1, gyr=2.0):
-    v = None if n == 0 else 0.0
     return ImuFrameMotion(side, fid, t, n, None if n == 0 else acc,
-                          None if n == 0 else gyr, v, v, None if n == 0 else 1.0,
-                          v, v, v)
+                          None if n == 0 else gyr)
 
 
 def test_runner_routes_frames_to_imu_frame_channel_only():
@@ -250,8 +247,7 @@ def _record(db_path, events):
 
 
 _KEYS = {"session_id", "side", "frame_id", "timestamp_s", "n_samples",
-         "accel_dev_g", "gyro_dps", "ax_g", "ay_g", "az_g",
-         "gx_dps", "gy_dps", "gz_dps"}
+         "accel_dev_g", "gyro_dps"}
 
 
 def test_db_sink_persists_frames_and_getter_filters(tmp_path):
@@ -266,7 +262,8 @@ def test_db_sink_persists_frames_and_getter_filters(tmp_path):
         left = db.get_imu_frames(sid, side=0)
         assert [r["frame_id"] for r in left] == list(range(1, 9))
         zero = [r for r in left if r["n_samples"] == 0]
-        assert zero and all(r["accel_dev_g"] is None and r["az_g"] is None for r in zero)
+        assert zero and all(r["accel_dev_g"] is None and r["gyro_dps"] is None
+                            for r in zero)
         assert db.get_imu_frames(sid, side=1)[0]["gyro_dps"] == 30.0
         win = db.get_imu_frames(sid, side=0, t_lo=0.05, t_hi=0.1)   # inclusive
         assert [r["frame_id"] for r in win] == [2, 3, 4]

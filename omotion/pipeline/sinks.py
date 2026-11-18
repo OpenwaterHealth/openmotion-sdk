@@ -700,9 +700,6 @@ class ScanDBSink:
             "n_samples": int(m.n_samples),
             "accel_dev_g": _r(m.accel_dev_g, 6),
             "gyro_dps": _r(m.gyro_dps, 4),
-            "ax_g": _r(m.ax_g, 6), "ay_g": _r(m.ay_g, 6), "az_g": _r(m.az_g, 6),
-            "gx_dps": _r(m.gx_dps, 4), "gy_dps": _r(m.gy_dps, 4),
-            "gz_dps": _r(m.gz_dps, 4),
         }
         with self._imu_lock:
             self._imu_buffer.append(row)

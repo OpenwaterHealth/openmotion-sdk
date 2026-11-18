@@ -194,9 +194,7 @@ CREATE TABLE imu_frame (
     timestamp_s  REAL    NOT NULL,   -- = session_data.timestamp_s
     n_samples    INTEGER NOT NULL,   -- IMU samples since the side's previous frame
     accel_dev_g  REAL,               -- mean of | |a| - 1 g |   (NULL when n_samples = 0)
-    gyro_dps     REAL,               -- mean of |omega| (deg/s)
-    ax_g REAL, ay_g REAL, az_g REAL,          -- mean accel axes (g)
-    gx_dps REAL, gy_dps REAL, gz_dps REAL     -- mean gyro axes (deg/s)
+    gyro_dps     REAL                -- mean of |omega| (deg/s)
 );
 CREATE INDEX idx_imu_frame_session_side_time ON imu_frame(session_id, side, timestamp_s);
 ```

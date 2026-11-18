@@ -141,7 +141,8 @@ def _migration_003_imu_frame(conn) -> None:
     histogram frame, written by ScanDBSink from the scan's ImuFrameMotion
     events (ScanRequest.imu_motion). Keyed like session_data (frame_id =
     abs_frame_id, same timestamp_s). Values average the IMU samples since
-    the side's previous frame; NULL when n_samples is 0."""
+    the side's previous frame (accelerometer and gyroscope magnitudes
+    only); NULL when n_samples is 0."""
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS imu_frame (
@@ -153,13 +154,7 @@ def _migration_003_imu_frame(conn) -> None:
             timestamp_s  REAL    NOT NULL,
             n_samples    INTEGER NOT NULL,
             accel_dev_g  REAL,
-            gyro_dps     REAL,
-            ax_g         REAL,
-            ay_g         REAL,
-            az_g         REAL,
-            gx_dps       REAL,
-            gy_dps       REAL,
-            gz_dps       REAL
+            gyro_dps     REAL
         )
         """
     )

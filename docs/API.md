@@ -469,9 +469,9 @@ class MySink:
 `ImuFrameMotion` (`omotion.pipeline`) carries `side` ("left"/"right"),
 `frame_id` (the frame's `abs_frame_id`, = `session_data.frame_id`),
 `timestamp_s` (= `session_data.timestamp_s`), `n_samples`, and the means over
-the IMU samples since that side's previous frame: `accel_dev_g`
-(`| |a| - 1 g |`, averaged per sample), `gyro_dps` (`|omega|`), and the axes
-`ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps`. The IMU and the frames both run at
+the IMU samples since that side's previous frame of the two magnitudes:
+`accel_dev_g` (`| |a| - 1 g |`, averaged per sample) and `gyro_dps`
+(`|omega|`). The per-axis values are not kept. The IMU and the frames both run at
 40 Hz on separate clocks, so `n_samples` is usually 1 and sometimes 0 or 2;
 with 0 every value is `None`. Weight any rolling average by `n_samples`. The
 SDK does no smoothing or thresholding; that is the app's. Events trail their

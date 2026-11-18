@@ -376,8 +376,7 @@ class ScanDatabase:
 
     _IMU_FRAME_COLUMNS = (
         "session_id", "side", "frame_id", "timestamp_s", "n_samples",
-        "accel_dev_g", "gyro_dps", "ax_g", "ay_g", "az_g",
-        "gx_dps", "gy_dps", "gz_dps",
+        "accel_dev_g", "gyro_dps",
     )
 
     def insert_imu_frame_rows(self, rows: Sequence[Dict[str, Any]]) -> int:

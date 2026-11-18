@@ -12,7 +12,8 @@ For each frame of a side it averages the IMU samples with
 ``prev_frame_t < t <= frame_t`` (the side's previous emitted frame; one
 nominal frame period before the first) and appends an ``ImuFrameMotion``
 event to the batch, which the runner routes to the ``"imu_frame"`` channel.
-Per sample it uses ``imu_csv.motion_magnitude``; the axes are averaged too.
+Per sample it uses ``imu_csv.motion_magnitude``; only the two magnitudes are
+kept (accelerometer and gyroscope), not the axes.
 
 A frame is emitted once that side's IMU has delivered a sample at or past
 the frame's time, or once the frame is more than ``lag_s`` older than the
@@ -44,8 +45,8 @@ logger = logging.getLogger(
 _SIDE_NAMES = {0: "left", 1: "right"}
 _SKIP_FRAME_TYPES = {"warmup", "stale"}
 
-# One IMU sample, scaled: (t, accel_dev_g, gyro_dps, ax, ay, az, gx, gy, gz)
-_Sample = Tuple[float, float, float, float, float, float, float, float, float]
+# One IMU sample: (t, accel_dev_g, gyro_dps)
+_Sample = Tuple[float, float, float]
 
 
 def average_imu_samples(side: str, frame_id: int, timestamp_s: float,
@@ -55,9 +56,10 @@ def average_imu_samples(side: str, frame_id: int, timestamp_s: float,
     n = len(samples)
     if n == 0:
         return ImuFrameMotion(side, int(frame_id), float(timestamp_s), 0,
-                              None, None, None, None, None, None, None, None)
-    m = [sum(s[k] for s in samples) / n for k in range(1, 9)]
-    return ImuFrameMotion(side, int(frame_id), float(timestamp_s), n, *m)
+                              None, None)
+    return ImuFrameMotion(side, int(frame_id), float(timestamp_s), n,
+                          sum(s[1] for s in samples) / n,
+                          sum(s[2] for s in samples) / n)
 
 
 class ImuFrameStage:
@@ -78,7 +80,7 @@ class ImuFrameStage:
         a = [v / ACCEL_LSB_PER_G for v in sample.accel]
         g = [v / GYRO_LSB_PER_DPS for v in sample.gyro]
         acc, gyr = motion_magnitude(a, g)
-        row: _Sample = (float(timestamp_s), acc, gyr, *a, *g)
+        row: _Sample = (float(timestamp_s), acc, gyr)
         with self._lock:
             self._samples.setdefault(side, deque()).append(row)
             wm = self._watermark.get(side)
