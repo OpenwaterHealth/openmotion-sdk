@@ -88,3 +88,18 @@ def test_does_not_raise_on_refused_start_without_raise_on_error():
     run_collection_scan(sw, object(), subject_id="s", duration_sec=1,
                         left_camera_mask=1, right_camera_mask=0)  # no raise
     assert sw.await_timeouts  # still awaited
+
+
+def test_trigger_config_becomes_the_requests_override():
+    sw = _FakeScanWorkflow()
+    run_collection_scan(sw, object(), subject_id="s", duration_sec=1,
+                        left_camera_mask=1, right_camera_mask=0,
+                        trigger_config={"LaserPulseSkipDelayUsec": 2400})
+    assert sw.requests[0].trigger_config == {"LaserPulseSkipDelayUsec": 2400}
+
+
+def test_no_trigger_config_leaves_the_interface_default():
+    sw = _FakeScanWorkflow()
+    run_collection_scan(sw, object(), subject_id="s", duration_sec=1,
+                        left_camera_mask=1, right_camera_mask=0)
+    assert sw.requests[0].trigger_config is None

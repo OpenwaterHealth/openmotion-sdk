@@ -1,6 +1,7 @@
 import concurrent.futures
 import datetime
 import csv
+import dataclasses
 import logging
 import math
 import os
@@ -24,6 +25,8 @@ from omotion.MotionProcessing import (
 from omotion.Calibration import Calibration
 
 if TYPE_CHECKING:
+    import numpy as np
+
     from omotion.MotionInterface import MotionInterface
     from omotion.contact_quality import CQSettings
 
@@ -118,6 +121,33 @@ class _TelemetryCsvWriter:
             pass
 
 
+@dataclass(frozen=True)
+class ScanTiming:
+    """Teardown and polling timings for one scan.
+
+    The defaults are what every full scan uses: they make sure the terminal
+    laser-off frame (the last FSYNC pulse, which fires up to ~150 ms after
+    the stop) reaches the pipeline and is identified as the terminal dark.
+    A short collection scan whose sink only reads frames from early in the
+    scan (Optimize Laser) does not need that tail and can use shorter ones.
+
+    ``stop_settle_s``: wait after ``stop_trigger`` before the cameras are
+    disabled. ``disable_settle_s``: wait after ``disable_camera`` before the
+    USB source is closed. ``drain_timeout_ms``: per-read timeout of the
+    source's final endpoint drain after streaming stops (0 skips the drain;
+    the next scan's stale-data flush clears anything left). ``report_terminal_fsync``:
+    read the console's final FSYNC count for terminal-dark identification.
+    ``guard_poll_s``: how often the duration guard checks for the end of
+    the scan (and ``ScanRequest.stop_when``).
+    """
+
+    stop_settle_s: float = 0.5
+    disable_settle_s: float = 0.35
+    drain_timeout_ms: int = 750
+    report_terminal_fsync: bool = True
+    guard_poll_s: float = 0.2
+
+
 @dataclass
 class ScanRequest:
     subject_id: str
@@ -186,6 +216,20 @@ class ScanRequest:
     # resolved default (DEFAULT_TRIGGER_CONFIG ⊕ constructor override). A dict
     # here is shallow-merged on top (e.g. {"TriggerFrequencyHz": 30}).
     trigger_config: dict | None = None
+    # Per-camera analog gain the sensors run with for this scan, for
+    # shot-noise correction: (8,) for both sides or (2, 8) per side, as true
+    # multipliers (not register codes). None -> CAMERA_GAIN_MAP, the gains
+    # the sensor firmware sets. Optimize Laser sets its solved gains here.
+    camera_gains: "np.ndarray | None" = None
+    # BFI/BVI calibration arrays replaced for this scan only, on top of the
+    # installed calibration (Calibration.with_overrides): e.g.
+    # {"i_max": 400.0}. Unlike set_realtime_calibration it does not outlive
+    # the scan. None -> the installed calibration.
+    calibration_override: dict | None = None
+    # Extra keys merged into the scan DB's session_meta (JSON-serializable),
+    # e.g. the Optimize Laser settings a scan ran at. They never replace the
+    # SDK's own keys (scan_id, sdk_flags, ...).
+    extra_session_meta: dict | None = None
     # Called (with the exception) when the scan worker thread aborts AFTER
     # start_scan returned True — e.g. a critical sink failing in on_scan_start
     # because the scan DB became unwritable in the race window past the
@@ -193,6 +237,16 @@ class ScanRequest:
     # value can no longer carry. Fires on the worker thread, so the handler
     # must be thread-safe. See bloodflow-app issue #213.
     on_error: Callable[[BaseException], None] | None = None
+    # Teardown / polling timings (ScanTiming). The default is the full-scan
+    # teardown; short collection scans that ignore the scan's tail may pass
+    # shorter ones.
+    timing: ScanTiming = field(default_factory=ScanTiming)
+    # Ends the scan before duration_sec when it returns True: the duration
+    # guard asks it every timing.guard_poll_s once the trigger is on (e.g. a
+    # collecting sink that has all the frames it needs). duration_sec stays
+    # the upper bound. Called on the guard thread; must be cheap and must
+    # not raise (an exception is logged and treated as False).
+    stop_when: Callable[[], bool] | None = None
 
 
 @dataclass
@@ -206,6 +260,28 @@ class ConfigureRequest:
 class ConfigureResult:
     ok: bool
     error: str
+
+
+def _with_prepared_overrides(request: "ScanRequest", prepared: dict) -> "ScanRequest":
+    """``request`` with a scan preparer's overrides applied (a copy).
+
+    The preparer's trigger keys win: they are what keeps the device's
+    widened limits and the trigger schedule consistent. Gains and the
+    calibration override apply unless the caller set its own, and session
+    meta keys are added without replacing the caller's.
+    """
+    return dataclasses.replace(
+        request,
+        trigger_config={**(request.trigger_config or {}),
+                        **(prepared.get("trigger_config") or {})},
+        camera_gains=(request.camera_gains if request.camera_gains is not None
+                      else prepared.get("camera_gains")),
+        calibration_override=(request.calibration_override
+                              if request.calibration_override is not None
+                              else prepared.get("calibration_override")),
+        extra_session_meta={**(prepared.get("extra_session_meta") or {}),
+                            **(request.extra_session_meta or {})} or None,
+    )
 
 
 def run_collection_scan(
@@ -222,6 +298,9 @@ def run_collection_scan(
     poll_interval_s: float = 0.1,
     timeout_pad_s: float = 2.0,
     raise_on_error: bool = False,
+    trigger_config: dict | None = None,
+    timing: "ScanTiming | None" = None,
+    stop_when: Callable[[], bool] | None = None,
 ) -> bool:
     """Run one short scan whose only sink is ``collector``, blocking until it
     finishes. This is the shared "threshold scan" engine behind both the
@@ -235,6 +314,10 @@ def run_collection_scan(
     Without it (CQ): a single ``await_complete(duration_sec + timeout_pad_s)``.
     ``raise_on_error``: a refused start or a scan-level error raises
     ``RuntimeError``. Returns ``False`` when the scan was canceled, else ``True``.
+    ``trigger_config`` becomes the request's per-scan trigger override (see
+    ``ScanRequest.trigger_config``), e.g. Optimize Laser's longer dark skip.
+    ``timing`` / ``stop_when`` become ``ScanRequest.timing`` (None = the
+    full-scan default) and ``ScanRequest.stop_when``.
 
     Operates only on ``scan_workflow``'s public surface (``start_scan`` /
     ``await_complete`` / ``running`` / ``cancel_scan`` / ``last_scan_error`` /
@@ -250,6 +333,9 @@ def run_collection_scan(
         reduced_mode=reduced_mode,
         sinks=[collector],
         skip_default_storage=True,
+        trigger_config=trigger_config,
+        timing=timing if timing is not None else ScanTiming(),
+        stop_when=stop_when,
     )
     started = scan_workflow.start_scan(request)
     if raise_on_error and not started:
@@ -314,6 +400,9 @@ class ScanWorkflow:
         # CalibrationWorkflow) check this after await_complete to decide
         # whether the scan succeeded.
         self._last_scan_error: str | None = None
+        # Called by start_scan with the request's (left, right) masks before
+        # anything starts; see set_scan_preparer.
+        self._scan_preparer = None
         self._last_scan_canceled: bool = False
         # Label of the scan-DB session for the most recent start_scan, set
         # synchronously when the scan's metadata is built. Lets callers bind
@@ -406,6 +495,20 @@ class ScanWorkflow:
             auto_upload=bool(auto_upload),
         )
 
+    def set_scan_preparer(self, preparer) -> None:
+        """Register ``preparer(left_camera_mask, right_camera_mask)``, which
+        start_scan calls before every scan, trigger off.
+
+        It puts back device settings that must hold for the scan and returns
+        the ``ScanRequest`` overrides that go with them (``trigger_config``,
+        ``camera_gains``, ``calibration_override``, ``extra_session_meta``),
+        or None when it has nothing active. If it raises, the scan is refused
+        with its message. Optimize Laser registers its
+        ``OptimizeLaserWorkflow.prepare_scan``. One preparer at a time; None
+        removes it.
+        """
+        self._scan_preparer = preparer
+
     def start_scan(
         self,
         request: ScanRequest,
@@ -464,6 +567,36 @@ class ScanWorkflow:
             self._last_scan_error = limits_error
             return False
 
+        # Device settings some other workflow keeps active (Optimize Laser):
+        # re-apply them and take their request overrides here, for every
+        # scan path at once (app scans, contact-quality checks, calibration,
+        # scripts). A scan that ran without them would put a 2400 us dark
+        # skip under the stock RATE_LL, or stock gains under optimized
+        # light, so a failure refuses the scan.
+        if self._scan_preparer is not None and not self._running:
+            try:
+                prepared = self._scan_preparer(
+                    request.left_camera_mask, request.right_camera_mask)
+            except Exception as e:
+                logger.error("start_scan refused: %s", e)
+                self._last_scan_error = str(e)
+                return False
+            if prepared:
+                request = _with_prepared_overrides(request, prepared)
+
+        # Per-scan gain and calibration overrides: resolve them before
+        # anything starts, so a bad value refuses the scan rather than
+        # processing it with the stock gains or calibration.
+        from omotion.pipeline.stages.shot_noise import camera_gain_map_2d
+        try:
+            calibration = self._calibration.with_overrides(request.calibration_override)
+            camera_gain_map = (None if request.camera_gains is None
+                               else camera_gain_map_2d(request.camera_gains))
+        except ValueError as e:
+            logger.error("start_scan refused: %s", e)
+            self._last_scan_error = f"scan request rejected: {e}"
+            return False
+
         with self._lock:
             if self._running or (self._thread and self._thread.is_alive()):
                 logger.warning(
@@ -491,6 +624,7 @@ class ScanWorkflow:
             left_camera_mask=request.left_camera_mask,
             right_camera_mask=request.right_camera_mask,
             reduced_mode=request.reduced_mode,
+            extra_session_meta=request.extra_session_meta,
         )
         # Mirror ScanDBSink.on_scan_start's label so callers can bind to this
         # exact session row (must match f"{scan_id}_{subject_id}" there).
@@ -530,7 +664,10 @@ class ScanWorkflow:
                 telemetry_feeder = None
 
         # ── Build pipeline ────────────────────────────────────────────────
-        calibration = self._calibration
+        if request.calibration_override or camera_gain_map is not None:
+            logger.info("start_scan: per-scan overrides: calibration %s, camera gains %s",
+                        sorted(request.calibration_override or {}),
+                        "custom" if camera_gain_map is not None else "stock")
         pipeline = default_pipeline(
             metadata=meta,
             calibration=calibration,
@@ -538,6 +675,7 @@ class ScanWorkflow:
             raw_save_max_duration_s=request.raw_save_max_duration_s,
             telemetry=telemetry_aggregator,
             contact_quality=request.contact_quality,
+            camera_gain_map=camera_gain_map,
         )
 
         # ── Auto-inject default sinks ──────────────────────────────────────
@@ -662,6 +800,10 @@ class ScanWorkflow:
             right=_live_sensor(self._interface.right, request.right_camera_mask),
             batch_size_frames=request.batch_size_frames or 10,
             metadata=meta,
+            # Only a non-default drain is passed, so source stand-ins
+            # without the parameter keep working for full scans.
+            **({"drain_timeout_ms": request.timing.drain_timeout_ms}
+               if request.timing.drain_timeout_ms != ScanTiming.drain_timeout_ms else {}),
         )
         self._runner = ScanRunner(
             source=source,
@@ -828,13 +970,30 @@ class ScanWorkflow:
 
                 # ── Duration gate: stop the source when time is up ────────
                 stop_after = 0.0 if trigger_error else float(request.duration_sec)
+                timing = request.timing
+
+                def _stop_early() -> bool:
+                    if request.stop_when is None:
+                        return False
+                    try:
+                        return bool(request.stop_when())
+                    except Exception:
+                        logger.exception("ScanRequest.stop_when raised; ignoring it")
+                        return False
 
                 def _duration_guard():
                     deadline = time.monotonic() + stop_after
                     while time.monotonic() < deadline:
                         if self._stop_evt.is_set():
                             break
-                        time.sleep(0.2)
+                        if _stop_early():
+                            logger.info(
+                                "duration_guard: stop_when satisfied %.2f s into the scan",
+                                time.monotonic() - (deadline - stop_after),
+                            )
+                            break
+                        time.sleep(min(timing.guard_poll_s,
+                                       max(0.0, deadline - time.monotonic())))
                     # Cancel race: cancel_scan() already closed the source
                     # (and likely called stop_trigger) before we got here.
                     # Don't re-run stop_trigger/close on a closed source —
@@ -875,11 +1034,12 @@ class ScanWorkflow:
                         # the trigger is not firing anymore — downstream
                         # trigger-state consumers must still see the close.
                         self._emit_trigger_event("OFF")
-                    time.sleep(0.5)
+                    time.sleep(timing.stop_settle_s)
                     # The deferred final FSYNC pulse (the terminal dark) has
                     # fired by now — report its index for positive terminal-
                     # dark identification in the flush.
-                    self._report_terminal_fsync()
+                    if timing.report_terminal_fsync:
+                        self._report_terminal_fsync()
                     for side, mask, _ in active_sides:
                         try:
                             self._interface.run_on_sensors(
@@ -894,7 +1054,8 @@ class ScanWorkflow:
                     # reach ImuFrameStage before the pipeline's final flush.
                     t_imu = time.monotonic()
                     self._stop_imu()
-                    time.sleep(max(0.0, 0.35 - (time.monotonic() - t_imu)))
+                    time.sleep(max(0.0, timing.disable_settle_s
+                                   - (time.monotonic() - t_imu)))
                     try:
                         source.close()
                     except Exception:
