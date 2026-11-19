@@ -41,6 +41,7 @@ def test_public_api_all_list_complete() -> None:
         "FrameBatch", "BatchEvent", "IntervalClosed", "LiveEmit",
         "DarkIntegrityWarning", "StencilFallback", "TerminalDarkResult",
         "PipelineError", "TimestampMisalignmentWindow",
+        "ImuFrameMotion", "IMU_FRAME_CHANNEL",
         "Pipeline", "Stage", "Tee",
         "ScanRunner", "CriticalSinkError",
         "default_pipeline",

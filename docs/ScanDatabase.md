@@ -179,6 +179,39 @@ Notes:
   t0 captures whichever side fires first; the other side's per-row
   timestamp can therefore be offset by a few ms from its sibling's.
 
+### IMU columns on `session_data`
+
+Schema v3 (bloodflow-app#783) adds three nullable columns to `session_data`:
+
+```sql
+ALTER TABLE session_data ADD COLUMN imu_n_samples   INTEGER;  -- IMU samples since the side's previous frame
+ALTER TABLE session_data ADD COLUMN imu_accel_dev_g REAL;     -- mean of |a - 2 s running mean a|  (g)
+ALTER TABLE session_data ADD COLUMN imu_gyro_dps    REAL;     -- mean of |omega|  (deg/s)
+```
+
+`imu_accel_dev_g` measures change, not tilt: each accelerometer sample is
+compared with that side's own running mean over the previous 2 s, so gravity
+and the chip's per-axis offset cancel (~1-3 mg at rest in any pose; no
+calibration). A held new pose settles back to ~0 within 2 s.
+`imu_gyro_dps` is `|omega|` with no bias removal (~1-2 deg/s at rest).
+
+They are filled when the scan ran with `ScanRequest.imu_motion=True`:
+`ImuFrameStage` averages each side's IMU samples per frame and stamps the
+result onto the corrected frames when their dark interval closes, so the
+values travel with the rows `ScanDBSink` writes. The IMU is per sensor
+module, so every camera row of a side/frame carries the same values (in
+reduced mode there is one `cam_id = -1` row per side/frame). The IMU and the
+frames both run at 40 Hz on separate clocks, so `imu_n_samples` is usually 1
+and sometimes 0 or 2; with 0 the two values are NULL. All three are NULL
+for rows of scans recorded without the IMU, rows of a side with no IMU
+stream, and all pre-migration rows.
+
+`ScanDatabase.get_imu_frames(session_id, side=None, t_lo=None, t_hi=None)`
+(or the iterator `iter_imu_frames`) collapses them to one dict per
+`(side, frame_id)`, ordered by side then time, with keys `session_id, side,
+frame_id, timestamp_s, n_samples, accel_dev_g, gyro_dps` and an inclusive
+`timestamp_s` range.
+
 ### `database_settings`
 
 A tiny key/value table for per-DB settings that have to outlive a single
@@ -328,6 +361,8 @@ Differences from the live `CsvSink` file:
   `0.0` instead of an empty cell.
 - `temp_*` cells are empty for sessions recorded before schema v2
   added `session_data.temp` (issue #221).
+- The IMU columns (`imu_*`, schema v3) are not part of the corrected CSV;
+  read them with `ScanDatabase.get_imu_frames` or `iter_session_data`.
 
 Pre-#92 Step F sessions raise `RuntimeError` — their `frame_id` rows
 are all the sentinel `-1`, so the row layout can't be reconstructed.
