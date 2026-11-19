@@ -70,6 +70,10 @@ class _BaseSource:
         self._normalize_timestamps = normalize_timestamps
         self._t0: Optional[float] = None
         self._t0_by_side: dict[str, float] = {}
+        # Host time.monotonic() when each side's t0 was latched: lets
+        # side streams with no device clock (IMU on older sensor firmware,
+        # bloodflow-app#779) land on the same axis. See side_t0().
+        self._t0_host_by_side: dict[str, float] = {}
 
     def _apply_timestamp_normalization(self, timestamp_s: np.ndarray) -> np.ndarray:
         """Subtract the first observed timestamp so scans always start at t=0.
@@ -115,8 +119,28 @@ class _BaseSource:
         t0 = self._t0_by_side.get(side_name)
         if t0 is None:
             t0 = float(ts)
+            # Host anchor first: side_t0() readers on other threads test
+            # _t0_by_side, so the pair must be complete when that appears.
+            self._t0_host_by_side[side_name] = time.monotonic()
             self._t0_by_side[side_name] = t0
         return float(ts) - t0
+
+    def side_t0(self, side_name: str) -> Optional[tuple[float, float]]:
+        """``(t0_device_s, t0_host_monotonic)`` for a side, or None until its
+        first histogram sample has been normalized.
+
+        ``t0_device_s`` is the (rollover-unwrapped) firmware timestamp that
+        became that side's ``timestamp_s == 0``; ``t0_host_monotonic`` is the
+        host ``time.monotonic()`` at which it was latched. Safe to call from
+        any thread.
+        """
+        t0 = self._t0_by_side.get(side_name)
+        if t0 is None:
+            return None
+        host = self._t0_host_by_side.get(side_name)
+        if host is None:
+            return None
+        return (t0, host)
 
     def close(self) -> None:
         pass

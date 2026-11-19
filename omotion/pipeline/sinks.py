@@ -805,6 +805,10 @@ class ScanDBSink:
                 "contrast": contrast_v,
                 "temp": _round(getattr(f, "temp_c", None)),
                 "quality": join_quality(getattr(f, "quality", None)),
+                # Per-frame IMU motion stamped by ImuFrameStage (#783).
+                "imu_n_samples": getattr(f, "imu_n_samples", None),
+                "imu_accel_dev_g": _round(getattr(f, "imu_accel_dev_g", None)),
+                "imu_gyro_dps": _round(getattr(f, "imu_gyro_dps", None)),
             })
 
         if len(self._buffer) >= self._batch_size:

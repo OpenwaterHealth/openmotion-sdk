@@ -34,7 +34,7 @@ import logging
 logger = logging.getLogger("omotion.db_schema")
 
 # Bump this whenever a migration is appended to MIGRATIONS.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class SchemaTooNewError(RuntimeError):
@@ -136,6 +136,20 @@ def _migration_002_session_data_temp(conn) -> None:
     _add_column_if_missing(conn, "session_data", "temp", "REAL")
 
 
+def _migration_003_session_data_imu(conn) -> None:
+    """Per-frame IMU motion on the scan rows (bloodflow-app#783): the mean
+    accelerometer motion (|a - 2 s running mean a|) and gyroscope magnitude
+    of the frame's side over the IMU samples since that side's previous
+    frame, stamped by ImuFrameStage
+    (ScanRequest.imu_motion). Every camera row of a side/frame carries the
+    same values. NULL on rows of scans recorded without the IMU and on all
+    pre-migration rows; imu_n_samples = 0 with NULL values when no sample
+    landed in the frame."""
+    _add_column_if_missing(conn, "session_data", "imu_n_samples", "INTEGER")
+    _add_column_if_missing(conn, "session_data", "imu_accel_dev_g", "REAL")
+    _add_column_if_missing(conn, "session_data", "imu_gyro_dps", "REAL")
+
+
 # (version, description, function) — ordered, append-only.
 #
 # Only real, used schema belongs here: every entry lands in every database in
@@ -147,6 +161,8 @@ MIGRATIONS: list[tuple[int, str, object]] = [
      _migration_001_baseline),
     (2, "session_data.temp — per-frame camera temperature",
      _migration_002_session_data_temp),
+    (3, "session_data IMU columns — per-frame motion magnitudes",
+     _migration_003_session_data_imu),
 ]
 
 

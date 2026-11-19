@@ -146,15 +146,15 @@ def test_production_registry_holds_no_unused_schema():
     """Every migration lands in every field database permanently, so the
     registry must contain only real, used schema. The runner is proven by the
     synthetic migration below, not by shipping demo tables."""
-    assert [v for v, _, _ in db_schema.MIGRATIONS] == [1, 2]
-    assert db_schema.SCHEMA_VERSION == 2
+    assert [v for v, _, _ in db_schema.MIGRATIONS] == [1, 2, 3]
+    assert db_schema.SCHEMA_VERSION == 3
 
 
 # ---------------------------------------------------------------------------
 # A synthetic migration — proves the runner handles a real schema change
 # ---------------------------------------------------------------------------
 
-def _test_migration_003(conn) -> None:
+def _test_migration_004(conn) -> None:
     """Stand-in for a future migration: adds a table AND alters an existing one."""
     conn.execute(
         "CREATE TABLE IF NOT EXISTS session_annotations ("
@@ -171,12 +171,12 @@ def _test_migration_003(conn) -> None:
 
 @pytest.fixture
 def with_test_migration(monkeypatch):
-    """Register a v3 migration for the duration of one test."""
+    """Register a v4 migration for the duration of one test."""
     monkeypatch.setattr(
         db_schema, "MIGRATIONS",
-        list(db_schema.MIGRATIONS) + [(3, "test: annotations", _test_migration_003)],
+        list(db_schema.MIGRATIONS) + [(4, "test: annotations", _test_migration_004)],
     )
-    monkeypatch.setattr(db_schema, "SCHEMA_VERSION", 3)
+    monkeypatch.setattr(db_schema, "SCHEMA_VERSION", 4)
 
 
 def test_new_migration_applies_to_a_legacy_db(with_test_migration, legacy_db):
@@ -185,13 +185,13 @@ def test_new_migration_applies_to_a_legacy_db(with_test_migration, legacy_db):
     db = ScanDatabase(db_path=str(legacy_db))
     try:
         conn = db._connection()
-        assert db_schema.current_version(conn) == 3
+        assert db_schema.current_version(conn) == 4
 
         # migration 1 ran (ADD COLUMN on the legacy table)
         assert "frame_id" in {r[1] for r in conn.execute("PRAGMA table_info('session_data')")}
         # migration 2 ran (temp column)
         assert "temp" in {r[1] for r in conn.execute("PRAGMA table_info('session_data')")}
-        # migration 3 ran (new table + altered table)
+        # migration 4 ran (new table + altered table)
         assert "operator_id" in {r[1] for r in conn.execute("PRAGMA table_info('sessions')")}
         conn.execute(
             "INSERT INTO session_annotations(session_id, timestamp_s, label)"
@@ -216,7 +216,7 @@ def test_new_migration_applies_to_an_up_to_date_db(with_test_migration, tmp_path
     db = ScanDatabase(db_path=path)
     try:
         conn = db._connection()
-        assert db_schema.current_version(conn) == 3
+        assert db_schema.current_version(conn) == 4
         assert "operator_id" in {r[1] for r in conn.execute("PRAGMA table_info('sessions')")}
         assert db.get_session(sid)["session_label"] == "S"
     finally:
@@ -227,7 +227,7 @@ def test_new_migration_applies_to_an_encrypted_db(clinical, with_test_migration,
     db = ScanDatabase(db_path=str(tmp_path / "scans.db"))
     try:
         conn = db._connection()
-        assert db_schema.current_version(conn) == 3
+        assert db_schema.current_version(conn) == 4
         conn.execute(
             "INSERT INTO sessions(session_label, session_start, operator_id)"
             " VALUES('S', 1.0, 'ethan')")

@@ -231,6 +231,12 @@ class EnrichedCorrectedFrame:
     temp_c:   Optional[float] = None  # on-chip camera temperature (°C);
                                       # None only where no stamp was available
                                       # (e.g. reduced-mode side averages)
+    # Per-frame IMU motion of this frame's side, stamped by ImuFrameStage
+    # when the interval closes (bloodflow-app#783; ScanRequest.imu_motion).
+    # None when no IMU ran; n_samples 0 (values None) when no sample landed.
+    imu_n_samples:   Optional[int] = None
+    imu_accel_dev_g: Optional[float] = None   # mean |a - a_mean(2 s)|  (g)
+    imu_gyro_dps:    Optional[float] = None   # mean |omega|  (deg/s)
 
 
 @dataclass

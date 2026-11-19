@@ -217,6 +217,9 @@ class ScanRequest:
     expected_size: int = 32837
     write_corrected_csv: bool = True # opt out when the DB is the system of record
     write_telemetry_csv: bool = True
+    write_camera_telemetry_csv: bool = False         # 1 Hz per-camera sensor telemetry
+    write_imu_csv: bool = False      # per-scan IMU CSV aligned to timestamp_s (below)
+    imu_motion: bool = False         # per-frame IMU motion averages (below)
     reduced_mode: bool = False       # per-side averaged BFI/BVI instead of per-camera
     sinks: list = field(default_factory=list)        # custom pipeline sinks (§6)
     skip_default_storage: bool = False               # don't auto-inject CSV/DB sinks
@@ -294,6 +297,7 @@ unless the console runs a Factory image.
 | `cancel_scan(join_timeout=5.0)` | User-stop with orderly teardown. |
 | `last_scan_error` (str \| None) | Error from the most recent scan, else `None`. |
 | `last_scan_canceled` (bool) | True if the most recent scan was user-canceled. |
+| `last_imu_csv_path` (str \| None) | IMU CSV of the most recent scan (`write_imu_csv`), else `None`. |
 | `current_scan_label` (str \| None) | `"{scan_id}_{subject_id}"` of the most recent scan — the DB `session_label`, valid as soon as `start_scan` returns. |
 
 `ScanResult` (the per-scan outcome object, surfaced via the legacy callback path
@@ -304,6 +308,16 @@ and the calibration workflow) carries `ok`, `error`, `canceled`,
 
 - **CSV** (if `data_dir` set): corrected, raw (duration-capped), and telemetry
   CSVs, gated by the per-scan flags. Corrected CSV is opt-in when a DB is set.
+- **IMU CSV** (`write_imu_csv=True`, needs `data_dir`, sensor fw >= 1.6.2):
+  `{scan_id}_{subject_id}_imu.csv`, both sides in one file, one row per 40 Hz
+  IMU sample. Columns: `side, imu_frame, timestamp_s, time_source, device_ms,
+  host_time_unix, ax..az, gx..gz, mx..mz` (raw counts), `accel_*_g` (raw/2048),
+  `gyro_*_dps` (raw/16.4), `temp_c`. `timestamp_s` shares the histogram rows'
+  per-side zero: `time_source=device` when the firmware line carries `ms`
+  (same TIM5 clock as histograms, exact), else `host` (host receive time
+  relative to when that side's first histogram sample arrived, ~10-20 ms).
+  Samples before the first histogram get negative times. IMU failures are
+  logged and never abort the scan. Implementation: `omotion/imu_csv.py`.
 - **Scan DB** (if `scan_db_path` set): `session_data` rows per frame — per-camera
   BFI/BVI/mean/contrast/temp in normal mode, or the per-side average (`cam_id=-1`)
   in reduced mode. This is what §5 reads back for replay.
@@ -448,8 +462,30 @@ class MySink:
 | `"live_side"` | `SideAverageSample` (realtime per-side avg) | per capture, reduced mode |
 | `"final"` | `EnrichedCorrectedInterval` (dark-corrected frames; in reduced mode also the cam_id=-1 side-average intervals) | per closed dark interval (~15 s) |
 | `"diagnostics"` | `BatchEvent` (e.g. `DarkIntegrityWarning`, trigger transitions) | as they occur |
+| `"imu_frame"` | `ImuFrameMotion` — one side's IMU motion averaged over one histogram frame | per frame per side (40 Hz), `ScanRequest.imu_motion` only |
 
-`SideAverageSample` carries `t, frame_id, side, bfi, bvi`. A
+`SideAverageSample` carries `t, frame_id, side, bfi, bvi`.
+
+`ImuFrameMotion` (`omotion.pipeline`) carries `side` ("left"/"right"),
+`frame_id` (the frame's `abs_frame_id`, = `session_data.frame_id`),
+`timestamp_s` (= `session_data.timestamp_s`), `n_samples`, and the means over
+the IMU samples since that side's previous frame of two magnitudes:
+`accel_dev_g` (`|a - a_mean|`, each accelerometer sample against that side's
+2 s running mean, so gravity and the chip's offset cancel: ~0 at rest in any
+pose, no calibration) and `gyro_dps` (`|omega|`, no bias removal). The
+per-axis values are not kept. The IMU and the frames both run at
+40 Hz on separate clocks, so `n_samples` is usually 1 and sometimes 0 or 2;
+with 0 every value is `None`. Weight any rolling average by `n_samples`. The
+SDK does no smoothing or thresholding; that is the app's. Events trail their
+frame by up to ~1 s while the IMU catches up. The per-sample math is
+`omotion.imu_csv.AccelBaseline` (one per sensor) and
+`omotion.imu_csv.gyro_magnitude`. The same per-frame
+values are stamped onto the corrected frames (`imu_n_samples`,
+`imu_accel_dev_g`, `imu_gyro_dps`) and so stored on the `session_data` rows;
+`ScanDatabase.get_imu_frames` reads them back one row per side/frame (see
+ScanDatabase.md).
+
+A
 sink whose `on_scan_start` raises is disabled for the scan unless it sets
 `critical = True`, in which case `ScanRunner` raises `CriticalSinkError` and the
 scan aborts (this is how `ScanDBSink` guarantees no silent data loss). Pass

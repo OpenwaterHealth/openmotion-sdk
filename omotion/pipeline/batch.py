@@ -542,3 +542,33 @@ class FrameBatch:
         completed.extend(indices for _, _, indices in active.values())
         completed.sort(key=lambda indices: indices[0])
         return completed
+
+
+# Runner channel for ImuFrameMotion events (bloodflow-app#783).
+IMU_FRAME_CHANNEL = "imu_frame"
+
+
+@dataclass(frozen=True)
+class ImuFrameMotion(BatchEvent):
+    """One side's IMU motion over one histogram frame interval.
+
+    Emitted by ImuFrameStage (``ScanRequest.imu_motion``) for every
+    light/dark frame of a side whose IMU is streaming, keyed like
+    session_data: ``frame_id`` is the frame's ``abs_frame_id`` and
+    ``timestamp_s`` its (repaired) scan time. The values average the IMU
+    samples with ``prev_timestamp_s < t <= timestamp_s`` (the previous frame
+    of the same side; one nominal frame period for the first). The IMU
+    (40 Hz, own clock) and the frames (40 Hz FSIN) are not phase-locked, so
+    ``n_samples`` is usually 1 and sometimes 0 or 2; with 0, every value is
+    None. A rolling average should weight by ``n_samples``.
+
+    ScanRunner.dispatch_event routes it to the ``"imu_frame"`` channel
+    (IMU_FRAME_CHANNEL), on the runner thread like every other channel. It
+    trails the frame by up to ~1 s while the IMU catches up.
+    """
+    side:         str               # "left" | "right"
+    frame_id:     int               # abs_frame_id (session_data.frame_id)
+    timestamp_s:  float             # session_data.timestamp_s
+    n_samples:    int
+    accel_dev_g:  Optional[float]   # mean over samples of |a - a_mean(2 s)|  (g)
+    gyro_dps:     Optional[float]   # mean over samples of |omega|  (deg/s, no bias removal)
