@@ -170,3 +170,9 @@ histogram.csv
 /reports/*
 .claude/*
 .scratch/wi15_out/
+
+# Scan databases created by ScanDatabase("<bare name>.db") resolve into
+# omotion/data/ (ScanDatabase._resolve_path); never commit or package them.
+omotion/data/*.db
+omotion/data/*.db-wal
+omotion/data/*.db-shm
