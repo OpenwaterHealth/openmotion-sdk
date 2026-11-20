@@ -129,6 +129,36 @@ def test_download_does_not_fail_when_the_unit_is_gone_before_the_last_status(con
     assert dev.manifested and dev.read(SLOT, 2048) == b"\x06" * 2048
 
 
+def test_download_without_manifest_leaves_the_device_in_dfu(connected):
+    """The ROM loader starts the image at the manifestation, so a write that is
+    still to be verified must not send it."""
+    dfu, dev = connected
+    dfu.set_rom_mode()
+
+    dfu.download(0x08000000, b"\x05" * 2048, manifest=False)
+
+    assert dev.read(0x08000000, 2048) == b"\x05" * 2048
+    assert not dev.manifested
+
+
+def test_verify_reports_read_progress(connected):
+    dfu, dev = connected
+    dfu.download(SLOT, b"\x03" * 2500)
+    seen = []
+
+    dfu.verify(SLOT, b"\x03" * 2500, progress_cb=lambda done, total: seen.append((done, total)))
+
+    assert seen == [(1024, 2500), (2048, 2500), (2500, 2500)]
+
+
+def test_serial_names_the_opened_unit(monkeypatch):
+    install_fake_usb(monkeypatch, [FakeUsbDevice(serial="ROM-UID")])
+    dfu = STM32DFU()
+    assert dfu.serial is None
+    dfu.connect()
+    assert dfu.serial == "ROM-UID"
+
+
 def test_download_pre_erased_does_not_erase(connected):
     dfu, dev = connected
     dfu.download(SLOT, b"\x01" * 64, pre_erased=True)

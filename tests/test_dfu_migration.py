@@ -1,13 +1,21 @@
-"""The migration helpers: bootloader version parsing and production-image
-consistency. Version vectors are the ones in the bootloader repository's
-py-tools/tests/test_migrate_tools.py. Needs no hardware.
+"""The migration helpers: bootloader version parsing, production-image
+consistency, and the bare-metal write. Version vectors are the ones in the
+bootloader repository's py-tools/tests/test_migrate_tools.py. Needs no hardware.
 """
 
 import struct
 
 import pytest
 
-from _dfu_fakes import make_key, make_production, sign_image
+from _dfu_fakes import (
+    FakeUsbDevice,
+    install_fake_usb,
+    make_key,
+    make_production,
+    sign_image,
+    usb_error,
+)
+from omotion.dfu import STM32DFU, DFUError, DFUVerifyError
 from omotion.dfu.image import ImageVerificationError
 from omotion.dfu.migration import (
     BOOTLOADER_LEN,
@@ -15,7 +23,9 @@ from omotion.dfu.migration import (
     MIN_BOOTLOADER,
     ROM_ERASE_END,
     check_production_image,
+    install_bare_metal_app,
     parse_bl_version,
+    write_bare_metal_app,
 )
 
 pytestmark = pytest.mark.unit
@@ -82,3 +92,78 @@ def test_production_image_with_an_implausible_vector_table_is_rejected(signed, s
 def test_updater_embedding_another_bootloader_is_rejected(signed):
     with pytest.raises(ImageVerificationError, match="updater"):
         check_production_image(make_production(signed), updater=b"\x00" * 4096)
+
+
+# ---------------------------------------------------------------------------
+# Bare-metal application (sdk#333): the ROM loader starts whatever is in flash
+# at the manifestation, so the image is read back before that.
+# ---------------------------------------------------------------------------
+
+BARE_METAL = struct.pack("<II", 0x24080000, 0x08000401) + bytes(range(256)) * 12
+
+
+@pytest.fixture
+def rom(monkeypatch):
+    dev = FakeUsbDevice(serial="ROM-UID")
+    install_fake_usb(monkeypatch, [dev])
+    dfu = STM32DFU()
+    dfu.connect()
+    yield dfu, dev
+    dfu.disconnect()
+
+
+def test_bare_metal_install_reads_back_before_it_starts_the_image(rom, monkeypatch):
+    dfu, dev = rom
+    manifested_at_verify = []
+    real_verify = dfu.verify
+
+    def spy(address, data, progress_cb=None):
+        manifested_at_verify.append(dev.manifested)
+        return real_verify(address, data, progress_cb=progress_cb)
+
+    monkeypatch.setattr(dfu, "verify", spy)
+
+    install_bare_metal_app(dfu, BARE_METAL)
+
+    assert manifested_at_verify == [False]
+    assert dev.read(FLASH_BASE, len(BARE_METAL)) == BARE_METAL
+    assert dev.manifested
+
+
+def test_bare_metal_install_with_a_bad_read_back_never_starts_the_image(rom):
+    dfu, dev = rom
+    dev.corrupt_upload = True
+
+    with pytest.raises(DFUVerifyError):
+        install_bare_metal_app(dfu, BARE_METAL)
+
+    assert not dev.manifested
+
+
+def test_bare_metal_install_that_fails_mid_write_never_starts_the_image(rom, monkeypatch):
+    dfu, dev = rom
+    real = dev.ctrl_transfer
+    blocks = []
+
+    def flaky(request_type, request, value, index, data):
+        if request == 1 and value >= 2:          # data blocks
+            blocks.append(value)
+            if len(blocks) == 2:
+                raise usb_error("timeout")
+        return real(request_type, request, value, index, data)
+
+    monkeypatch.setattr(dev, "ctrl_transfer", flaky)
+
+    with pytest.raises(DFUError):
+        install_bare_metal_app(dfu, BARE_METAL)
+
+    assert not dev.manifested
+
+
+def test_write_bare_metal_app_leaves_the_unit_in_dfu(rom):
+    dfu, dev = rom
+
+    write_bare_metal_app(dfu, BARE_METAL)
+
+    assert dev.read(FLASH_BASE, len(BARE_METAL)) == BARE_METAL
+    assert not dev.manifested
