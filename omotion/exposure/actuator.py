@@ -41,7 +41,7 @@ Camera = tuple[int, int]    # (side: 0 left / 1 right, position 0..7)
 SAFETY_PULSE_WIDTH_UL_US = ABSOLUTE_MAX_PULSE_WIDTH_US   # above the longest pulse
 # The 2400 us dark skip leaves 25000 - 2400 = 22600 us from the displaced dark
 # pulse to the next one at 40 Hz; real consoles hold 23125 (stock 22500).
-SAFETY_RATE_LL_US = 22400.0                              # raw 70000
+from omotion.dark_skip import SAFETY_RATE_LL_US         # 22400 us, raw 70000
 # Above any 5000 mA peak (the WI-15 laser calibration swept with 9999).
 #
 # The raw value's low byte must be 0xFF. The safety FPGA takes the 16-bit

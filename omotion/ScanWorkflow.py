@@ -403,6 +403,10 @@ class ScanWorkflow:
         # Called by start_scan with the request's (left, right) masks before
         # anything starts; see set_scan_preparer.
         self._scan_preparer = None
+        # Long-exposure dark skip and the RATE_LL floor it needs
+        # (bloodflow-app#747); see set_device_timing.
+        from omotion.dark_skip import LongExposureDarkSkip
+        self._dark_skip = LongExposureDarkSkip(self._console_registers)
         self._last_scan_canceled: bool = False
         # Label of the scan-DB session for the most recent start_scan, set
         # synchronously when the scan's metadata is built. Lets callers bind
@@ -509,6 +513,27 @@ class ScanWorkflow:
         """
         self._scan_preparer = preparer
 
+    def set_device_timing(self, *, camera_exposure_us=None,
+                          laser_pulse_width_us=None) -> None:
+        """Tell the SDK the camera exposure and TA laser pulse width the host
+        has written outside a workflow (``None`` = the firmware default).
+
+        Every scan that starts after it uses them to pick its dark-frame
+        skip: past 1700 us (exposure, or pulse delay + pulse width) the
+        scan runs a 2400 us skip so the displaced dark pulse misses the
+        exposure, with both safety FPGAs' ``RATE_LL`` lowered first and put
+        back once a scan no longer needs it (:mod:`omotion.dark_skip`). The
+        host sees none of that. Call it before every scan or check whose
+        settings may have changed; Optimize Laser's own settings don't need it.
+        """
+        self._dark_skip.set_device_timing(
+            camera_exposure_us=camera_exposure_us,
+            laser_pulse_width_us=laser_pulse_width_us)
+
+    def _console_registers(self):
+        from omotion.calibration.motion_bench import FpgaRegisterIO
+        return FpgaRegisterIO(self._interface.console)
+
     def start_scan(
         self,
         request: ScanRequest,
@@ -583,6 +608,23 @@ class ScanWorkflow:
                 return False
             if prepared:
                 request = _with_prepared_overrides(request, prepared)
+
+        # Long-exposure dark skip (omotion.dark_skip): adds the 2400 us skip
+        # when the host's camera exposure or pulse width needs it, after
+        # lowering RATE_LL, or keeps the default skip if that fails. Stays
+        # out when the request (or Optimize Laser above) already sets a skip.
+        if not self._running:
+            try:
+                delay = self._interface.resolve_trigger_config(
+                    request.trigger_config).get("LaserPulseDelayUsec")
+            except Exception:
+                delay = None
+            skip = self._dark_skip.prepare(request.trigger_config,
+                                           disable_laser=request.disable_laser,
+                                           pulse_delay_us=delay)
+            if skip:
+                request = dataclasses.replace(
+                    request, trigger_config={**(request.trigger_config or {}), **skip})
 
         # Per-scan gain and calibration overrides: resolve them before
         # anything starts, so a bad value refuses the scan rather than

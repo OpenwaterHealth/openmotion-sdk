@@ -232,6 +232,23 @@ class ScanRequest:
 which resets the firmware fsync/dark-frame schedule so dark correction stays
 aligned — so you normally never need to set `trigger_config`.
 
+**Long camera exposures.** If the host writes a camera exposure or a TA laser
+pulse width itself (outside Optimize Laser), it reports them before the scan:
+
+```python
+iface.scan_workflow.set_device_timing(camera_exposure_us=2196,
+                                      laser_pulse_width_us=None)  # None = firmware default
+```
+
+Every scan after that (including contact-quality checks and calibration
+sub-scans) picks its dark-frame skip from them: past 1700 µs of exposure, or of
+pulse delay + width, the displaced dark pulse would land inside the exposure,
+so the SDK lowers both safety FPGAs' `RATE_LL` to 22400 µs (read back) and runs
+a 2400 µs skip; the first scan that no longer needs it puts `RATE_LL` back. If
+the floor can't be lowered, the scan keeps the default 1800 µs skip (its darks
+catch the laser, but the interlock doesn't latch). A request or Optimize Laser
+that sets its own skip is left alone. See `omotion/dark_skip.py`.
+
 **reduced mode** is the clinical path: the pipeline averages the active cameras
 into one left + one right BFI/BVI value per capture. In reduced mode the scan DB
 stores only the per-side average (`cam_id = -1` rows), not per-camera rows.
