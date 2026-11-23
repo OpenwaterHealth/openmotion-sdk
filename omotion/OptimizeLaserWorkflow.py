@@ -61,8 +61,9 @@ from omotion.ScanWorkflow import ScanTiming, run_collection_scan
 logger = logging.getLogger("openmotion.sdk.exposure")
 
 # Dark skip for every scan at the long exposure: the displaced dark pulse
-# starts at 100 + 2400 = 2500 us, after a 2196 us exposure ends.
-DARK_SKIP_US = 2400
+# starts at 100 + 2400 = 2500 us, after a 2196 us exposure ends. The same
+# skip the SDK gives any long-exposure scan (omotion.dark_skip).
+from omotion.dark_skip import LONG_DARK_SKIP_US as DARK_SKIP_US
 # restore() problems that mean the laser side may still hold optimized
 # settings or the 2400 us skip. A camera write failure alone does not block
 # a scan, because every scan reconfigures its cameras first.
