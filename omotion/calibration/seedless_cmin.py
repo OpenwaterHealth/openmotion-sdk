@@ -73,6 +73,7 @@ PHASE_NOMINAL = "nominal"
 PHASE_SEARCH = "search"
 PHASE_CMIN = "cmin"
 PHASE_PLATEAU = "plateau"
+PHASE_NOMINAL_AFTER = "nominal_after"
 
 #: How C_min was obtained: at matched brightness, or from the plateau check.
 BASIS_MATCHED = "matched"
@@ -175,6 +176,15 @@ class CminSettings:
     round_fractions: tuple[float, ...] = (0.5, 0.75, 1.0)   # of max_ta_us
     min_current_gain: float = 0.005         # a current step must raise the mean
     max_total_bursts: int = 80
+    # Confidence in the per-camera C_min (Ethan 2026-11-24):
+    cmin_repeats: int = 3                   # 1 s captures at the matched setting
+    camera_tolerance: float = 0.05          # each camera's brightness vs its nominal
+    repeat_spread_max: float = 0.02         # per camera, (max - min) / mean
+    correction_min_ratio: float = 0.6       # bursts used for the 1.0x correction
+    correction_flag: float = 0.01           # flag a correction bigger than this
+    nominal_recheck: bool = True            # seeded nominal again at the end
+    nominal_recheck_frames: int = 40
+    nominal_drift_max: float = 0.02         # per camera, after vs before
 
     def validate(self) -> None:
         if not (MIN_TA_PULSE_WIDTH_US <= self.start_ta_us <= self.max_ta_us
@@ -204,6 +214,55 @@ class CminSettings:
             raise ValueError("plateau_min_ratio must be between 0 and 1")
         if not (0 < self.plateau_tolerance < 1):
             raise ValueError("plateau_tolerance must be between 0 and 1")
+        if int(self.cmin_repeats) < 2:
+            raise ValueError("cmin_repeats must be >= 2 (one capture has no spread)")
+        if int(self.nominal_recheck_frames) < 1:
+            raise ValueError("nominal_recheck_frames must be >= 1")
+        for name in ("camera_tolerance", "repeat_spread_max", "correction_flag",
+                     "nominal_drift_max"):
+            if not (0 < getattr(self, name) < 1):
+                raise ValueError(f"{name} must be between 0 and 1")
+        if not (0 < self.correction_min_ratio < 1):
+            raise ValueError("correction_min_ratio must be between 0 and 1")
+
+
+@dataclass(frozen=True)
+class CameraCmin:
+    """One camera's C_min and the evidence for it."""
+    side: str
+    cam_id: int
+    nominal_mean: float
+    nominal_contrast: float
+    ratio: float                 # capture mean / nominal mean (all repeats)
+    cmin_raw: float              # average contrast over the repeats
+    repeats: tuple[float, ...]   # each repeat's average contrast
+    repeat_spread: float         # (max - min) / mean of the repeats
+    slope: Optional[float]       # d contrast / d ratio near the match
+    cmin: float                  # corrected to ratio 1.0 (raw if no slope)
+    correction: float            # cmin / cmin_raw - 1
+    nominal_drift: Optional[float] = None   # nominal after / before - 1
+
+    @property
+    def label(self) -> str:
+        return f"{'L' if self.side == 'left' else 'R'}{self.cam_id + 1}"
+
+    @property
+    def cmin_over_nominal(self) -> float:
+        return self.cmin / self.nominal_contrast if self.nominal_contrast else math.nan
+
+
+def contrast_slope(points: Sequence[tuple[float, float]]) -> Optional[float]:
+    """Least-squares d contrast / d ratio, or None without a usable spread
+    of brightness (at least 2 points spanning 5 %)."""
+    if len(points) < 2:
+        return None
+    xs = [p[0] for p in points]
+    if max(xs) - min(xs) < 0.05:
+        return None
+    mx = sum(xs) / len(xs)
+    my = sum(p[1] for p in points) / len(points)
+    den = sum((x - mx) ** 2 for x in xs)
+    return sum((x - mx) * (y - my) for x, y in points) / den
 
 
 class CminBench(Protocol):
@@ -258,6 +317,11 @@ class CminResult:
     currents_tried_ma: list[float] = field(default_factory=list)
     plateau: list[BurstResult] = field(default_factory=list)  # below the capture
     plateau_spread: dict[str, float] = field(default_factory=dict)
+    cmin_captures: list[BurstResult] = field(default_factory=list)
+    cameras: list[CameraCmin] = field(default_factory=list)
+    nominal_after: tuple[CameraStats, ...] = ()
+    seedless_exited: bool = False
+    notes: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         def stats(cams):
@@ -282,6 +346,12 @@ class CminResult:
             "start_ta_current_ma": self.start_current_ma,
             "ta_currents_tried_ma": list(self.currents_tried_ma),
             "plateau": [burst(b) for b in self.plateau],
+            "cmin_repeats": [burst(b) for b in self.cmin_captures],
+            "cameras": [dict(asdict(c), label=c.label,
+                             cmin_over_nominal=c.cmin_over_nominal)
+                        for c in self.cameras],
+            "nominal_after": stats(self.nominal_after),
+            "notes": list(self.notes),
             "plateau_contrast_spread": dict(self.plateau_spread),
             "nominal": stats(self.nominal),
             "search": [burst(b) for b in self.bursts],
@@ -596,32 +666,13 @@ class SeedlessCminProcedure:
                         f"{result.bursts[-1].ratio:.3f}x at "
                         f"{result.bursts[-1].ta_pulse_width_us:.0f} us)")
 
-            self._out(f"Matched at {result.matched_ta_us:.1f} us, "
-                      f"{self._current:.0f} mA. Capturing "
-                      f"{s.cmin_light_frames} seedless frames ...")
-            cap = self._burst(result, 0, result.matched_ta_us,
-                              s.cmin_light_frames, PHASE_CMIN, "C_min capture")
-            result.cmin_capture = cap
-            if abs(cap.ratio - 1.0) > s.cmin_tolerance:
-                raise ProcedureStop(
-                    f"the C_min capture drifted to {cap.ratio:.3f}x the normal "
-                    f"brightness (allowed {1 - s.cmin_tolerance:.2f}.."
-                    f"{1 + s.cmin_tolerance:.2f}x)")
-            per_cam = {c.label: c.contrast for c in cap.cameras
-                       if (c.side, c.cam_id) in self._cams}
-            bad = [k for k, v in per_cam.items() if not math.isfinite(v)]
-            if bad:
-                raise ProcedureStop(f"no contrast for {', '.join(bad)}")
-            result.cmin_per_camera = per_cam
-            result.cmin = sum(per_cam.values()) / len(per_cam)
-            result.basis = BASIS_MATCHED
-            result.verdict = VERDICT_PASS
+            self._capture_and_evaluate(result)
         except ProcedureStop as exc:
             result.problem = str(exc)
         except Exception as exc:
             result.problem = f"{type(exc).__name__}: {exc}"
         finally:
-            if result.seedless_entered:
+            if result.seedless_entered and not result.seedless_exited:
                 try:
                     result.restore_problem = self._bench.exit_seedless()
                 except Exception as exc:
@@ -632,6 +683,121 @@ class SeedlessCminProcedure:
                         result.problem = ("the normal laser settings were not "
                                           "restored: " + result.restore_problem)
         return result
+
+    def _capture_and_evaluate(self, result: CminResult) -> None:
+        """Repeat captures at the matched setting, per-camera C_min with a
+        correction to exactly 1.0x, then (after the restore) the seeded
+        nominal again. Every gate failure raises ProcedureStop; the per-camera
+        results are filled in first, so the report always has them."""
+        s = self._s
+        n = int(s.cmin_repeats)
+        self._out(f"Matched at {result.matched_ta_us:.1f} us, "
+                  f"{self._current:.0f} mA. Capturing {n} x "
+                  f"{s.cmin_light_frames} seedless frames ...")
+        frames_before = len(result.frames)
+        for i in range(1, n + 1):
+            cap = self._burst(result, i, result.matched_ta_us,
+                              s.cmin_light_frames, PHASE_CMIN,
+                              f"C_min capture {i} of {n}")
+            result.cmin_captures.append(cap)
+            if abs(cap.ratio - 1.0) > s.cmin_tolerance:
+                raise ProcedureStop(
+                    f"C_min capture {i} drifted to {cap.ratio:.3f}x the normal "
+                    f"brightness (allowed {1 - s.cmin_tolerance:.2f}.."
+                    f"{1 + s.cmin_tolerance:.2f}x)")
+        all_cap = [f for f in result.frames[frames_before:]]
+        combined = replace(compare_to_nominal(
+            0, result.matched_ta_us,
+            camera_stats([FrameRecord(f.side, f.cam_id, f.abs_frame_id, f.mean,
+                                      f.std, f.contrast) for f in all_cap]),
+            result.nominal), ta_current_ma=self._current)
+        result.cmin_capture = combined
+
+        nominal = {(c.side, c.cam_id): c for c in result.nominal}
+        local = [b for b in result.bursts
+                 if b.ta_current_ma == self._current] + result.cmin_captures
+        cams: list[CameraCmin] = []
+        for c in combined.cameras:
+            key = (c.side, c.cam_id)
+            if key not in self._cams:
+                continue
+            nom = nominal[key]
+            reps = tuple(cc.contrast for b in result.cmin_captures
+                         for cc in b.cameras if (cc.side, cc.cam_id) == key)
+            if not all(math.isfinite(v) for v in reps) or not reps:
+                raise ProcedureStop(f"no contrast for {c.label}")
+            raw = sum(reps) / len(reps)
+            ratio = c.mean / nom.mean
+            pts = [(cc.mean / nom.mean, cc.contrast) for b in local
+                   for cc in b.cameras if (cc.side, cc.cam_id) == key
+                   and cc.mean / nom.mean >= s.correction_min_ratio]
+            slope = contrast_slope(pts)
+            corrected = raw + slope * (1.0 - ratio) if slope is not None else raw
+            cams.append(CameraCmin(
+                c.side, c.cam_id, nom.mean, nom.contrast, ratio, raw, reps,
+                contrast_spread(reps), slope, corrected,
+                corrected / raw - 1.0 if raw else math.nan))
+        result.cameras = cams
+        result.cmin_per_camera = {c.label: c.cmin for c in cams}
+        result.cmin = sum(c.cmin for c in cams) / len(cams)
+        result.basis = BASIS_MATCHED
+        for c in cams:
+            self._detail(
+                f"{c.label}: brightness {c.ratio:.3f}x, C_min raw {c.cmin_raw:.4f}"
+                f" -> {c.cmin:.4f} at 1.0x (slope "
+                + ("n/a" if c.slope is None else f"{c.slope:+.4f}")
+                + f"), repeats spread {c.repeat_spread:.1%}")
+            if c.slope is None:
+                result.notes.append(f"{c.label}: no brightness spread near the "
+                                    "match, C_min not corrected to 1.0x")
+            elif abs(c.correction) > s.correction_flag:
+                result.notes.append(f"{c.label}: correction to 1.0x is "
+                                    f"{c.correction:+.1%}")
+
+        off = [c for c in cams if abs(c.ratio - 1.0) > s.camera_tolerance]
+        if off:
+            raise ProcedureStop(
+                "brightness not matched per camera (limit "
+                f"{s.camera_tolerance:.0%}): "
+                + ", ".join(f"{c.label} {c.ratio:.3f}x" for c in off))
+        noisy = [c for c in cams if not (c.repeat_spread <= s.repeat_spread_max)]
+        if noisy:
+            raise ProcedureStop(
+                f"C_min does not repeat within {s.repeat_spread_max:.0%}: "
+                + ", ".join(f"{c.label} {c.repeat_spread:.1%}" for c in noisy))
+
+        if s.nominal_recheck:
+            result.seedless_exited = True
+            result.restore_problem = self._bench.exit_seedless()
+            if result.restore_problem:
+                raise ProcedureStop("the normal laser settings were not "
+                                    "restored: " + result.restore_problem)
+            self._out(f"Seed back ON. Re-measuring the normal image "
+                      f"({s.nominal_recheck_frames} frames) ...")
+            frames = self._bench.capture(s.nominal_recheck_frames,
+                                         seedless=False)
+            self._tag(result, frames, PHASE_NOMINAL_AFTER, 0,
+                      quantize_ta_us(500.0), "on", result.start_current_ma)
+            after = camera_stats(frames)
+            _check_frame_counts(after, self._cams, s.nominal_recheck_frames,
+                                s.min_frame_fraction, "normal re-check")
+            result.nominal_after = tuple(c for c in after
+                                         if (c.side, c.cam_id) in self._cams)
+            by_key = {(c.side, c.cam_id): c for c in result.nominal_after}
+            result.cameras = cams = [
+                replace(c, nominal_drift=by_key[(c.side, c.cam_id)].mean
+                        / c.nominal_mean - 1.0) for c in cams]
+            drift = [c for c in cams
+                     if not (abs(c.nominal_drift) <= s.nominal_drift_max)]
+            for c in cams:
+                self._detail(f"{c.label}: normal brightness moved "
+                             f"{c.nominal_drift:+.1%} during the run")
+            if drift:
+                raise ProcedureStop(
+                    "the normal (seeded) brightness moved during the run "
+                    f"(limit {s.nominal_drift_max:.0%}): "
+                    + ", ".join(f"{c.label} {c.nominal_drift:+.1%}" for c in drift))
+        result.verdict = VERDICT_PASS
 
     def _search_with_current(self, result: CminResult) -> None:
         """Rounds of bursts at progressive pulse widths, one round per drive

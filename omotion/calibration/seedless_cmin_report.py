@@ -113,11 +113,38 @@ def format_summary(result: CminResult, run_info: Mapping[str, object]) -> str:
                   "((max - min) / mean)"]
         for label, spread in result.plateau_spread.items():
             lines.append(f"{label:<5}{spread:>8.1%}")
+    if result.cameras:
+        lines += ["", "Per camera C_min (average of the repeat captures, then "
+                  "corrected to exactly 1.0x the normal brightness along the "
+                  "camera's own contrast-vs-brightness slope)",
+                  f"{'cam':<5}{'nom mean':>10}{'nom K':>9}{'bright':>9}"
+                  f"{'C_min raw':>11}{'slope':>9}{'C_min':>9}{'corr':>8}"
+                  f"{'repeat':>8}{'drift':>8}{'C_min/K':>9}"]
+        for c in result.cameras:
+            slope = "n/a" if c.slope is None else f"{c.slope:+.4f}"
+            drift = "" if c.nominal_drift is None else f"{c.nominal_drift:+.1%}"
+            lines.append(
+                f"{c.label:<5}{c.nominal_mean:>10.2f}{c.nominal_contrast:>9.4f}"
+                f"{c.ratio:>8.3f}x{c.cmin_raw:>11.4f}{slope:>9}{c.cmin:>9.4f}"
+                f"{c.correction:>8.1%}{c.repeat_spread:>8.1%}{drift:>8}"
+                f"{c.cmin_over_nominal:>9.3f}")
+        lines += ["", "Repeat captures (contrast per camera)",
+                  f"{'cam':<5}" + "".join(f"{'#' + str(i + 1):>9}" for i in
+                                          range(len(result.cmin_captures)))]
+        for c in result.cameras:
+            lines.append(f"{c.label:<5}" + "".join(f"{v:>9.4f}" for v in c.repeats))
+    for note in result.notes:
+        lines.append(f"Note: {note}")
+    if result.nominal_after:
+        lines += ["", "Nominal again after the restore (seed on)",
+                  f"{'cam':<5}{'n':>4}{'mean':>10}{'contrast':>10}"]
+        for c in result.nominal_after:
+            lines.append(f"{c.label:<5}{c.n:>4}{c.mean:>10.2f}{c.contrast:>10.4f}")
     if result.cmin_capture is not None:
         cap = result.cmin_capture
-        lines += ["", f"C_min capture at {cap.ta_pulse_width_us:.1f} us "
+        lines += ["", f"C_min captures combined at {cap.ta_pulse_width_us:.1f} us "
                   f"(mean ratio {cap.ratio:.3f})",
-                  f"{'cam':<5}{'n':>4}{'mean':>10}{'C_min':>10}"]
+                  f"{'cam':<5}{'n':>4}{'mean':>10}{'contrast':>10}"]
         for c in cap.cameras:
             lines.append(f"{c.label:<5}{c.n:>4}{c.mean:>10.2f}{c.contrast:>10.4f}")
     return "\n".join(lines) + "\n"

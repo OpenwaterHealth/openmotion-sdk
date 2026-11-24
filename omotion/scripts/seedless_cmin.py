@@ -64,7 +64,9 @@ from omotion.calibration.seedless_cmin_report import write_cmin_report
 from omotion.seedless import (
     MAX_TA_CURRENT_MA,
     MAX_TA_PULSE_WIDTH_US,
+    read_ta_current_ma,
     seedless_unsupported_reason,
+    ta_current_problem,
 )
 
 interface_factory = MotionInterface
@@ -253,6 +255,13 @@ def main(
                         f"{getattr(holder['result'], 'error', '')}")
         if not iface.apply_laser_power():
             return fail("could not set the laser power.")
+        # The nominal target must be at the unit's calibrated drive current.
+        problem = ta_current_problem(iface.console)
+        if problem:
+            return fail(problem + ".")
+        _emit_detail(output_func, "TA drive current "
+                     f"{read_ta_current_ma(iface.console):.0f} mA matches the "
+                     "console config")
 
         output_func("Step 3 of 4: Measuring. The laser will turn ON; part of "
                     "the run is with the seed OFF.")
@@ -313,8 +322,22 @@ def main(
     if result.problem:
         output_func(f"Problem: {result.problem}")
     if result.cmin is not None:
-        for label, value in result.cmin_per_camera.items():
-            _emit_detail(output_func, f"C_min {label}: {value:.4f}")
+        if result.cameras:
+            output_func("Per camera (C_min corrected to exactly the normal "
+                        "brightness):")
+            output_func(f"  {'cam':<4}{'bright':>8}{'C_min':>9}{'raw':>9}"
+                        f"{'repeat':>8}{'drift':>8}{'/seeded':>9}")
+            for c in result.cameras:
+                drift = ("" if c.nominal_drift is None
+                         else f"{c.nominal_drift:+.1%}")
+                output_func(f"  {c.label:<4}{c.ratio:>7.3f}x{c.cmin:>9.4f}"
+                            f"{c.cmin_raw:>9.4f}{c.repeat_spread:>8.1%}"
+                            f"{drift:>8}{c.cmin_over_nominal:>9.3f}")
+            for note in result.notes:
+                output_func(f"Note: {note}")
+        else:
+            for label, value in result.cmin_per_camera.items():
+                _emit_detail(output_func, f"C_min {label}: {value:.4f}")
         if result.matched_ta_us is not None:
             output_func(f"TA pulse width for matched brightness: "
                         f"{result.matched_ta_us:.1f} us")
@@ -330,7 +353,11 @@ def main(
                 f"Brightness not matched: C_min from the plateau check at "
                 f"{result.cmin_capture.ta_pulse_width_us:.1f} us "
                 f"({result.cmin_capture.ratio:.2f}x normal brightness)")
-        output_func(f"C_min = {result.cmin:.4f}")
+        if result.verdict == VERDICT_PASS:
+            output_func(f"C_min = {result.cmin:.4f}")
+        else:
+            output_func(f"C_min NOT confirmed (the run failed a check): "
+                        f"{result.cmin:.4f}")
     output_func("Nothing was written to the device.")
     output_func(f"Final result: {'PASS' if code == 0 else 'FAIL'}")
     return code

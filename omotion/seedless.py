@@ -163,6 +163,47 @@ def ta_current_ma_from_ticks(ticks: int) -> float:
     return ticks * TA_CURRENT_TICK_MA
 
 
+def read_ta_current_ma(console: Any) -> Optional[float]:
+    """The TA drive current the console's TA FPGA holds now (mA), or None."""
+    try:
+        data, dlen = console.read_i2c_packet(
+            mux_index=_MUX, channel=_TA_CH, device_addr=_DEV,
+            reg_addr=_TA_CUR_REG, read_len=_TA_CUR_LEN)
+    except Exception:
+        logger.exception("seedless: TA_CURRENT_DRV read raised")
+        return None
+    if data is None or dlen != _TA_CUR_LEN:
+        return None
+    return ta_current_ma_from_ticks(int.from_bytes(bytes(data[:2]), "little"))
+
+
+def ta_current_problem(console: Any) -> Optional[str]:
+    """Why the nominal (seeded) target would not be at the unit's calibrated
+    drive current, or None when it will be. Call after the laser bring-up.
+
+    Bench 2026-11-24: flashing console 1.8.1 empties the user config, and
+    the bring-up then left TA_CURRENT_DRV at the 4999.68 mA baseline instead
+    of the unit's 3900 mA, so three runs measured a 5 A target with no room
+    to step the current."""
+    try:
+        cfg = console.read_config()
+        data = dict(getattr(cfg, "json_data", None) or {})
+    except Exception as exc:
+        return f"the console config could not be read ({exc})"
+    want = data.get("TA_CURRENT_DRV")
+    if want is None:
+        return ("the console config has no TA_CURRENT_DRV, so the laser runs "
+                "at the bundled baseline instead of this unit's calibrated "
+                "current; write the unit's config first")
+    have = read_ta_current_ma(console)
+    if have is None:
+        return "the TA drive current could not be read back"
+    if abs(have - float(want)) > TA_CURRENT_TICK_MA * 1.5:
+        return (f"the TA drive current is {have:.0f} mA but the console config "
+                f"says {float(want):.0f} mA")
+    return None
+
+
 def _ta_payload(us: float) -> bytes:
     return ta_ticks_from_us(us).to_bytes(_TA_PW_LEN, "little")
 

@@ -14,6 +14,7 @@ import pytest
 from omotion.calibration.seedless_cmin import (
     PHASE_CMIN,
     PHASE_NOMINAL,
+    PHASE_NOMINAL_AFTER,
     PHASE_PLATEAU,
     PHASE_SEARCH,
     BASIS_MATCHED,
@@ -27,6 +28,7 @@ from omotion.calibration.seedless_cmin import (
     ProcedureStop,
     SeedlessCminProcedure,
     camera_stats,
+    contrast_slope,
     contrast_spread,
     next_ta_us,
     plateau_widths,
@@ -119,6 +121,15 @@ class FakeBench:
         return self.restore_problem
 
 
+def restored(bench):
+    """Exited seedless exactly once, and only seeded captures (the nominal
+    re-check) came after."""
+    exits = [i for i, e in enumerate(bench.log) if e == ("exit",)]
+    return (len(exits) == 1 and not bench.seedless
+            and all(e[0] == "capture" and e[1] is False
+                    for e in bench.log[exits[0] + 1:]))
+
+
 def run(bench, **kw):
     lines = []
     result = SeedlessCminProcedure(bench, CminSettings(**kw), CAMS,
@@ -141,13 +152,22 @@ def test_happy_path_matches_and_reports_cmin():
     assert abs(widths[0] - 500) < 0.5
     assert not any(c[0] == "current" for c in bench.log)
     assert result.matched_current_ma == result.start_current_ma == 3900.0
-    assert bench.log[-1] == ("exit",)
+    assert restored(bench)
     phases = {f.phase for f in result.frames}
-    assert phases == {PHASE_NOMINAL, PHASE_SEARCH, PHASE_CMIN}
+    assert phases == {PHASE_NOMINAL, PHASE_SEARCH, PHASE_CMIN,
+                      PHASE_NOMINAL_AFTER}
     # Every search burst is 10 light frames per camera.
     assert all(c[3] == 10 for c in bench.log
                if c[0] == "capture" and c[1] and c[3] != 40)
-    assert sum(1 for f in result.frames if f.phase == PHASE_CMIN) == 8 * 40
+    # Three 1 s repeats at the matched setting, then the seeded re-check.
+    assert sum(1 for f in result.frames if f.phase == PHASE_CMIN) == 3 * 8 * 40
+    assert len(result.cmin_captures) == 3
+    assert [c.label for c in result.cameras] == [f"R{c}" for c in range(1, 9)]
+    for cam in result.cameras:
+        assert len(cam.repeats) == 3 and cam.repeat_spread == pytest.approx(0)
+        assert cam.nominal_drift == pytest.approx(0, abs=1e-4)
+        assert cam.cmin_over_nominal == pytest.approx(0.09 / 0.40)
+    assert result.notes == []
 
 
 def test_seed_still_on_stops_after_first_burst():
@@ -156,7 +176,7 @@ def test_seed_still_on_stops_after_first_burst():
     assert result.verdict == VERDICT_FAIL
     assert "seed may not be off" in result.problem
     assert len(result.bursts) == 1
-    assert bench.log[-1] == ("exit",)
+    assert restored(bench)
 
 
 def test_bad_nominal_readout_stops_before_seed_is_touched():
@@ -213,7 +233,7 @@ def test_out_of_reach_flat_contrast_passes_on_the_plateau_check():
     assert all(v < 1e-9 for v in result.plateau_spread.values())
     assert {f.phase for f in result.frames} == {PHASE_NOMINAL, PHASE_SEARCH,
                                                  PHASE_PLATEAU, PHASE_CMIN}
-    assert bench.log[-1] == ("exit",)
+    assert restored(bench)
     assert any("out of reach" in line for line in lines)
 
 
@@ -225,7 +245,7 @@ def test_out_of_reach_contrast_that_follows_brightness_fails_per_camera():
     assert "not flat" in result.problem and "R1" in result.problem
     assert result.cmin is not None            # measured and reported anyway
     assert all(v > 0.05 for v in result.plateau_spread.values())
-    assert bench.log[-1] == ("exit",)
+    assert restored(bench)
 
 
 def test_plateau_check_tolerance_is_a_setting():
@@ -280,7 +300,7 @@ def test_enter_failure_still_restores():
     result, _ = run(bench)
     assert result.verdict == VERDICT_FAIL
     assert "refused" in result.problem
-    assert bench.log[-1] == ("exit",)
+    assert restored(bench)
 
 
 def test_restore_problem_fails_a_good_run():
@@ -377,7 +397,7 @@ def test_current_steps_up_100ma_until_the_brightness_is_reachable():
     # Each round: 3 progressive widths at one current (round 1 adds 500 us).
     at_3900 = [b.ta_pulse_width_us for b in result.bursts if b.ta_current_ma == 3900]
     assert at_3900 == pytest.approx([499.84, 1075.2, 1612.8, 2149.76], abs=0.4)
-    assert bench.log[-1] == ("exit",)
+    assert restored(bench)
     assert any("Raising the TA drive current to 4000 mA" in line for line in lines)
     # Every frame carries its current.
     assert all(f.ta_current_ma is not None for f in result.frames)
@@ -392,7 +412,7 @@ def test_out_of_reach_at_5a_fails_and_never_passes_the_ceiling():
     assert max(steps) == pytest.approx(MAX_TA_CURRENT_MA)
     assert steps[-2:] == pytest.approx([4900, MAX_TA_CURRENT_MA])
     assert result.cmin is None
-    assert bench.log[-1] == ("exit",)
+    assert restored(bench)
 
 
 def test_max_current_setting_caps_the_search():
@@ -407,7 +427,7 @@ def test_current_that_does_not_raise_the_mean_stops():
     result, _ = run(bench)
     assert result.verdict == VERDICT_FAIL
     assert "raising the drive current to 4000 mA did not raise" in result.problem
-    assert bench.log[-1] == ("exit",)
+    assert restored(bench)
 
 
 def test_settings_reject_current_above_5a():
@@ -425,3 +445,132 @@ def test_report_records_the_current(tmp_path):
     rows = paths["frames"].read_text().splitlines()
     assert rows[0].split(",")[4] == "ta_current_ma"
     assert "TA drive current for matched brightness: 4700.00 mA" in paths["text"].read_text()
+
+
+class PerCamBench(FakeBench):
+    """FakeBench with per-camera seedless brightness, repeat noise and a
+    seeded brightness that moves after the seedless part."""
+
+    def __init__(self, *, cam_gain=None, repeat_k=None, after_gain=1.0, **kw):
+        super().__init__(**kw)
+        self.cam_gain = cam_gain or {}
+        self.repeat_k = list(repeat_k or [])
+        self.after_gain = after_gain
+        self.exited = False
+
+    def exit_seedless(self):
+        self.exited = True
+        return super().exit_seedless()
+
+    def capture(self, light_frames, *, seedless):
+        frames = super().capture(light_frames, seedless=seedless)
+        out = []
+        for f in frames:
+            g = 1.0
+            k = f.contrast
+            if seedless:
+                g = self.cam_gain.get(f.cam_id, 1.0)
+                if light_frames == 40 and self.repeat_k:
+                    k = k * self.repeat_k[0]
+            elif self.exited:
+                g = self.after_gain
+            out.append(FrameRecord(f.side, f.cam_id, f.abs_frame_id, f.mean * g,
+                                   f.std * g * k / f.contrast, k))
+        if seedless and light_frames == 40 and self.repeat_k:
+            self.repeat_k.pop(0)
+        return out
+
+
+def test_one_camera_out_of_brightness_fails_with_its_name():
+    bench = PerCamBench(cam_gain={3: 0.90})
+    result, _ = run(bench)
+    assert result.verdict == VERDICT_FAIL
+    assert "brightness not matched per camera" in result.problem
+    assert "R4 0.9" in result.problem
+    # Per-camera numbers are still in the result for the report.
+    assert len(result.cameras) == 8
+    assert restored(bench)
+
+
+def test_cmin_that_does_not_repeat_fails():
+    bench = PerCamBench(repeat_k=[1.0, 1.03, 1.0])
+    result, _ = run(bench)
+    assert result.verdict == VERDICT_FAIL
+    assert "does not repeat within 2%" in result.problem
+    assert all(c.repeat_spread == pytest.approx(0.03, rel=0.05)
+               for c in result.cameras)
+    assert restored(bench)
+
+
+def test_nominal_drift_fails_after_the_restore():
+    bench = PerCamBench(after_gain=0.97)
+    result, _ = run(bench)
+    assert result.verdict == VERDICT_FAIL
+    assert "normal (seeded) brightness moved" in result.problem
+    assert all(c.nominal_drift == pytest.approx(-0.03, abs=1e-4)
+               for c in result.cameras)
+    assert len(result.nominal_after) == 8
+    assert restored(bench)
+
+
+def test_nominal_recheck_can_be_skipped():
+    bench = FakeBench()
+    result, _ = run(bench, nominal_recheck=False)
+    assert result.verdict == VERDICT_PASS
+    assert bench.log[-1] == ("exit",)
+    assert all(c.nominal_drift is None for c in result.cameras)
+
+
+def test_restore_problem_before_recheck_fails_without_recapturing():
+    bench = FakeBench(restore_problem="TA width read back wrong")
+    result, _ = run(bench)
+    assert result.verdict == VERDICT_FAIL
+    assert "TA width read back wrong" in result.problem
+    assert bench.log[-1] == ("exit",)
+    assert result.nominal_after == ()
+
+
+def test_cmin_is_corrected_to_exactly_one_times_brightness():
+    # Contrast rises as the image dims; the capture lands a little dim
+    # (drift 0.985), so the raw C_min is a bit high and the fit pulls it
+    # back to the contrast at 1.0x.
+    bench = FakeBench(k_slope=0.5, drift=0.985)
+    result, _ = run(bench)
+    assert result.verdict == VERDICT_PASS, result.problem
+    for cam in result.cameras:
+        assert cam.ratio < 1.0
+        assert cam.cmin_raw > cam.cmin
+        assert cam.slope == pytest.approx(-0.09 * 0.5, rel=0.02)
+        # The model's contrast at exactly 1.0x is seedless_k.
+        assert cam.cmin == pytest.approx(0.09, abs=2e-4)
+
+
+def test_contrast_slope_needs_a_spread_of_brightness():
+    assert contrast_slope([(1.0, 0.1)]) is None
+    assert contrast_slope([(0.99, 0.1), (1.0, 0.1)]) is None
+    assert contrast_slope([(0.8, 0.12), (1.0, 0.10)]) == pytest.approx(-0.1)
+
+
+@pytest.mark.parametrize("kw", [{"cmin_repeats": 1}, {"repeat_spread_max": 0},
+                                {"nominal_drift_max": 1.5},
+                                {"camera_tolerance": 0}])
+def test_settings_reject_bad_confidence_gates(kw):
+    with pytest.raises(ValueError):
+        CminSettings(**kw).validate()
+
+
+def test_report_has_per_camera_table_and_repeats(tmp_path):
+    bench = FakeBench()
+    result, _ = run(bench)
+    paths = write_cmin_report(result, CminSettings(), folder=tmp_path,
+                              stem="t", run_info={})
+    text = paths["text"].read_text()
+    assert "Per camera C_min" in text and "Repeat captures" in text
+    assert "Nominal again after the restore" in text
+    doc = json.loads(paths["json"].read_text())
+    cams = doc["result"]["cameras"]
+    assert [c["label"] for c in cams] == [f"R{c}" for c in range(1, 9)]
+    assert len(doc["result"]["cmin_repeats"]) == 3
+    assert cams[0]["cmin"] == pytest.approx(0.09)
+    rows = paths["frames"].read_text().splitlines()
+    assert sum(1 for r in rows if r.startswith("nominal_after,")) == 8 * 40

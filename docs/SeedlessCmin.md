@@ -24,7 +24,8 @@ enough, the TA drive current is stepped up, 100 mA at a time, to at most 5 A.
 |---|---|---|---|---|
 | Nominal | on | 648 us | console's (500 us) | 80 light frames (2 s) |
 | Search bursts | **off** | 2295 us | 500 us, then rounds of 3 widths per drive current | 10 light frames per burst |
-| C_min capture | **off** | 2295 us | matched width and current | 40 light frames (1 s) |
+| C_min captures | **off** | 2295 us | matched width and current | 3 x 40 light frames (3 x 1 s) |
+| Nominal again | on | 648 us | console's, restored | 40 light frames (1 s) |
 
 * All analysed frames are **light** frames from the science pipeline's
   corrected stream: dark-subtracted mean, shot-noise-corrected std,
@@ -45,9 +46,34 @@ enough, the TA drive current is stepped up, 100 mA at a time, to at most 5 A.
     at the ceiling: FAIL.
   `--no-current-stepping` keeps the unit's own current (the earlier,
   pulse-width-only search).
-* **C_min** = average contrast over the 1 s capture (average of per-frame
-  ratios, sdk#148), per camera and over all cameras. The capture must stay
-  within 6 % of the nominal brightness.
+* **C_min, per camera** (Ethan, 2026-11-24: "confidently ascertain a per
+  camera C_min"):
+  1. Three 1 s captures at the matched width and current
+     (`cmin_repeats`). Each must stay within 6 % of the nominal brightness
+     overall.
+  2. Raw C_min = the average of the three captures' contrast (each an
+     average of per-frame ratios, sdk#148).
+  3. Each camera's brightness over the captures must be within 5 % of its
+     **own** nominal (`camera_tolerance`): the search matches the average, a
+     camera far from it is not measured at its own brightness.
+  4. The three captures must agree within 2 % per camera
+     (`repeat_spread_max`, (max - min) / mean).
+  5. Seedless contrast falls as the image brightens, so a camera at 0.98x
+     reads a little high. A least-squares slope of contrast against
+     brightness, per camera, from the bursts at the matched current (from
+     0.6x up) and the three captures corrects each camera's C_min to exactly
+     1.0x. Raw and corrected are both reported; a correction over 1 % is
+     noted. Without a spread of brightness there (< 5 %), no correction.
+  6. The laser settings are restored and the seeded image is measured again:
+     each camera's nominal must be within 2 % of the start
+     (`nominal_drift_max`), so neither the phantom nor the laser moved
+     during the run. `nominal_recheck=False` skips it.
+  The overall C_min is the average of the per-camera values. A run that
+  fails any of these still reports the numbers, marked not confirmed.
+* The nominal is checked against the unit's calibrated drive current
+  before the laser starts: the TA_CURRENT_DRV the TA FPGA holds after the
+  bring-up must match the console config's. A console with no
+  TA_CURRENT_DRV in its config (1.8.1 straight after a flash) refuses.
 
 ### Plateau check (opt-in, `--plateau-check`)
 
@@ -92,6 +118,10 @@ R3 to R6 rise 6 to 9 %.
 | Target reachable | search | at 5 A and 2150 us the mean is still short: FAIL (or the plateau check, if asked for) |
 | Contrast flat per camera | plateau check (opt-in) | spread <= 5 % per camera from the 0.5x width up |
 | Every camera delivers | every capture | >= 80 % of the requested frames |
+| Calibrated drive current | after the laser bring-up, before any light | live TA_CURRENT_DRV = the console config's (config must have it) |
+| Each camera matched | C_min captures | every camera within 5 % of its own nominal |
+| C_min repeats | C_min captures | per camera, 3 captures within 2 % |
+| Nominal unchanged | seeded re-check after the restore | per camera within 2 % of the start |
 
 The bench numbers behind the first-burst limits are from the 2026-07-17
 validation on the seedless-frames branch (sdk#146): 2 ms unseeded gave
@@ -139,7 +169,10 @@ The script checks this before any camera or laser activity.
 In `<output-dir>/seedless-cmin-<run id>/`, prefixed with the console serial:
 
 * `-frames.csv`: every light frame of every phase (phase, burst, seed, TA
-  pulse width, side, camera, frame id, mean, std, contrast).
-* `.json`: identity, settings, nominal stats, search history, C_min capture,
-  per-camera and overall C_min, matched TA pulse width, verdict.
+  pulse width, TA drive current, side, camera, frame id, mean, std, contrast).
+* `.json`: identity, settings, nominal stats, search history, C_min
+  captures, per-camera results (`cameras`: nominal mean and contrast,
+  brightness, raw C_min, the 3 repeats and their spread, slope, C_min at
+  1.0x, correction, nominal drift, C_min / seeded contrast), the seeded
+  re-check, overall C_min, matched TA pulse width and current, verdict.
 * `.txt`: the same summary as text.

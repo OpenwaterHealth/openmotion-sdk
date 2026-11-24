@@ -31,9 +31,20 @@ def load_script():
 
 
 class ScriptConsole:
-    def __init__(self, boot_info=None):
+    def __init__(self, boot_info=None, config_ma=3900.0, live_ma=3900.0):
         self.boot_info = boot_info
         self.device_writes = []
+        self.config_ma = config_ma      # TA_CURRENT_DRV in the user config
+        self.live_ma = live_ma          # what the TA FPGA holds
+
+    def read_config(self):
+        data = {} if self.config_ma is None else {"TA_CURRENT_DRV": self.config_ma}
+        return SimpleNamespace(json_data=data)
+
+    def read_i2c_packet(self, *, mux_index, channel, device_addr, reg_addr,
+                        read_len):
+        assert (channel, reg_addr, read_len) == (4, 0x06, 2)
+        return round(self.live_ma / 0.16).to_bytes(2, "little"), 2
 
     def get_boot_info(self):
         return self.boot_info
@@ -94,9 +105,11 @@ class ScriptInterface:
 
 
 def run_main(tmp_path, monkeypatch, *, boot_info=None, answers=("yes",),
-             bench=None, argv_extra=("--side", "right")):
+             bench=None, argv_extra=("--side", "right"), console_kw=None):
     script = load_script()
     iface = ScriptInterface(boot_info)
+    for k, v in (console_kw or {}).items():
+        setattr(iface.console, k, v)
     bench = bench or FakeBench()
     created = []
     monkeypatch.setattr(script, "interface_factory", lambda **_k: iface)
@@ -120,6 +133,8 @@ def test_script_pass_prints_cmin_and_writes_report_only(tmp_path, monkeypatch):
     assert code == 0, lines
     assert lines[-1] == "Final result: PASS"
     assert any(line.startswith("C_min = 0.0900") for line in lines)
+    assert "Per camera (C_min corrected to exactly the normal brightness):" in lines
+    assert sum(1 for line in lines if line.startswith("  R")) == 8
     assert "Nothing was written to the device." in lines
     assert iface.console.device_writes == []
     assert created[0][0] == {"left": 0x00, "right": 0xFF}
@@ -143,6 +158,20 @@ def test_script_refuses_envelope_firmware_before_the_laser(tmp_path, monkeypatch
     assert any("660 us" in line for line in lines)
     assert iface.laser_applied == 0 and created == []
     assert iface.right.powered == []
+
+
+@pytest.mark.parametrize("console_kw, words", [
+    ({"config_ma": None}, "has no TA_CURRENT_DRV"),
+    ({"live_ma": 4999.68}, "is 5000 mA but the console config says 3900 mA"),
+])
+def test_script_refuses_a_nominal_not_at_the_calibrated_current(
+        tmp_path, monkeypatch, console_kw, words):
+    bench = FakeBench()
+    code, lines, _, created = run_main(tmp_path, monkeypatch, bench=bench,
+                                       console_kw=console_kw)
+    assert code == 1 and lines[-1] == "Final result: FAIL"
+    assert any(words in line for line in lines), lines
+    assert created == [] and bench.log == []
 
 
 def test_script_runs_on_firmware_that_leaves_limits_to_the_host(tmp_path,
