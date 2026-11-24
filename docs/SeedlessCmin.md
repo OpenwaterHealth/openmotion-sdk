@@ -22,7 +22,7 @@ enough, the TA drive current is stepped up, 100 mA at a time, to at most 5 A.
 
 | Phase | Seed | Exposure | TA pulse | Frames |
 |---|---|---|---|---|
-| Warm-up | on | 648 us | console's (500 us) | 800 light frames (20 s) at a time, until the image holds within 0.2 % per camera (at most 5 min) |
+| Warm-up | on | 648 us | console's (500 us) | 800 light frames (20 s) at a time, until the total output (average of the per-camera ratios) holds within 0.2 % (at most 5 min) |
 | Nominal | on | 648 us | console's (500 us) | 80 light frames (2 s) |
 | Search bursts | **off** | 2295 us | 500 us, then rounds of 3 widths per drive current | 10 light frames per burst |
 | C_min captures | **off** | 2295 us | matched width and current | 3 x 40 light frames (3 x 1 s) |
@@ -60,9 +60,14 @@ enough, the TA drive current is stepped up, 100 mA at a time, to at most 5 A.
   earlier width refinement.
 * **Warm-up** (default; `--no-warmup` skips it): the cold run's seeded
   image rose 0.6-2.0 % during the run and failed the drift check; seeded
-  20 s chunks run until no camera changes by more than 0.2 % from one chunk
-  to the next (at least 2 chunks, at most 15, else FAIL before the seed is
-  touched).
+  20 s chunks run until the laser's total output, the average of the
+  per-camera chunk-to-chunk ratios, changes by no more than 0.2 % (at least
+  2 chunks, at most 15, else FAIL before the seed is touched). The largest
+  single-camera change is logged alongside. It is not the gate: on
+  `--side both` the left/right split wandered 0.3-0.8 % per chunk,
+  anti-correlated (corr -0.89), while the L+R average held within 0.11 %
+  (bench 2026-11-24), so a per-camera rule never settled. That split is the
+  fixture, not the laser; the per-camera gates below still see it.
 * **C_min, per camera** (Ethan, 2026-11-24: "confidently ascertain a per
   camera C_min"):
   1. Three 1 s captures at the matched width and current

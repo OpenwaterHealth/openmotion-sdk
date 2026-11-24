@@ -672,6 +672,40 @@ def test_warm_up_that_never_settles_fails_before_the_seed_is_touched():
     assert not any(e[0] == "enter" for e in bench.log)
 
 
+class SwayingBench(FakeBench):
+    """Total seeded output steady, but cameras 0-3 and 4-7 trade light by
+    +/-`sway` from one warm-up chunk to the next (the two-sided fixture's
+    left/right split, bench 2026-11-24)."""
+
+    def __init__(self, *, sway=0.004, **kw):
+        super().__init__(**kw)
+        self.sway, self.chunks = sway, 0
+
+    def capture(self, light_frames, *, seedless):
+        frames = super().capture(light_frames, seedless=seedless)
+        if seedless or light_frames != 800:
+            return frames
+        self.chunks += 1
+        a = self.sway * (-1) ** self.chunks
+        return [FrameRecord(f.side, f.cam_id, f.abs_frame_id,
+                            f.mean * (1 + (a if f.cam_id < 4 else -a)),
+                            f.std * (1 + (a if f.cam_id < 4 else -a)),
+                            f.contrast) for f in frames]
+
+
+def test_warm_up_gates_on_total_output_not_the_camera_split():
+    bench = SwayingBench(sway=0.004)
+    lines = []
+    result = SeedlessCminProcedure(bench, CminSettings(match_by="width"), CAMS,
+                                   output_func=lines.append,
+                                   detail_func=lines.append).run()
+    assert result.verdict == VERDICT_PASS, result.problem
+    assert bench.chunks == 2
+    assert result.warmup[-1] <= 0.002
+    # The worst camera is still reported.
+    assert any("largest camera" in line and "0.8" in line for line in lines)
+
+
 def test_gate_failure_still_rechecks_the_seeded_image():
     bench = PerCamBench(cam_gain={3: 0.90})
     result, lines = run(bench)

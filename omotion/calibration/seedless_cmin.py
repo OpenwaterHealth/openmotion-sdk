@@ -722,8 +722,8 @@ class SeedlessCminProcedure:
         return result
 
     def _warm_up(self, result: CminResult) -> None:
-        """Seeded chunks until each camera's mean changes by at most
-        warmup_stable from one chunk to the next."""
+        """Seeded chunks until the average of the per-camera chunk-to-chunk
+        ratios (the laser's total output) changes by at most warmup_stable."""
         s = self._s
         secs = s.warmup_chunk_frames / 40.0
         self._out(f"Warming up the laser (seed on, {secs:.0f} s at a time, "
@@ -739,9 +739,17 @@ class SeedlessCminProcedure:
             stats = {(c.side, c.cam_id): c.mean for c in cams
                      if (c.side, c.cam_id) in self._cams}
             if prev is not None:
-                change = max(abs(stats[key] / prev[key] - 1.0) for key in stats)
+                # Gate on the laser's total output: the average of the
+                # per-camera ratios. Per camera, the left/right split of a
+                # two-sided fixture wanders (anti-correlated) while the total
+                # holds, so a per-camera rule never settles on --side both.
+                ratios = {key: stats[key] / prev[key] for key in stats}
+                change = abs(sum(ratios.values()) / len(ratios) - 1.0)
+                worst = max(ratios, key=lambda key: abs(ratios[key] - 1.0))
                 result.warmup.append(change)
-                self._detail(f"warm-up {k}: largest change {change:.2%}")
+                self._detail(f"warm-up {k}: output change {change:.2%} "
+                             f"(largest camera {worst[0]}{worst[1]} "
+                             f"{ratios[worst] - 1.0:+.2%})")
                 if k >= s.warmup_min_chunks and change <= s.warmup_stable:
                     self._out(f"  Laser warm after {k * secs:.0f} s.")
                     return
