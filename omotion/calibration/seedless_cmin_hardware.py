@@ -169,13 +169,20 @@ class MotionCminBench:
         ctrl = self._ctrl
         if ctrl is None:
             return None
+        console = self._iface.console
         # The trigger is stopped between scans, but make sure: the rate
         # lower limits are re-armed here and must not see seedless pulses.
         try:
-            self._iface.console.stop_trigger()
+            console.stop_trigger()
         except Exception:
             logger.warning("stop_trigger before seedless restore raised",
                            exc_info=True)
+        # The last seedless scan left its trigger config (2500 us dark skip)
+        # on the console. Put the standard one back BEFORE the rate lower
+        # limit is re-armed: anything that later starts the trigger with the
+        # config the console holds would otherwise latch a rate fault (E-202)
+        # on its first dark frame (Optimize Laser bench run, 2026-10-28).
+        trigger_problem = self._restore_trigger(console)
         if not ctrl.restore():
             return ("restore incomplete: power-cycle the console (its laser "
                     "registers are volatile) before any other use")
@@ -183,4 +190,25 @@ class MotionCminBench:
         if mismatches:
             return "registers read back wrong after restore: " + ", ".join(
                 f"{k}={v[0]} (expected {v[1]})" for k, v in mismatches.items())
+        return trigger_problem
+
+    def _restore_trigger(self, console) -> Optional[str]:
+        """Send the standard trigger config and read it back."""
+        try:
+            if not console.set_trigger_json(data=dict(self._trigger)):
+                raise RuntimeError("the console refused it")
+            back = console.get_trigger_json()
+            want = self._trigger.get("LaserPulseSkipDelayUsec")
+            if want is not None and (not isinstance(back, dict) or
+                                     back.get("LaserPulseSkipDelayUsec") != want):
+                raise RuntimeError(
+                    "dark-frame skip delay reads back "
+                    f"{back.get('LaserPulseSkipDelayUsec') if isinstance(back, dict) else back}"
+                    f", expected {want}")
+        except Exception as exc:
+            logger.error("seedless: standard trigger config not restored: %s",
+                         exc)
+            return ("the standard trigger config was not restored "
+                    f"({exc}): power-cycle the console before starting the "
+                    "trigger with the config it holds")
         return None

@@ -28,6 +28,17 @@ Sequence (:class:`SeedlessCminProcedure`):
    pulse width. C_min is the average contrast (average of per-frame ratios,
    the project-wide convention, sdk#148): per camera, and over all cameras.
 
+When the longest pulse cannot reach the nominal brightness (bench
+2026-11-24: 0.75x at 2150 us), the run falls back to a **plateau check**
+(Brad's review, 2026-11-24): seedless contrast is measured per camera at
+``plateau_points`` increasing pulse widths, from the width that gives
+``plateau_min_ratio`` of nominal brightness up to the longest pulse (the
+last one is the 1 s C_min capture). If every camera's contrast stays within
+``plateau_tolerance`` (max - min over mean) across those widths, contrast
+does not depend on brightness there and C_min is reported from the capture
+at the longest pulse. Otherwise the run fails and still reports what it
+measured.
+
 Every frame from every phase, the search history and the pulse width go into
 the report (:mod:`omotion.calibration.seedless_cmin_report`).
 
@@ -54,6 +65,11 @@ from omotion.seedless import (
 PHASE_NOMINAL = "nominal"
 PHASE_SEARCH = "search"
 PHASE_CMIN = "cmin"
+PHASE_PLATEAU = "plateau"
+
+#: How C_min was obtained: at matched brightness, or from the plateau check.
+BASIS_MATCHED = "matched"
+BASIS_PLATEAU = "plateau"
 
 VERDICT_PASS = "PASS"
 VERDICT_FAIL = "FAIL"
@@ -134,6 +150,12 @@ class CminSettings:
     first_burst_max_contrast_fraction: float = 0.75
     # Each lengthening must raise the mean by at least this (relative).
     min_ratio_gain: float = 0.02
+    # Plateau check when the nominal brightness is out of reach (see the
+    # module docstring). Brad's review 2026-11-24: per camera, 5 %.
+    plateau_check: bool = True
+    plateau_min_ratio: float = 0.5          # lowest brightness it looks at
+    plateau_points: int = 3                 # pulse widths, the C_min capture included
+    plateau_tolerance: float = 0.05         # per-camera (max - min) / mean
 
     def validate(self) -> None:
         if not (MIN_TA_PULSE_WIDTH_US <= self.start_ta_us <= self.max_ta_us
@@ -149,6 +171,12 @@ class CminSettings:
             raise ValueError("need 0 < tolerance < cmin_tolerance < 1")
         if self.max_step_factor <= 1:
             raise ValueError("max_step_factor must be > 1")
+        if int(self.plateau_points) < 2:
+            raise ValueError("plateau_points must be >= 2")
+        if not (0 < self.plateau_min_ratio < 1):
+            raise ValueError("plateau_min_ratio must be between 0 and 1")
+        if not (0 < self.plateau_tolerance < 1):
+            raise ValueError("plateau_tolerance must be between 0 and 1")
 
 
 class CminBench(Protocol):
@@ -174,6 +202,10 @@ class ProcedureStop(Exception):
     """The run cannot continue; the message is for the operator."""
 
 
+class OutOfReach(ProcedureStop):
+    """The longest pulse leaves the seedless image dimmer than nominal."""
+
+
 @dataclass
 class CminResult:
     verdict: str = VERDICT_FAIL
@@ -187,6 +219,9 @@ class CminResult:
     frames: list[TaggedFrame] = field(default_factory=list)
     restore_problem: Optional[str] = None
     seedless_entered: bool = False
+    basis: Optional[str] = None             # BASIS_MATCHED / BASIS_PLATEAU
+    plateau: list[BurstResult] = field(default_factory=list)  # below the capture
+    plateau_spread: dict[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         def stats(cams):
@@ -204,7 +239,10 @@ class CminResult:
             "problem": self.problem,
             "c_min": self.cmin,
             "c_min_per_camera": dict(self.cmin_per_camera),
+            "c_min_basis": self.basis,
             "matched_ta_pulse_width_us": self.matched_ta_us,
+            "plateau": [burst(b) for b in self.plateau],
+            "plateau_contrast_spread": dict(self.plateau_spread),
             "nominal": stats(self.nominal),
             "search": [burst(b) for b in self.bursts],
             "cmin_capture": burst(self.cmin_capture),
@@ -351,13 +389,43 @@ def next_ta_us(history: Sequence[BurstResult], settings: CminSettings) -> float:
         nxt = ta_us_from_ticks(math.floor(hi / 0.32))
     if abs(nxt - w) < 0.32 / 2:
         if r < 1.0:
-            raise ProcedureStop(
+            raise OutOfReach(
                 f"the normal brightness is out of reach: at the "
                 f"{w:.0f} us limit the seedless mean is only {r:.3f}x nominal")
         raise ProcedureStop(
             f"the pulse cannot get short enough: at {w:.0f} us the seedless "
             f"mean is already {r:.3f}x nominal")
     return nxt
+
+
+def width_for_ratio(history: Sequence[BurstResult], ratio: float,
+                    lo: float, hi: float) -> float:
+    """Pulse width that gives ``ratio`` of nominal brightness, from a
+    least-squares line through the bursts, clamped to [lo, hi]."""
+    xs = [b.ta_pulse_width_us for b in history]
+    ys = [b.ratio for b in history]
+    if len(set(xs)) < 2:
+        return lo
+    mx, my = sum(xs) / len(xs), sum(ys) / len(ys)
+    slope = (sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+             / sum((x - mx) ** 2 for x in xs))
+    if slope <= 0:
+        return lo
+    return min(max(mx + (ratio - my) / slope, lo), hi)
+
+
+def plateau_widths(lo: float, hi: float, points: int) -> list[float]:
+    """``points`` evenly spaced, tick-quantized widths from lo to hi; the
+    last is exactly ``hi`` (the C_min capture)."""
+    step = (hi - lo) / (points - 1)
+    out = [quantize_ta_us(lo + i * step) for i in range(points - 1)]
+    return [min(w, hi) for w in out] + [hi]
+
+
+def contrast_spread(values: Sequence[float]) -> float:
+    """(max - min) / mean of one camera's contrasts across pulse widths."""
+    m = sum(values) / len(values)
+    return (max(values) - min(values)) / m if m > 0 else math.inf
 
 
 # ---------------------------------------------------------------------------
@@ -438,7 +506,13 @@ class SeedlessCminProcedure:
                 if abs(b.ratio - 1.0) <= s.tolerance:
                     result.matched_ta_us = ta
                     break
-                ta = next_ta_us(result.bursts, s)
+                try:
+                    ta = next_ta_us(result.bursts, s)
+                except OutOfReach as exc:
+                    if not s.plateau_check:
+                        raise
+                    self._plateau(result, str(exc))
+                    return result      # the finally below still restores
             else:
                 raise ProcedureStop(
                     f"no match within {s.max_bursts} bursts (last "
@@ -462,6 +536,7 @@ class SeedlessCminProcedure:
                 raise ProcedureStop(f"no contrast for {', '.join(bad)}")
             result.cmin_per_camera = per_cam
             result.cmin = sum(per_cam.values()) / len(per_cam)
+            result.basis = BASIS_MATCHED
             result.verdict = VERDICT_PASS
         except ProcedureStop as exc:
             result.problem = str(exc)
@@ -479,3 +554,64 @@ class SeedlessCminProcedure:
                         result.problem = ("the normal laser settings were not "
                                           "restored: " + result.restore_problem)
         return result
+
+    def _plateau(self, result: CminResult, reason: str) -> None:
+        """Brightness cannot be matched: check that each camera's contrast
+        is flat across the upper part of the reachable range instead.
+        Called inside run()'s try, so a ProcedureStop fails the run and the
+        restore still happens."""
+        s = self._s
+        top = result.bursts[-1]
+        w_max = top.ta_pulse_width_us
+        if top.ratio < s.plateau_min_ratio:
+            raise ProcedureStop(
+                f"{reason}, below the {s.plateau_min_ratio:g}x the plateau "
+                "check needs")
+        w_lo = width_for_ratio(result.bursts, s.plateau_min_ratio,
+                               s.start_ta_us, w_max)
+        if w_max - w_lo < 0.1 * w_max:
+            raise ProcedureStop(
+                f"{reason}; the pulse range above {s.plateau_min_ratio:g}x "
+                f"({w_lo:.0f}..{w_max:.0f} us) is too narrow for the plateau "
+                "check")
+        widths = plateau_widths(w_lo, w_max, int(s.plateau_points))
+        self._out(f"Normal brightness is out of reach ({top.ratio:.2f}x at "
+                  f"{w_max:.0f} us). Checking that contrast stays flat per "
+                  f"camera from {widths[0]:.0f} to {w_max:.0f} us ...")
+        index = len(result.bursts)
+        for w in widths[:-1]:
+            index += 1
+            self._bench.set_ta_pulse_width_us(w)
+            b = self._burst(result, index, w, s.burst_light_frames,
+                            PHASE_PLATEAU, f"plateau burst {index}")
+            result.plateau.append(b)
+            self._out(f"  plateau: pulse {w:.0f} us -> {b.ratio:.2f}x normal "
+                      f"brightness, contrast {b.contrast:.4f}")
+        self._bench.set_ta_pulse_width_us(w_max)
+        self._out(f"Capturing {s.cmin_light_frames} seedless frames at "
+                  f"{w_max:.0f} us ...")
+        cap = self._burst(result, 0, w_max, s.cmin_light_frames, PHASE_CMIN,
+                          "C_min capture")
+        result.cmin_capture = cap
+        per_cam = {c.label: c.contrast for c in cap.cameras
+                   if (c.side, c.cam_id) in self._cams}
+        bad = [k for k, v in per_cam.items() if not math.isfinite(v)]
+        if bad:
+            raise ProcedureStop(f"no contrast for {', '.join(bad)}")
+        result.cmin_per_camera = per_cam
+        result.cmin = sum(per_cam.values()) / len(per_cam)
+        result.basis = BASIS_PLATEAU
+        for label in per_cam:
+            values = [c.contrast for b in (*result.plateau, cap)
+                      for c in b.cameras if c.label == label]
+            result.plateau_spread[label] = contrast_spread(values)
+        for label, spread in result.plateau_spread.items():
+            self._detail(f"plateau {label}: contrast spread {spread:.1%}")
+        over = {k: v for k, v in result.plateau_spread.items()
+                if not (v <= s.plateau_tolerance)}
+        if over:
+            raise ProcedureStop(
+                f"{reason}, and contrast is not flat from {widths[0]:.0f} to "
+                f"{w_max:.0f} us (limit {s.plateau_tolerance:.0%} per camera): "
+                + ", ".join(f"{k} {v:.1%}" for k, v in over.items()))
+        result.verdict = VERDICT_PASS

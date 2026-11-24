@@ -74,8 +74,12 @@ def format_summary(result: CminResult, run_info: Mapping[str, object]) -> str:
         lines.append(f"Problem: {result.problem}")
     if result.cmin is not None:
         lines.append(f"C_min (average contrast, all cameras): {result.cmin:.4f}")
-        lines.append(f"TA pulse width for matched brightness: "
-                     f"{result.matched_ta_us:.2f} us")
+        if result.matched_ta_us is not None:
+            lines.append(f"TA pulse width for matched brightness: "
+                         f"{result.matched_ta_us:.2f} us")
+        else:
+            lines.append("Brightness not matched: C_min from the plateau "
+                         "check (contrast flatness per camera, below)")
     lines.append("Nothing was written to the device.")
     if result.restore_problem:
         lines.append(f"RESTORE PROBLEM: {result.restore_problem}")
@@ -90,6 +94,17 @@ def format_summary(result: CminResult, run_info: Mapping[str, object]) -> str:
         for b in result.bursts:
             lines.append(f"{b.burst:<7}{b.ta_pulse_width_us:>9.1f}"
                          f"{b.ratio:>12.3f}{b.contrast:>10.4f}")
+    if result.plateau:
+        lines += ["", "Plateau check (below the C_min capture)",
+                  f"{'burst':<7}{'TA us':>9}{'mean ratio':>12}{'contrast':>10}"]
+        for b in result.plateau:
+            lines.append(f"{b.burst:<7}{b.ta_pulse_width_us:>9.1f}"
+                         f"{b.ratio:>12.3f}{b.contrast:>10.4f}")
+    if result.plateau_spread:
+        lines += ["", "Contrast spread per camera across the plateau widths "
+                  "((max - min) / mean)"]
+        for label, spread in result.plateau_spread.items():
+            lines.append(f"{label:<5}{spread:>8.1%}")
     if result.cmin_capture is not None:
         cap = result.cmin_capture
         lines += ["", f"C_min capture at {cap.ta_pulse_width_us:.1f} us "

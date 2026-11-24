@@ -16,6 +16,7 @@ from omotion.seedless import (
     PULSE_WIDTH_UL_SEEDLESS,
     RATE_LL_BASELINE,
     RATE_LL_SEEDLESS,
+    RATE_LL_SEEDLESS_US,
     SEED_CW_GAIN_BASELINE,
     TA_PULSE_WIDTH_BASELINE,
     SeedlessController,
@@ -120,6 +121,15 @@ def test_apply_writes_seedless_values_in_safe_order():
     assert console.index(EE_DYN, [1, 0]) < console.index(EE_UL, PULSE_WIDTH_UL_SEEDLESS)
     assert console.index(EE_RATE, RATE_LL_SEEDLESS) < console.index(SEED_CW, b"\0\0")
     assert console.index(OPT_UL, PULSE_WIDTH_UL_SEEDLESS) < console.index(TA, ta(1000.0))
+
+
+def test_seedless_rate_ll_is_lowered_not_disabled():
+    ticks = int.from_bytes(RATE_LL_SEEDLESS, "little")
+    assert ticks == round(RATE_LL_SEEDLESS_US / 0.32) == 59375
+    # Clears the seedless dark -> light spacing (25 ms - 2.5 ms skip, and
+    # end to start with the longest pulse), still catches a doubled rate.
+    assert RATE_LL_SEEDLESS_US < 25000 - 2500 - MAX_TA_PULSE_WIDTH_US
+    assert RATE_LL_SEEDLESS_US > 12500
 
 
 def test_apply_sets_exposure_on_masked_cameras_only():

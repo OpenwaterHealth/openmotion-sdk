@@ -152,6 +152,16 @@ def test_script_runs_on_firmware_that_leaves_limits_to_the_host(tmp_path,
     assert code == 0
 
 
+def test_script_plateau_pass_prints_basis(tmp_path, monkeypatch):
+    code, lines, iface, _ = run_main(
+        tmp_path, monkeypatch, bench=FakeBench(seedless_per_us=0.75 / 2150))
+    assert code == 0, lines
+    assert any("plateau check" in line for line in lines)
+    assert not any("matched brightness:" in line for line in lines)
+    assert any(line.startswith("C_min = 0.0900") for line in lines)
+    assert iface.console.device_writes == []
+
+
 def test_script_phantom_declined_changes_nothing(tmp_path, monkeypatch):
     code, lines, iface, created = run_main(tmp_path, monkeypatch, answers=("no",))
     assert code == 1
@@ -207,10 +217,22 @@ class FakeWorkflow:
 
 
 class AdapterInterface:
-    def __init__(self, workflow, console=None):
+    def __init__(self, workflow, console=None, *, trigger_ok=True):
         self.scan_workflow = workflow
         self.console = console or RegisterConsole()
         self.console.stop_trigger = lambda: True
+        self.console.trigger = None
+        console = self.console
+
+        def set_trigger_json(data=None):
+            if not trigger_ok:
+                return None
+            console.writes.append(("trigger", dict(data)))
+            console.trigger = dict(data)
+            return dict(data)
+
+        console.set_trigger_json = set_trigger_json
+        console.get_trigger_json = lambda: console.trigger
         self.left = RegisterSensor()
         self.right = RegisterSensor()
 
@@ -271,6 +293,30 @@ def test_enter_seedless_refused_on_envelope_firmware_writes_nothing():
         bench.enter_seedless(500.0)
     assert console.writes == []
     assert bench.exit_seedless() is None
+
+
+def test_exit_seedless_sends_the_standard_trigger_before_rearming_rate_ll():
+    iface = AdapterInterface(FakeWorkflow([]))
+    bench = MotionCminBench(iface, {"right": 0xFF}, TRIGGER, settle_s=0.0)
+    bench.enter_seedless(1000.0)
+    n = len(iface.console.writes)
+    assert bench.exit_seedless() is None
+    after = iface.console.writes[n:]
+    keys = [w[0] for w in after]
+    assert after[0] == ("trigger", TRIGGER)
+    assert keys.index("trigger") < keys.index((6, 0x08)) and \
+        keys.index("trigger") < keys.index((7, 0x08))
+    assert iface.console.trigger["LaserPulseSkipDelayUsec"] == 1800
+
+
+def test_exit_seedless_trigger_refused_still_restores_and_reports():
+    iface = AdapterInterface(FakeWorkflow([]), trigger_ok=False)
+    bench = MotionCminBench(iface, {"right": 0xFF}, TRIGGER, settle_s=0.0)
+    bench.enter_seedless(1000.0)
+    problem = bench.exit_seedless()
+    assert problem and "trigger config" in problem
+    for key, value in LIVE.items():
+        assert iface.console.regs[key] == value
 
 
 def test_exit_seedless_reports_refused_write():

@@ -22,11 +22,16 @@ Everything is host-side register writes:
 
 The safety configuration it relaxes for the seedless window: the EE/OPT
 pulse-width UPPER limits (to clear the long pulse) and the EE/OPT rate LOWER
-limits (set to 0, which disables the check). With the seed off the safety
-monitor sees only faint sub-threshold pulses and trips rate_lower_limit_fail
--> TA_shutdown (bench 2026-07-16: the scan died at ~12 frames). Both
-relaxations are Ethan-authorized for this engineering test and restored on
-every exit path.
+limits. With the seed off the safety monitor sees only faint sub-threshold
+pulses and trips rate_lower_limit_fail -> TA_shutdown (bench 2026-07-16: the
+scan died at ~12 frames). The sdk#146 branch set the rate limit to 0
+(disabled); here it is lowered to ``RATE_LL_SEEDLESS_US`` (19 ms) instead,
+which still clears the seedless dark-frame spacing but keeps a guard on the
+pulse rate (Brad's review, 2026-11-24). Not yet run on hardware at 19 ms:
+if the faint pulses still trip it, the first seedless burst gets too few
+frames and the run stops and restores. Both relaxations are
+Ethan-authorized for this engineering test and restored on every exit
+path.
 
 **Console firmware that owns the safety state** (boot-info v2, PTR-2026-1-5)
 refuses the widened limits on every image: its WI-00015 envelope caps the
@@ -91,12 +96,20 @@ SEED_CW_GAIN_BASELINE   = bytes([0x0E, 0x08])         # 2062 -> ~142 mV
 SEED_GAIN_OFF           = bytes([0x00, 0x00])
 PULSE_WIDTH_UL_BASELINE = bytes([0x35, 0x0C, 0x00, 0x00])  # 3125 -> 1.000 ms
 PULSE_WIDTH_UL_SEEDLESS = bytes([0x85, 0x1E, 0x00, 0x00])  # 7813 -> 2.500 ms
-# RATE lower limit (EE/OPT, reg 0x08). The safety FPGA trips
+# RATE lower limit (EE/OPT, reg 0x08, 0.32 us ticks). The safety FPGA trips
 # rate_lower_limit_fail when a detected pulse arrives with count <
-# rate_lower_limit (safety-fpga/src/logic_check.v:179). 0 makes `count < 0`
-# never true -> never trips. NOTE the direction: 0 DISABLES it; a MAX value
+# rate_lower_limit (safety-fpga/src/logic_check.v:179): pulses closer
+# together than the limit. NOTE the direction: 0 disables it; a MAX value
 # would trip on every real pulse instead.
-RATE_LL_SEEDLESS = bytes([0x00, 0x00, 0x00, 0x00])
+#
+# Seedless scans move the dark-frame pulse to 2500 us into its frame, so the
+# shortest gap is dark -> next light: 25000 - 2500 = 22500 us start to start
+# (20350 us end to start with a 2150 us pulse). That is under the stock
+# 23125 us limit, so the limit is LOWERED for the run, not disabled (Brad's
+# review 2026-11-24): 19000 us keeps a guard against a faster trigger (40 Hz
+# doubled is 12500 us) with margin to both gaps.
+RATE_LL_SEEDLESS_US = 19000.0
+RATE_LL_SEEDLESS = round(RATE_LL_SEEDLESS_US / 0.32).to_bytes(4, "little")
 RATE_LL_BASELINE = bytes([0xA9, 0x12, 0x01, 0x00])    # 70313 (laser_params EE/OPT_RATE_LL)
 
 # OV2312 exposure via passthrough: byte = us/9. Restore value mirrors the
@@ -390,8 +403,9 @@ class SeedlessController:
             self._applied = True   # before writes: any partial apply must restore
 
             logger.info("seedless: applying: seed OFF, TA %.2f us, safety ULs "
-                        "widened, rate LLs off, exposure %d us",
-                        self.ta_pulse_width_us, EXPOSURE_SEEDLESS_US)
+                        "widened, rate LLs %.0f us, exposure %d us",
+                        self.ta_pulse_width_us, RATE_LL_SEEDLESS_US,
+                        EXPOSURE_SEEDLESS_US)
             for name, ch, reg, _, seedless_val, _ in seq:
                 if not self._write_verified(name, ch, reg, seedless_val):
                     logger.error("seedless: apply failed at %s -- aborting", name)

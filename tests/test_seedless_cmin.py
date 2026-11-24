@@ -14,7 +14,10 @@ import pytest
 from omotion.calibration.seedless_cmin import (
     PHASE_CMIN,
     PHASE_NOMINAL,
+    PHASE_PLATEAU,
     PHASE_SEARCH,
+    BASIS_MATCHED,
+    BASIS_PLATEAU,
     VERDICT_FAIL,
     VERDICT_PASS,
     BurstResult,
@@ -24,7 +27,10 @@ from omotion.calibration.seedless_cmin import (
     ProcedureStop,
     SeedlessCminProcedure,
     camera_stats,
+    contrast_spread,
     next_ta_us,
+    plateau_widths,
+    width_for_ratio,
 )
 from omotion.calibration.seedless_cmin_report import write_cmin_report
 from omotion.seedless import MAX_TA_PULSE_WIDTH_US
@@ -36,7 +42,8 @@ class FakeBench:
     def __init__(self, *, nominal_mean=200.0, nominal_k=0.40,
                  seedless_per_us=0.975 / 2000, seedless_k=0.09,
                  seed_stays_on=False, dead_cam=None, plateau_us=None,
-                 enter_error=None, restore_problem=None, drift=1.0):
+                 enter_error=None, restore_problem=None, drift=1.0,
+                 k_slope=0.0):
         self.nominal_mean = nominal_mean
         self.nominal_k = nominal_k
         self.per_us = seedless_per_us
@@ -47,6 +54,8 @@ class FakeBench:
         self.enter_error = enter_error
         self.restore_problem = restore_problem
         self.drift = drift
+        # Seedless contrast rises as the image dims: k * (1 + k_slope * (1 - ratio)).
+        self.k_slope = k_slope
         self.ta = None
         self.seedless = False
         self.log = []
@@ -72,7 +81,8 @@ class FakeBench:
         mean = self.nominal_mean * self.per_us * width
         if light_frames == 40:
             mean *= self.drift
-        return self._frames(light_frames, mean, self.seedless_k)
+        k = self.seedless_k * (1 + self.k_slope * (1 - mean / self.nominal_mean))
+        return self._frames(light_frames, mean, k)
 
     def enter_seedless(self, us):
         self.log.append(("enter", us))
@@ -102,6 +112,7 @@ def test_happy_path_matches_and_reports_cmin():
     bench = FakeBench()
     result, _ = run(bench)
     assert result.verdict == VERDICT_PASS, result.problem
+    assert result.basis == BASIS_MATCHED and result.plateau == []
     assert abs(result.cmin - 0.09) < 1e-6
     assert set(result.cmin_per_camera) == {f"R{c}" for c in range(1, 9)}
     # Matched width: 1 / (0.975/2000) = 2051 us, within tolerance.
@@ -150,13 +161,78 @@ def test_ta_shutdown_like_dark_first_burst_stops():
     assert "shut down" in result.problem
 
 
-def test_unreachable_target_fails_at_the_limit():
-    # Half as efficient: 2150 us gives only ~0.54x.
-    result, _ = run(FakeBench(seedless_per_us=0.5 / 2000), first_burst_min_ratio=0.01)
+def test_unreachable_target_fails_at_the_limit_without_plateau_check():
+    result, _ = run(FakeBench(seedless_per_us=0.75 / 2150), plateau_check=False)
     assert result.verdict == VERDICT_FAIL
     assert "out of reach" in result.problem
     assert result.bursts[-1].ta_pulse_width_us <= MAX_TA_PULSE_WIDTH_US
     assert result.cmin is None
+
+
+# The bench case (2026-11-24): 2150 us reaches ~0.75x nominal.
+BENCH_REACH = 0.75 / 2150
+
+
+def test_out_of_reach_flat_contrast_passes_on_the_plateau_check():
+    bench = FakeBench(seedless_per_us=BENCH_REACH)
+    result, lines = run(bench)
+    assert result.verdict == VERDICT_PASS, result.problem
+    assert result.basis == BASIS_PLATEAU and result.matched_ta_us is None
+    assert result.cmin == pytest.approx(0.09)
+    cap = result.cmin_capture
+    assert cap.ta_pulse_width_us == result.bursts[-1].ta_pulse_width_us
+    assert cap.ratio == pytest.approx(0.75, abs=0.01)
+    # Two plateau bursts below the capture, starting near 0.5x brightness.
+    assert len(result.plateau) == 2
+    assert result.plateau[0].ratio == pytest.approx(0.5, abs=0.03)
+    assert result.plateau[0].ta_pulse_width_us < result.plateau[1].ta_pulse_width_us \
+        < cap.ta_pulse_width_us
+    assert set(result.plateau_spread) == {f"R{c}" for c in range(1, 9)}
+    assert all(v < 1e-9 for v in result.plateau_spread.values())
+    assert {f.phase for f in result.frames} == {PHASE_NOMINAL, PHASE_SEARCH,
+                                                 PHASE_PLATEAU, PHASE_CMIN}
+    assert bench.log[-1] == ("exit",)
+    assert any("out of reach" in line for line in lines)
+
+
+def test_out_of_reach_contrast_that_follows_brightness_fails_per_camera():
+    # 0.5x -> 0.75x brightness moves contrast by ~10 %: not flat.
+    bench = FakeBench(seedless_per_us=BENCH_REACH, k_slope=0.4)
+    result, _ = run(bench)
+    assert result.verdict == VERDICT_FAIL
+    assert "not flat" in result.problem and "R1" in result.problem
+    assert result.cmin is not None            # measured and reported anyway
+    assert all(v > 0.05 for v in result.plateau_spread.values())
+    assert bench.log[-1] == ("exit",)
+
+
+def test_plateau_check_tolerance_is_a_setting():
+    bench = FakeBench(seedless_per_us=BENCH_REACH, k_slope=0.4)
+    result, _ = run(bench, plateau_tolerance=0.2)
+    assert result.verdict == VERDICT_PASS, result.problem
+
+
+def test_too_dim_for_the_plateau_check_fails():
+    result, _ = run(FakeBench(seedless_per_us=0.4 / 2150))
+    assert result.verdict == VERDICT_FAIL
+    assert "out of reach" in result.problem and "plateau check" in result.problem
+    assert result.plateau == [] and result.cmin is None
+
+
+def test_plateau_range_too_narrow_fails():
+    # ~0.54x at the limit: the 0.5x width is within 10 % of the longest pulse.
+    result, _ = run(FakeBench(seedless_per_us=0.54 / 2150))
+    assert result.verdict == VERDICT_FAIL
+    assert "too narrow" in result.problem
+
+
+def test_plateau_helpers():
+    hist = [_burst(1, 500.0, 0.2), _burst(2, 1000.0, 0.4), _burst(3, 2000.0, 0.8)]
+    assert width_for_ratio(hist, 0.5, 500.0, 2000.0) == pytest.approx(1250.0)
+    assert width_for_ratio(hist, 0.01, 500.0, 2000.0) == 500.0     # clamped
+    w = plateau_widths(1250.0, 2149.76, 3)
+    assert len(w) == 3 and w[-1] == 2149.76 and w[0] < w[1] < w[2]
+    assert contrast_spread([0.10, 0.105, 0.095]) == pytest.approx(0.1)
 
 
 def test_mean_not_responding_to_pulse_width_stops():
@@ -235,8 +311,23 @@ def test_report_files(tmp_path):
     assert doc["written_to_device"] is False
     assert doc["result"]["c_min"] == pytest.approx(result.cmin)
     assert doc["result"]["matched_ta_pulse_width_us"] == result.matched_ta_us
+    assert doc["result"]["c_min_basis"] == BASIS_MATCHED
     rows = paths["frames"].read_text().splitlines()
     assert rows[0].startswith("phase,burst,seed,ta_pulse_width_us")
     assert len(rows) - 1 == len(result.frames)
     assert "C_min" in paths["text"].read_text()
     assert not math.isnan(result.cmin)
+
+
+def test_report_files_plateau(tmp_path):
+    result, _ = run(FakeBench(seedless_per_us=BENCH_REACH))
+    paths = write_cmin_report(result, CminSettings(), folder=tmp_path,
+                              stem="p", run_info={})
+    doc = json.loads(paths["json"].read_text())
+    assert doc["result"]["c_min_basis"] == BASIS_PLATEAU
+    assert len(doc["result"]["plateau"]) == 2
+    assert set(doc["result"]["plateau_contrast_spread"]) == {f"R{c}" for c in range(1, 9)}
+    text = paths["text"].read_text()
+    assert "plateau" in text and "Contrast spread per camera" in text
+    assert ",plateau," not in paths["frames"].read_text().splitlines()[0]
+    assert any(r.startswith("plateau,") for r in paths["frames"].read_text().splitlines())

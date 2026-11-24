@@ -9,14 +9,19 @@ mean the seeded system produces:
 3. one second of seedless frames at that pulse width gives C_min, the
    average contrast, which is printed and saved in the report.
 
+If the longest pulse cannot reach the nominal brightness, C_min is accepted
+only when each camera's contrast stays within 5 % across pulse widths from
+half the nominal brightness up (the plateau check).
+
 C_min is NEVER written to the device. The report (frames CSV, JSON, text
 summary) records every frame of every phase and the matched TA pulse width.
 See omotion.calibration.seedless_cmin for the logic and its limits.
 
 LASER SAFETY: the laser fires, and for the seedless part the TA runs
 unseeded with pulses up to 2.15 ms while the EE/OPT pulse-width upper limits
-are widened (2.5 ms) and the rate lower limits are disabled. Those changes
-are restored and read back at the end of every run, pass or fail. The module
+are widened (2.5 ms) and the rate lower limits lowered to 19 ms. Those
+changes, and the standard trigger config, are restored and read back at the
+end of every run, pass or fail. The module
 must be on the static phantom with the weight; if the first readouts do not
 look like the phantom, the run stops by itself. Console firmware that owns
 the laser-safety limits (1.8.2, Factory image included) enforces a WI-00015
@@ -91,6 +96,12 @@ def _parser() -> argparse.ArgumentParser:
             help="longest TA pulse the search may use (at most "
                  f"{MAX_TA_PULSE_WIDTH_US:g} us)")
         parser.add_argument(
+            "--plateau-min-ratio", type=float,
+            default=CminSettings.plateau_min_ratio,
+            help="when the normal brightness is out of reach, the lowest "
+                 "brightness (fraction of normal) the per-camera contrast "
+                 "flatness check starts at (default %(default)s)")
+        parser.add_argument(
             "--tolerance", type=float, default=CminSettings.tolerance,
             help="how close the seedless mean must come to nominal "
                  "(fraction; default %(default)s)")
@@ -126,6 +137,7 @@ def main(
                             cmin_tolerance=max(CminSettings.cmin_tolerance,
                                                2 * args.tolerance))
     settings.max_ta_us = args.max_pulse_us
+    settings.plateau_min_ratio = args.plateau_min_ratio
     try:
         settings.validate()
     except ValueError as exc:
@@ -281,8 +293,17 @@ def main(
     if result.cmin is not None:
         for label, value in result.cmin_per_camera.items():
             _emit_detail(output_func, f"C_min {label}: {value:.4f}")
-        output_func(f"TA pulse width for matched brightness: "
-                    f"{result.matched_ta_us:.1f} us")
+        if result.matched_ta_us is not None:
+            output_func(f"TA pulse width for matched brightness: "
+                        f"{result.matched_ta_us:.1f} us")
+        elif result.cmin_capture is not None:
+            for label, spread in result.plateau_spread.items():
+                _emit_detail(output_func,
+                             f"contrast spread {label}: {spread:.1%}")
+            output_func(
+                f"Brightness not matched: C_min from the plateau check at "
+                f"{result.cmin_capture.ta_pulse_width_us:.1f} us "
+                f"({result.cmin_capture.ratio:.2f}x normal brightness)")
         output_func(f"C_min = {result.cmin:.4f}")
     output_func("Nothing was written to the device.")
     output_func(f"Final result: {'PASS' if code == 0 else 'FAIL'}")
