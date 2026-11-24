@@ -9,16 +9,19 @@ mean the seeded system produces:
 3. one second of seedless frames at that pulse width gives C_min, the
    average contrast, which is printed and saved in the report.
 
-If the longest pulse cannot reach the nominal brightness, C_min is accepted
-only when each camera's contrast stays within 5 % across pulse widths from
-half the nominal brightness up (the plateau check).
+If a line through 3 bursts at progressive pulse widths says the nominal
+brightness is out of reach within 2150 us, the TA drive current is raised by
+100 mA and the bursts repeated, up to 5 A; past that the run fails (or, with
+--plateau-check, accepts C_min if each camera's contrast is flat within 5 %).
 
 C_min is NEVER written to the device. The report (frames CSV, JSON, text
 summary) records every frame of every phase and the matched TA pulse width.
 See omotion.calibration.seedless_cmin for the logic and its limits.
 
 LASER SAFETY: the laser fires, and for the seedless part the TA runs
-unseeded with pulses up to 2.15 ms while the EE/OPT pulse-width upper limits
+unseeded with pulses up to 2.15 ms, and its drive current may be stepped up
+in 100 mA steps to at most 5 A (4999.68 mA, the EE drive rating), while the
+EE/OPT pulse-width upper limits
 are widened (2.5 ms) and the rate lower limits lowered to 19 ms. Those
 changes, and the standard trigger config, are restored and read back at the
 end of every run, pass or fail. The module
@@ -58,7 +61,11 @@ from omotion.calibration.seedless_cmin import (
 )
 from omotion.calibration.seedless_cmin_hardware import MotionCminBench
 from omotion.calibration.seedless_cmin_report import write_cmin_report
-from omotion.seedless import MAX_TA_PULSE_WIDTH_US, seedless_unsupported_reason
+from omotion.seedless import (
+    MAX_TA_CURRENT_MA,
+    MAX_TA_PULSE_WIDTH_US,
+    seedless_unsupported_reason,
+)
 
 interface_factory = MotionInterface
 bench_factory = MotionCminBench
@@ -95,6 +102,18 @@ def _parser() -> argparse.ArgumentParser:
             "--max-pulse-us", type=float, default=MAX_TA_PULSE_WIDTH_US,
             help="longest TA pulse the search may use (at most "
                  f"{MAX_TA_PULSE_WIDTH_US:g} us)")
+        parser.add_argument(
+            "--max-current-ma", type=float, default=MAX_TA_CURRENT_MA,
+            help="highest TA drive current the search may step up to (at "
+                 f"most {MAX_TA_CURRENT_MA:g} mA)")
+        parser.add_argument(
+            "--no-current-stepping", action="store_true",
+            help="keep the unit's own TA drive current (pulse width only)")
+        parser.add_argument(
+            "--plateau-check", action="store_true",
+            help="when the normal brightness is out of reach at the highest "
+                 "current, accept C_min if each camera's contrast is flat "
+                 "within 5 %% (off by default)")
         parser.add_argument(
             "--plateau-min-ratio", type=float,
             default=CminSettings.plateau_min_ratio,
@@ -138,6 +157,9 @@ def main(
                                                2 * args.tolerance))
     settings.max_ta_us = args.max_pulse_us
     settings.plateau_min_ratio = args.plateau_min_ratio
+    settings.plateau_check = args.plateau_check
+    settings.current_stepping = not args.no_current_stepping
+    settings.max_current_ma = args.max_current_ma
     try:
         settings.validate()
     except ValueError as exc:
@@ -296,6 +318,10 @@ def main(
         if result.matched_ta_us is not None:
             output_func(f"TA pulse width for matched brightness: "
                         f"{result.matched_ta_us:.1f} us")
+            if result.matched_current_ma is not None:
+                output_func(f"TA drive current for matched brightness: "
+                            f"{result.matched_current_ma:.0f} mA (the unit's "
+                            f"own is {result.start_current_ma:.0f} mA)")
         elif result.cmin_capture is not None:
             for label, spread in result.plateau_spread.items():
                 _emit_detail(output_func,

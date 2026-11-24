@@ -11,6 +11,7 @@ import pytest
 from omotion.seedless import (
     EXPOSURE_RESTORE_BYTE,
     EXPOSURE_SEEDLESS_BYTE,
+    MAX_TA_CURRENT_MA,
     MAX_TA_PULSE_WIDTH_US,
     PULSE_WIDTH_UL_BASELINE,
     PULSE_WIDTH_UL_SEEDLESS,
@@ -25,6 +26,7 @@ from omotion.seedless import (
 )
 
 TA = (4, 0x00)
+TA_CUR = (4, 0x06)
 SEED_DDS, SEED_CW = (5, 0x02), (5, 0x04)
 EE_UL, OPT_UL = (6, 0x04), (7, 0x04)
 EE_RATE, OPT_RATE = (6, 0x08), (7, 0x08)
@@ -36,6 +38,7 @@ EE_ST, OPT_ST = (6, 0x24), (7, 0x24)
 # rate LL 72266, seed CW 2035).
 LIVE = {
     TA: bytes(TA_PULSE_WIDTH_BASELINE),
+    TA_CUR: (24375).to_bytes(2, "little"),     # 3900 mA, the bench unit's own
     SEED_DDS: bytes([0, 0]),
     SEED_CW: (2035).to_bytes(2, "little"),
     EE_UL: (1718).to_bytes(4, "little"),
@@ -176,6 +179,45 @@ def test_set_ta_pulse_width_between_scans():
     assert ctrl.set_ta_pulse_width_us(1500.0) is True
     assert console.regs[TA] == ta(1500.0)
     assert abs(ctrl.ta_pulse_width_us - 1500.0) < 0.32
+
+
+def test_set_ta_current_and_restore_puts_the_snapshot_back():
+    console = FakeConsole()
+    ctrl = controller(console, us=2000.0)
+    assert ctrl.apply() is True
+    assert ctrl.ta_current_ma == pytest.approx(3900.0)
+    assert console.regs[TA_CUR] == LIVE[TA_CUR]          # apply leaves it alone
+    assert ctrl.set_ta_current_ma(4600.0) is True
+    assert console.regs[TA_CUR] == (28750).to_bytes(2, "little")
+    assert ctrl.ta_current_ma == pytest.approx(4600.0)
+    n = len(console.writes)
+    assert ctrl.restore() is True
+    keys = [k for k, _ in console.writes[n:]]
+    # Pulse width first, then the current, before the limits re-tighten.
+    assert keys.index(TA) < keys.index(TA_CUR) < keys.index(EE_UL)
+    assert console.regs[TA_CUR] == LIVE[TA_CUR]
+    assert ctrl.verify_restored() == {}
+
+
+def test_ta_current_is_bounded_to_5a():
+    ctrl = controller(FakeConsole())
+    with pytest.raises(RuntimeError):
+        ctrl.set_ta_current_ma(4000.0)                   # before apply
+    ctrl.apply()
+    assert ctrl.set_ta_current_ma(MAX_TA_CURRENT_MA) is True
+    with pytest.raises(ValueError):
+        ctrl.set_ta_current_ma(5000.0)
+    with pytest.raises(ValueError):
+        ctrl.set_ta_current_ma(500.0)
+
+
+def test_verify_restored_covers_the_current():
+    console = FakeConsole()
+    ctrl = controller(console)
+    ctrl.apply()
+    ctrl.restore()
+    console.regs[TA_CUR] = (31248).to_bytes(2, "little")
+    assert set(ctrl.verify_restored()) == {"TA_CURRENT_DRV"}
 
 
 def test_ta_pulse_width_is_bounded():

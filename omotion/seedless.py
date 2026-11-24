@@ -79,6 +79,7 @@ logger = logging.getLogger("openmotion.sdk.seedless")
 _MUX = 1
 _DEV = 0x41
 _TA_CH, _TA_PW_REG, _TA_PW_LEN = 4, 0x00, 3
+_TA_CUR_REG, _TA_CUR_LEN = 0x06, 2   # TA CURRENT DRV, 0.16 mA per tick
 _SEED_CH, _SEED_DDS_REG, _SEED_CW_REG, _SEED_GAIN_LEN = 5, 0x02, 0x04, 2
 _EE_CH, _OPT_CH, _UL_REG, _UL_LEN = 6, 7, 0x04, 4
 _RATE_LL_REG, _RATE_LL_LEN = 0x08, 4  # EE/OPT RATE lower limit
@@ -87,6 +88,15 @@ _STATUS_REG = 0x24                    # EE/OPT status; bits 2..0 = rate/pulse/po
 
 #: TA_PULSE_WIDTH register scale (fpga_model: 0.32 us per tick).
 TA_TICK_US = 0.32
+#: TA_CURRENT_DRV register scale (fpga_model: 0.16 mA per tick).
+TA_CURRENT_TICK_MA = 0.16
+#: Ceiling for the TA drive current in seedless mode: the 5000 mA EE drive
+#: rating as the safety FPGA holds it (31248 x 0.16 = 4999.68 mA, the
+#: laser_params baseline). Brad / Ethan 2026-11-24: "up to 5A".
+MAX_TA_CURRENT_MA = 31248 * TA_CURRENT_TICK_MA
+#: Floor: a current request below this is a mistake, not a measurement.
+MIN_TA_CURRENT_MA = 1000.0
+TA_CURRENT_BASELINE = bytes([0x10, 0x7A])                 # 31248 -> 4999.68 mA
 
 # Values. Baselines mirror omotion/data/laser_params.py (locked data); they
 # are only restore fallbacks for a failed snapshot read.
@@ -145,6 +155,14 @@ def ta_us_from_ticks(ticks: int) -> float:
     return int(ticks) * TA_TICK_US
 
 
+def ta_current_ticks_from_ma(ma: float) -> int:
+    return int(round(float(ma) / TA_CURRENT_TICK_MA))
+
+
+def ta_current_ma_from_ticks(ticks: int) -> float:
+    return ticks * TA_CURRENT_TICK_MA
+
+
 def _ta_payload(us: float) -> bytes:
     return ta_ticks_from_us(us).to_bytes(_TA_PW_LEN, "little")
 
@@ -201,6 +219,7 @@ class SeedlessController:
         self._ta_us = float(ta_pulse_width_us)
         self._settle_s = float(settle_s)
         self._snapshot: dict[str, bytes] = {}
+        self._current: Optional[bytes] = None
         self._applied = False
         self._restored = threading.Event()
         self._lock = threading.Lock()
@@ -215,6 +234,15 @@ class SeedlessController:
     def ta_pulse_width_us(self) -> float:
         """The TA width as written to the register (tick-rounded)."""
         return ta_us_from_ticks(ta_ticks_from_us(self._ta_us))
+
+    @property
+    def ta_current_ma(self) -> Optional[float]:
+        """The TA drive current now in the register (as last written, or the
+        snapshot before any change); ``None`` before apply()."""
+        raw = self._current or self._snapshot.get("TA_CURRENT_DRV")
+        if raw is None:
+            return None
+        return ta_current_ma_from_ticks(int.from_bytes(raw, "little"))
 
     @property
     def snapshot(self) -> dict[str, bytes]:
@@ -400,6 +428,14 @@ class SeedlessController:
                         "use the bundled baseline", name)
                     live = baseline
                 self._snapshot[name] = live
+            # The drive current is not changed by apply(); snapshot it so a
+            # later set_ta_current_ma() is restored too.
+            cur = self._read("TA_CURRENT_DRV", _TA_CH, _TA_CUR_REG, _TA_CUR_LEN)
+            if cur is None:
+                logger.warning("seedless: snapshot read of TA_CURRENT_DRV "
+                               "failed; restore will use the bundled baseline")
+                cur = TA_CURRENT_BASELINE
+            self._snapshot["TA_CURRENT_DRV"] = cur
             self._applied = True   # before writes: any partial apply must restore
 
             logger.info("seedless: applying: seed OFF, TA %.2f us, safety ULs "
@@ -435,6 +471,32 @@ class SeedlessController:
                             self.ta_pulse_width_us)
             return ok
 
+    def set_ta_current_ma(self, ma: float) -> bool:
+        """Change the TA drive current while seedless is applied.
+
+        Call ONLY with the trigger stopped (between scans). Bounded to
+        ``MIN_TA_CURRENT_MA``..``MAX_TA_CURRENT_MA``; verified by read-back.
+        Returns False on a failed write -- the caller must stop and
+        restore().
+        """
+        ma = float(ma)
+        if not (MIN_TA_CURRENT_MA <= ma <= MAX_TA_CURRENT_MA + 1e-6):
+            raise ValueError(
+                f"seedless TA drive current {ma:g} mA outside "
+                f"{MIN_TA_CURRENT_MA:g}..{MAX_TA_CURRENT_MA:g} mA")
+        with self._lock:
+            if not self.applied:
+                raise RuntimeError("set_ta_current_ma before apply() "
+                                   "or after restore()")
+            payload = ta_current_ticks_from_ma(ma).to_bytes(_TA_CUR_LEN, "little")
+            ok = self._write_verified("TA_CURRENT_DRV", _TA_CH, _TA_CUR_REG,
+                                      payload)
+            if ok:
+                self._current = payload
+                logger.info("seedless: TA drive current -> %.2f mA",
+                            self.ta_current_ma)
+            return ok
+
     def restore(self) -> bool:
         """Write everything back. Idempotent; safe from any thread. Call
         with the trigger STOPPED (it re-arms the rate lower limits).
@@ -448,6 +510,10 @@ class SeedlessController:
             snap = self._snapshot
             ok &= self._restore_reg("TA_PULSE_WIDTH", _TA_CH, _TA_PW_REG,
                                     snap.get("TA_PULSE_WIDTH", TA_PULSE_WIDTH_BASELINE))
+            # The drive current back down with the pulse, before anything else.
+            if "TA_CURRENT_DRV" in snap:
+                ok &= self._restore_reg("TA_CURRENT_DRV", _TA_CH, _TA_CUR_REG,
+                                        snap["TA_CURRENT_DRV"])
             if self._settle_s:
                 time.sleep(self._settle_s)   # let any in-flight long pulse clear
             for name, ch, reg, fallback in (
@@ -475,7 +541,9 @@ class SeedlessController:
         mismatches as ``{name: (read hex or None, expected hex)}``; empty
         means the console holds exactly what apply() found."""
         mismatches: dict[str, tuple[Optional[str], str]] = {}
-        for name, ch, reg, length, _, _ in self._apply_sequence():
+        regs = [(n, ch, reg, ln) for n, ch, reg, ln, _, _ in self._apply_sequence()]
+        regs.append(("TA_CURRENT_DRV", _TA_CH, _TA_CUR_REG, _TA_CUR_LEN))
+        for name, ch, reg, length in regs:
             expected = self._snapshot.get(name)
             if expected is None:
                 continue

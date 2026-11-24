@@ -29,7 +29,13 @@ Sequence (:class:`SeedlessCminProcedure`):
    the project-wide convention, sdk#148): per camera, and over all cameras.
 
 When the longest pulse cannot reach the nominal brightness (bench
-2026-11-24: 0.75x at 2150 us), the run falls back to a **plateau check**
+2026-11-24: 0.75x at 2150 us at the unit's own 3.9 A), the TA drive current
+is stepped up (Brad / Ethan 2026-11-24): at each current, bursts at
+``round_fractions`` of the longest pulse; if a least-squares line through
+them reaches 1.0x within ``max_ta_us``, the width is refined there (fit, then
+secant); otherwise the current goes up by ``current_step_ma`` and the round
+repeats, up to ``max_current_ma`` (5 A). Each current step must raise the
+mean. Out of reach at 5 A fails, unless the opt-in **plateau check**
 (Brad's review, 2026-11-24): seedless contrast is measured per camera at
 ``plateau_points`` increasing pulse widths, from the width that gives
 ``plateau_min_ratio`` of nominal brightness up to the longest pulse (the
@@ -52,10 +58,11 @@ over a bench interface, so it is testable without hardware.
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Callable, Optional, Protocol, Sequence
 
 from omotion.seedless import (
+    MAX_TA_CURRENT_MA,
     MAX_TA_PULSE_WIDTH_US,
     MIN_TA_PULSE_WIDTH_US,
     ta_ticks_from_us,
@@ -99,6 +106,7 @@ class TaggedFrame:
     mean: float
     std: float
     contrast: float
+    ta_current_ma: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -122,6 +130,7 @@ class BurstResult:
     ratio: float           # mean over cameras of seedless/nominal mean
     contrast: float        # mean over cameras of average contrast
     cameras: tuple[CameraStats, ...]
+    ta_current_ma: Optional[float] = None
 
 
 @dataclass
@@ -152,10 +161,20 @@ class CminSettings:
     min_ratio_gain: float = 0.02
     # Plateau check when the nominal brightness is out of reach (see the
     # module docstring). Brad's review 2026-11-24: per camera, 5 %.
-    plateau_check: bool = True
+    plateau_check: bool = False             # opt-in (--plateau-check)
     plateau_min_ratio: float = 0.5          # lowest brightness it looks at
     plateau_points: int = 3                 # pulse widths, the C_min capture included
     plateau_tolerance: float = 0.05         # per-camera (max - min) / mean
+    # Drive-current stepping (Brad / Ethan 2026-11-24): at each current, 3
+    # bursts at progressive pulse widths; if a line through them says the
+    # nominal brightness is out of reach within max_ta_us, raise the TA
+    # drive current by current_step_ma and go again, up to max_current_ma.
+    current_stepping: bool = True
+    current_step_ma: float = 100.0
+    max_current_ma: float = MAX_TA_CURRENT_MA
+    round_fractions: tuple[float, ...] = (0.5, 0.75, 1.0)   # of max_ta_us
+    min_current_gain: float = 0.005         # a current step must raise the mean
+    max_total_bursts: int = 80
 
     def validate(self) -> None:
         if not (MIN_TA_PULSE_WIDTH_US <= self.start_ta_us <= self.max_ta_us
@@ -171,6 +190,14 @@ class CminSettings:
             raise ValueError("need 0 < tolerance < cmin_tolerance < 1")
         if self.max_step_factor <= 1:
             raise ValueError("max_step_factor must be > 1")
+        if not (0 < self.current_step_ma <= 1000):
+            raise ValueError("current_step_ma must be in (0, 1000]")
+        if not (0 < self.max_current_ma <= MAX_TA_CURRENT_MA + 1e-6):
+            raise ValueError(f"max_current_ma must be <= {MAX_TA_CURRENT_MA:g}")
+        if (len(self.round_fractions) < 2
+                or list(self.round_fractions) != sorted(set(self.round_fractions))
+                or not all(0 < f <= 1 for f in self.round_fractions)):
+            raise ValueError("round_fractions: >= 2 increasing values in (0, 1]")
         if int(self.plateau_points) < 2:
             raise ValueError("plateau_points must be >= 2")
         if not (0 < self.plateau_min_ratio < 1):
@@ -192,6 +219,12 @@ class CminBench(Protocol):
         Raises on failure (after rolling back what it changed)."""
 
     def set_ta_pulse_width_us(self, ta_pulse_width_us: float) -> None:
+        """Between bursts only. Raises on failure."""
+
+    def ta_current_ma(self) -> float:
+        """The TA drive current now set (after enter_seedless)."""
+
+    def set_ta_current_ma(self, ta_current_ma: float) -> None:
         """Between bursts only. Raises on failure."""
 
     def exit_seedless(self) -> Optional[str]:
@@ -220,6 +253,9 @@ class CminResult:
     restore_problem: Optional[str] = None
     seedless_entered: bool = False
     basis: Optional[str] = None             # BASIS_MATCHED / BASIS_PLATEAU
+    start_current_ma: Optional[float] = None    # the unit's own drive current
+    matched_current_ma: Optional[float] = None
+    currents_tried_ma: list[float] = field(default_factory=list)
     plateau: list[BurstResult] = field(default_factory=list)  # below the capture
     plateau_spread: dict[str, float] = field(default_factory=dict)
 
@@ -231,6 +267,7 @@ class CminResult:
             if b is None:
                 return None
             return {"burst": b.burst, "ta_pulse_width_us": b.ta_pulse_width_us,
+                    "ta_current_ma": b.ta_current_ma,
                     "ratio": b.ratio, "contrast": b.contrast,
                     "cameras": stats(b.cameras)}
 
@@ -241,6 +278,9 @@ class CminResult:
             "c_min_per_camera": dict(self.cmin_per_camera),
             "c_min_basis": self.basis,
             "matched_ta_pulse_width_us": self.matched_ta_us,
+            "matched_ta_current_ma": self.matched_current_ma,
+            "start_ta_current_ma": self.start_current_ma,
+            "ta_currents_tried_ma": list(self.currents_tried_ma),
             "plateau": [burst(b) for b in self.plateau],
             "plateau_contrast_spread": dict(self.plateau_spread),
             "nominal": stats(self.nominal),
@@ -414,6 +454,21 @@ def width_for_ratio(history: Sequence[BurstResult], ratio: float,
     return min(max(mx + (ratio - my) / slope, lo), hi)
 
 
+def extrapolate_width(history: Sequence[BurstResult], ratio: float = 1.0) -> float:
+    """Pulse width at which a least-squares line through ``history`` reaches
+    ``ratio`` (unclamped; ``inf`` when the line does not rise)."""
+    xs = [b.ta_pulse_width_us for b in history]
+    ys = [b.ratio for b in history]
+    if len(set(xs)) < 2:
+        return math.inf
+    mx, my = sum(xs) / len(xs), sum(ys) / len(ys)
+    slope = (sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+             / sum((x - mx) ** 2 for x in xs))
+    if slope <= 0:
+        return math.inf
+    return mx + (ratio - my) / slope
+
+
 def plateau_widths(lo: float, hi: float, points: int) -> list[float]:
     """``points`` evenly spaced, tick-quantized widths from lo to hi; the
     last is exactly ``hi`` (the C_min capture)."""
@@ -441,26 +496,31 @@ class SeedlessCminProcedure:
         if not expected_cameras:
             raise ValueError("no cameras selected")
         self._bench = bench
+        self._current: Optional[float] = None
         self._s = settings
         self._cams = set(expected_cameras)
         self._out = output_func
         self._detail = detail_func or (lambda _m: None)
 
-    def _tag(self, result: CminResult, frames, phase, burst, ta_us, seed):
+    def _tag(self, result: CminResult, frames, phase, burst, ta_us, seed,
+             current=None):
         result.frames.extend(
             TaggedFrame(phase, burst, ta_us, seed, f.side, f.cam_id,
-                        f.abs_frame_id, f.mean, f.std, f.contrast)
+                        f.abs_frame_id, f.mean, f.std, f.contrast, current)
             for f in frames)
 
     def _burst(self, result: CminResult, index: int, ta_us: float,
                light_frames: int, phase: str, what: str) -> BurstResult:
+        current = self._current
         frames = self._bench.capture(light_frames, seedless=True)
-        self._tag(result, frames, phase, index, ta_us, "off")
+        self._tag(result, frames, phase, index, ta_us, "off", current)
         cams = camera_stats(frames)
         _check_frame_counts(cams, self._cams, light_frames,
                             self._s.min_frame_fraction, what)
-        b = compare_to_nominal(index, ta_us, cams, result.nominal)
-        self._detail(f"{what}: TA {ta_us:.1f} us -> mean {b.ratio:.3f}x "
+        b = replace(compare_to_nominal(index, ta_us, cams, result.nominal),
+                    ta_current_ma=current)
+        cur = f", {current:.0f} mA" if current is not None else ""
+        self._detail(f"{what}: TA {ta_us:.1f} us{cur} -> mean {b.ratio:.3f}x "
                      f"nominal, contrast {b.contrast:.4f}")
         return b
 
@@ -493,33 +553,46 @@ class SeedlessCminProcedure:
             ta = quantize_ta_us(s.start_ta_us)
             result.seedless_entered = True
             self._bench.enter_seedless(ta)
-            for index in range(1, s.max_bursts + 1):
-                if index > 1:
-                    self._bench.set_ta_pulse_width_us(ta)
-                b = self._burst(result, index, ta, s.burst_light_frames,
-                                PHASE_SEARCH, f"burst {index}")
-                result.bursts.append(b)
-                self._out(f"  burst {index}: pulse {ta:.0f} us -> "
-                          f"{b.ratio:.2f}x normal brightness")
-                if index == 1:
-                    check_first_burst(b, result.nominal, s)
-                if abs(b.ratio - 1.0) <= s.tolerance:
-                    result.matched_ta_us = ta
-                    break
-                try:
-                    ta = next_ta_us(result.bursts, s)
-                except OutOfReach as exc:
-                    if not s.plateau_check:
-                        raise
-                    self._plateau(result, str(exc))
-                    return result      # the finally below still restores
+            self._current = self._bench.ta_current_ma()
+            result.start_current_ma = self._current
+            # The nominal scan ran at the unit's own current.
+            result.frames = [replace(f, ta_current_ma=self._current)
+                             if f.phase == PHASE_NOMINAL else f
+                             for f in result.frames]
+            if s.current_stepping:
+                self._search_with_current(result)
+                if result.matched_ta_us is None:      # plateau path finished
+                    return result                     # (finally restores)
             else:
-                raise ProcedureStop(
-                    f"no match within {s.max_bursts} bursts (last "
-                    f"{result.bursts[-1].ratio:.3f}x at "
-                    f"{result.bursts[-1].ta_pulse_width_us:.0f} us)")
+                for index in range(1, s.max_bursts + 1):
+                    if index > 1:
+                        self._bench.set_ta_pulse_width_us(ta)
+                    b = self._burst(result, index, ta, s.burst_light_frames,
+                                    PHASE_SEARCH, f"burst {index}")
+                    result.bursts.append(b)
+                    self._out(f"  burst {index}: pulse {ta:.0f} us -> "
+                              f"{b.ratio:.2f}x normal brightness")
+                    if index == 1:
+                        check_first_burst(b, result.nominal, s)
+                    if abs(b.ratio - 1.0) <= s.tolerance:
+                        result.matched_ta_us = ta
+                        result.matched_current_ma = self._current
+                        break
+                    try:
+                        ta = next_ta_us(result.bursts, s)
+                    except OutOfReach as exc:
+                        if not s.plateau_check:
+                            raise
+                        self._plateau(result, str(exc), result.bursts)
+                        return result      # the finally below still restores
+                else:
+                    raise ProcedureStop(
+                        f"no match within {s.max_bursts} bursts (last "
+                        f"{result.bursts[-1].ratio:.3f}x at "
+                        f"{result.bursts[-1].ta_pulse_width_us:.0f} us)")
 
-            self._out(f"Matched at {result.matched_ta_us:.1f} us. Capturing "
+            self._out(f"Matched at {result.matched_ta_us:.1f} us, "
+                      f"{self._current:.0f} mA. Capturing "
                       f"{s.cmin_light_frames} seedless frames ...")
             cap = self._burst(result, 0, result.matched_ta_us,
                               s.cmin_light_frames, PHASE_CMIN, "C_min capture")
@@ -555,19 +628,125 @@ class SeedlessCminProcedure:
                                           "restored: " + result.restore_problem)
         return result
 
-    def _plateau(self, result: CminResult, reason: str) -> None:
+    def _search_with_current(self, result: CminResult) -> None:
+        """Rounds of bursts at progressive pulse widths, one round per drive
+        current. Sets result.matched_ta_us / matched_current_ma, or runs the
+        (opt-in) plateau check, or raises ProcedureStop."""
+        s = self._s
+        index = 0
+
+        def burst(ta: float, what: str) -> BurstResult:
+            nonlocal index
+            index += 1
+            if index > s.max_total_bursts:
+                raise ProcedureStop(f"no match within {s.max_total_bursts} bursts")
+            if index > 1:
+                self._bench.set_ta_pulse_width_us(ta)
+            b = self._burst(result, index, ta, s.burst_light_frames,
+                            PHASE_SEARCH, f"burst {index}")
+            result.bursts.append(b)
+            self._out(f"  burst {index}: {self._current:.0f} mA, pulse "
+                      f"{ta:.0f} us -> {b.ratio:.2f}x normal brightness"
+                      + (f" ({what})" if what else ""))
+            return b
+
+        def matched(b: BurstResult) -> bool:
+            if abs(b.ratio - 1.0) <= s.tolerance:
+                result.matched_ta_us = b.ta_pulse_width_us
+                result.matched_current_ma = self._current
+                return True
+            return False
+
+        first = burst(quantize_ta_us(s.start_ta_us), "seed-off check")
+        check_first_burst(first, result.nominal, s)
+        if matched(first):
+            return
+        round_bursts: list[BurstResult] = [first]
+        prev_top: Optional[BurstResult] = None
+        widths = [quantize_ta_us(f * s.max_ta_us) for f in s.round_fractions]
+        widths[-1] = min(widths[-1], s.max_ta_us)
+        while True:
+            result.currents_tried_ma.append(self._current)
+            for w in widths:
+                if any(abs(w - b.ta_pulse_width_us) < 0.5 for b in round_bursts):
+                    continue
+                b = burst(w, "")
+                lower = [x for x in round_bursts if x.ta_pulse_width_us < w]
+                if lower:
+                    p = max(lower, key=lambda x: x.ta_pulse_width_us)
+                    if b.ratio - p.ratio < s.min_ratio_gain * p.ratio:
+                        raise ProcedureStop(
+                            f"lengthening the pulse from {p.ta_pulse_width_us:.0f} "
+                            f"to {w:.0f} us did not raise the image mean "
+                            f"({p.ratio:.3f}x -> {b.ratio:.3f}x): the pulse is "
+                            "not reaching the cameras as set")
+                round_bursts.append(b)
+                if matched(b):
+                    return
+            top = max(round_bursts, key=lambda x: x.ta_pulse_width_us)
+            if prev_top is not None and not (
+                    top.ratio >= prev_top.ratio * (1 + s.min_current_gain)):
+                raise ProcedureStop(
+                    f"raising the drive current to {self._current:.0f} mA did "
+                    f"not raise the image mean ({prev_top.ratio:.3f}x -> "
+                    f"{top.ratio:.3f}x at {top.ta_pulse_width_us:.0f} us)")
+            need = extrapolate_width(round_bursts, 1.0)
+            self._detail(f"at {self._current:.0f} mA a line through "
+                         f"{len(round_bursts)} bursts reaches 1.0x at "
+                         f"{need:.0f} us (limit {s.max_ta_us:.0f} us)")
+            if need <= s.max_ta_us:
+                # Reachable at this current: refine (fit first, then secant).
+                hist = sorted(round_bursts, key=lambda x: x.ta_pulse_width_us)
+                ta = quantize_ta_us(min(max(need, MIN_TA_PULSE_WIDTH_US),
+                                        s.max_ta_us))
+                for _ in range(s.max_bursts):
+                    b = burst(ta, "refine")
+                    hist.append(b)
+                    if matched(b):
+                        return
+                    try:
+                        ta = next_ta_us(hist, s)
+                    except OutOfReach:
+                        break      # the line was optimistic: more current
+                else:
+                    raise ProcedureStop(
+                        f"no match within {s.max_bursts} refining bursts at "
+                        f"{self._current:.0f} mA")
+                round_bursts = hist
+                top = max(round_bursts, key=lambda x: x.ta_pulse_width_us)
+            if self._current >= s.max_current_ma - 0.01:
+                reason = (f"the normal brightness is out of reach: at "
+                          f"{self._current:.0f} mA and {top.ta_pulse_width_us:.0f} us "
+                          f"the seedless mean is only {top.ratio:.3f}x nominal "
+                          f"(a line through this current's bursts needs "
+                          f"{need:.0f} us)")
+                if s.plateau_check:
+                    self._plateau(result, reason, round_bursts)
+                    return
+                raise OutOfReach(reason)
+            new = min(self._current + s.current_step_ma, s.max_current_ma)
+            self._out(f"Out of reach at {self._current:.0f} mA (needs about "
+                      f"{need:.0f} us). Raising the TA drive current to "
+                      f"{new:.0f} mA ...")
+            self._bench.set_ta_current_ma(new)
+            self._current = self._bench.ta_current_ma()
+            prev_top = top
+            round_bursts = []
+
+    def _plateau(self, result: CminResult, reason: str,
+                 history: Sequence[BurstResult]) -> None:
         """Brightness cannot be matched: check that each camera's contrast
         is flat across the upper part of the reachable range instead.
         Called inside run()'s try, so a ProcedureStop fails the run and the
         restore still happens."""
         s = self._s
-        top = result.bursts[-1]
+        top = max(history, key=lambda b: b.ta_pulse_width_us)
         w_max = top.ta_pulse_width_us
         if top.ratio < s.plateau_min_ratio:
             raise ProcedureStop(
                 f"{reason}, below the {s.plateau_min_ratio:g}x the plateau "
                 "check needs")
-        w_lo = width_for_ratio(result.bursts, s.plateau_min_ratio,
+        w_lo = width_for_ratio(history, s.plateau_min_ratio,
                                s.start_ta_us, w_max)
         if w_max - w_lo < 0.1 * w_max:
             raise ProcedureStop(

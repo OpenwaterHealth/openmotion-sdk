@@ -24,7 +24,8 @@ from typing import Mapping
 
 from .seedless_cmin import CminResult, CminSettings
 
-FRAME_COLUMNS = ("phase", "burst", "seed", "ta_pulse_width_us", "side",
+FRAME_COLUMNS = ("phase", "burst", "seed", "ta_pulse_width_us",
+                 "ta_current_ma", "side",
                  "camera", "abs_frame_id", "mean", "std", "contrast")
 
 
@@ -44,7 +45,9 @@ def write_cmin_report(result: CminResult, settings: CminSettings, *,
         w.writerow(FRAME_COLUMNS)
         for fr in result.frames:
             w.writerow([fr.phase, fr.burst, fr.seed,
-                        f"{fr.ta_pulse_width_us:.2f}", fr.side, fr.cam_id + 1,
+                        f"{fr.ta_pulse_width_us:.2f}",
+                        "" if fr.ta_current_ma is None else f"{fr.ta_current_ma:.2f}",
+                        fr.side, fr.cam_id + 1,
                         fr.abs_frame_id, f"{fr.mean:.4f}", f"{fr.std:.4f}",
                         f"{fr.contrast:.6f}"])
 
@@ -77,6 +80,10 @@ def format_summary(result: CminResult, run_info: Mapping[str, object]) -> str:
         if result.matched_ta_us is not None:
             lines.append(f"TA pulse width for matched brightness: "
                          f"{result.matched_ta_us:.2f} us")
+            if result.matched_current_ma is not None:
+                lines.append(f"TA drive current for matched brightness: "
+                             f"{result.matched_current_ma:.2f} mA (unit's own: "
+                             f"{result.start_current_ma:.2f} mA)")
         else:
             lines.append("Brightness not matched: C_min from the plateau "
                          "check (contrast flatness per camera, below)")
@@ -89,10 +96,11 @@ def format_summary(result: CminResult, run_info: Mapping[str, object]) -> str:
         for c in result.nominal:
             lines.append(f"{c.label:<5}{c.n:>4}{c.mean:>10.2f}{c.contrast:>10.4f}")
     if result.bursts:
-        lines += ["", "Seedless search", f"{'burst':<7}{'TA us':>9}"
+        lines += ["", "Seedless search", f"{'burst':<7}{'TA mA':>9}{'TA us':>9}"
                   f"{'mean ratio':>12}{'contrast':>10}"]
         for b in result.bursts:
-            lines.append(f"{b.burst:<7}{b.ta_pulse_width_us:>9.1f}"
+            ma = "" if b.ta_current_ma is None else f"{b.ta_current_ma:.0f}"
+            lines.append(f"{b.burst:<7}{ma:>9}{b.ta_pulse_width_us:>9.1f}"
                          f"{b.ratio:>12.3f}{b.contrast:>10.4f}")
     if result.plateau:
         lines += ["", "Plateau check (below the C_min capture)",

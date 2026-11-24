@@ -16,14 +16,15 @@ The test-app runs the same module from its Procedures pane
 With the seed laser off the TA emits low-coherence light, so the speckle
 contrast it gives on the static phantom is the floor the system can see:
 C_min. Contrast estimates depend on intensity, so C_min is taken at the image
-mean the seeded system produces. The TA pulse is lengthened (never driven
-harder) until the seedless mean matches.
+mean the seeded system produces. The TA pulse is lengthened until the
+seedless mean matches; when the longest pulse that fits the exposure is not
+enough, the TA drive current is stepped up, 100 mA at a time, to at most 5 A.
 
 | Phase | Seed | Exposure | TA pulse | Frames |
 |---|---|---|---|---|
 | Nominal | on | 648 us | console's (500 us) | 80 light frames (2 s) |
-| Search bursts | **off** | 2295 us | 500 us, then lengthened | 10 light frames per burst |
-| C_min capture | **off** | 2295 us | matched width | 40 light frames (1 s) |
+| Search bursts | **off** | 2295 us | 500 us, then rounds of 3 widths per drive current | 10 light frames per burst |
+| C_min capture | **off** | 2295 us | matched width and current | 40 light frames (1 s) |
 
 * All analysed frames are **light** frames from the science pipeline's
   corrected stream: dark-subtracted mean, shot-noise-corrected std,
@@ -31,21 +32,32 @@ harder) until the seedless mean matches.
   frames (and dark correction) are at the same exposure as its light frames.
 * Brightness ratio = mean over cameras of (seedless mean / nominal mean) for
   the same camera. Matched when within 3 % of 1 (`--tolerance`).
-* Search: proportional from the first burst, secant afterwards; the pulse
-  never more than doubles in one step and never exceeds 2150 us
+* Search (Brad / Ethan, 2026-11-24): after the 500 us seed-off check, each
+  round runs 3 bursts at 50 %, 75 % and 100 % of the 2150 us ceiling
   (`omotion.seedless.MAX_TA_PULSE_WIDTH_US`: the pulse starts 100 us into
-  the frame and must end inside the 2295 us exposure). Up to 10 bursts.
+  the frame and must end inside the 2295 us exposure) at one TA drive
+  current. A least-squares line through the round says where 1.0x falls:
+  * within 2150 us: refine there (the fitted width, then secant steps, up
+    to 10 bursts) and take the C_min capture at that width and current;
+  * beyond 2150 us: raise `TA_CURRENT_DRV` by 100 mA (`current_step_ma`)
+    and run the round again, up to 4999.68 mA (the 5 A EE drive rating as
+    the safety FPGA holds it; `--max-current-ma` can lower it). Out of reach
+    at the ceiling: FAIL.
+  `--no-current-stepping` keeps the unit's own current (the earlier,
+  pulse-width-only search).
 * **C_min** = average contrast over the 1 s capture (average of per-frame
   ratios, sdk#148), per camera and over all cameras. The capture must stay
   within 6 % of the nominal brightness.
 
-### When the nominal brightness is out of reach: plateau check
+### Plateau check (opt-in, `--plateau-check`)
 
 On the bench (2026-11-24, console 1.8.1) the longest pulse that fits the
-exposure, 2150 us, reached only 0.75x the seeded brightness; a linear fit
-puts 1.0x at about 2.9 ms. Seedless contrast barely moved across the sweep
-(0.103, 0.099, 0.100, 0.098 overall). Following Brad's review, the run then
-checks that contrast is flat **per camera** instead of failing outright:
+exposure, 2150 us, reached only 0.75x the seeded brightness at the unit's
+own 3.9 A; a linear fit puts 1.0x at about 2.9 ms. Seedless contrast barely
+moved across the sweep (0.103, 0.099, 0.100, 0.098 overall). Brad's first
+review proposed checking that contrast is flat **per camera** instead of
+failing; the drive-current search replaced it as the default, and it stays
+available for an out-of-reach result at the highest current:
 
 * Pulse widths: `plateau_points` (3) evenly spaced, from the width that
   gives `plateau_min_ratio` (0.5x, `--plateau-min-ratio`) of nominal
@@ -56,11 +68,11 @@ checks that contrast is flat **per camera** instead of failing outright:
   reported with the brightness it reached. Otherwise FAIL, with each
   camera's spread in the report.
 
-The bench data say where this lands. Per camera, across all four bursts
-(0.20x to 0.75x), the corner cameras R1 and R8 moved 27 % and 36 %; their
-contrast still falls as the image gets brighter. Across the two longest
-pulses (0.71x to 0.75x) every camera stayed within 2.1 %. So the floor
-decides the verdict, and on this unit 0.5x would likely fail R1 and R8.
+On the bench (2026-11-24 day run, 1387 to 2150 us at 3.9 A) it failed on
+R8 alone: R1 3.3 %, R2 2.6 %, R3 4.3 %, R4 3.5 %, R5 5.0 %, R6 4.3 %,
+R7 2.4 %, R8 6.0 %. Across all widths from 500 us the corner cameras R1 and
+R8 move 28 % and 40 % (their contrast falls as the image brightens), while
+R3 to R6 rise 6 to 9 %.
 
 ## When it stops by itself ("bonk out")
 
@@ -72,8 +84,10 @@ decides the verdict, and on this unit 0.5x would likely fail R1 and R8.
 | TA not shut down / phantom in place | first burst | brightness >= 0.05x nominal |
 | Unseeded light | first burst | contrast <= 0.75x nominal contrast (bench: 0.09 vs 0.40) |
 | Pulse width reaches the cameras | every lengthening | brightness rises by >= 2 % |
-| Target reachable | search | at 2150 us the mean is still short: plateau check |
-| Contrast flat per camera | plateau check | spread <= 5 % per camera from the 0.5x width up |
+| Current reaches the cameras | every current step | brightness at 2150 us rises by >= 0.5 % |
+| No safety fault | after every seedless burst | EE/OPT STATUS must read 0 (a latched power, pulse-width or rate fault stops the run) |
+| Target reachable | search | at 5 A and 2150 us the mean is still short: FAIL (or the plateau check, if asked for) |
+| Contrast flat per camera | plateau check (opt-in) | spread <= 5 % per camera from the 0.5x width up |
 | Every camera delivers | every capture | >= 80 % of the requested frames |
 
 The bench numbers behind the first-burst limits are from the 2026-07-17
@@ -87,13 +101,15 @@ was never merged): clear any latched EE/OPT fault, snapshot the live values,
 then widen EE/OPT pulse-width UL to 2.5 ms, lower EE/OPT rate LL to 19 ms
 (the seedless dark-frame spacing is 22.5 ms, under the stock 23.125 ms
 limit; sdk#146 disabled the limit, this keeps a guard on the pulse rate),
-seed DDS/CW gain to 0, TA pulse width, camera exposure 2295 us. Every write
-is verified by read-back. Seedless scans use `LaserPulseSkipDelayUsec=2500`
+seed DDS/CW gain to 0, TA pulse width, camera exposure 2295 us. The TA
+drive current (`TA_CURRENT_DRV`, ch4 reg 0x06, 0.16 mA ticks) is snapshotted
+too and changed only between bursts, by the search, up to 4999.68 mA. Every
+write is verified by read-back. Seedless scans use `LaserPulseSkipDelayUsec=2500`
 so dark frames stay dark.
 
 On every exit path, pass or fail, the adapter stops the trigger and sends
 the standard trigger config back (1800 us dark skip, read back), *then* the
-controller restores the snapshot (TA first, then the limits, then the seed,
+controller restores the snapshot (TA width first, then the drive current, then the limits, then the seed,
 then the rate LL, then exposure) and the adapter reads every register back.
 Without the trigger config, the console would keep the 2500 us skip while
 the rate LL returns to 23.125 ms, and anything that starts the trigger with

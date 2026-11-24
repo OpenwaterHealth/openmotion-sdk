@@ -138,6 +138,16 @@ class MotionCminBench:
                 raise RuntimeError("the scan did not finish in time")
         if workflow.last_scan_error:
             raise RuntimeError(f"the scan failed: {workflow.last_scan_error}")
+        if seedless:
+            # A drive or rate fault latched by this burst shuts the TA down;
+            # say so instead of letting it look like a dim burst.
+            status = self._ctrl.read_safety_status()
+            latched = {k: v for k, v in status.items() if v}
+            if latched:
+                raise RuntimeError(
+                    "the safety FPGA latched a fault during the burst ("
+                    + ", ".join(f"{k} STATUS=0x{v:02X}" for k, v in latched.items())
+                    + "; bit0 power, bit1 pulse width, bit2 rate)")
         return first_light_frames(collector.frames, light_frames)
 
     def _sensors(self) -> list:
@@ -158,6 +168,16 @@ class MotionCminBench:
         if not self._ctrl.apply():
             raise RuntimeError("could not apply the seedless settings "
                                "(see the log); they are being rolled back")
+
+    def ta_current_ma(self) -> float:
+        if self._ctrl is None or self._ctrl.ta_current_ma is None:
+            raise RuntimeError("the TA drive current is not known yet")
+        return self._ctrl.ta_current_ma
+
+    def set_ta_current_ma(self, ta_current_ma: float) -> None:
+        if self._ctrl is None or not self._ctrl.set_ta_current_ma(ta_current_ma):
+            raise RuntimeError(f"could not set the TA drive current to "
+                               f"{ta_current_ma:.0f} mA")
 
     def set_ta_pulse_width_us(self, ta_pulse_width_us: float) -> None:
         if self._ctrl is None or not self._ctrl.set_ta_pulse_width_us(

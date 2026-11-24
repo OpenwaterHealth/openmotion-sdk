@@ -152,9 +152,20 @@ def test_script_runs_on_firmware_that_leaves_limits_to_the_host(tmp_path,
     assert code == 0
 
 
-def test_script_plateau_pass_prints_basis(tmp_path, monkeypatch):
+def test_script_steps_current_and_prints_it(tmp_path, monkeypatch):
     code, lines, iface, _ = run_main(
         tmp_path, monkeypatch, bench=FakeBench(seedless_per_us=0.75 / 2150))
+    assert code == 0, lines
+    assert any("TA drive current for matched brightness: 4700 mA" in line
+               for line in lines)
+    assert iface.console.device_writes == []
+
+
+def test_script_plateau_pass_prints_basis(tmp_path, monkeypatch):
+    code, lines, iface, _ = run_main(
+        tmp_path, monkeypatch, bench=FakeBench(seedless_per_us=0.75 / 2150),
+        argv_extra=("--side", "right", "--no-current-stepping",
+                    "--plateau-check"))
     assert code == 0, lines
     assert any("plateau check" in line for line in lines)
     assert not any("matched brightness:" in line for line in lines)
@@ -317,6 +328,27 @@ def test_exit_seedless_trigger_refused_still_restores_and_reports():
     assert problem and "trigger config" in problem
     for key, value in LIVE.items():
         assert iface.console.regs[key] == value
+
+
+def test_seedless_capture_raises_when_a_safety_fault_latched():
+    scan = [frame(c, i) for c in range(8) for i in range(11, 40)]
+    iface = AdapterInterface(FakeWorkflow([scan]))
+    bench = MotionCminBench(iface, {"right": 0xFF}, TRIGGER, settle_s=0.0)
+    bench.enter_seedless(1000.0)
+    iface.console.regs[(6, 0x24)] = bytes([0x01])      # EE power fault
+    with pytest.raises(RuntimeError, match="EE STATUS=0x01"):
+        bench.capture(10, seedless=True)
+
+
+def test_adapter_current_round_trip():
+    iface = AdapterInterface(FakeWorkflow([]))
+    bench = MotionCminBench(iface, {"right": 0xFF}, TRIGGER, settle_s=0.0)
+    bench.enter_seedless(1000.0)
+    assert bench.ta_current_ma() == pytest.approx(3900.0)
+    bench.set_ta_current_ma(4500.0)
+    assert bench.ta_current_ma() == pytest.approx(4500.0)
+    assert bench.exit_seedless() is None
+    assert iface.console.regs[(4, 0x06)] == LIVE[(4, 0x06)]
 
 
 def test_exit_seedless_reports_refused_write():

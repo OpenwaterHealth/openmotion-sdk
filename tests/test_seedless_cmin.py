@@ -33,7 +33,7 @@ from omotion.calibration.seedless_cmin import (
     width_for_ratio,
 )
 from omotion.calibration.seedless_cmin_report import write_cmin_report
-from omotion.seedless import MAX_TA_PULSE_WIDTH_US
+from omotion.seedless import MAX_TA_CURRENT_MA, MAX_TA_PULSE_WIDTH_US
 
 CAMS = {("right", c) for c in range(8)}
 
@@ -43,7 +43,8 @@ class FakeBench:
                  seedless_per_us=0.975 / 2000, seedless_k=0.09,
                  seed_stays_on=False, dead_cam=None, plateau_us=None,
                  enter_error=None, restore_problem=None, drift=1.0,
-                 k_slope=0.0):
+                 k_slope=0.0, current_ma=3900.0, threshold_ma=1500.0,
+                 current_ignored=False):
         self.nominal_mean = nominal_mean
         self.nominal_k = nominal_k
         self.per_us = seedless_per_us
@@ -56,6 +57,12 @@ class FakeBench:
         self.drift = drift
         # Seedless contrast rises as the image dims: k * (1 + k_slope * (1 - ratio)).
         self.k_slope = k_slope
+        # Unseeded output above threshold scales with drive current (a
+        # simple model; the bench says nothing yet about the real curve).
+        self.start_ma = current_ma
+        self.current = current_ma
+        self.threshold_ma = threshold_ma
+        self.current_ignored = current_ignored
         self.ta = None
         self.seedless = False
         self.log = []
@@ -79,6 +86,9 @@ class FakeBench:
             return self._frames(light_frames, self.nominal_mean, self.nominal_k)
         width = self.ta if self.plateau_us is None else min(self.ta, self.plateau_us)
         mean = self.nominal_mean * self.per_us * width
+        if not self.current_ignored:
+            mean *= ((self.current - self.threshold_ma)
+                     / (self.start_ma - self.threshold_ma))
         if light_frames == 40:
             mean *= self.drift
         k = self.seedless_k * (1 + self.k_slope * (1 - mean / self.nominal_mean))
@@ -94,6 +104,14 @@ class FakeBench:
         assert self.seedless and us <= MAX_TA_PULSE_WIDTH_US
         self.log.append(("set", us))
         self.ta = us
+
+    def ta_current_ma(self):
+        return self.current
+
+    def set_ta_current_ma(self, ma):
+        assert self.seedless and ma <= MAX_TA_CURRENT_MA + 1e-6
+        self.log.append(("current", ma))
+        self.current = ma
 
     def exit_seedless(self):
         self.log.append(("exit",))
@@ -118,10 +136,11 @@ def test_happy_path_matches_and_reports_cmin():
     # Matched width: 1 / (0.975/2000) = 2051 us, within tolerance.
     assert abs(result.cmin_capture.ratio - 1) <= 0.03
     assert 1950 <= result.matched_ta_us <= MAX_TA_PULSE_WIDTH_US
-    # First burst at the normal 500 us; pulse never more than doubles.
+    # First burst at the normal 500 us; reachable at the unit's own current.
     widths = [b.ta_pulse_width_us for b in result.bursts]
     assert abs(widths[0] - 500) < 0.5
-    assert all(b <= 2 * a + 0.5 for a, b in zip(widths, widths[1:]))
+    assert not any(c[0] == "current" for c in bench.log)
+    assert result.matched_current_ma == result.start_current_ma == 3900.0
     assert bench.log[-1] == ("exit",)
     phases = {f.phase for f in result.frames}
     assert phases == {PHASE_NOMINAL, PHASE_SEARCH, PHASE_CMIN}
@@ -162,7 +181,7 @@ def test_ta_shutdown_like_dark_first_burst_stops():
 
 
 def test_unreachable_target_fails_at_the_limit_without_plateau_check():
-    result, _ = run(FakeBench(seedless_per_us=0.75 / 2150), plateau_check=False)
+    result, _ = run(FakeBench(seedless_per_us=0.75 / 2150), current_stepping=False)
     assert result.verdict == VERDICT_FAIL
     assert "out of reach" in result.problem
     assert result.bursts[-1].ta_pulse_width_us <= MAX_TA_PULSE_WIDTH_US
@@ -173,9 +192,12 @@ def test_unreachable_target_fails_at_the_limit_without_plateau_check():
 BENCH_REACH = 0.75 / 2150
 
 
+PLATEAU = dict(current_stepping=False, plateau_check=True)
+
+
 def test_out_of_reach_flat_contrast_passes_on_the_plateau_check():
     bench = FakeBench(seedless_per_us=BENCH_REACH)
-    result, lines = run(bench)
+    result, lines = run(bench, **PLATEAU)
     assert result.verdict == VERDICT_PASS, result.problem
     assert result.basis == BASIS_PLATEAU and result.matched_ta_us is None
     assert result.cmin == pytest.approx(0.09)
@@ -198,7 +220,7 @@ def test_out_of_reach_flat_contrast_passes_on_the_plateau_check():
 def test_out_of_reach_contrast_that_follows_brightness_fails_per_camera():
     # 0.5x -> 0.75x brightness moves contrast by ~10 %: not flat.
     bench = FakeBench(seedless_per_us=BENCH_REACH, k_slope=0.4)
-    result, _ = run(bench)
+    result, _ = run(bench, **PLATEAU)
     assert result.verdict == VERDICT_FAIL
     assert "not flat" in result.problem and "R1" in result.problem
     assert result.cmin is not None            # measured and reported anyway
@@ -208,12 +230,12 @@ def test_out_of_reach_contrast_that_follows_brightness_fails_per_camera():
 
 def test_plateau_check_tolerance_is_a_setting():
     bench = FakeBench(seedless_per_us=BENCH_REACH, k_slope=0.4)
-    result, _ = run(bench, plateau_tolerance=0.2)
+    result, _ = run(bench, plateau_tolerance=0.2, **PLATEAU)
     assert result.verdict == VERDICT_PASS, result.problem
 
 
 def test_too_dim_for_the_plateau_check_fails():
-    result, _ = run(FakeBench(seedless_per_us=0.4 / 2150))
+    result, _ = run(FakeBench(seedless_per_us=0.4 / 2150), **PLATEAU)
     assert result.verdict == VERDICT_FAIL
     assert "out of reach" in result.problem and "plateau check" in result.problem
     assert result.plateau == [] and result.cmin is None
@@ -221,7 +243,7 @@ def test_too_dim_for_the_plateau_check_fails():
 
 def test_plateau_range_too_narrow_fails():
     # ~0.54x at the limit: the 0.5x width is within 10 % of the longest pulse.
-    result, _ = run(FakeBench(seedless_per_us=0.54 / 2150))
+    result, _ = run(FakeBench(seedless_per_us=0.54 / 2150), **PLATEAU)
     assert result.verdict == VERDICT_FAIL
     assert "too narrow" in result.problem
 
@@ -320,7 +342,7 @@ def test_report_files(tmp_path):
 
 
 def test_report_files_plateau(tmp_path):
-    result, _ = run(FakeBench(seedless_per_us=BENCH_REACH))
+    result, _ = run(FakeBench(seedless_per_us=BENCH_REACH), **PLATEAU)
     paths = write_cmin_report(result, CminSettings(), folder=tmp_path,
                               stem="p", run_info={})
     doc = json.loads(paths["json"].read_text())
@@ -331,3 +353,75 @@ def test_report_files_plateau(tmp_path):
     assert "plateau" in text and "Contrast spread per camera" in text
     assert ",plateau," not in paths["frames"].read_text().splitlines()[0]
     assert any(r.startswith("plateau,") for r in paths["frames"].read_text().splitlines())
+
+
+# ---------------------------------------------------------------------------
+# Drive-current stepping (Brad / Ethan 2026-11-24)
+# ---------------------------------------------------------------------------
+
+def test_current_steps_up_100ma_until_the_brightness_is_reachable():
+    # 0.75x at 2150 us at 3.9 A (the bench); with a 1.5 A threshold the
+    # model needs 1/0.75 more light: 1500 + 2400 / 0.75 = 4700 mA.
+    bench = FakeBench(seedless_per_us=BENCH_REACH)
+    result, lines = run(bench)
+    assert result.verdict == VERDICT_PASS, result.problem
+    assert result.basis == BASIS_MATCHED
+    steps = [c[1] for c in bench.log if c[0] == "current"]
+    assert steps == pytest.approx([4000, 4100, 4200, 4300, 4400, 4500, 4600, 4700])
+    assert result.currents_tried_ma == pytest.approx([3900] + steps)
+    assert result.matched_current_ma == pytest.approx(4700)
+    assert result.start_current_ma == pytest.approx(3900)
+    assert result.matched_ta_us <= MAX_TA_PULSE_WIDTH_US
+    assert abs(result.cmin_capture.ratio - 1) <= 0.03
+    assert result.cmin_capture.ta_current_ma == pytest.approx(4700)
+    # Each round: 3 progressive widths at one current (round 1 adds 500 us).
+    at_3900 = [b.ta_pulse_width_us for b in result.bursts if b.ta_current_ma == 3900]
+    assert at_3900 == pytest.approx([499.84, 1075.2, 1612.8, 2149.76], abs=0.4)
+    assert bench.log[-1] == ("exit",)
+    assert any("Raising the TA drive current to 4000 mA" in line for line in lines)
+    # Every frame carries its current.
+    assert all(f.ta_current_ma is not None for f in result.frames)
+
+
+def test_out_of_reach_at_5a_fails_and_never_passes_the_ceiling():
+    bench = FakeBench(seedless_per_us=0.5 / 2150)   # needs ~6.3 A in the model
+    result, _ = run(bench)
+    assert result.verdict == VERDICT_FAIL
+    assert "out of reach" in result.problem and "5000 mA" in result.problem
+    steps = [c[1] for c in bench.log if c[0] == "current"]
+    assert max(steps) == pytest.approx(MAX_TA_CURRENT_MA)
+    assert steps[-2:] == pytest.approx([4900, MAX_TA_CURRENT_MA])
+    assert result.cmin is None
+    assert bench.log[-1] == ("exit",)
+
+
+def test_max_current_setting_caps_the_search():
+    bench = FakeBench(seedless_per_us=BENCH_REACH)
+    result, _ = run(bench, max_current_ma=4300)
+    assert result.verdict == VERDICT_FAIL
+    assert max(c[1] for c in bench.log if c[0] == "current") == pytest.approx(4300)
+
+
+def test_current_that_does_not_raise_the_mean_stops():
+    bench = FakeBench(seedless_per_us=BENCH_REACH, current_ignored=True)
+    result, _ = run(bench)
+    assert result.verdict == VERDICT_FAIL
+    assert "raising the drive current to 4000 mA did not raise" in result.problem
+    assert bench.log[-1] == ("exit",)
+
+
+def test_settings_reject_current_above_5a():
+    with pytest.raises(ValueError):
+        CminSettings(max_current_ma=5100).validate()
+
+
+def test_report_records_the_current(tmp_path):
+    result, _ = run(FakeBench(seedless_per_us=BENCH_REACH))
+    paths = write_cmin_report(result, CminSettings(), folder=tmp_path,
+                              stem="c", run_info={})
+    doc = json.loads(paths["json"].read_text())
+    assert doc["result"]["matched_ta_current_ma"] == pytest.approx(4700)
+    assert doc["result"]["start_ta_current_ma"] == pytest.approx(3900)
+    rows = paths["frames"].read_text().splitlines()
+    assert rows[0].split(",")[4] == "ta_current_ma"
+    assert "TA drive current for matched brightness: 4700.00 mA" in paths["text"].read_text()
