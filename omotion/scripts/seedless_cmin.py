@@ -27,9 +27,11 @@ changes, and the standard trigger config, are restored and read back at the
 end of every run, pass or fail. The module
 must be on the static phantom with the weight; if the first readouts do not
 look like the phantom, the run stops by itself. Console firmware that owns
-the laser-safety limits (1.8.2, Factory image included) enforces a WI-00015
-envelope that refuses the widened limits; on it the run stops before the
-laser fires.
+the laser-safety limits (1.8.2) enforces a WI-00015 envelope on its
+Release/Debug images that refuses the widened limits; there the run stops
+before the laser fires. Run it on 1.8.1 or on a Factory image whose
+pass-through allows the limits (a Factory build that refuses them fails the
+first seedless write and rolls back before the seed is turned off).
 """
 
 from __future__ import annotations

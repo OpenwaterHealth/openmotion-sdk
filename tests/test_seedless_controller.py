@@ -301,9 +301,10 @@ class _Info:
 @pytest.mark.parametrize("info, refused", [
     (None, False),                      # older firmware
     (_Info(False, None), False),
-    # Firmware that owns the safety state enforces its envelope (pulse-width
-    # UL <= 660 us) on every image, Factory included (bench 2026-11-24).
-    (_Info(True, True), True),
+    # Release/Debug enforce the envelope (pulse-width UL <= 660 us); a
+    # Factory build may not (console-fw factory-passthrough-unbounded), and
+    # an old one refuses the first write, which apply() rolls back.
+    (_Info(True, True), False),
     (_Info(True, False), True),
 ])
 def test_unsupported_reason(info, refused):

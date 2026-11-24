@@ -34,11 +34,13 @@ Ethan-authorized for this engineering test and restored on every exit
 path.
 
 **Console firmware that owns the safety state** (boot-info v2, PTR-2026-1-5)
-refuses the widened limits on every image: its WI-00015 envelope caps the
-pulse-width upper limit at 660 us even on a Factory image (bench
-2026-11-24). :func:`seedless_unsupported_reason` says so before anything is
-written; :meth:`SeedlessController.apply` would also fail on the refused
-write and roll back.
+refuses the widened limits on its Release/Debug images (WI-00015 envelope:
+pulse-width upper limit at most 660 us); :func:`seedless_unsupported_reason`
+says so before anything is written. 1.8.2-factory refused them too (bench
+2026-11-24); a Factory build whose pass-through skips the envelope
+(console-fw feature/factory-passthrough-unbounded) accepts them. On a
+Factory image that still refuses, :meth:`SeedlessController.apply` fails on
+the read-back and rolls back before the seed is touched.
 
 SAFETY PROPERTIES this module must preserve:
 1. The widened pulse-width upper limits AND relaxed rate lower limits exist
@@ -220,20 +222,27 @@ def seedless_unsupported_reason(console: Any) -> Optional[str]:
     pulse-width upper limit at 660 us and holds the rate lower limit at
     >= 23125 us (``safety_envelope.h``), so the 2.5 ms limit and the disabled
     rate check seedless mode needs are refused (bench 2026-11-24, 1.8.2 and
-    1.8.2-factory). Only older firmware, which leaves the limits to the
-    host, can run it. Never writes anything.
+    1.8.2-factory). A Factory build whose pass-through skips the envelope
+    (console-fw feature/factory-passthrough-unbounded) can run it, so a
+    Factory image is let through; an old Factory build refuses the first
+    write and the controller rolls back. Release/Debug images are refused
+    here. Never writes anything.
     """
     get_boot_info = getattr(console, "get_boot_info", None)
     info = get_boot_info() if callable(get_boot_info) else None
     if info is None or not getattr(info, "firmware_owns_safety_state", False):
         return None
-    image = "Factory" if getattr(info, "factory_image", None) else "Release/Debug"
+    if getattr(info, "factory_image", None):
+        # A Factory build with unbounded pass-through (console-fw
+        # feature/factory-passthrough-unbounded) accepts the seedless
+        # limits; 1.8.2-factory still refuses the first write, which the
+        # controller reads back and rolls back before the seed is touched.
+        return None
     return ("this console firmware enforces the WI-00015 laser-safety "
-            f"envelope ({image} image): it refuses the 2.5 ms pulse-width "
-            "limit and the disabled rate limit seedless mode needs (it caps "
-            "the pulse-width limit at 660 us), so the unseeded TA cannot be "
-            "pulsed long enough. Seedless mode needs console firmware that "
-            "allows those limits")
+            "envelope on its Release/Debug image: it refuses the 2.5 ms "
+            "pulse-width limit seedless mode needs (it caps the pulse-width "
+            "limit at 660 us), so the unseeded TA cannot be pulsed long "
+            "enough. Run it on the console's Factory image")
 
 
 class SeedlessController:

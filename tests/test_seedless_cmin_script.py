@@ -148,14 +148,12 @@ def test_script_pass_prints_cmin_and_writes_report_only(tmp_path, monkeypatch):
     assert list(run_dir.glob("*-frames.csv"))
 
 
-@pytest.mark.parametrize("factory", [False, True])
-def test_script_refuses_envelope_firmware_before_the_laser(tmp_path, monkeypatch,
-                                                           factory):
-    info = SimpleNamespace(firmware_owns_safety_state=True, factory_image=factory)
+def test_script_refuses_envelope_firmware_before_the_laser(tmp_path, monkeypatch):
+    info = SimpleNamespace(firmware_owns_safety_state=True, factory_image=False)
     code, lines, iface, created = run_main(tmp_path, monkeypatch, boot_info=info)
     assert code == 1
     assert lines[-1] == "Final result: FAIL"
-    assert any("660 us" in line for line in lines)
+    assert any("660 us" in line and "Factory image" in line for line in lines)
     assert iface.laser_applied == 0 and created == []
     assert iface.right.powered == []
 
@@ -388,3 +386,9 @@ def test_exit_seedless_reports_refused_write():
     console.refuse = {(7, 0x08)}       # OPT_RATE_LL cannot be re-armed
     problem = bench.exit_seedless()
     assert problem and "power-cycle" in problem
+
+
+def test_script_runs_on_a_factory_image(tmp_path, monkeypatch):
+    info = SimpleNamespace(firmware_owns_safety_state=True, factory_image=True)
+    code, lines, _, _ = run_main(tmp_path, monkeypatch, boot_info=info)
+    assert code == 0, lines

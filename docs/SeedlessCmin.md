@@ -178,9 +178,16 @@ lifts the firmware's ownership of those registers but not the envelope, so
 `EE_PULSE_WIDTH_UL = 2.5 ms` is refused on 1.8.2-factory too (confirmed on
 the bench: the nominal phase completed, then the first seedless write was
 refused and rolled back). The unseeded TA cannot be pulsed long enough
-inside that envelope, so seedless mode needs console firmware that allows
-these limits, or firmware that leaves them to the host (pre-PTR-2026-1-5).
-The script checks this before any camera or laser activity.
+inside that envelope (TA_PULSE_WIDTH itself is also capped at 600 us there),
+so seedless mode needs console firmware that allows these limits, or
+firmware that leaves them to the host (pre-PTR-2026-1-5, e.g. 1.8.1).
+
+A Factory build whose I2C pass-through skips the range check (console-fw
+branch `feature/factory-passthrough-unbounded`, in progress) is meant to
+run it. The script therefore refuses Release/Debug images before any
+camera or laser activity, and lets a Factory image through; a Factory
+build that still refuses fails the first seedless write, which is read back
+and rolled back before the seed is turned off.
 
 ## Report
 
