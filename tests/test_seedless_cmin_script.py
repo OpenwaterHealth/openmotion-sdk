@@ -133,18 +133,21 @@ def test_script_pass_prints_cmin_and_writes_report_only(tmp_path, monkeypatch):
     assert list(run_dir.glob("*-frames.csv"))
 
 
-def test_script_refuses_on_release_image_before_the_laser(tmp_path, monkeypatch):
-    info = SimpleNamespace(firmware_owns_safety_state=True, factory_image=False)
+@pytest.mark.parametrize("factory", [False, True])
+def test_script_refuses_envelope_firmware_before_the_laser(tmp_path, monkeypatch,
+                                                           factory):
+    info = SimpleNamespace(firmware_owns_safety_state=True, factory_image=factory)
     code, lines, iface, created = run_main(tmp_path, monkeypatch, boot_info=info)
     assert code == 1
     assert lines[-1] == "Final result: FAIL"
-    assert any("Factory image" in line for line in lines)
+    assert any("660 us" in line for line in lines)
     assert iface.laser_applied == 0 and created == []
     assert iface.right.powered == []
 
 
-def test_script_runs_on_factory_image(tmp_path, monkeypatch):
-    info = SimpleNamespace(firmware_owns_safety_state=True, factory_image=True)
+def test_script_runs_on_firmware_that_leaves_limits_to_the_host(tmp_path,
+                                                                monkeypatch):
+    info = SimpleNamespace(firmware_owns_safety_state=False, factory_image=None)
     code, _, _, _ = run_main(tmp_path, monkeypatch, boot_info=info)
     assert code == 0
 
@@ -259,12 +262,12 @@ def test_capture_raises_on_scan_error():
         bench.capture(10, seedless=False)
 
 
-def test_enter_seedless_refused_on_release_image_writes_nothing():
+def test_enter_seedless_refused_on_envelope_firmware_writes_nothing():
     console = RegisterConsole(boot_info=SimpleNamespace(
         firmware_owns_safety_state=True, factory_image=False))
     bench = MotionCminBench(AdapterInterface(FakeWorkflow([]), console),
                             {"right": 0xFF}, TRIGGER, settle_s=0.0)
-    with pytest.raises(RuntimeError, match="Factory"):
+    with pytest.raises(RuntimeError, match="660 us"):
         bench.enter_seedless(500.0)
     assert console.writes == []
     assert bench.exit_seedless() is None

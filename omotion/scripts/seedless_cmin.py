@@ -19,8 +19,9 @@ are widened (2.5 ms) and the rate lower limits are disabled. Those changes
 are restored and read back at the end of every run, pass or fail. The module
 must be on the static phantom with the weight; if the first readouts do not
 look like the phantom, the run stops by itself. Console firmware that owns
-the laser-safety limits accepts the widened limits only on its Factory
-image; on any other image the run stops before the laser fires.
+the laser-safety limits (1.8.2, Factory image included) enforces a WI-00015
+envelope that refuses the widened limits; on it the run stops before the
+laser fires.
 """
 
 from __future__ import annotations

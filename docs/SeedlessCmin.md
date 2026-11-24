@@ -43,7 +43,7 @@ harder) until the seedless mean matches.
 
 | Check | Where | Limit |
 |---|---|---|
-| Console accepts widened safety limits | before the laser | firmware that owns the safety state needs its **Factory image** |
+| Console accepts widened safety limits | before the laser | firmware that owns the safety state refuses them on **every** image (see below) |
 | Nominal looks like the phantom | after the nominal scan, before the seed is touched | factory floors: mean >= 40 (cams 1, 8) / 80, contrast >= 0.25 |
 | Seed really off | first burst (normal 500 us pulse) | brightness <= 0.75x nominal (expected ~0.26x) |
 | TA not shut down / phantom in place | first burst | brightness >= 0.05x nominal |
@@ -69,6 +69,20 @@ On every exit path, pass or fail, the controller restores the snapshot
 (TA first, then the limits, then the seed, then the rate LL, then exposure)
 and the adapter reads every register back. A restore problem fails the run
 and says to power-cycle the console (the laser registers are volatile).
+
+## Console firmware (bench 2026-11-24)
+
+Console firmware that owns the laser-safety state (boot-info v2,
+PTR-2026-1-5; 1.8.2) range-checks every host write to the EE/OPT limits
+against its WI-00015 envelope (`safety_envelope.h`): pulse-width upper limit
+at most **660 us**, rate lower limit at least **23125 us**. A Factory image
+lifts the firmware's ownership of those registers but not the envelope, so
+`EE_PULSE_WIDTH_UL = 2.5 ms` is refused on 1.8.2-factory too (confirmed on
+the bench: the nominal phase completed, then the first seedless write was
+refused and rolled back). The unseeded TA cannot be pulsed long enough
+inside that envelope, so seedless mode needs console firmware that allows
+these limits, or firmware that leaves them to the host (pre-PTR-2026-1-5).
+The script checks this before any camera or laser activity.
 
 ## Report
 

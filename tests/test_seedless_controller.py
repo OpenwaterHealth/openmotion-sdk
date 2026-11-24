@@ -249,8 +249,10 @@ class _Info:
 @pytest.mark.parametrize("info, refused", [
     (None, False),                      # older firmware
     (_Info(False, None), False),
-    (_Info(True, True), False),         # Factory image
-    (_Info(True, False), True),         # Release/Debug image owns the limits
+    # Firmware that owns the safety state enforces its envelope (pulse-width
+    # UL <= 660 us) on every image, Factory included (bench 2026-11-24).
+    (_Info(True, True), True),
+    (_Info(True, False), True),
 ])
 def test_unsupported_reason(info, refused):
     reason = seedless_unsupported_reason(FakeConsole(boot_info=info))

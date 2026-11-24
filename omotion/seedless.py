@@ -29,9 +29,9 @@ relaxations are Ethan-authorized for this engineering test and restored on
 every exit path.
 
 **Console firmware that owns the safety state** (boot-info v2, PTR-2026-1-5)
-refuses host writes to the safety limits on its Release and Debug images, so
-this controller can only run against a Factory image there, or against older
-firmware. :func:`seedless_unsupported_reason` says which, before anything is
+refuses the widened limits on every image: its WI-00015 envelope caps the
+pulse-width upper limit at 660 us even on a Factory image (bench
+2026-11-24). :func:`seedless_unsupported_reason` says so before anything is
 written; :meth:`SeedlessController.apply` would also fail on the refused
 write and roll back.
 
@@ -139,21 +139,29 @@ def _ta_payload(us: float) -> bytes:
 def seedless_unsupported_reason(console: Any) -> Optional[str]:
     """Why this console cannot run seedless mode, or ``None`` if it can.
 
-    Console firmware that owns the laser-safety state refuses host writes to
-    the EE/OPT pulse-width and rate limits except on a Factory image. Older
-    firmware (no boot-info v2) and a Factory image are both fine. Never
-    writes anything.
+    Console firmware that owns the laser-safety state (boot-info v2,
+    PTR-2026-1-5) range-checks every host write to the EE/OPT limits against
+    its WI-00015 safety envelope, on EVERY image: a Factory image lifts the
+    firmware's ownership of the registers but not the envelope
+    (console-fw ``fpga_register_map.c`` ``passthrough_ownership_problem``
+    against ``motion_cfg_effective_max``). On 1.8.2 the envelope caps the
+    pulse-width upper limit at 660 us and holds the rate lower limit at
+    >= 23125 us (``safety_envelope.h``), so the 2.5 ms limit and the disabled
+    rate check seedless mode needs are refused (bench 2026-11-24, 1.8.2 and
+    1.8.2-factory). Only older firmware, which leaves the limits to the
+    host, can run it. Never writes anything.
     """
     get_boot_info = getattr(console, "get_boot_info", None)
     info = get_boot_info() if callable(get_boot_info) else None
     if info is None or not getattr(info, "firmware_owns_safety_state", False):
         return None
-    if getattr(info, "factory_image", None):
-        return None
-    return ("this console firmware owns the laser-safety limits and refuses "
-            "the widened pulse-width and rate limits seedless mode needs on a "
-            "Release or Debug image: install the console's Factory image "
-            "first")
+    image = "Factory" if getattr(info, "factory_image", None) else "Release/Debug"
+    return ("this console firmware enforces the WI-00015 laser-safety "
+            f"envelope ({image} image): it refuses the 2.5 ms pulse-width "
+            "limit and the disabled rate limit seedless mode needs (it caps "
+            "the pulse-width limit at 660 us), so the unseeded TA cannot be "
+            "pulsed long enough. Seedless mode needs console firmware that "
+            "allows those limits")
 
 
 class SeedlessController:
