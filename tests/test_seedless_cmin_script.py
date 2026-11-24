@@ -181,10 +181,27 @@ def test_script_runs_on_firmware_that_leaves_limits_to_the_host(tmp_path,
 
 def test_script_steps_current_and_prints_it(tmp_path, monkeypatch):
     code, lines, iface, _ = run_main(
-        tmp_path, monkeypatch, bench=FakeBench(seedless_per_us=0.75 / 2150))
+        tmp_path, monkeypatch, bench=FakeBench(seedless_per_us=0.75 / 2150),
+        argv_extra=("--side", "right", "--current-stepping"))
     assert code == 0, lines
     assert any("TA drive current for matched brightness: 4700 mA" in line
                for line in lines)
+    assert iface.console.device_writes == []
+
+
+def test_script_default_takes_cmin_at_the_longest_pulse(tmp_path, monkeypatch):
+    bench = FakeBench(seedless_per_us=0.75 / 2150)
+    code, lines, iface, _ = run_main(tmp_path, monkeypatch, bench=bench)
+    assert code == 0, lines
+    assert not any(e[0] == "current" for e in bench.log)
+    assert any("C_min taken at the longest pulse" in line and "3900 mA" in line
+               for line in lines)
+    assert any("as measured" in line for line in lines)
+    assert not any("matched brightness:" in line for line in lines)
+    assert any(line.startswith("C_min = ") for line in lines)
+    (run_dir,) = tmp_path.iterdir()
+    (txt,) = run_dir.glob("*.txt")
+    assert "C_min at the longest pulse" in txt.read_text(encoding="utf-8")
     assert iface.console.device_writes == []
 
 

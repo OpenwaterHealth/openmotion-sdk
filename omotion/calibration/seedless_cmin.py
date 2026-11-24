@@ -28,9 +28,14 @@ Sequence (:class:`SeedlessCminProcedure`):
    pulse width. C_min is the average contrast (average of per-frame ratios,
    the project-wide convention, sdk#148): per camera, and over all cameras.
 
-When the longest pulse cannot reach the nominal brightness (bench
-2026-11-24: 0.75x at 2150 us, seeded and seedless both at 5 A), the TA drive current
-is stepped up (Brad / Ethan 2026-11-24): at each current, bursts at
+The TA drive current is never changed (Ethan 2026-11-24). When the longest
+pulse cannot reach the nominal brightness at the unit's own current (bench
+2026-11-24: about 0.66x at 2150 us and 3900 mA), C_min is taken at the
+longest pulse as it is, with that brightness reported and not corrected to
+1.0x (``cmin_at_max_pulse``; basis ``max_pulse``).
+
+Engineering options, off by default: with ``current_stepping`` the TA drive
+current is stepped up (Brad / Ethan 2026-11-24): at each current, bursts at
 ``round_fractions`` of the longest pulse; if a least-squares line through
 them reaches 1.0x within ``max_ta_us``, the width is refined there (fit, then
 secant); otherwise the current goes up by ``current_step_ma`` and the round
@@ -83,6 +88,9 @@ MATCH_BY_WIDTH = "width"
 #: How C_min was obtained: at matched brightness, or from the plateau check.
 BASIS_MATCHED = "matched"
 BASIS_PLATEAU = "plateau"
+#: Ethan 2026-11-24: the unit's own current, pulse lengthened to the ceiling;
+#: if 1.0x is not reached there, C_min is taken at the ceiling as it is.
+BASIS_MAX_PULSE = "max_pulse"
 
 VERDICT_PASS = "PASS"
 VERDICT_FAIL = "FAIL"
@@ -175,7 +183,9 @@ class CminSettings:
     # bursts at progressive pulse widths; if a line through them says the
     # nominal brightness is out of reach within max_ta_us, raise the TA
     # drive current by current_step_ma and go again, up to max_current_ma.
-    current_stepping: bool = True
+    # Off by default (Ethan 2026-11-24: the TA current is never changed);
+    # --current-stepping keeps it for engineering.
+    current_stepping: bool = False
     current_step_ma: float = 100.0
     max_current_ma: float = MAX_TA_CURRENT_MA
     round_fractions: tuple[float, ...] = (0.5, 0.75, 1.0)   # of max_ta_us
@@ -194,7 +204,7 @@ class CminSettings:
     # and one at 4400 mA/2059 us. Seedless contrast depends on the pulse
     # width, so the match holds the width at the ceiling and tunes the
     # current ("current"); "width" is the earlier width refinement.
-    match_by: str = MATCH_BY_CURRENT
+    match_by: str = MATCH_BY_WIDTH
     current_match_tolerance: float = 0.01   # 1.0x +- this, at the full pulse
     max_current_step_ma: float = 300.0      # per refining step
     # Seeded warm-up before the nominal: the cold run's seeded image rose
@@ -204,6 +214,10 @@ class CminSettings:
     warmup_stable: float = 0.002            # chunk-to-chunk, per camera
     warmup_min_chunks: int = 2
     warmup_max_chunks: int = 15             # 5 min, then FAIL
+    # Ethan 2026-11-24: when the longest pulse at the unit's own current
+    # falls short of the normal brightness, C_min is taken there as it is
+    # (no extrapolation to 1.0x). False: out of reach fails, as before.
+    cmin_at_max_pulse: bool = True
 
     def validate(self) -> None:
         if not (MIN_TA_PULSE_WIDTH_US <= self.start_ta_us <= self.max_ta_us
@@ -351,7 +365,7 @@ class CminResult:
     nominal_after: tuple[CameraStats, ...] = ()
     seedless_exited: bool = False
     warmup: list[float] = field(default_factory=list)   # chunk change, worst cam
-    match_by: str = MATCH_BY_CURRENT
+    match_by: str = MATCH_BY_WIDTH
     notes: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -691,10 +705,18 @@ class SeedlessCminProcedure:
                     try:
                         ta = next_ta_us(result.bursts, s)
                     except OutOfReach as exc:
-                        if not s.plateau_check:
+                        if s.plateau_check:
+                            self._plateau(result, str(exc), result.bursts)
+                            return result  # the finally below still restores
+                        if not s.cmin_at_max_pulse:
                             raise
-                        self._plateau(result, str(exc), result.bursts)
-                        return result      # the finally below still restores
+                        self._out(f"  Longest pulse ({ta:.0f} us) reached "
+                                  f"{b.ratio:.3f}x the normal brightness: "
+                                  "C_min is taken there.")
+                        result.matched_ta_us = ta
+                        result.matched_current_ma = self._current
+                        result.basis = BASIS_MAX_PULSE
+                        break
                 else:
                     raise ProcedureStop(
                         f"no match within {s.max_bursts} bursts (last "
@@ -766,7 +788,12 @@ class SeedlessCminProcedure:
         results are filled in first, so the report always has them."""
         s = self._s
         n = int(s.cmin_repeats)
-        self._out(f"Matched at {result.matched_ta_us:.1f} us, "
+        at_max = result.basis == BASIS_MAX_PULSE
+        # Brightness the captures should come back at: 1.0x when matched,
+        # else what the longest pulse reached in the search.
+        target = result.bursts[-1].ratio if at_max else 1.0
+        self._out(("At the longest pulse" if at_max else "Matched") +
+                  f" {result.matched_ta_us:.1f} us, "
                   f"{self._current:.0f} mA. Capturing {n} x "
                   f"{s.cmin_light_frames} seedless frames ...")
         frames_before = len(result.frames)
@@ -775,11 +802,11 @@ class SeedlessCminProcedure:
                               s.cmin_light_frames, PHASE_CMIN,
                               f"C_min capture {i} of {n}")
             result.cmin_captures.append(cap)
-            if abs(cap.ratio - 1.0) > s.cmin_tolerance:
+            if abs(cap.ratio / target - 1.0) > s.cmin_tolerance:
                 raise ProcedureStop(
                     f"C_min capture {i} drifted to {cap.ratio:.3f}x the normal "
-                    f"brightness (allowed {1 - s.cmin_tolerance:.2f}.."
-                    f"{1 + s.cmin_tolerance:.2f}x)")
+                    f"brightness (allowed {target * (1 - s.cmin_tolerance):.2f}.."
+                    f"{target * (1 + s.cmin_tolerance):.2f}x)")
         all_cap = [f for f in result.frames[frames_before:]]
         combined = replace(compare_to_nominal(
             0, result.matched_ta_us,
@@ -811,7 +838,9 @@ class SeedlessCminProcedure:
             pts = [(cc.mean / nom.mean, cc.contrast) for b in local
                    for cc in b.cameras if (cc.side, cc.cam_id) == key
                    and cc.mean / nom.mean >= s.correction_min_ratio]
-            slope = contrast_slope(pts)
+            # At the longest pulse there is nothing to correct to: C_min is
+            # the contrast as measured there (Ethan 2026-11-24).
+            slope = None if at_max else contrast_slope(pts)
             corrected = raw + slope * (1.0 - ratio) if slope is not None else raw
             cams.append(CameraCmin(
                 c.side, c.cam_id, nom.mean, nom.contrast, ratio, raw, reps,
@@ -820,14 +849,21 @@ class SeedlessCminProcedure:
         result.cameras = cams
         result.cmin_per_camera = {c.label: c.cmin for c in cams}
         result.cmin = sum(c.cmin for c in cams) / len(cams)
-        result.basis = BASIS_MATCHED
+        if not at_max:
+            result.basis = BASIS_MATCHED
+        else:
+            result.notes.append(
+                f"brightness out of reach at the unit's own current: C_min is "
+                f"at the longest pulse, {result.matched_ta_us:.0f} us, "
+                f"{combined.ratio:.3f}x the normal brightness (not corrected "
+                "to 1.0x)")
         for c in cams:
             self._detail(
                 f"{c.label}: brightness {c.ratio:.3f}x, C_min raw {c.cmin_raw:.4f}"
                 f" -> {c.cmin:.4f} at 1.0x (slope "
                 + ("n/a" if c.slope is None else f"{c.slope:+.4f}")
                 + f"), repeats spread {c.repeat_spread:.1%}")
-            if c.slope is None:
+            if c.slope is None and not at_max:
                 result.notes.append(f"{c.label}: no brightness spread near the "
                                     "match, C_min not corrected to 1.0x")
             elif abs(c.correction) > s.correction_flag:
@@ -837,11 +873,15 @@ class SeedlessCminProcedure:
         # Gate failures are collected, not raised, so the seeded re-check
         # below still runs and the report has the drift either way.
         problems = []
-        off = [c for c in cams if abs(c.ratio - 1.0) > s.camera_tolerance]
+        # Each camera against the brightness the whole capture reached (1.0x
+        # when matched): one camera the average hides still fails.
+        level = combined.ratio if at_max else 1.0
+        off = [c for c in cams
+               if abs(c.ratio / level - 1.0) > s.camera_tolerance]
         if off:
             problems.append(
                 "brightness not matched per camera (limit "
-                f"{s.camera_tolerance:.0%}): "
+                f"{s.camera_tolerance:.0%} of {level:.3f}x): "
                 + ", ".join(f"{c.label} {c.ratio:.3f}x" for c in off))
         noisy = [c for c in cams if not (c.repeat_spread <= s.repeat_spread_max)]
         if noisy:

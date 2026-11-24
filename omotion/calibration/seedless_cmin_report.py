@@ -77,7 +77,14 @@ def format_summary(result: CminResult, run_info: Mapping[str, object]) -> str:
         lines.append(f"Problem: {result.problem}")
     if result.cmin is not None:
         lines.append(f"C_min (average contrast, all cameras): {result.cmin:.4f}")
-        if result.matched_ta_us is not None:
+        if result.basis == "max_pulse" and result.cmin_capture is not None:
+            lines.append(f"Normal brightness out of reach at the unit's own "
+                         f"current: C_min at the longest pulse, "
+                         f"{result.matched_ta_us:.2f} us and "
+                         f"{result.matched_current_ma:.2f} mA, "
+                         f"{result.cmin_capture.ratio:.3f}x normal brightness "
+                         "(not corrected to 1.0x)")
+        elif result.matched_ta_us is not None:
             lines.append(f"TA pulse width for matched brightness: "
                          f"{result.matched_ta_us:.2f} us")
             if result.matched_current_ma is not None:
@@ -89,10 +96,10 @@ def format_summary(result: CminResult, run_info: Mapping[str, object]) -> str:
                          "check (contrast flatness per camera, below)")
     lines.append("Match: " + ("pulse held at the ceiling, drive current "
                               "tuned" if result.match_by == "current"
-                              else "pulse width tuned at the search's current"))
+                              else "pulse width tuned at the unit's own current"))
     if result.warmup:
         lines.append("Warm-up: " + ", ".join(f"{c:.2%}" for c in result.warmup)
-                     + " largest per-camera change chunk to chunk")
+                     + " total-output change chunk to chunk")
     lines.append("Nothing was written to the device.")
     if result.restore_problem:
         lines.append(f"RESTORE PROBLEM: {result.restore_problem}")
@@ -120,7 +127,9 @@ def format_summary(result: CminResult, run_info: Mapping[str, object]) -> str:
         for label, spread in result.plateau_spread.items():
             lines.append(f"{label:<5}{spread:>8.1%}")
     if result.cameras:
-        lines += ["", "Per camera C_min (average of the repeat captures, then "
+        lines += ["", "Per camera C_min (average of the repeat captures, as "
+                  "measured at the longest pulse)" if result.basis == "max_pulse"
+                  else "Per camera C_min (average of the repeat captures, then "
                   "corrected to exactly 1.0x the normal brightness along the "
                   "camera's own contrast-vs-brightness slope)",
                   f"{'cam':<5}{'nom mean':>10}{'nom K':>9}{'bright':>9}"

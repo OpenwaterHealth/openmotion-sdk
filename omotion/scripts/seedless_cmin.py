@@ -6,21 +6,21 @@ mean the seeded system produces:
 1. a normal laser scan gives the nominal per-camera image mean;
 2. the seed is turned OFF and the TA pulse is lengthened (never driven
    harder) in short 10-frame bursts until the seedless mean matches;
-3. one second of seedless frames at that pulse width gives C_min, the
-   average contrast, which is printed and saved in the report.
+3. three 1 s captures of seedless frames at that pulse width give C_min per
+   camera, the average contrast, which is printed and saved in the report.
 
-If a line through 3 bursts at progressive pulse widths says the nominal
-brightness is out of reach within 2150 us, the TA drive current is raised by
-100 mA and the bursts repeated, up to 5 A; past that the run fails (or, with
---plateau-check, accepts C_min if each camera's contrast is flat within 5 %).
+The TA drive current is never changed. If the nominal brightness is out of
+reach at the longest pulse (2150 us), C_min is taken there as it is, and the
+brightness it reached is reported. --current-stepping (engineering) instead
+raises the current in 100 mA steps up to 5 A.
 
 C_min is NEVER written to the device. The report (frames CSV, JSON, text
 summary) records every frame of every phase and the matched TA pulse width.
 See omotion.calibration.seedless_cmin for the logic and its limits.
 
 LASER SAFETY: the laser fires, and for the seedless part the TA runs
-unseeded with pulses up to 2.15 ms, and its drive current may be stepped up
-in 100 mA steps to at most 5 A (4999.68 mA, the EE drive rating), while the
+unseeded with pulses up to 2.15 ms at the unit's own drive current (with
+--current-stepping, up to 5 A, the EE drive rating), while the
 EE/OPT pulse-width upper limits
 are widened (2.5 ms) and the rate lower limits lowered to 19 ms. Those
 changes, and the standard trigger config, are restored and read back at the
@@ -57,6 +57,7 @@ from omotion.calibration.script_support import (
     utc_run_id as _run_id,
 )
 from omotion.calibration.seedless_cmin import (
+    BASIS_MAX_PULSE,
     VERDICT_PASS,
     CminSettings,
     SeedlessCminProcedure,
@@ -111,13 +112,17 @@ def _parser() -> argparse.ArgumentParser:
             help="highest TA drive current the search may step up to (at "
                  f"most {MAX_TA_CURRENT_MA:g} mA)")
         parser.add_argument(
+            "--current-stepping", action="store_true",
+            help="engineering: step the TA drive current up when the longest "
+                 "pulse falls short (default: the unit's own current is "
+                 "never changed and C_min is taken at the longest pulse)")
+        parser.add_argument(      # the default now; kept so old commands run
             "--no-current-stepping", action="store_true",
-            help="keep the unit's own TA drive current (pulse width only)")
+            help=argparse.SUPPRESS)
         parser.add_argument(
-            "--match-by", choices=("current", "width"), default="current",
-            help="final match: hold the pulse at the ceiling and tune the "
-                 "drive current (default), or shorten the pulse at the "
-                 "current the search reached (the earlier behaviour)")
+            "--match-by", choices=("current", "width"), default=None,
+            help="with --current-stepping: hold the pulse at the ceiling and "
+                 "tune the drive current (default there), or tune the width")
         parser.add_argument(
             "--no-warmup", action="store_true",
             help="skip the seeded laser warm-up before the normal image")
@@ -170,10 +175,12 @@ def main(
     settings.max_ta_us = args.max_pulse_us
     settings.plateau_min_ratio = args.plateau_min_ratio
     settings.plateau_check = args.plateau_check
-    settings.current_stepping = not args.no_current_stepping
+    settings.current_stepping = (args.current_stepping
+                                 and not args.no_current_stepping)
     settings.max_current_ma = args.max_current_ma
     # Without current stepping only the width can be tuned.
-    settings.match_by = args.match_by if settings.current_stepping else "width"
+    settings.match_by = ((args.match_by or "current")
+                         if settings.current_stepping else "width")
     settings.warmup = not args.no_warmup
     try:
         settings.validate()
@@ -336,7 +343,9 @@ def main(
         output_func(f"Problem: {result.problem}")
     if result.cmin is not None:
         if result.cameras:
-            output_func("Per camera (C_min corrected to exactly the normal "
+            output_func("Per camera (C_min at the longest pulse, as measured):"
+                        if result.basis == BASIS_MAX_PULSE else
+                        "Per camera (C_min corrected to exactly the normal "
                         "brightness):")
             output_func(f"  {'cam':<4}{'bright':>8}{'C_min':>9}{'raw':>9}"
                         f"{'repeat':>8}{'drift':>8}{'/seeded':>9}")
@@ -351,7 +360,14 @@ def main(
         else:
             for label, value in result.cmin_per_camera.items():
                 _emit_detail(output_func, f"C_min {label}: {value:.4f}")
-        if result.matched_ta_us is not None:
+        if result.basis == BASIS_MAX_PULSE and result.cmin_capture is not None:
+            output_func(
+                f"Normal brightness out of reach at the unit's own current: "
+                f"C_min taken at the longest pulse, "
+                f"{result.matched_ta_us:.1f} us and "
+                f"{result.matched_current_ma:.0f} mA, "
+                f"{result.cmin_capture.ratio:.3f}x normal brightness")
+        elif result.matched_ta_us is not None:
             output_func(f"TA pulse width for matched brightness: "
                         f"{result.matched_ta_us:.1f} us")
             if result.matched_current_ma is not None:

@@ -136,6 +136,10 @@ def run(bench, **kw):
     # own tests at the end.
     kw.setdefault("warmup", False)
     kw.setdefault("match_by", "width")
+    # The current-stepping search (now an engineering option) keeps its
+    # coverage here; the default (own current, C_min at the longest pulse)
+    # has its own tests at the end.
+    kw.setdefault("current_stepping", True)
     lines = []
     result = SeedlessCminProcedure(bench, CminSettings(**kw), CAMS,
                                    output_func=lines.append).run()
@@ -206,7 +210,8 @@ def test_ta_shutdown_like_dark_first_burst_stops():
 
 
 def test_unreachable_target_fails_at_the_limit_without_plateau_check():
-    result, _ = run(FakeBench(seedless_per_us=0.75 / 2150), current_stepping=False)
+    result, _ = run(FakeBench(seedless_per_us=0.75 / 2150), current_stepping=False,
+                   cmin_at_max_pulse=False)
     assert result.verdict == VERDICT_FAIL
     assert "out of reach" in result.problem
     assert result.bursts[-1].ta_pulse_width_us <= MAX_TA_PULSE_WIDTH_US
@@ -610,7 +615,8 @@ def run_default(bench, **kw):
 def test_default_holds_the_pulse_at_the_ceiling_and_tunes_current():
     # 0.74x at 2150 us at 3900 mA: needs more current.
     bench = FakeBench(seedless_per_us=0.74 / 2150)
-    result, lines = run_default(bench, warmup=False)
+    result, lines = run_default(bench, warmup=False, current_stepping=True,
+                               match_by="current")
     assert result.verdict == VERDICT_PASS, result.problem
     assert result.match_by == "current"
     assert result.matched_ta_us == pytest.approx(MAX_TA_PULSE_WIDTH_US, abs=0.5)
@@ -627,7 +633,8 @@ def test_default_holds_the_pulse_at_the_ceiling_and_tunes_current():
 
 def test_default_lowers_the_current_when_the_full_pulse_is_too_bright():
     bench = FakeBench()               # 1.048x at 2150 us, 3900 mA
-    result, _ = run_default(bench, warmup=False)
+    result, _ = run_default(bench, warmup=False, current_stepping=True,
+                               match_by="current")
     assert result.verdict == VERDICT_PASS, result.problem
     assert result.matched_ta_us == pytest.approx(MAX_TA_PULSE_WIDTH_US, abs=0.5)
     assert result.matched_current_ma < 3900
@@ -636,7 +643,8 @@ def test_default_lowers_the_current_when_the_full_pulse_is_too_bright():
 
 def test_current_match_corrects_along_the_full_pulse_bursts():
     bench = FakeBench(seedless_per_us=0.75 / 2150, k_slope=0.5)
-    result, _ = run_default(bench, warmup=False)
+    result, _ = run_default(bench, warmup=False, current_stepping=True,
+                               match_by="current")
     assert result.verdict == VERDICT_PASS, result.problem
     for cam in result.cameras:
         assert cam.slope == pytest.approx(-0.045, rel=0.05)
@@ -645,7 +653,8 @@ def test_current_match_corrects_along_the_full_pulse_bursts():
 
 def test_current_that_does_nothing_fails_the_current_match():
     bench = FakeBench(current_ignored=True)
-    result, _ = run_default(bench, warmup=False)
+    result, _ = run_default(bench, warmup=False, current_stepping=True,
+                               match_by="current")
     assert result.verdict == VERDICT_FAIL
     assert "saturated" in result.problem
     assert restored(bench)
@@ -741,7 +750,8 @@ class SaturatingBench(FakeBench):
 def test_saturated_ta_fails_with_a_clear_reason():
     # 0.6x at 2150 us at 3900 mA; saturates at 4500 mA, below 1.0x.
     bench = SaturatingBench(seedless_per_us=0.6 / 2150, sat_ma=4500)
-    result, _ = run_default(bench, warmup=False)
+    result, _ = run_default(bench, warmup=False, current_stepping=True,
+                               match_by="current")
     assert result.verdict == VERDICT_FAIL
     assert "TA output has saturated" in result.problem
     assert "4600 mA" in result.problem
@@ -755,4 +765,63 @@ def test_saturation_during_the_current_match_is_named():
     result, _ = run_default(bench, warmup=False)
     if result.verdict == VERDICT_FAIL:
         assert "saturated" in result.problem
+    assert restored(bench)
+
+
+# --- default: the unit's own current; C_min at the longest pulse if short ---
+
+def run_own_current(bench, **kw):
+    kw.setdefault("warmup", False)
+    lines = []
+    result = SeedlessCminProcedure(bench, CminSettings(**kw), CAMS,
+                                   output_func=lines.append).run()
+    return result, lines
+
+
+def test_default_never_changes_the_current():
+    assert CminSettings().current_stepping is False
+    assert CminSettings().match_by == "width"
+    bench = FakeBench()                      # reachable: 1.0x near 2051 us
+    result, _ = run_own_current(bench)
+    assert result.verdict == VERDICT_PASS, result.problem
+    assert result.basis == BASIS_MATCHED
+    assert not any(e[0] == "current" for e in bench.log)
+    assert result.matched_current_ma == 3900.0
+    assert restored(bench)
+
+
+def test_short_at_the_longest_pulse_takes_cmin_there_uncorrected():
+    bench = FakeBench(seedless_per_us=0.66 / 2150)       # 0.66x at 2150 us
+    result, lines = run_own_current(bench)
+    assert result.verdict == VERDICT_PASS, result.problem
+    assert result.basis == "max_pulse"
+    assert not any(e[0] == "current" for e in bench.log)
+    assert result.matched_ta_us == pytest.approx(MAX_TA_PULSE_WIDTH_US, abs=0.5)
+    assert result.matched_current_ma == 3900.0
+    assert result.cmin_capture.ratio == pytest.approx(0.66, abs=0.02)
+    # No extrapolation to 1.0x: C_min is the contrast as measured.
+    for c in result.cameras:
+        assert c.slope is None and c.cmin == c.cmin_raw and c.correction == 0
+    assert any("longest pulse" in n and "not corrected" in n
+               for n in result.notes)
+    assert any("C_min is taken there" in line for line in lines)
+    assert len(result.cmin_captures) == 3
+    assert len(result.nominal_after) == 8
+    assert restored(bench)
+
+
+def test_short_at_the_longest_pulse_still_gates_each_camera():
+    bench = PerCamBench(seedless_per_us=0.66 / 2150, cam_gain={3: 0.90})
+    result, _ = run_own_current(bench)
+    assert result.verdict == VERDICT_FAIL
+    assert "brightness not matched per camera" in result.problem
+    assert "R4" in result.problem and "R5" not in result.problem
+    assert restored(bench)
+
+
+def test_short_at_the_longest_pulse_can_still_be_made_to_fail():
+    bench = FakeBench(seedless_per_us=0.66 / 2150)
+    result, _ = run_own_current(bench, cmin_at_max_pulse=False)
+    assert result.verdict == VERDICT_FAIL
+    assert "out of reach" in result.problem
     assert restored(bench)

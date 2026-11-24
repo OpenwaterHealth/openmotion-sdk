@@ -17,15 +17,22 @@ With the seed laser off the TA emits low-coherence light, so the speckle
 contrast it gives on the static phantom is the floor the system can see:
 C_min. Contrast estimates depend on intensity, so C_min is taken at the image
 mean the seeded system produces. The TA pulse is lengthened until the
-seedless mean matches; when the longest pulse that fits the exposure is not
-enough, the TA drive current is stepped up, 100 mA at a time, to at most 5 A.
+seedless mean matches. **The TA drive current is never changed** (Ethan,
+2026-11-24): when the longest pulse that fits the exposure (2150 us) is not
+enough at the unit's own current, C_min is taken at 2150 us as it is, and
+the brightness it reached is reported next to it (basis `max_pulse`; not
+corrected to 1.0x). `cmin_at_max_pulse=False` makes that case FAIL instead.
+
+On the bench unit (3900 mA) 2150 us gives about 0.66x, so this is the usual
+outcome there. Stepping the current, described below, is an engineering
+option (`--current-stepping`), off by default.
 
 | Phase | Seed | Exposure | TA pulse | Frames |
 |---|---|---|---|---|
 | Warm-up | on | 648 us | console's (500 us) | 800 light frames (20 s) at a time, until the total output (average of the per-camera ratios) holds within 0.2 % (at most 5 min) |
 | Nominal | on | 648 us | console's (500 us) | 80 light frames (2 s) |
-| Search bursts | **off** | 2295 us | 500 us, then rounds of 3 widths per drive current | 10 light frames per burst |
-| C_min captures | **off** | 2295 us | matched width and current | 3 x 40 light frames (3 x 1 s) |
+| Search bursts | **off** | 2295 us | 500 us, then lengthened (proportional, then secant; at most 2x per step) up to 2150 us | 10 light frames per burst |
+| C_min captures | **off** | 2295 us | matched width, or 2150 us if short; unit's own current | 3 x 40 light frames (3 x 1 s) |
 | Nominal again | on | 648 us | console's, restored | 40 light frames (1 s) |
 
 * All analysed frames are **light** frames from the science pipeline's
@@ -34,7 +41,12 @@ enough, the TA drive current is stepped up, 100 mA at a time, to at most 5 A.
   frames (and dark correction) are at the same exposure as its light frames.
 * Brightness ratio = mean over cameras of (seedless mean / nominal mean) for
   the same camera. Matched when within 3 % of 1 (`--tolerance`).
-* Search (Brad / Ethan, 2026-11-24): after the 500 us seed-off check, each
+* With the current held (the default), a capture at the longest pulse must
+  come back within 6 % of the brightness the search burst there reached,
+  each camera within 5 % of the all-camera brightness, and the repeat and
+  seeded re-check gates below apply unchanged.
+* **Engineering option `--current-stepping`** (Brad / Ethan, 2026-11-24, the
+  earlier default): after the 500 us seed-off check, each
   round runs 3 bursts at 50 %, 75 % and 100 % of the 2150 us ceiling
   (`omotion.seedless.MAX_TA_PULSE_WIDTH_US`: the pulse starts 100 us into
   the frame and must end inside the 2295 us exposure) at one TA drive
@@ -45,10 +57,8 @@ enough, the TA drive current is stepped up, 100 mA at a time, to at most 5 A.
     and run the round again, up to 4999.68 mA (the 5 A EE drive rating as
     the safety FPGA holds it; `--max-current-ma` can lower it). Out of reach
     at the ceiling: FAIL.
-  `--no-current-stepping` keeps the unit's own current (the earlier,
-  pulse-width-only search).
-* **The final match tunes the current, not the width** (bench 2026-11-24,
-  `--match-by current`, the default). Three back-to-back runs matched at
+* With `--current-stepping`, **the final match tunes the current, not the
+  width** (bench 2026-11-24, `--match-by current`, the default there). Three back-to-back runs matched at
   4300 mA / 2150 us (C_min 0.0923, 0.0934) and 4400 mA / 2059 us (0.0998):
   seedless contrast depends on the pulse width, so a width chosen by
   where the search happened to land moved C_min ~8 % while the repeats
@@ -86,6 +96,9 @@ enough, the TA drive current is stepped up, 100 mA at a time, to at most 5 A.
      0.6x up) and the three captures corrects each camera's C_min to exactly
      1.0x. Raw and corrected are both reported; a correction over 1 % is
      noted. Without a spread of brightness there (< 5 %), no correction.
+     **At the longest pulse (short of 1.0x) there is no correction**: C_min
+     is the contrast as measured, and steps 1 and 3 compare against the
+     brightness reached there instead of 1.0x.
   6. The laser settings are restored and the seeded image is measured again:
      each camera's nominal must be within 2 % of the start
      (`nominal_drift_max`), so neither the phantom nor the laser moved
