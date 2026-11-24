@@ -64,7 +64,9 @@ from typing import Callable, Optional, Protocol, Sequence
 from omotion.seedless import (
     MAX_TA_CURRENT_MA,
     MAX_TA_PULSE_WIDTH_US,
+    MIN_TA_CURRENT_MA,
     MIN_TA_PULSE_WIDTH_US,
+    TA_CURRENT_TICK_MA,
     ta_ticks_from_us,
     ta_us_from_ticks,
 )
@@ -74,6 +76,9 @@ PHASE_SEARCH = "search"
 PHASE_CMIN = "cmin"
 PHASE_PLATEAU = "plateau"
 PHASE_NOMINAL_AFTER = "nominal_after"
+PHASE_WARMUP = "warmup"
+MATCH_BY_CURRENT = "current"
+MATCH_BY_WIDTH = "width"
 
 #: How C_min was obtained: at matched brightness, or from the plateau check.
 BASIS_MATCHED = "matched"
@@ -185,6 +190,20 @@ class CminSettings:
     nominal_recheck: bool = True            # seeded nominal again at the end
     nominal_recheck_frames: int = 40
     nominal_drift_max: float = 0.02         # per camera, after vs before
+    # Bench 2026-11-24: C_min moved ~8 % between a match at 4300 mA/2150 us
+    # and one at 4400 mA/2059 us. Seedless contrast depends on the pulse
+    # width, so the match holds the width at the ceiling and tunes the
+    # current ("current"); "width" is the earlier width refinement.
+    match_by: str = MATCH_BY_CURRENT
+    current_match_tolerance: float = 0.01   # 1.0x +- this, at the full pulse
+    max_current_step_ma: float = 300.0      # per refining step
+    # Seeded warm-up before the nominal: the cold run's seeded image rose
+    # 0.6-2.0 % during the run. Chunks until two in a row agree.
+    warmup: bool = True
+    warmup_chunk_frames: int = 800          # 20 s per chunk
+    warmup_stable: float = 0.002            # chunk-to-chunk, per camera
+    warmup_min_chunks: int = 2
+    warmup_max_chunks: int = 15             # 5 min, then FAIL
 
     def validate(self) -> None:
         if not (MIN_TA_PULSE_WIDTH_US <= self.start_ta_us <= self.max_ta_us
@@ -224,6 +243,16 @@ class CminSettings:
                 raise ValueError(f"{name} must be between 0 and 1")
         if not (0 < self.correction_min_ratio < 1):
             raise ValueError("correction_min_ratio must be between 0 and 1")
+        if self.match_by not in (MATCH_BY_CURRENT, MATCH_BY_WIDTH):
+            raise ValueError("match_by must be 'current' or 'width'")
+        if not (0 < self.current_match_tolerance <= self.tolerance):
+            raise ValueError("need 0 < current_match_tolerance <= tolerance")
+        if not (0 < self.max_current_step_ma <= 1000):
+            raise ValueError("max_current_step_ma must be in (0, 1000]")
+        if not (2 <= int(self.warmup_min_chunks) <= int(self.warmup_max_chunks)):
+            raise ValueError("need 2 <= warmup_min_chunks <= warmup_max_chunks")
+        if int(self.warmup_chunk_frames) < 1 or not (0 < self.warmup_stable < 1):
+            raise ValueError("bad warm-up settings")
 
 
 @dataclass(frozen=True)
@@ -321,6 +350,8 @@ class CminResult:
     cameras: list[CameraCmin] = field(default_factory=list)
     nominal_after: tuple[CameraStats, ...] = ()
     seedless_exited: bool = False
+    warmup: list[float] = field(default_factory=list)   # chunk change, worst cam
+    match_by: str = MATCH_BY_CURRENT
     notes: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -352,6 +383,8 @@ class CminResult:
                         for c in self.cameras],
             "nominal_after": stats(self.nominal_after),
             "notes": list(self.notes),
+            "warmup_chunk_change": list(self.warmup),
+            "match_by": self.match_by,
             "plateau_contrast_spread": dict(self.plateau_spread),
             "nominal": stats(self.nominal),
             "search": [burst(b) for b in self.bursts],
@@ -595,9 +628,11 @@ class SeedlessCminProcedure:
         return b
 
     def run(self) -> CminResult:
-        result = CminResult()
+        result = CminResult(match_by=self._s.match_by)
         s = self._s
         try:
+            if s.warmup:
+                self._warm_up(result)
             self._out(f"Measuring the normal image ({s.nominal_light_frames} "
                       "frames, seed on) ...")
             nominal_frames = self._bench.capture(s.nominal_light_frames,
@@ -677,12 +712,44 @@ class SeedlessCminProcedure:
                     result.restore_problem = self._bench.exit_seedless()
                 except Exception as exc:
                     result.restore_problem = f"{type(exc).__name__}: {exc}"
+                if not result.restore_problem:
+                    self._out("Laser settings restored, seed back ON.")
                 if result.restore_problem:
                     result.verdict = VERDICT_FAIL
                     if not result.problem:
                         result.problem = ("the normal laser settings were not "
                                           "restored: " + result.restore_problem)
         return result
+
+    def _warm_up(self, result: CminResult) -> None:
+        """Seeded chunks until each camera's mean changes by at most
+        warmup_stable from one chunk to the next."""
+        s = self._s
+        secs = s.warmup_chunk_frames / 40.0
+        self._out(f"Warming up the laser (seed on, {secs:.0f} s at a time, "
+                  f"until the image holds within {s.warmup_stable:.1%}) ...")
+        prev = None
+        for k in range(1, int(s.warmup_max_chunks) + 1):
+            frames = self._bench.capture(int(s.warmup_chunk_frames),
+                                         seedless=False)
+            self._tag(result, frames, PHASE_WARMUP, k, quantize_ta_us(500.0), "on")
+            cams = camera_stats(frames)
+            _check_frame_counts(cams, self._cams, int(s.warmup_chunk_frames),
+                                s.min_frame_fraction, f"warm-up {k}")
+            stats = {(c.side, c.cam_id): c.mean for c in cams
+                     if (c.side, c.cam_id) in self._cams}
+            if prev is not None:
+                change = max(abs(stats[key] / prev[key] - 1.0) for key in stats)
+                result.warmup.append(change)
+                self._detail(f"warm-up {k}: largest change {change:.2%}")
+                if k >= s.warmup_min_chunks and change <= s.warmup_stable:
+                    self._out(f"  Laser warm after {k * secs:.0f} s.")
+                    return
+            prev = stats
+        raise ProcedureStop(
+            f"the seeded image did not settle within "
+            f"{s.warmup_max_chunks * secs:.0f} s of warm-up (last change "
+            f"{result.warmup[-1]:.2%}, limit {s.warmup_stable:.1%})")
 
     def _capture_and_evaluate(self, result: CminResult) -> None:
         """Repeat captures at the matched setting, per-camera C_min with a
@@ -714,8 +781,13 @@ class SeedlessCminProcedure:
         result.cmin_capture = combined
 
         nominal = {(c.side, c.cam_id): c for c in result.nominal}
-        local = [b for b in result.bursts
-                 if b.ta_current_ma == self._current] + result.cmin_captures
+        if s.match_by == MATCH_BY_CURRENT:
+            # Width held at the ceiling: brightness there varied by current.
+            local = [b for b in result.bursts
+                     if abs(b.ta_pulse_width_us - result.matched_ta_us) < 0.5]
+        else:
+            local = [b for b in result.bursts if b.ta_current_ma == self._current]
+        local = local + result.cmin_captures
         cams: list[CameraCmin] = []
         for c in combined.cameras:
             key = (c.side, c.cam_id)
@@ -754,15 +826,18 @@ class SeedlessCminProcedure:
                 result.notes.append(f"{c.label}: correction to 1.0x is "
                                     f"{c.correction:+.1%}")
 
+        # Gate failures are collected, not raised, so the seeded re-check
+        # below still runs and the report has the drift either way.
+        problems = []
         off = [c for c in cams if abs(c.ratio - 1.0) > s.camera_tolerance]
         if off:
-            raise ProcedureStop(
+            problems.append(
                 "brightness not matched per camera (limit "
                 f"{s.camera_tolerance:.0%}): "
                 + ", ".join(f"{c.label} {c.ratio:.3f}x" for c in off))
         noisy = [c for c in cams if not (c.repeat_spread <= s.repeat_spread_max)]
         if noisy:
-            raise ProcedureStop(
+            problems.append(
                 f"C_min does not repeat within {s.repeat_spread_max:.0%}: "
                 + ", ".join(f"{c.label} {c.repeat_spread:.1%}" for c in noisy))
 
@@ -770,9 +845,10 @@ class SeedlessCminProcedure:
             result.seedless_exited = True
             result.restore_problem = self._bench.exit_seedless()
             if result.restore_problem:
-                raise ProcedureStop("the normal laser settings were not "
-                                    "restored: " + result.restore_problem)
-            self._out(f"Seed back ON. Re-measuring the normal image "
+                raise ProcedureStop("; ".join(problems + [
+                    "the normal laser settings were not restored: "
+                    + result.restore_problem]))
+            self._out(f"Laser settings restored, seed back ON. Re-measuring the normal image "
                       f"({s.nominal_recheck_frames} frames) ...")
             frames = self._bench.capture(s.nominal_recheck_frames,
                                          seedless=False)
@@ -793,10 +869,12 @@ class SeedlessCminProcedure:
                 self._detail(f"{c.label}: normal brightness moved "
                              f"{c.nominal_drift:+.1%} during the run")
             if drift:
-                raise ProcedureStop(
+                problems.append(
                     "the normal (seeded) brightness moved during the run "
                     f"(limit {s.nominal_drift_max:.0%}): "
                     + ", ".join(f"{c.label} {c.nominal_drift:+.1%}" for c in drift))
+        if problems:
+            raise ProcedureStop("; ".join(problems))
         result.verdict = VERDICT_PASS
 
     def _search_with_current(self, result: CminResult) -> None:
@@ -821,8 +899,15 @@ class SeedlessCminProcedure:
                       + (f" ({what})" if what else ""))
             return b
 
+        by_current = s.match_by == MATCH_BY_CURRENT
+
         def matched(b: BurstResult) -> bool:
-            if abs(b.ratio - 1.0) <= s.tolerance:
+            if by_current:
+                ok = (abs(b.ta_pulse_width_us - s.max_ta_us) < 0.5
+                      and abs(b.ratio - 1.0) <= s.current_match_tolerance)
+            else:
+                ok = abs(b.ratio - 1.0) <= s.tolerance
+            if ok:
                 result.matched_ta_us = b.ta_pulse_width_us
                 result.matched_current_ma = self._current
                 return True
@@ -834,6 +919,7 @@ class SeedlessCminProcedure:
             return
         round_bursts: list[BurstResult] = [first]
         prev_top: Optional[BurstResult] = None
+        prev_current: Optional[float] = None
         widths = [quantize_ta_us(f * s.max_ta_us) for f in s.round_fractions]
         widths[-1] = min(widths[-1], s.max_ta_us)
         while True:
@@ -865,6 +951,13 @@ class SeedlessCminProcedure:
             self._detail(f"at {self._current:.0f} mA a line through "
                          f"{len(round_bursts)} bursts reaches 1.0x at "
                          f"{need:.0f} us (limit {s.max_ta_us:.0f} us)")
+            if need <= s.max_ta_us and by_current:
+                full = [(c, b.ratio) for c, b in
+                        ((prev_current, prev_top), (self._current, top))
+                        if b is not None
+                        and abs(b.ta_pulse_width_us - s.max_ta_us) < 0.5]
+                self._refine_current(result, full, burst, matched)
+                return
             if need <= s.max_ta_us:
                 # Reachable at this current: refine (fit first, then secant).
                 hist = sorted(round_bursts, key=lambda x: x.ta_pulse_width_us)
@@ -899,10 +992,46 @@ class SeedlessCminProcedure:
             self._out(f"Out of reach at {self._current:.0f} mA (needs about "
                       f"{need:.0f} us). Raising the TA drive current to "
                       f"{new:.0f} mA ...")
+            prev_current = self._current
             self._bench.set_ta_current_ma(new)
             self._current = self._bench.ta_current_ma()
             prev_top = top
             round_bursts = []
+
+    def _refine_current(self, result, points, burst, matched) -> None:
+        """Hold the pulse at the ceiling and tune the drive current until the
+        seedless mean is 1.0x (secant on (current, ratio))."""
+        s = self._s
+        w = s.max_ta_us
+        pts = sorted(points)
+        self._out(f"Holding the pulse at {w:.0f} us and tuning the TA drive "
+                  "current to match ...")
+        for _ in range(s.max_bursts):
+            if len(pts) >= 2:
+                (c0, r0), (c1, r1) = pts[-2], pts[-1]
+                if abs(r1 - r0) < 1e-6:
+                    raise ProcedureStop("the drive current does not change the "
+                                        "image mean")
+                target = c1 + (1.0 - r1) * (c1 - c0) / (r1 - r0)
+            else:
+                c1, r1 = pts[-1]
+                target = c1 + (s.current_step_ma if r1 < 1 else -s.current_step_ma)
+            step = max(-s.max_current_step_ma,
+                       min(s.max_current_step_ma, target - self._current))
+            new = min(max(self._current + step, MIN_TA_CURRENT_MA),
+                      s.max_current_ma)
+            if abs(new - self._current) < TA_CURRENT_TICK_MA:
+                break
+            self._bench.set_ta_current_ma(new)
+            self._current = self._bench.ta_current_ma()
+            b = burst(w, "current refine")
+            if matched(b):
+                return
+            pts.append((self._current, b.ratio))
+            pts = pts[-2:] if len(pts) > 2 else pts
+        raise ProcedureStop(
+            f"could not match the brightness by current at {w:.0f} us "
+            f"(last {pts[-1][1]:.3f}x at {pts[-1][0]:.0f} mA)")
 
     def _plateau(self, result: CminResult, reason: str,
                  history: Sequence[BurstResult]) -> None:

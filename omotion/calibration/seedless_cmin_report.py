@@ -87,6 +87,12 @@ def format_summary(result: CminResult, run_info: Mapping[str, object]) -> str:
         else:
             lines.append("Brightness not matched: C_min from the plateau "
                          "check (contrast flatness per camera, below)")
+    lines.append("Match: " + ("pulse held at the ceiling, drive current "
+                              "tuned" if result.match_by == "current"
+                              else "pulse width tuned at the search's current"))
+    if result.warmup:
+        lines.append("Warm-up: " + ", ".join(f"{c:.2%}" for c in result.warmup)
+                     + " largest per-camera change chunk to chunk")
     lines.append("Nothing was written to the device.")
     if result.restore_problem:
         lines.append(f"RESTORE PROBLEM: {result.restore_problem}")

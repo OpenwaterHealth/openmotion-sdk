@@ -112,6 +112,14 @@ def _parser() -> argparse.ArgumentParser:
             "--no-current-stepping", action="store_true",
             help="keep the unit's own TA drive current (pulse width only)")
         parser.add_argument(
+            "--match-by", choices=("current", "width"), default="current",
+            help="final match: hold the pulse at the ceiling and tune the "
+                 "drive current (default), or shorten the pulse at the "
+                 "current the search reached (the earlier behaviour)")
+        parser.add_argument(
+            "--no-warmup", action="store_true",
+            help="skip the seeded laser warm-up before the normal image")
+        parser.add_argument(
             "--plateau-check", action="store_true",
             help="when the normal brightness is out of reach at the highest "
                  "current, accept C_min if each camera's contrast is flat "
@@ -162,6 +170,9 @@ def main(
     settings.plateau_check = args.plateau_check
     settings.current_stepping = not args.no_current_stepping
     settings.max_current_ma = args.max_current_ma
+    # Without current stepping only the width can be tuned.
+    settings.match_by = args.match_by if settings.current_stepping else "width"
+    settings.warmup = not args.no_warmup
     try:
         settings.validate()
     except ValueError as exc:

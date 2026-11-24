@@ -131,6 +131,11 @@ def restored(bench):
 
 
 def run(bench, **kw):
+    # Most tests here cover the search and gates with the earlier width
+    # match and no warm-up; the default (current match, warm-up) has its
+    # own tests at the end.
+    kw.setdefault("warmup", False)
+    kw.setdefault("match_by", "width")
     lines = []
     result = SeedlessCminProcedure(bench, CminSettings(**kw), CAMS,
                                    output_func=lines.append).run()
@@ -574,3 +579,110 @@ def test_report_has_per_camera_table_and_repeats(tmp_path):
     assert cams[0]["cmin"] == pytest.approx(0.09)
     rows = paths["frames"].read_text().splitlines()
     assert sum(1 for r in rows if r.startswith("nominal_after,")) == 8 * 40
+
+
+# --- default: warm-up, then match by current at the full pulse -------------
+
+class WarmingBench(FakeBench):
+    """The seeded image brightens by `rise` per warm-up chunk, settling
+    after `settle` chunks."""
+
+    def __init__(self, *, rise=0.01, settle=4, **kw):
+        super().__init__(**kw)
+        self.rise, self.settle, self.chunks = rise, settle, 0
+        self.base = self.nominal_mean
+
+    def capture(self, light_frames, *, seedless):
+        if not seedless and light_frames == 800:
+            self.chunks += 1
+            self.nominal_mean = self.base * (
+                1 + self.rise * min(self.chunks, self.settle))
+        return super().capture(light_frames, seedless=seedless)
+
+
+def run_default(bench, **kw):
+    lines = []
+    result = SeedlessCminProcedure(bench, CminSettings(**kw), CAMS,
+                                   output_func=lines.append).run()
+    return result, lines
+
+
+def test_default_holds_the_pulse_at_the_ceiling_and_tunes_current():
+    # 0.74x at 2150 us at 3900 mA: needs more current.
+    bench = FakeBench(seedless_per_us=0.74 / 2150)
+    result, lines = run_default(bench, warmup=False)
+    assert result.verdict == VERDICT_PASS, result.problem
+    assert result.match_by == "current"
+    assert result.matched_ta_us == pytest.approx(MAX_TA_PULSE_WIDTH_US, abs=0.5)
+    # Model: ratio = 0.74 (I - 1500) / 2400 -> 1.0x at 4743 mA.
+    assert result.matched_current_ma == pytest.approx(4743, abs=30)
+    assert abs(result.cmin_capture.ratio - 1) <= 0.01 + 1e-9
+    assert any("tuning the TA drive current" in line for line in lines)
+    # Refine bursts are all at the full pulse.
+    refine = [b for b in result.bursts if b.ta_current_ma % 100]
+    assert refine and all(abs(b.ta_pulse_width_us - MAX_TA_PULSE_WIDTH_US) < 0.5
+               for b in refine)
+    assert restored(bench)
+
+
+def test_default_lowers_the_current_when_the_full_pulse_is_too_bright():
+    bench = FakeBench()               # 1.048x at 2150 us, 3900 mA
+    result, _ = run_default(bench, warmup=False)
+    assert result.verdict == VERDICT_PASS, result.problem
+    assert result.matched_ta_us == pytest.approx(MAX_TA_PULSE_WIDTH_US, abs=0.5)
+    assert result.matched_current_ma < 3900
+    assert abs(result.cmin_capture.ratio - 1) <= 0.01 + 1e-9
+
+
+def test_current_match_corrects_along_the_full_pulse_bursts():
+    bench = FakeBench(seedless_per_us=0.75 / 2150, k_slope=0.5)
+    result, _ = run_default(bench, warmup=False)
+    assert result.verdict == VERDICT_PASS, result.problem
+    for cam in result.cameras:
+        assert cam.slope == pytest.approx(-0.045, rel=0.05)
+        assert cam.cmin == pytest.approx(0.09, abs=2e-4)
+
+
+def test_current_that_does_nothing_fails_the_current_match():
+    bench = FakeBench(current_ignored=True)
+    result, _ = run_default(bench, warmup=False)
+    assert result.verdict == VERDICT_FAIL
+    assert "current" in result.problem
+    assert restored(bench)
+
+
+def test_warm_up_runs_until_the_seeded_image_settles():
+    bench = WarmingBench(rise=0.01, settle=4)
+    result, lines = run_default(bench, match_by="width")
+    assert result.verdict == VERDICT_PASS, result.problem
+    # Chunks 2-4 change ~1 %, chunk 5 doesn't: warm after 5 chunks.
+    assert bench.chunks == 5
+    assert result.warmup[-1] <= 0.002 and result.warmup[0] > 0.005
+    assert any("Laser warm after 100 s" in line for line in lines)
+    assert {f.phase for f in result.frames} >= {"warmup"}
+    # The nominal is the warm one.
+    assert result.nominal[0].mean == pytest.approx(200 * 1.04, rel=0.01)
+
+
+def test_warm_up_that_never_settles_fails_before_the_seed_is_touched():
+    bench = WarmingBench(rise=0.01, settle=100)
+    result, _ = run_default(bench, warmup_max_chunks=4)
+    assert result.verdict == VERDICT_FAIL
+    assert "did not settle" in result.problem
+    assert not any(e[0] == "enter" for e in bench.log)
+
+
+def test_gate_failure_still_rechecks_the_seeded_image():
+    bench = PerCamBench(cam_gain={3: 0.90})
+    result, lines = run(bench)
+    assert result.verdict == VERDICT_FAIL
+    assert "brightness not matched per camera" in result.problem
+    assert len(result.nominal_after) == 8
+    assert all(c.nominal_drift is not None for c in result.cameras)
+    assert any("seed back ON" in line for line in lines)
+
+
+def test_early_failure_says_the_seed_is_back_on():
+    bench = FakeBench(seed_stays_on=True)
+    _, lines = run(bench)
+    assert "Laser settings restored, seed back ON." in lines

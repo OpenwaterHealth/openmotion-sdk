@@ -22,6 +22,7 @@ enough, the TA drive current is stepped up, 100 mA at a time, to at most 5 A.
 
 | Phase | Seed | Exposure | TA pulse | Frames |
 |---|---|---|---|---|
+| Warm-up | on | 648 us | console's (500 us) | 800 light frames (20 s) at a time, until the image holds within 0.2 % per camera (at most 5 min) |
 | Nominal | on | 648 us | console's (500 us) | 80 light frames (2 s) |
 | Search bursts | **off** | 2295 us | 500 us, then rounds of 3 widths per drive current | 10 light frames per burst |
 | C_min captures | **off** | 2295 us | matched width and current | 3 x 40 light frames (3 x 1 s) |
@@ -46,6 +47,22 @@ enough, the TA drive current is stepped up, 100 mA at a time, to at most 5 A.
     at the ceiling: FAIL.
   `--no-current-stepping` keeps the unit's own current (the earlier,
   pulse-width-only search).
+* **The final match tunes the current, not the width** (bench 2026-11-24,
+  `--match-by current`, the default). Three back-to-back runs matched at
+  4300 mA / 2150 us (C_min 0.0923, 0.0934) and 4400 mA / 2059 us (0.0998):
+  seedless contrast depends on the pulse width, so a width chosen by
+  where the search happened to land moved C_min ~8 % while the repeats
+  agreed within 1 %. Once a round's line reaches 1.0x within 2150 us, the
+  pulse stays at 2150 us and the current is set by a secant on (current,
+  brightness) between that round and the one before, to 1.0x +- 1 %
+  (down to 1000 mA if the unit's own current is already too bright). C_min
+  then always refers to the full 2150 us pulse. `--match-by width` is the
+  earlier width refinement.
+* **Warm-up** (default; `--no-warmup` skips it): the cold run's seeded
+  image rose 0.6-2.0 % during the run and failed the drift check; seeded
+  20 s chunks run until no camera changes by more than 0.2 % from one chunk
+  to the next (at least 2 chunks, at most 15, else FAIL before the seed is
+  touched).
 * **C_min, per camera** (Ethan, 2026-11-24: "confidently ascertain a per
   camera C_min"):
   1. Three 1 s captures at the matched width and current
@@ -69,7 +86,8 @@ enough, the TA drive current is stepped up, 100 mA at a time, to at most 5 A.
      (`nominal_drift_max`), so neither the phantom nor the laser moved
      during the run. `nominal_recheck=False` skips it.
   The overall C_min is the average of the per-camera values. A run that
-  fails any of these still reports the numbers, marked not confirmed.
+  fails any of these still reports the numbers, marked not confirmed, and
+  still re-measures the seeded image after the restore.
 * The nominal is checked against the unit's calibrated drive current
   before the laser starts: the TA_CURRENT_DRV the TA FPGA holds after the
   bring-up must match the console config's. A console with no
