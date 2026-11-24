@@ -944,9 +944,12 @@ class SeedlessCminProcedure:
             if prev_top is not None and not (
                     top.ratio >= prev_top.ratio * (1 + s.min_current_gain)):
                 raise ProcedureStop(
-                    f"raising the drive current to {self._current:.0f} mA did "
-                    f"not raise the image mean ({prev_top.ratio:.3f}x -> "
-                    f"{top.ratio:.3f}x at {top.ta_pulse_width_us:.0f} us)")
+                    f"the TA output has saturated: raising the drive current "
+                    f"to {self._current:.0f} mA did not raise the image mean "
+                    f"({prev_top.ratio:.3f}x -> {top.ratio:.3f}x at "
+                    f"{top.ta_pulse_width_us:.0f} us), so this unit's unseeded "
+                    f"TA tops out below the normal brightness (bench "
+                    "2026-11-24: light stopped rising at about 4.5 A)")
             need = extrapolate_width(round_bursts, 1.0)
             self._detail(f"at {self._current:.0f} mA a line through "
                          f"{len(round_bursts)} bursts reaches 1.0x at "
@@ -1010,8 +1013,9 @@ class SeedlessCminProcedure:
             if len(pts) >= 2:
                 (c0, r0), (c1, r1) = pts[-2], pts[-1]
                 if abs(r1 - r0) < 1e-6:
-                    raise ProcedureStop("the drive current does not change the "
-                                        "image mean")
+                    raise ProcedureStop(
+                        f"the TA output has saturated: the image mean is "
+                        f"{r1:.3f}x at both {c0:.0f} and {c1:.0f} mA")
                 target = c1 + (1.0 - r1) * (c1 - c0) / (r1 - r0)
             else:
                 c1, r1 = pts[-1]

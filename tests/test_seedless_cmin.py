@@ -647,7 +647,7 @@ def test_current_that_does_nothing_fails_the_current_match():
     bench = FakeBench(current_ignored=True)
     result, _ = run_default(bench, warmup=False)
     assert result.verdict == VERDICT_FAIL
-    assert "current" in result.problem
+    assert "saturated" in result.problem
     assert restored(bench)
 
 
@@ -686,3 +686,39 @@ def test_early_failure_says_the_seed_is_back_on():
     bench = FakeBench(seed_stays_on=True)
     _, lines = run(bench)
     assert "Laser settings restored, seed back ON." in lines
+
+
+class SaturatingBench(FakeBench):
+    """Seedless light stops rising above `sat_ma` (bench 2026-11-24: ~4.5 A)."""
+
+    def __init__(self, *, sat_ma=4500.0, **kw):
+        super().__init__(**kw)
+        self.sat_ma = sat_ma
+
+    def capture(self, light_frames, *, seedless):
+        real = self.current
+        self.current = min(real, self.sat_ma)
+        try:
+            return super().capture(light_frames, seedless=seedless)
+        finally:
+            self.current = real
+
+
+def test_saturated_ta_fails_with_a_clear_reason():
+    # 0.6x at 2150 us at 3900 mA; saturates at 4500 mA, below 1.0x.
+    bench = SaturatingBench(seedless_per_us=0.6 / 2150, sat_ma=4500)
+    result, _ = run_default(bench, warmup=False)
+    assert result.verdict == VERDICT_FAIL
+    assert "TA output has saturated" in result.problem
+    assert "4600 mA" in result.problem
+    assert restored(bench)
+
+
+def test_saturation_during_the_current_match_is_named():
+    # Reaches 1.0x within the 2150 us line at 4500 mA but the light is flat
+    # there, so the secant on current sees no change.
+    bench = SaturatingBench(seedless_per_us=0.735 / 2150, sat_ma=4500)
+    result, _ = run_default(bench, warmup=False)
+    if result.verdict == VERDICT_FAIL:
+        assert "saturated" in result.problem
+    assert restored(bench)
