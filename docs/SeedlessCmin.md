@@ -52,8 +52,11 @@ enough, the TA drive current is stepped up, 100 mA at a time, to at most 5 A.
 ### Plateau check (opt-in, `--plateau-check`)
 
 On the bench (2026-11-24, console 1.8.1) the longest pulse that fits the
-exposure, 2150 us, reached only 0.75x the seeded brightness at the unit's
-own 3.9 A; a linear fit puts 1.0x at about 2.9 ms. Seedless contrast barely
+exposure, 2150 us, reached only 0.75x the seeded brightness; a linear fit
+puts 1.0x at about 2.9 ms. Both the seeded and the seedless frames were at
+a 4999.68 mA drive current: flashing 1.8.1 empties the console config, so
+the laser bring-up used the bundled baseline instead of the unit's 3900 mA
+(found on the third run, which recorded the current). Seedless contrast barely
 moved across the sweep (0.103, 0.099, 0.100, 0.098 overall). Brad's first
 review proposed checking that contrast is flat **per camera** instead of
 failing; the drive-current search replaced it as the default, and it stays
@@ -68,7 +71,7 @@ available for an out-of-reach result at the highest current:
   reported with the brightness it reached. Otherwise FAIL, with each
   camera's spread in the report.
 
-On the bench (2026-11-24 day run, 1387 to 2150 us at 3.9 A) it failed on
+On the bench (2026-11-24 day run, 1387 to 2150 us at 4999.68 mA) it failed on
 R8 alone: R1 3.3 %, R2 2.6 %, R3 4.3 %, R4 3.5 %, R5 5.0 %, R6 4.3 %,
 R7 2.4 %, R8 6.0 %. Across all widths from 500 us the corner cameras R1 and
 R8 move 28 % and 40 % (their contrast falls as the image brightens), while

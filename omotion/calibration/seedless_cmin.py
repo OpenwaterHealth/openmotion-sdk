@@ -29,7 +29,7 @@ Sequence (:class:`SeedlessCminProcedure`):
    the project-wide convention, sdk#148): per camera, and over all cameras.
 
 When the longest pulse cannot reach the nominal brightness (bench
-2026-11-24: 0.75x at 2150 us at the unit's own 3.9 A), the TA drive current
+2026-11-24: 0.75x at 2150 us, seeded and seedless both at 5 A), the TA drive current
 is stepped up (Brad / Ethan 2026-11-24): at each current, bursts at
 ``round_fractions`` of the longest pulse; if a least-squares line through
 them reaches 1.0x within ``max_ta_us``, the width is refined there (fit, then
@@ -555,6 +555,11 @@ class SeedlessCminProcedure:
             self._bench.enter_seedless(ta)
             self._current = self._bench.ta_current_ma()
             result.start_current_ma = self._current
+            self._out(f"TA drive current {self._current:.0f} mA (the normal "
+                      "image was taken at this current).")
+            if s.current_stepping and self._current >= s.max_current_ma - 0.01:
+                self._out("  The current is already at the ceiling: the search "
+                          "can only lengthen the pulse.")
             # The nominal scan ran at the unit's own current.
             result.frames = [replace(f, ta_current_ma=self._current)
                              if f.phase == PHASE_NOMINAL else f
