@@ -90,7 +90,9 @@ class CurrentSweep(SeedlessCminProcedure):
                                 s.min_frame_fraction, "normal capture")
             result.nominal = tuple(c for c in cams
                                    if (c.side, c.cam_id) in self._cams)
-            pulse = quantize_ta_us(min(PULSE_US, s.max_ta_us))
+            # Same as the C_min search: quantizing 2150 rounds up to 2150.08,
+            # past the limit, so cap after quantizing.
+            pulse = min(quantize_ta_us(PULSE_US), s.max_ta_us)
             self._out(f"Turning the seed OFF. TA pulse fixed at {pulse:.1f} us.")
             result.seedless_entered = True
             self._bench.enter_seedless(pulse)
