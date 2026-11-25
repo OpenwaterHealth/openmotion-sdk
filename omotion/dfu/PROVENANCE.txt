@@ -55,6 +55,17 @@ migration.py
 image.py
   9. cryptography is imported inside verify_image().
 
+Bare-metal write verification (sdk#333)
+  10. stm32dfu.py: download() takes manifest=False, which skips the closing
+      zero-length DNLOAD so the caller can verify() before the image starts.
+      upload() and verify() report progress. A read-only `serial` property
+      exposes the opened device's serial for a later reconnect.
+  11. migration.py: install_bare_metal_app() is split into
+      write_bare_metal_app() (erase, write, read back; never leaves DFU) and
+      leave_rom(). It leaves only after the read-back matches.
+      FirmwareUpdater retries the write while the unit is still in the ROM
+      loader. The production-image and bootloader paths are untouched.
+
 Everything else, including erase ranges, step order and timeouts, is as tested.
 
 Public keys (keys/)
